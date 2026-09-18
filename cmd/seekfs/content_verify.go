@@ -20,10 +20,16 @@ import (
 	"strings"
 )
 
-// contentCandidateBudget caps any materialized content candidate slice. Beyond
-// it the candidate set is not a complete superset, so the query is marked
-// incomplete rather than silently truncated. A var so tests can lower it.
-var contentCandidateBudget = 4_000_000
+// Default per-query content budgets. They cap materialized content candidates
+// (candidate budget) and records visited by a fallback scan (visit budget).
+// They are defaults only: a caller threads explicit per-query values through
+// queryOptions so no mutable package state is shared between concurrent
+// queries. Past either cap the candidate superset is incomplete and the query
+// is marked as such rather than silently truncated.
+const (
+	contentDefaultCandidateBudget = 4_000_000
+	contentDefaultScanVisitBudget = 4_000_000
+)
 
 // contentScanPathCacheCap bounds the path-reconstruction memo used by content
 // fallback scans. Past the cap the memo is reset, so peak memory is O(cap)
@@ -31,12 +37,23 @@ var contentCandidateBudget = 4_000_000
 // wrong path.
 const contentScanPathCacheCap = 4096
 
-// contentScanVisitBudget caps the number of records a content fallback scan
-// visits before it declares its candidate superset incomplete. It is separate
-// from contentCandidateBudget (which caps materialized matches) because a
-// sparse-match scan can walk the whole volume while producing few matches. A
-// var so tests can lower it.
-var contentScanVisitBudget = contentCandidateBudget
+// contentCandidateBudgetOf returns the query's candidate budget, or the default
+// when unset (<= 0).
+func contentCandidateBudgetOf(pq parsedQuery) int {
+	if pq.ContentCandidateBudget > 0 {
+		return pq.ContentCandidateBudget
+	}
+	return contentDefaultCandidateBudget
+}
+
+// contentScanVisitBudgetOf returns the query's fallback-scan visit budget, or
+// the default when unset (<= 0).
+func contentScanVisitBudgetOf(pq parsedQuery) int {
+	if pq.ContentScanVisitBudget > 0 {
+		return pq.ContentScanVisitBudget
+	}
+	return contentDefaultScanVisitBudget
+}
 
 // boundContentPathCache resets a content scan's path memo once it reaches
 // contentScanPathCacheCap, keeping the scan's memory O(contentScanPathCacheCap)
@@ -196,14 +213,15 @@ func (vol *serviceVolumeIndex) contentTextForEntry(entry *Entry) ([]byte, bool) 
 	return text, true
 }
 
-// contentLeafFirstOffset returns the byte offset of the first case-insensitive
-// occurrence of a term/phrase leaf in the stored text, or -1 for regex leaves
-// (a regex match offset is not reliably available, so no snippet is fabricated).
-func contentLeafFirstOffset(text []byte, leaf contentLeaf) int {
-	if leaf.Kind == contentLeafRegex {
+// contentLeafFirstOffset returns the byte offset of needle in text, or -1 when
+// needle is nil. Callers pass the matcher's precomputed lowercased needle, so
+// the leaf text is not re-lowercased per call; regex leaves are skipped by the
+// caller because a regex match offset is not reliably available.
+func contentLeafFirstOffset(text, needle []byte) int {
+	if needle == nil {
 		return -1
 	}
-	return bytes.Index(text, []byte(strings.ToLower(leaf.Text)))
+	return bytes.Index(text, needle)
 }
 
 // contentPositiveLeaves returns the query's content leaves that contribute a
@@ -233,8 +251,9 @@ func contentSnippet(text []byte, src *contentSnippetSource, positive []contentLe
 		if leaf.Kind == contentLeafRegex || !m.match(text, leaf) {
 			continue
 		}
-		if off := contentLeafFirstOffset(text, leaf); off >= 0 {
-			return contentSnippetWindowSource(text, src, off, len(m.needleOf(leaf)))
+		needle := m.needleOf(leaf)
+		if off := contentLeafFirstOffset(text, needle); off >= 0 {
+			return contentSnippetWindowSource(text, src, off, len(needle))
 		}
 	}
 	return ""
@@ -313,8 +332,8 @@ func markContentQueryDegraded(trace *searchTrace, skipped []string) {
 }
 
 // contentCandidates returns compact record indices that are a superset of the
-// records matching the query's positive content constraints, capped at
-// contentCandidateBudget. ok=false means the caller should fall back to a
+// records matching the query's positive content constraints, capped at the
+// query's candidate budget. ok=false means the caller should fall back to a
 // normal scan (still correct, post-filtered inline); ok=true with an empty
 // slice means there are genuinely no content matches and the caller must NOT
 // fall back. A capped set marks the trace incomplete.
@@ -377,9 +396,10 @@ func (vol *serviceVolumeIndex) contentCandidates(pq parsedQuery) ([]int, bool) {
 			break
 		}
 	}
+	budget := contentCandidateBudgetOf(pq)
 	capped := false
-	if len(candidates) > contentCandidateBudget {
-		candidates = candidates[:contentCandidateBudget]
+	if len(candidates) > budget {
+		candidates = candidates[:budget]
 		capped = true
 	}
 	out := make([]int, 0, len(candidates))
@@ -400,8 +420,8 @@ func (vol *serviceVolumeIndex) contentCandidates(pq parsedQuery) ([]int, bool) {
 	}
 	sort.Ints(out)
 	out = uniqueSortedInts(out)
-	if len(out) > contentCandidateBudget {
-		out = out[:contentCandidateBudget]
+	if len(out) > budget {
+		out = out[:budget]
 		capped = true
 	}
 	if capped {
@@ -544,23 +564,77 @@ func (vol *serviceVolumeIndex) searchContentVolume(opts queryOptions, countOnly 
 	return filterImplicitUnderExisting(matches, opts, countOnly), nil
 }
 
+// queryNeedsEntryPath reports whether any level of the query reads Entry.Path
+// (a path match, :under, Exists, parent/dir filters or a regexp). When false, a
+// content count can evaluate the query from the record's name/metadata alone
+// and never reconstruct a path.
+func queryNeedsEntryPath(pq parsedQuery) bool {
+	if pq.MatchPath || pq.Under != "" || pq.Exists ||
+		len(pq.Parents) > 0 || len(pq.Dirs) > 0 || len(pq.Regexps) > 0 {
+		return true
+	}
+	for _, group := range pq.OrGroups {
+		for i := range group {
+			if queryNeedsEntryPath(group[i]) {
+				return true
+			}
+		}
+	}
+	for i := range pq.NotGroups {
+		if queryNeedsEntryPath(pq.NotGroups[i]) {
+			return true
+		}
+	}
+	return false
+}
+
+// countContentVolume returns the number of records matching a content query
+// without materializing an Entry slice: the base scan counts in place (and
+// skips path reconstruction unless the query needs it), and the overlay delta
+// is counted through the same predicate. It keeps count == len(search) for the
+// same query.
+func (vol *serviceVolumeIndex) countContentVolume(opts queryOptions) (int, error) {
+	count := 0
+	opts.contentCount = &count
+	if _, err := vol.searchContentVolume(opts, true); err != nil {
+		return 0, err
+	}
+	// The base scan counted base matches; add the overlay count here so a
+	// cancellation inside the overlay walk can be surfaced.
+	if snap := vol.snap.Load(); snap != nil && len(snap.records) > 0 {
+		pq, err := parseQuery(opts)
+		if err != nil {
+			return 0, err
+		}
+		n, err := vol.overlayLiveMatchCountCancellable(snap, pq)
+		if err != nil {
+			return 0, err
+		}
+		count += n
+	}
+	return count, nil
+}
+
 // contentRelevanceWindow is the enlarged per-volume result window fetched
-// before relevance ranking. It is min(contentCandidateBudget, max(limit*100,
-// 4096)), computed without overflow: once limit exceeds budget/100 the product
-// cannot fall below the budget, so the budget is the min.
-func contentRelevanceWindow(limit int) int {
+// before relevance ranking. It is min(budget, max(limit*100, 4096)), computed
+// without overflow: once limit exceeds budget/100 the product cannot fall below
+// the budget, so the budget is the min.
+func contentRelevanceWindow(limit, budget int) int {
 	if limit <= 0 {
 		return 0
 	}
-	if limit > contentCandidateBudget/100 {
-		return contentCandidateBudget
+	if budget <= 0 {
+		budget = contentDefaultCandidateBudget
+	}
+	if limit > budget/100 {
+		return budget
 	}
 	window := limit * 100
 	if window < 4096 {
 		window = 4096
 	}
-	if window > contentCandidateBudget {
-		window = contentCandidateBudget
+	if window > budget {
+		window = budget
 	}
 	return window
 }
@@ -583,7 +657,7 @@ func searchContentServiceVolumes(volumes []*serviceVolumeIndex, opts queryOption
 	// as an incomplete (degraded) result rather than a silent truncation.
 	window := 0
 	if relevance {
-		window = contentRelevanceWindow(userLimit)
+		window = contentRelevanceWindow(userLimit, contentCandidateBudgetOf(pq))
 	}
 	var volByPath map[string]*serviceVolumeIndex
 	if postVerify {

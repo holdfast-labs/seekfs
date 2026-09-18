@@ -54,11 +54,11 @@ func countServiceVolumes(volumes []*serviceVolumeIndex, opts queryOptions) (int,
 			if queryCanceled(parsedQuery{DeadlineUnix: opts.DeadlineUnix, Cancel: opts.Cancel}) {
 				return 0, true, errQueryCanceled
 			}
-			matches, err := vol.searchContentVolume(opts, true)
+			n, err := vol.countContentVolume(opts)
 			if err != nil {
 				return 0, true, err
 			}
-			total += len(matches)
+			total += n
 		}
 		// A capped candidate superset means the count is not exact. Refuse it
 		// instead of returning a partial number that looks complete.

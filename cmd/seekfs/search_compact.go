@@ -293,8 +293,18 @@ func searchCompactWithCacheHidden(idx *Index, opts queryOptions, countOnly bool,
 			}
 			continue
 		}
-		entry := compactEntryFromRecord(idx, recIndex, rec, pathCache, true)
+		// Counting mode skips path reconstruction when the query has no path
+		// constraint, and tallies the match instead of retaining an Entry.
+		withPath := true
+		if opts.contentCount != nil {
+			withPath = queryNeedsEntryPath(pq)
+		}
+		entry := compactEntryFromRecordPath(idx, recIndex, rec, pathCache, true, withPath)
 		if entryMatchesWithContentMatcher(contentVol, entry, pq, pq.MatchPath, contentMatcher) {
+			if opts.contentCount != nil {
+				*opts.contentCount++
+				continue
+			}
 			results = append(results, entry)
 			if !countOnly && len(results) >= limit {
 				break
@@ -343,7 +353,17 @@ func compactCandidateCanSkipEntryMatches(pq parsedQuery, usedCandidates bool) bo
 }
 
 func compactEntryFromRecord(idx *Index, recIndex int, rec CompactRecord, pathCache map[int]string, withLower bool) Entry {
-	path := idx.reconstructCompactPathCached(recIndex, pathCache)
+	return compactEntryFromRecordPath(idx, recIndex, rec, pathCache, withLower, true)
+}
+
+// compactEntryFromRecordPath is compactEntryFromRecord with an explicit path
+// switch. withPath=false skips reconstructing Entry.Path (used by the content
+// count path when the query reads only the record's name/metadata).
+func compactEntryFromRecordPath(idx *Index, recIndex int, rec CompactRecord, pathCache map[int]string, withLower, withPath bool) Entry {
+	path := ""
+	if withPath {
+		path = idx.reconstructCompactPathCached(recIndex, pathCache)
+	}
 	entry := Entry{
 		Path:        path,
 		Name:        rec.Name,

@@ -490,6 +490,12 @@ func (vol *serviceVolumeIndex) mergeOverlayMatches(base []Entry, opts queryOptio
 	if vol == nil {
 		return base
 	}
+	if opts.contentCount != nil {
+		// Count mode: the compact scan tallied base matches in place and
+		// countContentVolume adds the overlay count (where cancellation is
+		// surfaced). Materializing entries here would defeat that.
+		return base
+	}
 	snap := vol.snap.Load()
 	if snap == nil || len(snap.records) == 0 {
 		return base

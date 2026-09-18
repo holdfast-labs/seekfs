@@ -567,6 +567,7 @@ func replaceServiceVolumeContents(dst, src *serviceVolumeIndex) {
 	if dst == nil || src == nil {
 		return
 	}
+	prevJournalID := dst.journalID
 	dst.dbPath = src.dbPath
 	dst.index = src.index
 	dst.volume = src.volume
@@ -616,7 +617,13 @@ func replaceServiceVolumeContents(dst, src *serviceVolumeIndex) {
 	dst.searchCount = src.searchCount
 	// Content is generation-independent: keep dst's loaded content state and
 	// rebind its resolver against the new record table. A base swap must never
-	// re-extract.
+	// re-extract. A real journal reset (the journal id changed) is different:
+	// the FRN-keyed content docs belong to the old journal generation, so the
+	// content index is invalidated rather than served stale.
+	if prevJournalID != 0 && src.journalID != 0 && prevJournalID != src.journalID {
+		invalidateContentAfterBaseReset(dst, fmt.Sprintf("journal id changed from %d to %d", prevJournalID, src.journalID))
+		return
+	}
 	rebindContentAfterBaseSwap(dst)
 }
 

@@ -1699,17 +1699,19 @@ func (idx *Index) compactPathContainsAll(i int, terms []string) bool {
 
 func parseQuery(opts queryOptions) (parsedQuery, error) {
 	pq := parsedQuery{
-		Raw:           opts.Query,
-		MatchPath:     opts.MatchPath || queryLooksPathScoped(opts.Query),
-		CaseSensitive: opts.CaseSensitive,
-		Fuzzy:         opts.Fuzzy,
-		Under:         normalizeFilterPath(opts.Under),
-		Exists:        opts.Exists,
-		CWDBias:       normalizeFilterPath(opts.CWDBias),
-		RootBias:      normalizeFilterPath(opts.RootBias),
-		DeadlineUnix:  opts.DeadlineUnix,
-		Cancel:        opts.Cancel,
-		Trace:         opts.Trace,
+		Raw:                    opts.Query,
+		MatchPath:              opts.MatchPath || queryLooksPathScoped(opts.Query),
+		CaseSensitive:          opts.CaseSensitive,
+		Fuzzy:                  opts.Fuzzy,
+		Under:                  normalizeFilterPath(opts.Under),
+		Exists:                 opts.Exists,
+		CWDBias:                normalizeFilterPath(opts.CWDBias),
+		RootBias:               normalizeFilterPath(opts.RootBias),
+		DeadlineUnix:           opts.DeadlineUnix,
+		Cancel:                 opts.Cancel,
+		Trace:                  opts.Trace,
+		ContentCandidateBudget: opts.ContentCandidateBudget,
+		ContentScanVisitBudget: opts.ContentScanVisitBudget,
 	}
 	if opts.ModifiedAfter != "" {
 		t, err := parseTimeValue(opts.ModifiedAfter)

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -36,6 +37,18 @@ func TestContentSnippetWindowAtEOF(t *testing.T) {
 	}
 	if strings.HasSuffix(got, "...") {
 		t.Fatalf("EOF snippet %q fabricated a trailing ellipsis", got)
+	}
+}
+
+// An offset exactly at len(text) (and empty text) must not panic; there is no
+// match start to window around, so the snippet is empty.
+func TestContentSnippetWindowAtEndOffset(t *testing.T) {
+	text := []byte("needle")
+	if got := contentSnippetWindow(text, len(text), 0); got != "" {
+		t.Fatalf("offset==len snippet = %q; want empty", got)
+	}
+	if got := contentSnippetWindow(nil, 0, 0); got != "" {
+		t.Fatalf("empty text snippet = %q; want empty", got)
 	}
 }
 
@@ -186,17 +199,48 @@ func TestContentRelevanceTopNWithLimit(t *testing.T) {
 // M1: the window rule is min(budget, max(limit*100, 4096)) and is
 // overflow-safe.
 func TestContentRelevanceWindowRule(t *testing.T) {
-	if got := contentRelevanceWindow(0); got != 0 {
+	budget := contentDefaultCandidateBudget
+	if got := contentRelevanceWindow(0, budget); got != 0 {
 		t.Fatalf("window(0) = %d; want 0", got)
 	}
-	if got := contentRelevanceWindow(1); got != 4096 {
+	if got := contentRelevanceWindow(1, budget); got != 4096 {
 		t.Fatalf("window(1) = %d; want the 4096 floor", got)
 	}
-	if got := contentRelevanceWindow(100); got != 10000 {
+	if got := contentRelevanceWindow(100, budget); got != 10000 {
 		t.Fatalf("window(100) = %d; want 10000", got)
 	}
-	if got := contentRelevanceWindow(int(^uint(0) >> 1)); got != contentCandidateBudget {
-		t.Fatalf("window(maxint) = %d; want the budget %d", got, contentCandidateBudget)
+	if got := contentRelevanceWindow(int(^uint(0)>>1), budget); got != budget {
+		t.Fatalf("window(maxint) = %d; want the budget %d", got, budget)
+	}
+	// A per-query budget below the 4096 floor caps the window.
+	if got := contentRelevanceWindow(1, 3); got != 3 {
+		t.Fatalf("window(1, budget=3) = %d; want 3", got)
+	}
+}
+
+// A relevance window that fills up means more matches may exist: the result is
+// marked incomplete (Complete=false), never presented as a complete top-N.
+func TestContentServiceRelevanceWindowFullMarksIncomplete(t *testing.T) {
+	var files []contentFixtureFile
+	for i := 0; i < 8; i++ {
+		files = append(files, contentFixtureFile{frn: uint64(100 + i), name: fmt.Sprintf("hit%02d.txt", i), text: "needle here"})
+	}
+	vol := newContentQueryVolume(t, files)
+
+	trace := &searchTrace{}
+	matches, err := searchServiceVolumes([]*serviceVolumeIndex{vol},
+		queryOptions{Query: "content:needle sort:relevance", Limit: 2, ContentCandidateBudget: 3, Trace: trace}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(matches) != 2 {
+		t.Fatalf("relevance returned %d matches; want the user limit 2", len(matches))
+	}
+	if !trace.ContentIncomplete {
+		t.Fatal("window-full relevance result was not marked incomplete")
+	}
+	if trace.Complete == nil || *trace.Complete {
+		t.Fatalf("window-full relevance result reported Complete=%v; want false", trace.Complete)
 	}
 }
 
@@ -277,6 +321,43 @@ func TestContentCLIJSONSnippetShape(t *testing.T) {
 	withSnippet := captureStdout(t, func() error { return cmdContent([]string{"-db", db, "--snippet", "needle"}) })
 	if !strings.Contains(withSnippet, "doc.txt\t") || !strings.Contains(withSnippet, "needle") {
 		t.Fatalf("--snippet stdout = %q; want path and matched text", withSnippet)
+	}
+}
+
+// The offline JSON keeps the original `results` key (an array of path strings)
+// alongside the additive `snippets` key; older consumers are unaffected.
+func TestContentCLIJSONKeepsResultsAndSnippetsKeys(t *testing.T) {
+	t.Setenv("SEEKFS_CONTENT_SEARCH", "1")
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "doc.txt"), []byte("needle body"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	idx, err := buildContentIndexFromDir(context.Background(), root, defaultContentBuildOptions())
+	if err != nil {
+		t.Fatal(err)
+	}
+	db := filepath.Join(root, "content.gsx")
+	if err := contentSaveFile(db, idx); err != nil {
+		t.Fatal(err)
+	}
+
+	out := captureStdout(t, func() error { return cmdContent([]string{"-db", db, "--json", "needle"}) })
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(out), &raw); err != nil {
+		t.Fatalf("decode JSON %q: %v", out, err)
+	}
+	if _, ok := raw["results"]; !ok {
+		t.Fatalf("JSON lost the original results key: %q", out)
+	}
+	if _, ok := raw["snippets"]; !ok {
+		t.Fatalf("JSON missing the additive snippets key: %q", out)
+	}
+	var results []string
+	if err := json.Unmarshal(raw["results"], &results); err != nil {
+		t.Fatalf("results is not an array of strings: %v", err)
+	}
+	if len(results) != 1 || !strings.HasSuffix(results[0], "doc.txt") || strings.Contains(results[0], "needle") {
+		t.Fatalf("results = %q; want a single path string", results)
 	}
 }
 

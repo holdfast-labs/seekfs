@@ -42,7 +42,9 @@ type contentSnippetSource struct {
 // rather than O(len(text)); the start and end snap to rune boundaries so a
 // multibyte rune is never split. text must be valid UTF-8 (the stored form).
 func contentSnippetWindow(text []byte, off, matchLen int) string {
-	if off < 0 || off > len(text) {
+	// off == len(text) is not a match start: there is no byte to window around,
+	// and indexing text[off] below would panic.
+	if off < 0 || off >= len(text) {
 		return ""
 	}
 	if matchLen < 0 {
@@ -53,8 +55,9 @@ func contentSnippetWindow(text []byte, off, matchLen int) string {
 		end = len(text)
 	}
 	// Snap to rune boundaries: a caller offset can land inside a multibyte rune
-	// (and a boundary-cut window must not split one).
-	for off > 0 && !utf8.RuneStart(text[off]) {
+	// (and a boundary-cut window must not split one). off < len(text) is
+	// rechecked so the loop can never index past the end.
+	for off > 0 && off < len(text) && !utf8.RuneStart(text[off]) {
 		off--
 	}
 	for end > off && end < len(text) && !utf8.RuneStart(text[end]) {

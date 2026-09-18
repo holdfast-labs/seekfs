@@ -427,7 +427,7 @@ func (vol *serviceVolumeIndex) boundedScanCandidatesFiltered(pq parsedQuery, fil
 			// reaching the budget, return what was found and say it is
 			// incomplete rather than scan forever. The non-content path is
 			// unchanged (both checks are gated on contentQuery).
-			if contentQuery && visited >= contentScanVisitBudget {
+			if contentQuery && visited >= contentScanVisitBudgetOf(pq) {
 				pq.Trace.setContentIncomplete()
 				break
 			}
@@ -460,7 +460,8 @@ func (vol *serviceVolumeIndex) boundedScanCandidatesFiltered(pq parsedQuery, fil
 		// volume while producing few matches, so the visited-record budget is
 		// enforced independently of the match budget, and the path memo is
 		// reset past a fixed cap to keep memory O(budget).
-		budget := contentCandidateBudget
+		budget := contentCandidateBudgetOf(pq)
+		visitBudget := contentScanVisitBudgetOf(pq)
 		out := make([]int, 0, min(recordCount, 1024))
 		cache := make(map[int]string)
 		visited := 0
@@ -469,7 +470,7 @@ func (vol *serviceVolumeIndex) boundedScanCandidatesFiltered(pq parsedQuery, fil
 			if pos&1023 == 0 && queryCanceled(pq) {
 				return nil, false
 			}
-			if visited >= contentScanVisitBudget {
+			if visited >= visitBudget {
 				incomplete = true
 				break
 			}

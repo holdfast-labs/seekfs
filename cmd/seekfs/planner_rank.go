@@ -212,7 +212,7 @@ func contentRelevanceOf(vol *serviceVolumeIndex, entry Entry, pq parsedQuery, m 
 	for _, leaf := range m.leaves {
 		matched[leaf.LeafID] = m.match(text, leaf)
 	}
-	rel.score, rel.first = contentScoreAt(entry, pq, pq.MatchPath, matched, text)
+	rel.score, rel.first = contentScoreAt(entry, pq, pq.MatchPath, matched, text, m)
 	return rel
 }
 
@@ -220,7 +220,7 @@ func contentRelevanceOf(vol *serviceVolumeIndex, entry Entry, pq parsedQuery, m 
 // rule as entryMatchesContentAt: top-level positive leaves always count, and an
 // OR group contributes only the leaves of the alternative that satisfies the
 // group. A failing alternative does not inflate the score.
-func contentScoreAt(entry Entry, pq parsedQuery, matchPath bool, matched []bool, text []byte) (score, first int) {
+func contentScoreAt(entry Entry, pq parsedQuery, matchPath bool, matched []bool, text []byte, m *contentLeafMatcher) (score, first int) {
 	first = contentRelevanceNoOffset
 	for _, leaf := range pq.Content {
 		if leaf.LeafID < 0 || leaf.LeafID >= len(matched) || !matched[leaf.LeafID] {
@@ -230,7 +230,7 @@ func contentScoreAt(entry Entry, pq parsedQuery, matchPath bool, matched []bool,
 		if leaf.Kind == contentLeafRegex {
 			continue
 		}
-		if off := contentLeafFirstOffset(text, leaf); off >= 0 && off < first {
+		if off := contentLeafFirstOffset(text, m.needleOf(leaf)); off >= 0 && off < first {
 			first = off
 		}
 	}
@@ -240,7 +240,7 @@ func contentScoreAt(entry Entry, pq parsedQuery, matchPath bool, matched []bool,
 			if !entryMatchesContentAt(entry, alt, matchPath || alt.MatchPath, matched) {
 				continue
 			}
-			s, f := contentScoreAt(entry, alt, matchPath || alt.MatchPath, matched, text)
+			s, f := contentScoreAt(entry, alt, matchPath || alt.MatchPath, matched, text, m)
 			score += s
 			if f < first {
 				first = f

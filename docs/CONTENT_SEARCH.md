@@ -1,10 +1,12 @@
 # Content Search — Design, Status, and Handoff
 
-Branch: `content-search`. Status: P0–P3 complete and reviewed; P4's two planner
-surfaces (`sort:relevance` and snippets) are implemented and tested, pending
-review; P4 document-extraction quality is still open. Content search is off by
-default; with `SEEKFS_CONTENT_SEARCH=1` and an FRN-keyed `.gsx` attached,
-`content:` queries now work through the service.
+Branch: `content-search`. Status: P0–P5 complete and reviewed. P4's two planner
+surfaces (`sort:relevance` and snippets) are implemented and tested; P5's final
+polish (review minors, per-query budgets, entry-free counting, journal-reset
+invalidation, freshness measurement, docs) landed. P4 document-extraction
+quality remains deferred (see §7). Content search is off by default; with
+`SEEKFS_CONTENT_SEARCH=1` and an FRN-keyed `.gsx` attached, `content:` queries
+now work through the service.
 
 This document is the committed handoff for an agent continuing the work. The
 fuller working plan lives at `docs/CONTENT_SEARCH_PLAN.md`, which is
@@ -141,24 +143,25 @@ applied before content verification, (2) multi-volume decline, (3) mixed-OR
 dropped matches, (4) unbounded candidate/Entry materialization, (5) unbounded
 fallback path memo.
 
-## 6b. P4 — remaining work (next)
+## 6b. P4 — remaining work
 
 1. **Snippets.** LANDED (see §6c): a bounded local-only window around the first
    matching term/phrase leaf. A `Matches` span list is still open.
 2. **`sort:relevance`.** LANDED (see §6c): bounded post-verify content rank.
    BM25 stays gated on the engine review.
 3. **Document-extraction quality:** PDF xref/object-streams and font coverage
-   (the current extractor is a spike); decide on legacy OLE.
+   (the current extractor is a spike); decide on legacy OLE. DEFERRED — see §7.
 4. **Scale follow-ups from review:** stream/cap the posting decode in
-   `contentCandidates` before the budget (a common-gram list can be large);
-   make the scan budgets per-query/options instead of mutable package vars;
-   rank the capped positive-content candidate set (it currently caps in
-   FRN-hash order); entry-free counting so count does not materialize `[]Entry`.
-5. **Freshness:** measure the p95 ≤ 5 s USN→result bound.
+   `contentCandidates` before the budget (a common-gram list can be large) —
+   DEFERRED, see §7; per-query/options scan budgets instead of mutable package
+   vars — DONE in P5 (§6d); rank the capped positive-content candidate set (it
+   currently caps in FRN-hash order) — open; entry-free counting so count does
+   not materialize `[]Entry` — DONE in P5 (§6d).
+5. **Freshness:** measure the p95 ≤ 5 s USN→result bound — DONE in P5 (§6d).
 6. **Tests:** multi-leaf AND (`content:a content:b`) and content nested inside
    OR/NOT.
 
-## 6c. P4 surfaces — implemented (pending review)
+## 6c. P4 surfaces — implemented (reviewed)
 
 - **`sort:relevance`.** Only meaningful for content queries; ranked post-verify
   over the bounded result set by `contentRelevanceOf` / `sortContentEntriesByRelevance`
@@ -174,8 +177,8 @@ fallback path memo.
   path applies the bounded sort instead. A non-content query with
   `sort:relevance` keeps the default order, like the other sort columns.
   Ranking must not be a top-of-page illusion: before scoring, each volume is
-  fetched with an enlarged window `min(contentCandidateBudget, max(limit*100,
-  4096))` (overflow-safe), ranked, then trimmed to the user limit. A per-volume
+  fetched with an enlarged window `min(candidateBudget, max(limit*100, 4096))`
+  (overflow-safe), ranked, then trimmed to the user limit. A per-volume
   match count that reaches the window means more matches may exist and is
   surfaced as incomplete/degraded, never a silent truncation.
 - **Snippets.** `Entry.Snippet` (and `jsonResult.Snippet`) is filled by
@@ -184,10 +187,11 @@ fallback path memo.
   term/phrase content leaf, with `...` on a truncated side; regex-only matches
   yield no snippet. The window decodes only the bytes around the match
   (`contentSnippetWindow`), so per-result work is O(window), not O(docLen), and
-  it snaps to rune boundaries so a multibyte rune is never split. Where a
-  case-preserving decoded source is available it is mapped through
-  `contentLossyFixups` (`contentSnippetWindowSource`); an inexact mapping falls
-  back to the normalized text rather than fabricating. The offline `content`
+  it snaps to rune boundaries so a multibyte rune is never split. The mapping
+  path `contentLossyFixups` (`contentSnippetWindowSource`) can render original
+  case from a case-preserving source, but no current build supplies one, so
+  snippets fall back to the normalized text (see §7). An inexact mapping also
+  falls back rather than fabricating. The offline `content`
   command keeps `results` as an array of path strings and adds a parallel
   `snippets` array in `--json`; plain stdout stays path-only unless `--snippet`
   is passed.
@@ -197,17 +201,48 @@ fallback path memo.
   matched text nor any other `Entry` text field reaches a remote caller. No new
   capability is granted.
 
+## 6d. P5 — final polish (done)
+
+- **Reviewer minors.** `contentSnippetWindow` no longer panics at
+  `off == len(text)` and its rune-snap loop is bounds-safe
+  (`TestContentSnippetWindowAtEndOffset`). `contentLeafFirstOffset` now takes
+  the matcher's hoisted lowercased needle instead of re-lowercasing per call.
+  Tests cover the relevance window-full incomplete path
+  (`TestContentServiceRelevanceWindowFullMarksIncomplete`) and the offline JSON
+  `results`-paths-only + `snippets` keys (`TestContentCLIJSONKeepsResultsAndSnippetsKeys`).
+- **Per-query budgets.** `queryOptions.ContentCandidateBudget` /
+  `ContentScanVisitBudget` (copied into `parsedQuery`, `contentDefaultCandidateBudget`
+  / `contentDefaultScanVisitBudget` = 4,000,000 defaults) replace the mutable
+  package vars; tests set the option, not a global. No production behavior
+  change (the service pipe does not carry the fields, so they default).
+- **Entry-free counting.** `countContentVolume` tallies content matches through
+  `queryOptions.contentCount` and the compact scan counts in place, skipping
+  path reconstruction unless the query reads `Entry.Path`; the overlay delta is
+  counted by the same predicate. `count == len(search)` is unchanged.
+- **Journal-reset invalidation.** `replaceServiceVolumeContents` (the same call
+  site as `rebindContentAfterBaseSwap`) now calls
+  `invalidateContentAfterBaseReset` when the base journal id actually changed,
+  dropping the FRN-keyed content index and pending delta so it is never served
+  stale; a same-journal swap still only rebinds the resolver
+  (`TestContentInvalidatedOnJournalReset`).
+- **Freshness measurement.** `TestContentFreshnessUSNWriteCloseLatency` drives
+  the write-close → drain → query path, asserts the changed content becomes
+  findable, and reports the per-round latency (p95, max) without asserting a
+  wall-clock bound. On this machine it reports single-digit milliseconds for the
+  in-process drain path, well inside the 5 s target; the production cadence adds
+  only the ≤2 s quiet-window drain tick.
+
 ## 7. Carried debt / known gaps
 
-- The `.gsx` text store is lowercased (`contentNormalizeText`), so service
-  snippets have no case-preserving source to map back to and fall back to the
-  normalized text. `contentSnippetWindowSource` + `contentLossyFixups` are in
-  place for a case-preserving source section/build; until one lands, only the
-  offline reader path can preserve case when its stored text already carries it.
+- **Snippet case is not preserved on any current path.** The `.gsx` text store
+  is lowercased (`contentNormalizeText`), and the offline reader's "source" is
+  that same normalized text, so neither the service nor the offline reader has a
+  case-carrying source to map back to and both fall back to the normalized text.
+  `contentSnippetWindowSource` + `contentLossyFixups` are in place for a
+  case-preserving source section, but a case-carrying source section must be
+  built before any snippet can show original case.
 - The service reads the whole `.gsx` into heap (`contentLoadFile`); mmap-ing it
   is deferred to the ARCHITECTURE_REVIEW R1/R5 engine work.
-- Journal-reset content invalidation (`contentCoordinator.invalidate`) is
-  implemented but not wired into the rebuild/replace path.
 - `contentResolvePath` has no end-to-end test (needs a compact index with a
   parent chain); only its `contentLookupFRNColumn` fallback is tested.
 - Runtime-added volumes (`replaceLoadedVolumeLocked`) get no content attach;
@@ -224,6 +259,25 @@ fallback path memo.
   content query see only `Complete=false`, not the degraded-volume detail.
 - A biased content search (`RootBias`/`CWDIBias`) disables the incremental
   early-stop and scans up to the match budget before the limit is applied.
+
+### Explicitly deferred (P5)
+
+Each item below is intentionally out of scope for P5; the rationale is one line.
+
+- **PDF extraction quality** (xref/object streams, CID/Type0 fonts): the
+  extractor is a best-effort spike; a real PDF engine is its own project.
+- **Posting-decode streaming in `contentCandidates`**: bounded per query today;
+  streaming only matters for pathologically common grams, which the budget
+  already caps.
+- **Case-preserving snippet source**: needs a new `.gsx` source section and a
+  build change; without it every snippet is correctly lowercased, never wrong.
+- **mmap of `.gsx`**: the whole file is read into heap; mmap belongs with the
+  ARCHITECTURE_REVIEW R1/R5 engine work.
+- **Runtime-added-volume attach**: `replaceLoadedVolumeLocked` attaches content
+  only for previously attached volumes; wiring attach-on-add is a broader
+  service change.
+- **`contentResolvePath` end-to-end test**: needs a compact index with a real
+  parent chain; only its `contentLookupFRNColumn` fallback is unit-tested today.
 
 ## 8. Review process used
 

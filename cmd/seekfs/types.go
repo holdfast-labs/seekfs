@@ -445,6 +445,13 @@ type queryOptions struct {
 	RequestSeq    int64        `json:"request_seq,omitempty"`
 	Cancel        func() bool  `json:"-"`
 	Trace         *searchTrace `json:"-"`
+	// Per-query content budgets. Zero means "use the default"; they are never
+	// globals, so concurrent queries cannot race on each other's limits.
+	ContentCandidateBudget int `json:"content_candidate_budget,omitempty"`
+	ContentScanVisitBudget int `json:"content_scan_visit_budget,omitempty"`
+	// contentCount, when non-nil, makes the content compact scan count matches
+	// in place instead of materializing and retaining []Entry. Local-only.
+	contentCount *int `json:"-"`
 }
 
 type parsedQuery struct {
@@ -480,6 +487,9 @@ type parsedQuery struct {
 	DeadlineUnix      int64
 	Cancel            func() bool
 	Trace             *searchTrace
+	// Per-query content budgets copied from queryOptions; 0 means use default.
+	ContentCandidateBudget int
+	ContentScanVisitBudget int
 }
 
 type searchTrace struct {

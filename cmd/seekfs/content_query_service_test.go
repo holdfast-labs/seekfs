@@ -415,9 +415,7 @@ func TestContentServiceMixedOrKeepsContentMatches(t *testing.T) {
 // capped and the degradation is visible, yet search still returns exactly the
 // user limit.
 func TestContentServiceCandidateBudgetMarksIncomplete(t *testing.T) {
-	old := contentCandidateBudget
-	contentCandidateBudget = 3
-	defer func() { contentCandidateBudget = old }()
+	const budget = 3
 
 	var files []contentFixtureFile
 	for i := 0; i < 8; i++ {
@@ -425,20 +423,24 @@ func TestContentServiceCandidateBudgetMarksIncomplete(t *testing.T) {
 	}
 	vol := newContentQueryVolume(t, files)
 
-	pq := parseServiceQuery(t, "content:needle")
+	pq, err := parseQuery(queryOptions{Query: "content:needle", ContentCandidateBudget: budget})
+	if err != nil {
+		t.Fatal(err)
+	}
 	pq.Trace = &searchTrace{}
 	candidates, ok := vol.nameTermCandidates(pq)
 	if !ok {
 		t.Fatal("nameTermCandidates declined a postings content query")
 	}
-	if len(candidates) > contentCandidateBudget {
-		t.Fatalf("candidate set = %d; want capped at %d", len(candidates), contentCandidateBudget)
+	if len(candidates) > budget {
+		t.Fatalf("candidate set = %d; want capped at %d", len(candidates), budget)
 	}
 	if !pq.Trace.ContentIncomplete {
 		t.Fatal("capped candidate set did not mark the trace incomplete")
 	}
 
-	matches, trace, err := contentServiceSearchLimit(t, []*serviceVolumeIndex{vol}, "content:needle", 2)
+	trace := &searchTrace{}
+	matches, err := searchServiceVolumes([]*serviceVolumeIndex{vol}, queryOptions{Query: "content:needle", Limit: 2, ContentCandidateBudget: budget, Trace: trace}, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -457,10 +459,6 @@ func TestContentServiceCandidateBudgetMarksIncomplete(t *testing.T) {
 // The fallback (boundedScan) path is capped for count and refuses an inexact
 // number instead of returning a silently truncated one.
 func TestContentServiceFallbackScanBudgetRefusesCount(t *testing.T) {
-	old := contentCandidateBudget
-	contentCandidateBudget = 3
-	defer func() { contentCandidateBudget = old }()
-
 	var files []contentFixtureFile
 	for i := 0; i < 8; i++ {
 		files = append(files, contentFixtureFile{frn: uint64(100 + i), name: fmt.Sprintf("clean%02d.txt", i), text: "clean text"})
@@ -468,7 +466,7 @@ func TestContentServiceFallbackScanBudgetRefusesCount(t *testing.T) {
 	vol := newContentQueryVolume(t, files)
 
 	trace := &searchTrace{}
-	_, ok, err := countServiceVolumes([]*serviceVolumeIndex{vol}, queryOptions{Query: "!content:marker", Trace: trace})
+	_, ok, err := countServiceVolumes([]*serviceVolumeIndex{vol}, queryOptions{Query: "!content:marker", Trace: trace, ContentCandidateBudget: 3})
 	if !ok || err == nil {
 		t.Fatalf("incomplete content count = ok=%v err=%v; want a refusal", ok, err)
 	}
@@ -485,9 +483,7 @@ func TestContentServiceFallbackScanBudgetRefusesCount(t *testing.T) {
 // returns what it found, degraded; count refuses) instead of walking the whole
 // volume for a sparse-match query.
 func TestContentServiceFallbackScanVisitBudget(t *testing.T) {
-	old := contentScanVisitBudget
-	contentScanVisitBudget = 3
-	defer func() { contentScanVisitBudget = old }()
+	const visitBudget = 3
 
 	var files []contentFixtureFile
 	for i := 0; i < 8; i++ {
@@ -496,12 +492,13 @@ func TestContentServiceFallbackScanVisitBudget(t *testing.T) {
 	vol := newContentQueryVolume(t, files)
 
 	// Search: return the matches found before the budget, visibly incomplete.
-	matches, trace, err := contentServiceSearchLimit(t, []*serviceVolumeIndex{vol}, "!content:marker", 100)
+	trace := &searchTrace{}
+	matches, err := searchServiceVolumes([]*serviceVolumeIndex{vol}, queryOptions{Query: "!content:marker", Limit: 100, ContentScanVisitBudget: visitBudget, Trace: trace}, false)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(matches) != contentScanVisitBudget {
-		t.Fatalf("budgeted content scan returned %d matches; want %d (visited budget)", len(matches), contentScanVisitBudget)
+	if len(matches) != visitBudget {
+		t.Fatalf("budgeted content scan returned %d matches; want %d (visited budget)", len(matches), visitBudget)
 	}
 	if !trace.ContentIncomplete {
 		t.Fatal("budgeted content scan did not mark the search incomplete")
@@ -515,7 +512,7 @@ func TestContentServiceFallbackScanVisitBudget(t *testing.T) {
 	}
 
 	// Count: refuse instead of returning a partial number.
-	_, ok, err := countServiceVolumes([]*serviceVolumeIndex{vol}, queryOptions{Query: "!content:marker", Trace: &searchTrace{}})
+	_, ok, err := countServiceVolumes([]*serviceVolumeIndex{vol}, queryOptions{Query: "!content:marker", Trace: &searchTrace{}, ContentScanVisitBudget: visitBudget})
 	if !ok || err == nil || !strings.Contains(err.Error(), "incomplete") {
 		t.Fatalf("budgeted content count = ok=%v err=%v; want an incomplete refusal", ok, err)
 	}

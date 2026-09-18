@@ -188,6 +188,22 @@ func (vol *serviceVolumeIndex) recordIDForFRN(frn uint64) (int, bool) {
 	return 0, false
 }
 
+// invalidateContentAfterBaseReset drops a volume's decoded content index and
+// any pending content work when the base was rebuilt against a different USN
+// journal generation. The content docs are FRN-keyed against the old journal,
+// so continuing to serve them would be stale; the volume is left stale (not
+// ready, not silently empty) until a full content rebuild.
+func invalidateContentAfterBaseReset(vol *serviceVolumeIndex, reason string) {
+	if vol == nil || vol.content == nil {
+		return
+	}
+	if vol.contentCoord != nil {
+		vol.contentCoord.invalidate(reason)
+		return
+	}
+	vol.content.markStale(reason)
+}
+
 // rebindContentAfterBaseSwap rebuilds a volume's content->record resolver
 // against its new record table. Content itself is untouched: docs are keyed on
 // FRN, so a persist/compaction swap must never re-extract.
