@@ -636,10 +636,21 @@ func (vol *serviceVolumeIndex) nameTermCandidates(pq parsedQuery) ([]int, bool) 
 	if queryHasAnyContentLeaf(pq) {
 		if queryHasPositiveContentLeaf(pq) {
 			if candidates, ok := vol.contentCandidates(pq); ok {
+				// Single-volume filename parity: the filename path orders its
+				// candidates by rankForQuery(pq) (name rank for the default
+				// order; size/modified/extension/type/path for explicit sorts),
+				// so order the content posting set the same way. sort:relevance
+				// keeps its own post-verify ranking (rankForQuery returns nil
+				// for it), so it is left in candidate order here.
+				if pq.SortColumn != "relevance" {
+					sortCandidateIDs(candidates, pq, vol.index, vol.rankForQuery(pq))
+				}
 				pq.Trace.setSource("content-candidates", len(candidates))
 				return candidates, true
 			}
 		}
+		// The bounded scan is already produced in orderForQuery(pq) order, which
+		// is the same rank sequence for every sort column.
 		if candidates, ok := vol.boundedScanCandidates(pq); ok {
 			pq.Trace.setSource("content-scan", len(candidates))
 			return candidates, true

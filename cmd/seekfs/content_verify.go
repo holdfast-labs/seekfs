@@ -616,9 +616,10 @@ func (vol *serviceVolumeIndex) countContentVolume(opts queryOptions) (int, error
 }
 
 // contentRelevanceWindow is the enlarged per-volume result window fetched
-// before relevance ranking. It is min(budget, max(limit*100, 4096)), computed
-// without overflow: once limit exceeds budget/100 the product cannot fall below
-// the budget, so the budget is the min.
+// before a post-verify content ordering (sort:relevance, or the default
+// name/path order). It is min(budget, max(limit*100, 4096)), computed without
+// overflow: once limit exceeds budget/100 the product cannot fall below the
+// budget, so the budget is the min.
 func contentRelevanceWindow(limit, budget int) int {
 	if limit <= 0 {
 		return 0
@@ -647,16 +648,25 @@ func contentRelevanceWindow(limit, budget int) int {
 func searchContentServiceVolumes(volumes []*serviceVolumeIndex, opts queryOptions, countOnly bool, pq parsedQuery) ([]Entry, error) {
 	postVerify := !countOnly && queryHasAnyContentLeaf(pq)
 	relevance := postVerify && pq.SortColumn == "relevance"
+	// A content query with no explicit sort must return the same relative order
+	// as the equivalent filename query. Single-volume order comes from the
+	// volume's rankForQuery(pq) candidate order (the same source the filename
+	// single-volume path uses; see nameTermCandidates). Multi-volume order is
+	// applied after the merge with the shared comparator below. The default
+	// order still fetches an enlarged bounded window so a candidate budget cap
+	// is surfaced as incomplete rather than silently truncating the page.
+	defaultOrder := postVerify && pq.SortColumn == ""
 	userLimit := 0
 	if !countOnly {
 		userLimit = normalizedLimit(opts.Limit, false)
 	}
-	// Relevance must rank the best matches, not an arbitrary candidate-order
-	// page: fetch an enlarged per-volume window, rank it, then trim to the user
-	// limit. Reaching the window means more matches may exist, which is surfaced
-	// as an incomplete (degraded) result rather than a silent truncation.
+	// Relevance and default order must rank the best matches, not an arbitrary
+	// candidate-order page: fetch an enlarged per-volume window, order it, then
+	// trim to the user limit. Reaching the window means more matches may exist,
+	// which is surfaced as an incomplete (degraded) result rather than a silent
+	// truncation.
 	window := 0
-	if relevance {
+	if relevance || defaultOrder {
 		window = contentRelevanceWindow(userLimit, contentCandidateBudgetOf(pq))
 	}
 	var volByPath map[string]*serviceVolumeIndex
@@ -697,6 +707,13 @@ func searchContentServiceVolumes(volumes []*serviceVolumeIndex, opts queryOption
 	if !countOnly && relevance {
 		sortContentEntriesByRelevance(results, volByPath, pq, contentMatcher)
 	} else if !countOnly && entriesSpanMultipleVolumes(results) {
+		// Multi-volume filename parity: the merged set uses the shared
+		// comparator (compareSearchAllEntries via sortSearchAllEntries), exactly
+		// as the filename multi-volume path does. A single volume is already in
+		// the volume's rankForQuery order from candidate generation and must not
+		// be re-sorted, since compareSearchAllEntryNamePath breaks basename ties
+		// by path while the filename single-volume rank breaks them by record
+		// id.
 		sortSearchAllEntries(results, pq)
 	}
 	if !countOnly && userLimit > 0 && len(results) > userLimit {
