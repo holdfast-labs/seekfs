@@ -7,13 +7,62 @@ import (
 	"errors"
 	"sort"
 	"strings"
+	"unicode/utf8"
 )
+
+// Snippet window bounds. The window is measured in runes (not bytes) and gets
+// an ASCII ellipsis on each truncated side.
+const (
+	contentSnippetMaxRunes     = 200
+	contentSnippetContextRunes = 60
+)
+
+var contentSnippetSpace = strings.NewReplacer("\r", " ", "\n", " ", "\t", " ")
 
 // contentHit is one matching document.
 type contentHit struct {
-	Path   string
-	DocID  uint32
-	Offset int
+	Path    string
+	DocID   uint32
+	Offset  int
+	Snippet string
+}
+
+// contentSnippetWindow returns a bounded window of text around the match at byte
+// offset off. Newlines and tabs are collapsed to spaces so the snippet stays one
+// line. text must be valid UTF-8 (the stored/normalized form).
+func contentSnippetWindow(text []byte, off, matchLen int) string {
+	if off < 0 || off > len(text) {
+		return ""
+	}
+	end := off + matchLen
+	if end > len(text) {
+		end = len(text)
+	}
+	runes := []rune(string(text))
+	start := utf8.RuneCount(text[:off])
+	matchRunes := utf8.RuneCount(text[off:end])
+	from := start - contentSnippetContextRunes
+	if from < 0 {
+		from = 0
+	}
+	to := from + contentSnippetMaxRunes
+	if to > len(runes) {
+		to = len(runes)
+		if from = to - contentSnippetMaxRunes; from < 0 {
+			from = 0
+		}
+	}
+	if to < start+matchRunes {
+		to = min(len(runes), start+matchRunes)
+	}
+	window := []rune(contentSnippetSpace.Replace(string(runes[from:to])))
+	if from > 0 {
+		window = append([]rune("..."), window...)
+	}
+	if to < len(runes) {
+		window = append(window, []rune("...")...)
+	}
+	return string(window)
 }
 
 // contentReader is a decoded `.gsx` ready to query.
@@ -102,7 +151,12 @@ func (r *contentReader) search(term string, limit int) []contentHit {
 			lower = []byte(strings.ToLower(string(text)))
 		}
 		if off := strings.Index(string(lower), t); off >= 0 {
-			hits = append(hits, contentHit{Path: r.docPath(id), DocID: id, Offset: off})
+			hits = append(hits, contentHit{
+				Path:    r.docPath(id),
+				DocID:   id,
+				Offset:  off,
+				Snippet: contentSnippetWindow(lower, off, len(t)),
+			})
 			if limit > 0 && len(hits) >= limit {
 				break
 			}
@@ -185,5 +239,3 @@ func (r *contentReader) sortedDocIDs() []uint32 {
 	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
 	return ids
 }
-
-

@@ -185,7 +185,84 @@ func (vol *serviceVolumeIndex) nameOrderRanks() []uint32 {
 	return vol.queryIndex.nameRank
 }
 
+// contentRelevanceNoOffset marks a result whose matched content leaves are all
+// regexes (no reliable offset); at equal score it sorts after any result with a
+// real offset.
+var contentRelevanceNoOffset = int(^uint(0) >> 1)
+
+// contentRelevance is the minimal deterministic content ranking key: score is
+// the number of matched positive content leaves (AND leaves plus matched OR
+// alternatives); first is the earliest first-match offset among term/phrase
+// leaves, with name/path order as the final tie-break.
+type contentRelevance struct {
+	score int
+	first int
+}
+
+func contentRelevanceOf(vol *serviceVolumeIndex, entry Entry, pq parsedQuery, m *contentLeafMatcher) contentRelevance {
+	rel := contentRelevance{first: contentRelevanceNoOffset}
+	if vol == nil {
+		return rel
+	}
+	text, ok := vol.contentTextForEntry(&entry)
+	if !ok {
+		return rel
+	}
+	for _, leaf := range contentPositiveLeaves(pq) {
+		if !m.match(text, leaf) {
+			continue
+		}
+		rel.score++
+		if leaf.Kind == contentLeafRegex {
+			continue
+		}
+		if off := contentLeafFirstOffset(text, leaf); off >= 0 && off < rel.first {
+			rel.first = off
+		}
+	}
+	return rel
+}
+
+// sortContentEntriesByRelevance orders a bounded content result set by the
+// relevance rule above, falling back to the existing name/path order.
+func sortContentEntriesByRelevance(entries []Entry, volByPath map[string]*serviceVolumeIndex, pq parsedQuery) {
+	if len(entries) < 2 {
+		return
+	}
+	m := newContentLeafMatcher(pq)
+	rel := make([]contentRelevance, len(entries))
+	order := make([]int, len(entries))
+	for i := range entries {
+		rel[i] = contentRelevanceOf(volByPath[entries[i].Path], entries[i], pq, m)
+		order[i] = i
+	}
+	defaultPQ := pq
+	defaultPQ.SortColumn = ""
+	sort.SliceStable(order, func(a, b int) bool {
+		i, j := order[a], order[b]
+		if rel[i].score != rel[j].score {
+			return rel[i].score > rel[j].score
+		}
+		if rel[i].first != rel[j].first {
+			return rel[i].first < rel[j].first
+		}
+		return compareSearchAllEntries(entries[i], entries[j], defaultPQ) < 0
+	})
+	sorted := make([]Entry, len(entries))
+	for k, i := range order {
+		sorted[k] = entries[i]
+	}
+	copy(entries, sorted)
+}
+
 func (vol *serviceVolumeIndex) rankForQuery(pq parsedQuery) []uint32 {
+	if pq.SortColumn == "relevance" && queryHasAnyContentLeaf(pq) {
+		// Content relevance is a post-verify key over the bounded result set
+		// (sortContentEntriesByRelevance); it is not expressible as an index-wide
+		// per-record rank without scanning every record, so no rank array is
+		// built here and candidate generation keeps the default order.
+		return nil
+	}
 	if pq.SortColumn == "size" {
 		if vol != nil && vol.queryIndex != nil && len(vol.queryIndex.sizeRank) > 0 {
 			return vol.queryIndex.sizeRank

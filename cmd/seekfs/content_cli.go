@@ -85,6 +85,13 @@ func cmdContentIndex(args []string) error {
 	return nil
 }
 
+// contentCLIResult is the additive JSON shape for the offline `content` command:
+// path plus the matched-text snippet when one is available.
+type contentCLIResult struct {
+	Path    string `json:"path"`
+	Snippet string `json:"snippet,omitempty"`
+}
+
 func cmdContent(args []string) error {
 	fs := flag.NewFlagSet("content", flag.ContinueOnError)
 	db := fs.String("db", "", "content index (.gsx) to query")
@@ -114,18 +121,22 @@ func cmdContent(args []string) error {
 	hits := r.search(term, *n)
 
 	if *asJSON {
-		results := make([]string, 0, len(hits))
+		results := make([]contentCLIResult, 0, len(hits))
 		for _, h := range hits {
-			results = append(results, h.Path)
+			results = append(results, contentCLIResult{Path: h.Path, Snippet: h.Snippet})
 		}
 		enc := json.NewEncoder(os.Stdout)
 		return enc.Encode(struct {
-			OK      bool     `json:"ok"`
-			Count   int      `json:"count"`
-			Results []string `json:"results"`
+			OK      bool               `json:"ok"`
+			Count   int                `json:"count"`
+			Results []contentCLIResult `json:"results"`
 		}{OK: true, Count: len(results), Results: results})
 	}
 	for _, h := range hits {
+		if h.Snippet != "" {
+			fmt.Fprintf(os.Stdout, "%s\t%s\n", h.Path, h.Snippet)
+			continue
+		}
 		fmt.Fprintln(os.Stdout, h.Path)
 	}
 	return nil

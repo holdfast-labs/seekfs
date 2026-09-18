@@ -167,6 +167,9 @@ type Entry struct {
 	// entries built from a compact record or an overlay record carry it for
 	// inline content verification. Zero for records that have no FRN.
 	FRN uint64
+	// Snippet is a short window of matched content text, populated only for
+	// content-query results (and only on the local path). Empty otherwise.
+	Snippet string
 }
 
 type jsonError struct {
@@ -182,6 +185,7 @@ type jsonResult struct {
 	Size        *int64 `json:"size,omitempty"`
 	Modified    string `json:"modified,omitempty"`
 	IndexSource string `json:"index_source,omitempty"`
+	Snippet     string `json:"snippet,omitempty"`
 	Exists      *bool  `json:"exists,omitempty"`
 }
 

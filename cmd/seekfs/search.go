@@ -181,6 +181,7 @@ func entryToJSON(entry Entry) jsonResult {
 		Volume:      filepath.VolumeName(entry.Path),
 		IsDir:       entry.Mode&uint32(os.ModeDir) != 0,
 		IndexSource: entry.IndexSource,
+		Snippet:     entry.Snippet,
 	}
 	if result.Name == "" {
 		result.Name = filepath.Base(result.Path)

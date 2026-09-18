@@ -182,6 +182,66 @@ func (vol *serviceVolumeIndex) contentTextForEntry(entry *Entry) ([]byte, bool) 
 	return text, true
 }
 
+// contentLeafFirstOffset returns the byte offset of the first case-insensitive
+// occurrence of a term/phrase leaf in the stored text, or -1 for regex leaves
+// (a regex match offset is not reliably available, so no snippet is fabricated).
+func contentLeafFirstOffset(text []byte, leaf contentLeaf) int {
+	if leaf.Kind == contentLeafRegex {
+		return -1
+	}
+	return bytes.Index(text, []byte(strings.ToLower(leaf.Text)))
+}
+
+// contentPositiveLeaves returns the query's content leaves that contribute a
+// positive match, in the canonical LeafID order. Leaves under NOT are exclusion
+// and carry no relevance or snippet.
+func contentPositiveLeaves(pq parsedQuery) []contentLeaf {
+	var out []contentLeaf
+	contentCollectPositiveLeaves(pq, &out)
+	return out
+}
+
+func contentCollectPositiveLeaves(pq parsedQuery, out *[]contentLeaf) {
+	*out = append(*out, pq.Content...)
+	for g := range pq.OrGroups {
+		for a := range pq.OrGroups[g] {
+			contentCollectPositiveLeaves(pq.OrGroups[g][a], out)
+		}
+	}
+}
+
+// contentSnippet returns a bounded window around the first matching term/phrase
+// content leaf. A query whose only content matches are regexes yields "".
+func contentSnippet(text []byte, pq parsedQuery, m *contentLeafMatcher) string {
+	for _, leaf := range contentPositiveLeaves(pq) {
+		if leaf.Kind == contentLeafRegex || !m.match(text, leaf) {
+			continue
+		}
+		if off := contentLeafFirstOffset(text, leaf); off >= 0 {
+			return contentSnippetWindow(text, off, len(strings.ToLower(leaf.Text)))
+		}
+	}
+	return ""
+}
+
+// attachContentSnippets fills Entry.Snippet for content-query results. It is
+// called after the result set is bounded by the limit, so the work is O(results).
+func attachContentSnippets(entries []Entry, volByPath map[string]*serviceVolumeIndex, pq parsedQuery) {
+	if len(entries) == 0 || len(volByPath) == 0 || !queryHasAnyContentLeaf(pq) {
+		return
+	}
+	m := newContentLeafMatcher(pq)
+	for i := range entries {
+		vol := volByPath[entries[i].Path]
+		if vol == nil {
+			continue
+		}
+		if text, ok := vol.contentTextForEntry(&entries[i]); ok {
+			entries[i].Snippet = contentSnippet(text, pq, m)
+		}
+	}
+}
+
 // contentUsableForQuery reports whether a volume can apply content semantics.
 func (vol *serviceVolumeIndex) contentUsableForQuery() bool {
 	if vol == nil || vol.content == nil {
@@ -474,6 +534,12 @@ func (vol *serviceVolumeIndex) searchContentVolume(opts queryOptions, countOnly 
 // applied only after inline content verification. It checks cancellation
 // between volumes so a superseded query does not start the next full scan.
 func searchContentServiceVolumes(volumes []*serviceVolumeIndex, opts queryOptions, countOnly bool, pq parsedQuery) ([]Entry, error) {
+	postVerify := !countOnly && queryHasAnyContentLeaf(pq)
+	relevance := postVerify && pq.SortColumn == "relevance"
+	var volByPath map[string]*serviceVolumeIndex
+	if postVerify {
+		volByPath = make(map[string]*serviceVolumeIndex)
+	}
 	results := make([]Entry, 0, 64)
 	for _, vol := range volumes {
 		if queryCanceled(parsedQuery{DeadlineUnix: opts.DeadlineUnix, Cancel: opts.Cancel}) {
@@ -483,15 +549,28 @@ func searchContentServiceVolumes(volumes []*serviceVolumeIndex, opts queryOption
 		if err != nil {
 			return nil, err
 		}
+		if postVerify {
+			for i := range matches {
+				if _, ok := volByPath[matches[i].Path]; !ok {
+					volByPath[matches[i].Path] = vol
+				}
+			}
+		}
 		results = append(results, matches...)
 	}
-	if !countOnly && entriesSpanMultipleVolumes(results) {
+	if !countOnly && relevance {
+		sortContentEntriesByRelevance(results, volByPath, pq)
+	} else if !countOnly && entriesSpanMultipleVolumes(results) {
 		sortSearchAllEntries(results, pq)
 	}
 	if !countOnly {
 		if limit := normalizedLimit(opts.Limit, false); limit > 0 && len(results) > limit {
 			results = results[:limit]
 		}
+	}
+	// Snippets are attached last so the work is bounded by the returned set.
+	if postVerify {
+		attachContentSnippets(results, volByPath, pq)
 	}
 	opts.Trace.setPlannerMode("service-content")
 	opts.Trace.setComplete(opts.Trace == nil || (!opts.Trace.ContentPartial && !opts.Trace.ContentIncomplete))
