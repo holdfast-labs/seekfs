@@ -1727,7 +1727,14 @@ func parseQuery(opts queryOptions) (parsedQuery, error) {
 		pq.ModifiedAfter = time.Now().Add(-d)
 		pq.HasModAfter = true
 	}
-	for _, raw := range strings.Fields(opts.Query) {
+	tokens := strings.Fields(opts.Query)
+	if queryHasContentToken(opts.Query) {
+		// Content queries need the quote/regex-span-aware tokenizer so
+		// content:"a b" and content:/a|b/ stay one constraint. Non-content
+		// queries keep the historical strings.Fields behavior.
+		tokens = contentTokenizeQuery(opts.Query)
+	}
+	for _, raw := range tokens {
 		if implicitPathSeparatorToken(raw) {
 			pq.ImplicitPathTerms = append(pq.ImplicitPathTerms, queryPlainTerms(raw, pq.CaseSensitive, true)...)
 		}

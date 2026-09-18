@@ -38,6 +38,19 @@ func contentSearchEnabled() bool {
 	return os.Getenv("SEEKFS_CONTENT_SEARCH") == "1"
 }
 
+// queryHasContentToken reports whether the raw query contains a token that
+// STARTS with content:/!content:/-content:. A substring match would switch the
+// tokenizer for a path like C:/x/content:y; only a token boundary counts.
+func queryHasContentToken(query string) bool {
+	for _, raw := range strings.Fields(query) {
+		token := strings.TrimLeft(raw, "!-")
+		if strings.HasPrefix(token, "content:") {
+			return true
+		}
+	}
+	return false
+}
+
 // contentUnavailableError is returned for any `content:` query. It is explicit:
 // an absent or still-building content index must never look like "no matches".
 func contentUnavailableError() error {
@@ -83,6 +96,50 @@ func queryHasPositiveContentLeaf(pq parsedQuery) bool {
 		}
 	}
 	return false
+}
+
+// queryHasAnyContentLeaf reports whether the query tree contains a content leaf
+// anywhere: top-level, inside an OR alternative, or under NOT. Candidate
+// generation only needs positive leaves; evaluation and the unavailable check
+// need any leaf, because `!content:x` is exclusion that must still be applied.
+func queryHasAnyContentLeaf(pq parsedQuery) bool {
+	if len(pq.Content) > 0 {
+		return true
+	}
+	for _, group := range pq.OrGroups {
+		for i := range group {
+			if queryHasAnyContentLeaf(group[i]) {
+				return true
+			}
+		}
+	}
+	for i := range pq.NotGroups {
+		if queryHasAnyContentLeaf(pq.NotGroups[i]) {
+			return true
+		}
+	}
+	return false
+}
+
+// contentAllLeaves returns every content leaf in the tree in the canonical DFS
+// order contentAssignLeafIDs used, so LeafID is a stable key. Callers use it to
+// evaluate a document against every leaf once.
+func contentAllLeaves(pq parsedQuery) []contentLeaf {
+	var out []contentLeaf
+	contentCollectLeaves(pq, &out)
+	return out
+}
+
+func contentCollectLeaves(pq parsedQuery, out *[]contentLeaf) {
+	*out = append(*out, pq.Content...)
+	for g := range pq.OrGroups {
+		for a := range pq.OrGroups[g] {
+			contentCollectLeaves(pq.OrGroups[g][a], out)
+		}
+	}
+	for n := range pq.NotGroups {
+		contentCollectLeaves(pq.NotGroups[n], out)
+	}
 }
 
 // contentAssignLeafIDs assigns LeafIDs deterministically: positive Content

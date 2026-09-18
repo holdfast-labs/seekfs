@@ -255,6 +255,9 @@ func scalarRangeForVolume(vol *serviceVolumeIndex, pq parsedQuery) (scalarRange,
 // use persisted/resident order arrays; type-only and unsupported compound
 // shapes retain the complete global scan fallback.
 func globalScalarQuerySupported(pq parsedQuery) bool {
+	if queryHasAnyContentLeaf(pq) {
+		return false
+	}
 	if pq.Exists || pq.Under != "" || len(nonVolumeTerms(pq.Terms)) != 0 ||
 		len(pq.Exts) != 0 || len(pq.Dirs) != 0 || len(pq.Globs) != 0 ||
 		len(pq.Regexps) != 0 || len(pq.RegexTerms) != 0 || len(pq.Parents) != 0 ||

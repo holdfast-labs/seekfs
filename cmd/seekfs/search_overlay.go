@@ -37,6 +37,7 @@ func (vol *serviceVolumeIndex) overlaySlotEntry(records []CompactRecord, latest 
 		Size:        rec.Size,
 		ModUnix:     rec.ModUnix,
 		IndexSource: vol.index.Source,
+		FRN:         rec.FRN,
 	}, true
 }
 
@@ -77,7 +78,7 @@ func (vol *serviceVolumeIndex) overlayLiveMatchCountCancellable(snap *volumeSnap
 		if !ok {
 			continue
 		}
-		if entryMatches(entry, pq, pq.MatchPath) {
+		if entryMatchesWithContent(vol, entry, pq, pq.MatchPath) {
 			count++
 		}
 	}
@@ -481,6 +482,7 @@ func (vol *serviceVolumeIndex) overlayEntry(records []CompactRecord, latest map[
 		Size:        rec.Size,
 		ModUnix:     rec.ModUnix,
 		IndexSource: vol.index.Source,
+		FRN:         rec.FRN,
 	}, true
 }
 

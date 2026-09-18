@@ -408,25 +408,88 @@ func (vol *serviceVolumeIndex) boundedScanCandidatesFiltered(pq parsedQuery, fil
 	}
 	order := vol.orderForQuery(pq)
 	limit := pq.Limit
+	contentQuery := queryHasAnyContentLeaf(pq)
+	var contentMatcher *contentLeafMatcher
+	if contentQuery {
+		contentMatcher = newContentLeafMatcher(pq)
+	}
 	canStopAtLimit := !pq.CountOnly && limit > 0 && pq.RootBias == "" && pq.CWDBias == ""
 	if canStopAtLimit {
 		out := make([]int, 0, min(limit, 1024))
 		cache := make(map[int]string)
+		visited := 0
 		for pos := 0; pos < compactUint32OrderLen(order, recordCount); pos++ {
 			if pos&1023 == 0 && queryCanceled(pq) {
 				return nil, false
+			}
+			// A content scan can walk the whole volume when matches are sparse,
+			// so it is bounded in visited records and in path-cache size. On
+			// reaching the budget, return what was found and say it is
+			// incomplete rather than scan forever. The non-content path is
+			// unchanged (both checks are gated on contentQuery).
+			if contentQuery && visited >= contentScanVisitBudget {
+				pq.Trace.setContentIncomplete()
+				break
+			}
+			if contentQuery {
+				cache = boundContentPathCache(cache)
 			}
 			id := compactUint32OrderAt(order, pos)
 			if filter != nil && !filter.contains(id) {
 				continue
 			}
-			if _, ok := compactCandidateEntryIfMatch(vol.index, pq, id, cache, true, false); !ok {
+			if contentQuery {
+				visited++
+			}
+			if _, ok := compactCandidateEntryIfMatchIn(vol, vol.index, pq, id, cache, true, false, contentMatcher); !ok {
 				continue
 			}
 			out = append(out, id)
 			if len(out) >= limit {
 				return out, true
 			}
+		}
+		return out, true
+	}
+
+	if contentQuery {
+		// Count (or a biased scan) cannot stop early and content verification
+		// drops candidates, so materialize the whole matching set up to the
+		// memory budget. Past either budget the superset is incomplete: mark it
+		// rather than silently truncate. A sparse-match scan can visit the whole
+		// volume while producing few matches, so the visited-record budget is
+		// enforced independently of the match budget, and the path memo is
+		// reset past a fixed cap to keep memory O(budget).
+		budget := contentCandidateBudget
+		out := make([]int, 0, min(recordCount, 1024))
+		cache := make(map[int]string)
+		visited := 0
+		incomplete := false
+		for pos := 0; pos < compactUint32OrderLen(order, recordCount); pos++ {
+			if pos&1023 == 0 && queryCanceled(pq) {
+				return nil, false
+			}
+			if visited >= contentScanVisitBudget {
+				incomplete = true
+				break
+			}
+			id := compactUint32OrderAt(order, pos)
+			if filter != nil && !filter.contains(id) {
+				continue
+			}
+			visited++
+			cache = boundContentPathCache(cache)
+			if _, ok := compactCandidateEntryIfMatchIn(vol, vol.index, pq, id, cache, true, false, contentMatcher); !ok {
+				continue
+			}
+			if len(out) >= budget {
+				incomplete = true
+				break
+			}
+			out = append(out, id)
+		}
+		if incomplete {
+			pq.Trace.setContentIncomplete()
 		}
 		return out, true
 	}

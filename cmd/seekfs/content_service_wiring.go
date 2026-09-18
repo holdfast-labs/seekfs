@@ -170,6 +170,24 @@ func contentLookupFRNColumn(frns []uint64, frn uint64) (int, bool) {
 	return 0, false
 }
 
+// recordIDForFRN resolves an FRN to a base record id, falling back to the
+// persisted FRN column when the resident arrays are absent (low-memory mode).
+// Content delta docs and candidate mapping must never drop a record just
+// because the resident FRN index was not built.
+func (vol *serviceVolumeIndex) recordIDForFRN(frn uint64) (int, bool) {
+	if vol == nil || vol.index == nil || frn == 0 {
+		return 0, false
+	}
+	if id, ok := vol.idForFRN(frn); ok {
+		return id, true
+	}
+	derived := vol.index.Derived
+	if i, ok := contentLookupFRNColumn(derived.FRNs, frn); ok && i < len(derived.FRNRecordIDs) {
+		return int(derived.FRNRecordIDs[i]), true
+	}
+	return 0, false
+}
+
 // rebindContentAfterBaseSwap rebuilds a volume's content->record resolver
 // against its new record table. Content itself is untouched: docs are keyed on
 // FRN, so a persist/compaction swap must never re-extract.

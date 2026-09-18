@@ -14,6 +14,7 @@ func globalExtOnlySupported(pq parsedQuery) bool {
 		len(pq.Regexps) != 0 || len(pq.RegexTerms) != 0 ||
 		len(pq.Parents) != 0 || pq.Under != "" || pq.Exists || pq.HasModAfter || len(pq.SizeFilters) != 0 ||
 		len(pq.DateFilters) != 0 || len(pq.AttrFilters) != 0 || len(pq.OrGroups) != 0 || len(pq.NotGroups) != 0 ||
+		queryHasAnyContentLeaf(pq) ||
 		pq.CaseSensitive {
 		return false
 	}
@@ -172,6 +173,11 @@ func globalComponentQuerySupported(pq parsedQuery, terms []string) bool {
 // regexes keep the components/literal lane so the persisted per-volume regex
 // candidates continue to serve them.
 func globalComponentQuerySupportedMulti(pq parsedQuery, terms []string, multi bool) bool {
+	if queryHasAnyContentLeaf(pq) {
+		// The components lane verifies only name/path; a content query must
+		// route through the content candidate + post-filter path.
+		return false
+	}
 	minTerms := 2
 	if queryHasExplicitPathTerm(pq.Raw) || globalComponentVolumeAnchored(pq) {
 		minTerms = 1

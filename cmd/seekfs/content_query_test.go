@@ -14,16 +14,20 @@ func TestContentQueryGateDisabled(t *testing.T) {
 	}
 }
 
-func TestContentQueryGateEnabledButUnavailable(t *testing.T) {
+func TestContentQueryGateEnabledParses(t *testing.T) {
 	t.Setenv("SEEKFS_CONTENT_SEARCH", "1")
 	var pq parsedQuery
-	err := applyQueryToken(&pq, "content:needle")
-	if err == nil || !strings.Contains(err.Error(), "content indexing unavailable") {
-		t.Fatalf("content: with the flag on returned %v; want unavailable", err)
+	if err := applyQueryToken(&pq, "content:needle"); err != nil {
+		t.Fatalf("content: with the flag on returned %v; want nil", err)
 	}
-	// The leaf is still parsed into the model before the gate refuses.
 	if len(pq.Content) != 1 || pq.Content[0].Kind != contentLeafTerm || pq.Content[0].Text != "needle" {
 		t.Fatalf("parsed content leaf = %+v", pq.Content)
+	}
+	// The same token with the flag off must still be refused at parse time.
+	t.Setenv("SEEKFS_CONTENT_SEARCH", "")
+	var off parsedQuery
+	if err := applyQueryToken(&off, "content:needle"); err == nil || !strings.Contains(err.Error(), "disabled") {
+		t.Fatalf("content: with the flag off returned %v; want a disabled error", err)
 	}
 }
 

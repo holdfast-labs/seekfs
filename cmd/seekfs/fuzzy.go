@@ -236,7 +236,7 @@ func appendFuzzyServiceMatches(volumes []*serviceVolumeIndex, opts queryOptions,
 		return matches, false
 	}
 	pq, err := parseQuery(opts)
-	if err != nil || pq.CaseSensitive || pq.MatchPath || len(pq.Terms) != 1 || len(pq.OrGroups) > 0 || len(pq.Regexps) > 0 || len(pq.Globs) > 0 {
+	if err != nil || pq.CaseSensitive || pq.MatchPath || queryHasAnyContentLeaf(pq) || len(pq.Terms) != 1 || len(pq.OrGroups) > 0 || len(pq.Regexps) > 0 || len(pq.Globs) > 0 {
 		return matches, false
 	}
 	// Auto-fuzzy: a query that matched nothing is the strongest typo signal,
@@ -520,7 +520,7 @@ type fuzzyRewriteTrial struct {
 // typo. Trials are capped; callers execute them cheapest-first and keep the
 // first that yields results.
 func multiTermFuzzyRewriteTrials(volumes []*serviceVolumeIndex, opts queryOptions, pq parsedQuery) []fuzzyRewriteTrial {
-	if len(pq.Terms) < 2 || pq.CaseSensitive || pq.MatchPath ||
+	if len(pq.Terms) < 2 || pq.CaseSensitive || pq.MatchPath || queryHasAnyContentLeaf(pq) ||
 		len(pq.OrGroups) > 0 || len(pq.Regexps) > 0 || len(pq.Globs) > 0 {
 		return nil
 	}
@@ -707,7 +707,7 @@ func fuzzyShortTermInsertionTrials(volumes []*serviceVolumeIndex, opts queryOpti
 // single-term fallback, which declines multi-term queries anyway.
 func tryMultiTermFuzzyRewrite(volumes []*serviceVolumeIndex, opts *queryOptions, matches *[]Entry, fuzzied *bool) bool {
 	pq, err := parseQuery(*opts)
-	if err != nil || len(pq.Terms) < 2 {
+	if err != nil || queryHasAnyContentLeaf(pq) || len(pq.Terms) < 2 {
 		return false
 	}
 	if len(*matches) > 0 && !pq.Fuzzy {

@@ -321,7 +321,7 @@ func (s *goSearchService) serviceCommandSearch(w io.Writer, caps serviceCapabili
 					_ = json.NewEncoder(w).Encode(serviceResponse{OK: false, Message: countErr.Error()})
 				} else {
 					trace.setSource("count-fast-posting", count)
-					_ = json.NewEncoder(w).Encode(serviceResponse{OK: true, Count: count, SearchMS: searchMS, Source: trace.Source, Decline: trace.Decline, Candidates: trace.Candidates, PlannerMode: trace.PlannerMode, EligibleVolumes: trace.EligibleVolumes, BlocksDecoded: trace.BlocksDecoded, BlocksSkipped: trace.BlocksSkipped, ScalarDriver: trace.ScalarDriver, ScalarInterval: trace.ScalarInterval, RecordsVerified: trace.ScalarRecordsVerified, ComponentDriver: trace.ComponentDriver, ComponentRoots: trace.ComponentRoots, ComponentIntervals: trace.ComponentIntervals, ComponentCardinality: trace.ComponentCardinality, ComponentSelfHits: trace.ComponentSelfHits, ComponentBounds: trace.ComponentBounds, ComponentRecordsVerified: trace.ComponentRecordsVerified, FilenameDriver: trace.FilenameDriver, FilenameRequiredGrams: trace.FilenameRequiredGrams, FilenamePostingHint: trace.FilenamePostingHint, FilenameRecordsVerified: trace.FilenameRecordsVerified, OverlayBaseWindow: trace.OverlayBaseWindow, PostingPrefetchBytes: trace.PostingPrefetchBytes, PostingPrefetchRanges: trace.PostingPrefetchRanges, PostingPrefetchPages: trace.PostingPrefetchPages, Terms: trace.Terms, Declines: trace.Declines, Fallback: trace.Fallback, Complete: trace.completePtr()})
+					_ = json.NewEncoder(w).Encode(serviceResponse{OK: true, Count: count, SearchMS: searchMS, Source: trace.Source, Decline: trace.Decline, Candidates: trace.Candidates, PlannerMode: trace.PlannerMode, EligibleVolumes: trace.EligibleVolumes, BlocksDecoded: trace.BlocksDecoded, BlocksSkipped: trace.BlocksSkipped, ScalarDriver: trace.ScalarDriver, ScalarInterval: trace.ScalarInterval, RecordsVerified: trace.ScalarRecordsVerified, ComponentDriver: trace.ComponentDriver, ComponentRoots: trace.ComponentRoots, ComponentIntervals: trace.ComponentIntervals, ComponentCardinality: trace.ComponentCardinality, ComponentSelfHits: trace.ComponentSelfHits, ComponentBounds: trace.ComponentBounds, ComponentRecordsVerified: trace.ComponentRecordsVerified, FilenameDriver: trace.FilenameDriver, FilenameRequiredGrams: trace.FilenameRequiredGrams, FilenamePostingHint: trace.FilenamePostingHint, FilenameRecordsVerified: trace.FilenameRecordsVerified, OverlayBaseWindow: trace.OverlayBaseWindow, PostingPrefetchBytes: trace.PostingPrefetchBytes, PostingPrefetchRanges: trace.PostingPrefetchRanges, PostingPrefetchPages: trace.PostingPrefetchPages, Terms: trace.Terms, Declines: trace.Declines, Fallback: trace.Fallback, Complete: trace.completePtr(), Content: s.searchContentHealth(trace)})
 				}
 				return
 			}
@@ -368,7 +368,7 @@ func (s *goSearchService) serviceCommandSearch(w io.Writer, caps serviceCapabili
 		}
 		resp.Rows = entriesToJSON(matches)
 	}
-	resp.Content = s.contentHealthSnapshot()
+	resp.Content = s.searchContentHealth(trace)
 	_ = json.NewEncoder(w).Encode(resp)
 }
 

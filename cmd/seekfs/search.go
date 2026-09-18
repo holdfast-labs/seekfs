@@ -194,6 +194,12 @@ func entryToJSON(entry Entry) jsonResult {
 }
 
 func searchAll(indexes []*Index, opts queryOptions, countOnly bool) ([]Entry, error) {
+	if pq, err := parseQuery(opts); err == nil && queryHasAnyContentLeaf(pq) {
+		// Content is only queryable through the service's FRN-keyed volumes;
+		// a direct-index search has no content resolver. Refuse rather than
+		// silently ignore the content leaf.
+		return nil, contentUnavailableError()
+	}
 	if len(indexes) == 1 {
 		matches, err := search(indexes[0], opts, countOnly)
 		if err != nil {
@@ -376,6 +382,18 @@ func searchServiceVolumes(volumes []*serviceVolumeIndex, opts queryOptions, coun
 	}
 	volumes = prioritizeServiceVolumesForPathTerms(volumes, opts)
 	opts.Trace.setEligibleVolumes(volumes)
+	if queryHasAnyContentLeaf(pq) {
+		// Content has its own candidate + post-filter path. It runs on every
+		// content-usable volume; an unusable volume degrades the result rather
+		// than bricking the whole service, but if none is usable the query is
+		// refused instead of reported as no matches.
+		usable, skipped := contentUsableVolumes(volumes, pq)
+		if len(usable) == 0 {
+			return nil, contentUnavailableError()
+		}
+		markContentQueryDegraded(opts.Trace, skipped)
+		return searchContentServiceVolumes(usable, opts, countOnly, pq)
+	}
 	snapshot := newGlobalQuerySnapshot(volumes, opts.Trace)
 	if matches, handled, err := searchServiceVolumesGlobalExtOnlySnapshot(snapshot, opts, countOnly); handled {
 		return matches, err
@@ -438,7 +456,7 @@ func searchServiceVolumes(volumes []*serviceVolumeIndex, opts queryOptions, coun
 				opts.Trace.OverlayBaseWindow = baseOpts.Limit
 			}
 		}
-		matches, err := searchCompactWithCacheHidden(vol.index, baseOpts, countOnly, pathCache, candidateFn, hidden)
+		matches, err := searchCompactWithCacheHidden(vol.index, baseOpts, countOnly, pathCache, candidateFn, hidden, nil)
 		matches = vol.mergeOverlayMatches(matches, opts, countOnly, pathCache)
 		vol.trimSearchCachesLocked()
 		if locked {
@@ -480,6 +498,12 @@ func (vol *serviceVolumeIndex) mergeOverlayMatches(base []Entry, opts queryOptio
 		return base
 	}
 	limit := normalizedLimit(opts.Limit, countOnly)
+	if queryHasAnyContentLeaf(pq) {
+		// Inline content verification owns the per-volume limit already;
+		// truncating the merged set here would drop a true match that the
+		// caller's post-merge limit has not yet considered.
+		limit = 0
+	}
 	overlay := vol.overlayRankedMatches(snap, pq, pathCache)
 	if !countOnly {
 		merged := make([]Entry, 0, len(base)+len(overlay))
@@ -513,13 +537,17 @@ func (vol *serviceVolumeIndex) overlayRankedMatches(snap *volumeSnapshot, pq par
 		return nil
 	}
 	latest := latestOverlaySlotsByFRN(records)
+	var contentMatcher *contentLeafMatcher
+	if queryHasAnyContentLeaf(pq) {
+		contentMatcher = newContentLeafMatcher(pq)
+	}
 	overlay := make([]rankedOverlayEntry, 0, len(records))
 	for slot := 0; slot < len(records); slot++ {
 		entry, ok := vol.overlayEntry(records, latest, slot, map[int32]struct{}{}, pathCache)
 		if !ok {
 			continue
 		}
-		if entryMatches(entry, pq, pq.MatchPath) {
+		if entryMatchesWithContentMatcher(vol, entry, pq, pq.MatchPath, contentMatcher) {
 			overlay = append(overlay, rankedOverlayEntry{entry: entry, rank: vol.overlayEntryRank(entry, pq)})
 		}
 	}

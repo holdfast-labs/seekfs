@@ -163,6 +163,10 @@ type Entry struct {
 	Mode        uint32
 	ModUnix     int64
 	IndexSource string
+	// FRN is the NTFS file reference. Content search keys documents on it, so
+	// entries built from a compact record or an overlay record carry it for
+	// inline content verification. Zero for records that have no FRN.
+	FRN uint64
 }
 
 type jsonError struct {
@@ -504,6 +508,14 @@ type searchTrace struct {
 	PostingPrefetchRanges    int    `json:"posting_prefetch_ranges,omitempty"`
 	PostingPrefetchPages     int    `json:"posting_prefetch_pages,omitempty"`
 	Complete                 *bool
+	// ContentPartial is set when a content query answered from only a subset of
+	// the eligible volumes; ContentSkippedVolumes names the volumes left out.
+	ContentPartial        bool
+	ContentSkippedVolumes []string
+	// ContentIncomplete is set when a content query could not evaluate the full
+	// candidate superset within the memory budget. The result is a visible
+	// degradation, never a silent truncation; a count refuses outright.
+	ContentIncomplete bool
 }
 
 type traceTerm struct {
@@ -606,6 +618,12 @@ func (t *searchTrace) setFallback(route string) {
 		return
 	}
 	t.Fallback = route
+}
+
+func (t *searchTrace) setContentIncomplete() {
+	if t != nil {
+		t.ContentIncomplete = true
+	}
 }
 
 func (t *searchTrace) setComplete(complete bool) {

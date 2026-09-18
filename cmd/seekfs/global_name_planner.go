@@ -3,6 +3,9 @@ package main
 import "strings"
 
 func globalNameQuerySupported(pq parsedQuery) bool {
+	if queryHasAnyContentLeaf(pq) {
+		return false
+	}
 	hasGlobs := len(pq.Globs) > 0
 	if hasGlobs && !pqGramsCouldDriveGlobs(pq) {
 		return false

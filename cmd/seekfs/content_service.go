@@ -30,6 +30,7 @@ const (
 	contentStateIndexing    = "indexing"
 	contentStateReady       = "ready"
 	contentStateStale       = "stale"
+	contentStateDegraded    = "degraded"
 )
 
 // Windows file attributes the content pipeline cares about.
@@ -76,6 +77,14 @@ type contentHealth struct {
 	LastDrain        string `json:"last_drain,omitempty"`
 	Evictions        int    `json:"evictions,omitempty"`
 	ExtractionErrors int    `json:"extract_errors,omitempty"`
+	// Partial is set when the content query answered from only a subset of the
+	// eligible volumes; DegradedVolumes names the volumes that could not.
+	Partial         bool     `json:"partial,omitempty"`
+	DegradedVolumes []string `json:"degraded_volumes,omitempty"`
+	// Incomplete is set when a content query's candidate set exceeded the
+	// memory budget, so the answer is a visible subset, never a silent
+	// truncation. A count in this state is refused instead of answered.
+	Incomplete bool `json:"incomplete,omitempty"`
 }
 
 // contentDeltaDoc is an extracted document for a file changed since the base,
@@ -133,6 +142,23 @@ func (d *contentDelta) live() []contentDeltaDoc {
 		}
 	}
 	return out
+}
+
+// textFor returns a delta doc's normalized text keyed by FRN. found is true
+// when the FRN is present at all; deleted marks a tombstoned doc whose text
+// must not be served even though it is still in the map.
+func (d *contentDelta) textFor(frn uint64) (text []byte, found, deleted bool) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	i, ok := d.byFRN[frn]
+	if !ok {
+		return nil, false, false
+	}
+	doc := d.docs[i]
+	if doc.Deleted {
+		return nil, true, true
+	}
+	return doc.Text, true, false
 }
 
 func (d *contentDelta) priorHash(frn uint64) ([contentHashLen]byte, bool) {
@@ -203,6 +229,28 @@ func (s *goSearchService) contentHealthSnapshot() *contentHealth {
 	return nil
 }
 
+// searchContentHealth is contentHealthSnapshot augmented with the query's
+// degraded (partial) state: a content query that had to skip an unusable volume
+// must not look complete to the caller.
+func (s *goSearchService) searchContentHealth(trace *searchTrace) *contentHealth {
+	h := s.contentHealthSnapshot()
+	if trace == nil || (!trace.ContentPartial && !trace.ContentIncomplete) {
+		return h
+	}
+	if h == nil {
+		h = &contentHealth{}
+	}
+	if trace.ContentPartial {
+		h.Partial = true
+		h.DegradedVolumes = append([]string(nil), trace.ContentSkippedVolumes...)
+	}
+	if trace.ContentIncomplete {
+		h.Incomplete = true
+	}
+	h.State = contentStateDegraded
+	return h
+}
+
 func (s *contentVolumeState) setReady(idx *contentIndex, reader *contentReader, resolver *contentResolver) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -248,6 +296,31 @@ func (s *contentVolumeState) readerView() *contentReader {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.reader
+}
+
+// readerResolverView returns the reader and resolver under one lock so a
+// concurrent base swap cannot hand back a reader and a resolver from different
+// generations.
+func (s *contentVolumeState) readerResolverView() (*contentReader, *contentResolver) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.reader, s.resolver
+}
+
+// usableForQuery reports whether the volume can answer content semantics: it
+// has a decoded base index joined to records, or at least a populated delta.
+// A stale/unavailable volume with neither must be refused, never treated as
+// "no matches".
+func (s *contentVolumeState) usableForQuery() bool {
+	if s == nil {
+		return false
+	}
+	reader, resolver := s.readerResolverView()
+	if reader != nil && resolver != nil {
+		return true
+	}
+	delta := s.deltaView()
+	return delta != nil && delta.len() > 0
 }
 
 func (s *contentVolumeState) deltaView() *contentDelta {

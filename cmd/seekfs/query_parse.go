@@ -183,7 +183,7 @@ func applyQueryToken(pq *parsedQuery, raw string) error {
 	// matches the group if it matches any alternative. We only treat '|' as an
 	// operator when it joins token-like alternatives (not inside a regex, which
 	// uses the regex: prefix and is handled before this point).
-	if strings.Contains(raw, "|") && !strings.HasPrefix(raw, "regex:") {
+	if _, isRegexSpan := contentTokenIsRegexSpan(raw); strings.Contains(raw, "|") && !strings.HasPrefix(raw, "regex:") && !isRegexSpan {
 		parts := strings.Split(raw, "|")
 		group := make([]parsedQuery, 0, len(parts))
 		for _, part := range parts {
@@ -284,10 +284,12 @@ func applyQueryToken(pq *parsedQuery, raw string) error {
 	case strings.HasPrefix(raw, "sort:"):
 		sortColumn := strings.ToLower(strings.TrimSpace(strings.TrimPrefix(raw, "sort:")))
 		switch sortColumn {
-		case "size", "modified", "extension", "type", "path":
+		case "size", "modified", "extension", "type", "path", "relevance":
+			// relevance is accepted but not yet ranked (P4); it keeps the token
+			// from being a parse error while falling through to default order.
 			pq.SortColumn = sortColumn
 		default:
-			return fmt.Errorf("unsupported sort %q; supported: sort:size, sort:modified, sort:extension, sort:type, sort:path", raw)
+			return fmt.Errorf("unsupported sort %q; supported: sort:size, sort:modified, sort:extension, sort:type, sort:path, sort:relevance", raw)
 		}
 	case raw == "case:" || raw == "case:true":
 		pq.CaseSensitive = true
@@ -301,11 +303,12 @@ func applyQueryToken(pq *parsedQuery, raw string) error {
 			return err
 		}
 		pq.Content = append(pq.Content, leaf)
-		// P0 gate: the content index and planner do not exist yet, so refuse
-		// rather than plan the query as a name search.
-		return contentUnavailableError()
+		if !contentSearchEnabled() {
+			return contentUnavailableError()
+		}
+		return nil
 	case isUnknownFilterToken(raw):
-		return fmt.Errorf("unsupported filter %q; supported: path: parent: ext: dir: glob: regex: type: case: size: dm: attrib: sort:size sort:modified sort:extension sort:type sort:path (and !term, a|b)", raw)
+		return fmt.Errorf("unsupported filter %q; supported: path: parent: ext: dir: glob: regex: type: case: size: dm: attrib: sort:size sort:modified sort:extension sort:type sort:path sort:relevance (and !term, a|b)", raw)
 	case looksLikeImplicitFilenameGlob(raw):
 		pq.Globs = append(pq.Globs, normalizeCase(raw, pq.CaseSensitive))
 	default:
@@ -529,7 +532,11 @@ func isRegexLiteralRune(r rune) bool {
 	return r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '_' || r == '-'
 }
 
-func entryMatches(entry Entry, pq parsedQuery, matchPath bool) bool {
+// entryMatchesScalar evaluates a query's name/path/scalar constraints only. It
+// is the shared body of entryMatches and entryMatchesWithContent; OR/NOT groups
+// recurse in the callers so content-aware verification can apply its own
+// per-alternative (joint) semantics.
+func entryMatchesScalar(entry Entry, pq parsedQuery, matchPath bool) bool {
 	path := filepath.Clean(entry.Path)
 	name := entry.Name
 	if name == "" {
@@ -603,7 +610,11 @@ func entryMatches(entry Entry, pq parsedQuery, matchPath bool) bool {
 			return false
 		}
 	}
-	if !attrFiltersMatch(entry.Mode, pq.AttrFilters) {
+	return attrFiltersMatch(entry.Mode, pq.AttrFilters)
+}
+
+func entryMatches(entry Entry, pq parsedQuery, matchPath bool) bool {
+	if !entryMatchesScalar(entry, pq, matchPath) {
 		return false
 	}
 	for _, group := range pq.OrGroups {
@@ -619,6 +630,12 @@ func entryMatches(entry Entry, pq parsedQuery, matchPath bool) bool {
 		}
 	}
 	for _, neg := range pq.NotGroups {
+		if queryHasAnyContentLeaf(neg) {
+			// Content exclusion is applied by entryMatchesWithContent, which
+			// knows the per-document results. entryMatches only sees name/scalar
+			// data and must not drop every entry here.
+			continue
+		}
 		if entryMatches(entry, neg, matchPath || neg.MatchPath) {
 			return false
 		}

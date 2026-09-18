@@ -314,6 +314,11 @@ func searchServiceVolumesGlobalBoundedFallbackSnapshot(snapshot globalQuerySnaps
 	if err != nil {
 		return nil, true, err
 	}
+	if queryHasAnyContentLeaf(pq) {
+		// This lane never attaches content results; refuse so the content path
+		// (candidate + post-filter) handles it.
+		return nil, false, nil
+	}
 	terms := nonVolumeTerms(pq.Terms)
 	if !globalPlannerEnabled() && !globalExtDefaultSupported(pq) && !globalComponentDefaultSupported(pq, terms) && !globalBoundedFallbackDefaultSupported(pq) {
 		return nil, false, nil
@@ -606,6 +611,9 @@ func countServiceVolumesGlobalBoundedFallbackSnapshot(snapshot globalQuerySnapsh
 	pq, err := parseQuery(opts)
 	if err != nil {
 		return 0, true, err
+	}
+	if queryHasAnyContentLeaf(pq) {
+		return 0, false, nil
 	}
 	terms := nonVolumeTerms(pq.Terms)
 	if !globalPlannerEnabled() && !globalExtDefaultSupported(pq) && !globalComponentDefaultSupported(pq, terms) && !globalBoundedFallbackDefaultSupported(pq) {
