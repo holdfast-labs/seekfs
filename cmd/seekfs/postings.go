@@ -1736,6 +1736,10 @@ func parseQuery(opts queryOptions) (parsedQuery, error) {
 		}
 	}
 	promotePathExtensionTerms(&pq)
+	// Assign deterministic content LeafIDs from the parsed tree. Inert today
+	// because any content: token returns before this point, but wired so P1 can
+	// rely on stable per-leaf keys the moment parsing succeeds.
+	contentAssignLeafIDs(&pq)
 	if pq.isEmpty() {
 		return pq, errors.New("query has no searchable terms or filters")
 	}

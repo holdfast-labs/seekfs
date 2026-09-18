@@ -337,6 +337,14 @@ func (vol *serviceVolumeIndex) applyUSNChanges(changes []usnChange) {
 			lastChange[change.FRN] = i
 		}
 	}
+	// Changes that actually apply to the indexed set: own-artifact churn is
+	// consumed below and must not reach the content coordinator either, or the
+	// content store would feed its own writes back. Built only when content is
+	// enabled so the default replay path pays nothing.
+	var applied []usnChange
+	if vol.contentCoord != nil {
+		applied = make([]usnChange, 0, len(changes))
+	}
 	for i, change := range changes {
 		if change.FRN == 0 {
 			continue
@@ -356,6 +364,9 @@ func (vol *serviceVolumeIndex) applyUSNChanges(changes []usnChange) {
 			continue
 		}
 		vol.recordOverlayChange(change, i == lastChange[change.FRN] && change.Reason&usnReasonNeedsInfoRefresh != 0)
+		if vol.contentCoord != nil {
+			applied = append(applied, change)
+		}
 		if change.USN > vol.checkpoint {
 			vol.checkpoint = change.USN
 		}
@@ -364,6 +375,12 @@ func (vol *serviceVolumeIndex) applyUSNChanges(changes []usnChange) {
 	vol.dirty = true
 	vol.publishDirSizeDelta()
 	vol.publishSnapshot()
+	// Content search consumes the same applied change stream as the record
+	// overlay (own-artifact churn already excluded). Nil unless the feature is
+	// enabled, so the default path is untouched.
+	if vol.contentCoord != nil {
+		vol.contentCoord.observeChanges(applied)
+	}
 }
 
 // filterOwnedReplayChanges drops changes that fall inside directories holding

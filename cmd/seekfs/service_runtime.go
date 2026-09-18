@@ -80,6 +80,11 @@ func (s *goSearchService) loadConfiguredIndexes() error {
 			go s.staleRecoveryLoop(vol)
 		}
 	}
+	if contentSearchEnabled() {
+		for _, vol := range volumes {
+			s.attachContentForVolume(vol)
+		}
+	}
 	go s.replayStallWatchdog()
 	serviceLog("loaded %d dbs entries=%d elapsed=%s", len(indexes), total, time.Since(start).Round(time.Millisecond))
 	return nil
@@ -305,6 +310,10 @@ func newServiceVolumeIndex(dbPath string, idx *Index) *serviceVolumeIndex {
 		state:       "ready",
 		pathCache:   make(map[int]string),
 		lastPersist: time.Now(),
+	}
+	if contentSearchEnabled() {
+		vol.content = newContentVolumeState(idx.Volume)
+		vol.contentCoord = newContentCoordinator(vol.content)
 	}
 	if idx.Compact && idx.Source == "usn" {
 		vol.ownedDirFRNs = ownedReplayDirFRNs(idx.Volume)

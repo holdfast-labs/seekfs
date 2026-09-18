@@ -70,6 +70,7 @@ type serviceResponse struct {
 	Runtime                  *runtimeMemoryInfo  `json:"runtime,omitempty"`
 	Health                   string              `json:"health,omitempty"`
 	HealthMessage            string              `json:"health_message,omitempty"`
+	Content                  *contentHealth      `json:"content,omitempty"`
 }
 
 // servicePrincipal describes the caller of a service command and the
@@ -425,6 +426,10 @@ type serviceVolumeIndex struct {
 	checkpoint  int64
 	state       string
 	staleReason string
+	// content is the per-volume content-search state and coordinator. Both are
+	// nil unless content search is enabled (SEEKFS_CONTENT_SEARCH=1).
+	content      *contentVolumeState
+	contentCoord *contentCoordinator
 	// ownedDirFRNs holds the NTFS file references of directories that hold
 	// seekfs's own artifacts (the seekfs dir and the name-gram spool dir) for
 	// this volume.  USN changes whose ParentFRN is in this set are consumed

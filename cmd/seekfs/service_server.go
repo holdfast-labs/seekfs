@@ -265,7 +265,7 @@ func (s *goSearchService) serviceCommandInfo(w io.Writer, req *serviceRequest) {
 		message = loadErr
 	}
 	health, healthMessage := classifyServiceHealth(loading, loadErr, infos)
-	_ = json.NewEncoder(w).Encode(serviceInfoResponseFor(serviceResponse{OK: loadErr == "", Message: message, Entries: total, Loading: loading, DBs: infos, Runtime: runtimeMemorySnapshot(), Health: health, HealthMessage: healthMessage}, s.pipeName, s.processMode))
+	_ = json.NewEncoder(w).Encode(serviceInfoResponseFor(serviceResponse{OK: loadErr == "", Message: message, Entries: total, Loading: loading, DBs: infos, Runtime: runtimeMemorySnapshot(), Health: health, HealthMessage: healthMessage, Content: s.contentHealthSnapshot()}, s.pipeName, s.processMode))
 }
 
 func (s *goSearchService) serviceCommandSearch(w io.Writer, caps serviceCapabilities, req *serviceRequest) {
@@ -368,6 +368,7 @@ func (s *goSearchService) serviceCommandSearch(w io.Writer, caps serviceCapabili
 		}
 		resp.Rows = entriesToJSON(matches)
 	}
+	resp.Content = s.contentHealthSnapshot()
 	_ = json.NewEncoder(w).Encode(resp)
 }
 
@@ -506,7 +507,7 @@ func (s *goSearchService) serviceCommandIndexUSN(w io.Writer, req *serviceReques
 }
 
 func (s *goSearchService) serviceCommandStatus(w io.Writer) {
-	_ = json.NewEncoder(w).Encode(serviceInfoResponseFor(serviceResponse{OK: true, Message: "service running"}, s.pipeName, s.processMode))
+		_ = json.NewEncoder(w).Encode(serviceInfoResponseFor(serviceResponse{OK: true, Message: "service running", Content: s.contentHealthSnapshot()}, s.pipeName, s.processMode))
 }
 
 func serviceResidentBackgroundLoading(volumes []*serviceVolumeIndex) bool {
@@ -607,6 +608,10 @@ func replaceServiceVolumeContents(dst, src *serviceVolumeIndex) {
 	dst.dirty = src.dirty
 	dst.lastPersist = src.lastPersist
 	dst.searchCount = src.searchCount
+	// Content is generation-independent: keep dst's loaded content state and
+	// rebind its resolver against the new record table. A base swap must never
+	// re-extract.
+	rebindContentAfterBaseSwap(dst)
 }
 
 func snapshotServiceVolumesForSearch(volumes []*serviceVolumeIndex) []*serviceVolumeIndex {

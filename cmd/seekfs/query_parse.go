@@ -143,7 +143,8 @@ func (pq parsedQuery) isEmpty() bool {
 	return len(pq.Terms) == 0 && len(pq.Exts) == 0 && len(pq.Dirs) == 0 &&
 		len(pq.Globs) == 0 && len(pq.Regexps) == 0 && pq.Type == "" &&
 		len(pq.Parents) == 0 && pq.Under == "" && !pq.HasModAfter && len(pq.SizeFilters) == 0 &&
-		len(pq.DateFilters) == 0 && len(pq.AttrFilters) == 0 && len(pq.OrGroups) == 0 && len(pq.NotGroups) == 0
+		len(pq.DateFilters) == 0 && len(pq.AttrFilters) == 0 && len(pq.Content) == 0 &&
+		len(pq.OrGroups) == 0 && len(pq.NotGroups) == 0
 }
 
 // applyQueryToken parses a single whitespace-delimited token and folds it into
@@ -294,6 +295,15 @@ func applyQueryToken(pq *parsedQuery, raw string) error {
 		pq.CaseSensitive = false
 	case raw == "type:file" || raw == "type:dir":
 		pq.Type = strings.TrimPrefix(raw, "type:")
+	case strings.HasPrefix(raw, "content:"):
+		leaf, err := parseContentLeaf(strings.TrimPrefix(raw, "content:"))
+		if err != nil {
+			return err
+		}
+		pq.Content = append(pq.Content, leaf)
+		// P0 gate: the content index and planner do not exist yet, so refuse
+		// rather than plan the query as a name search.
+		return contentUnavailableError()
 	case isUnknownFilterToken(raw):
 		return fmt.Errorf("unsupported filter %q; supported: path: parent: ext: dir: glob: regex: type: case: size: dm: attrib: sort:size sort:modified sort:extension sort:type sort:path (and !term, a|b)", raw)
 	case looksLikeImplicitFilenameGlob(raw):
@@ -338,6 +348,7 @@ func mergeSubquery(dst *parsedQuery, src parsedQuery) {
 	dst.SizeFilters = append(dst.SizeFilters, src.SizeFilters...)
 	dst.DateFilters = append(dst.DateFilters, src.DateFilters...)
 	dst.AttrFilters = append(dst.AttrFilters, src.AttrFilters...)
+	dst.Content = append(dst.Content, src.Content...)
 	if src.Type != "" {
 		dst.Type = src.Type
 	}

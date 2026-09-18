@@ -461,6 +461,7 @@ type parsedQuery struct {
 	SizeFilters       []sizeFilter
 	DateFilters       []dateFilter
 	AttrFilters       []uint32
+	Content           []contentLeaf
 	SortColumn        string
 	OrGroups          [][]parsedQuery
 	NotGroups         []parsedQuery
