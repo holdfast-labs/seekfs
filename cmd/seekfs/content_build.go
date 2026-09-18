@@ -143,18 +143,31 @@ func buildContentIndexFromDir(ctx context.Context, root string, opts contentBuil
 // it fills, sorted runs spill to disk and merge.
 const contentBuildArenaBytes = 64 << 20
 
-// assembleContentIndex turns extracted documents into a `.gsx`, assigning
-// DocID = position in the FRN-sorted table. Postings are accumulated through the
-// bounded external builder so the raw (key, docID, tf) maps are never held in
-// memory; only the encoded section and the text store are.
-func assembleContentIndex(build []contentBuildDoc, tmpDir string) (*contentIndex, error) {
-	sort.Slice(build, func(i, j int) bool {
-		if build[i].frn != build[j].frn {
-			return build[i].frn < build[j].frn
-		}
-		return build[i].path < build[j].path
-	})
+// contentBuildSource yields extracted documents one at a time for
+// assembleContentIndexStream. It must return docs in ascending (frn, path)
+// order, the order docIDs are assigned in. ok=false ends the stream; a non-nil
+// error aborts the build.
+type contentBuildSource func() (doc contentBuildDoc, ok bool, err error)
 
+// contentAssembleStreamHook runs after each document has been normalized and
+// its postings added, before the next one is pulled from the source. Tests use
+// it to prove the assembler processes docs one at a time instead of buffering.
+var contentAssembleStreamHook = func(docID int) {}
+
+// assembleContentIndexStream is the streaming core of assembleContentIndex. It
+// consumes documents from source in ascending (frn, path) order, assigning
+// DocID = arrival position, and never retains the raw extracted corpus: each
+// doc's text is normalized into the text store and tokenized into the bounded
+// external posting builders as it arrives, then released. Postings spill to
+// disk (contentBuildArenaBytes per builder). Peak transient heap is therefore
+// one document's raw text plus the two posting arenas (plus O(docs) metadata:
+// the doc table and paths) and the text store being assembled; the returned
+// index is bounded by its encoded sections (text + postings + doc table +
+// paths).
+func assembleContentIndexStream(source contentBuildSource, tmpDir string) (*contentIndex, error) {
+	if source == nil {
+		return nil, errors.New("nil content build source")
+	}
 	termBuilder, err := newContentExternalSectionBuilder(tmpDir, contentBuildArenaBytes)
 	if err != nil {
 		return nil, err
@@ -168,20 +181,25 @@ func assembleContentIndex(build []contentBuildDoc, tmpDir string) (*contentIndex
 
 	idx := newContentIndex()
 	idx.Origin = contentOriginWalk
-	idx.Docs = make([]contentDoc, len(build))
 	var textStore bytes.Buffer
-	paths := make([]string, len(build))
+	var paths []string
 
-	for i := range build {
-		d := &build[i]
-		docID := uint32(i)
-		paths[i] = d.path
+	for {
+		d, ok, err := source()
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			break
+		}
+		docID := uint32(len(idx.Docs))
+		paths = append(paths, d.path)
 		// Index and store lowercased text so grams, terms, and verification all
 		// agree on a case-insensitive match. v1 content search is always
 		// case-insensitive; per-leaf case handling is a later addition.
 		lower := contentNormalizeText(d.text)
 		textStore.Write(lower)
-		idx.Docs[i] = contentDoc{
+		idx.Docs = append(idx.Docs, contentDoc{
 			DocID:       docID,
 			FRN:         d.frn,
 			DocLen:      uint32(len(lower)),
@@ -190,15 +208,16 @@ func assembleContentIndex(build []contentBuildDoc, tmpDir string) (*contentIndex
 			ContentHash: sha256Of(lower),
 			TextOff:     uint64(textStore.Len() - len(lower)),
 			TextLen:     uint32(len(lower)),
-		}
-		// Documents are visited in ascending docID order, so each key's Adds
-		// arrive in ascending docID order as the builder requires.
+		})
+		// Documents arrive in ascending docID order, so each key's Adds arrive
+		// in ascending docID order as the builder requires.
 		for term, tf := range contentTermsOf(lower) {
 			termBuilder.Add(term, docID, tf)
 		}
 		for gram := range contentGramsOf(lower) {
 			gramBuilder.Add(gram, docID, 1)
 		}
+		contentAssembleStreamHook(int(docID))
 	}
 
 	if terms, err := termBuilder.Finish(); err != nil {
@@ -214,6 +233,28 @@ func assembleContentIndex(build []contentBuildDoc, tmpDir string) (*contentIndex
 	idx.Sections[contentSectionText] = textStore.Bytes()
 	idx.Sections[contentSectionPaths] = encodeContentPaths(paths)
 	return idx, nil
+}
+
+// assembleContentIndex turns extracted documents into a `.gsx`, assigning
+// DocID = position in the FRN-sorted table. It sorts build and streams it
+// through assembleContentIndexStream, so the raw-posting maps and the raw
+// extracted corpus are never all held at once.
+func assembleContentIndex(build []contentBuildDoc, tmpDir string) (*contentIndex, error) {
+	sort.Slice(build, func(i, j int) bool {
+		if build[i].frn != build[j].frn {
+			return build[i].frn < build[j].frn
+		}
+		return build[i].path < build[j].path
+	})
+	i := 0
+	return assembleContentIndexStream(func() (contentBuildDoc, bool, error) {
+		if i >= len(build) {
+			return contentBuildDoc{}, false, nil
+		}
+		d := build[i]
+		i++
+		return d, true, nil
+	}, tmpDir)
 }
 
 // buildContentIndexForIndex builds an FRN-keyed `.gsx` from a record index by
@@ -242,28 +283,9 @@ func buildContentIndexForIndex(ctx context.Context, idx *Index, opts contentBuil
 		if path == "" || !opts.allows(path) {
 			continue
 		}
-		f, err := contentOpenNoRecall(path)
-		if err != nil {
-			continue
+		if doc, ok := contentBuildDocSafe(ctx, contentBuildItem{frn: rec.FRN, path: path}); ok {
+			docs = append(docs, doc)
 		}
-		info, serr := f.Stat()
-		if serr != nil || info.IsDir() {
-			f.Close()
-			continue
-		}
-		size := info.Size()
-		head, _ := contentReadBounded(f, size, 512)
-		e := contentExtractorForPath(path, head)
-		if e == nil {
-			f.Close()
-			continue
-		}
-		res, eerr := e.Extract(ctx, f, size)
-		f.Close()
-		if eerr != nil || res.Skipped || len(res.Text) == 0 {
-			continue
-		}
-		docs = append(docs, contentBuildDoc{path: path, frn: rec.FRN, text: res.Text, modUnix: info.ModTime().Unix()})
 	}
 	tmpDir, err := os.MkdirTemp("", "seekfs-content-*")
 	if err != nil {

@@ -85,6 +85,12 @@ type contentHealth struct {
 	// memory budget, so the answer is a visible subset, never a silent
 	// truncation. A count in this state is refused instead of answered.
 	Incomplete bool `json:"incomplete,omitempty"`
+	// BuildDone/BuildTotal expose a service-owned background build's progress
+	// while the volume is in the `indexing` state. BuildError records why the
+	// last build failed and left the volume degraded (PF-3).
+	BuildDone  int    `json:"build_done,omitempty"`
+	BuildTotal int    `json:"build_total,omitempty"`
+	BuildError string `json:"build_error,omitempty"`
 }
 
 // contentDeltaDoc is an extracted document for a file changed since the base,
@@ -297,6 +303,73 @@ func (s *contentVolumeState) markStale(reason string) {
 	s.delta = newContentDelta()
 }
 
+// markIndexing is the service-owned background build's visible state. A
+// partially built index is never served: any prior reader/resolver is dropped
+// so a query during the build sees `indexing` (unavailable) rather than a
+// torn or stale base. PF-3/WP1d.
+func (s *contentVolumeState) markIndexing(total int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.state = contentStateIndexing
+	s.health.State = contentStateIndexing
+	s.health.BuildTotal = total
+	s.health.BuildDone = 0
+	s.health.BuildError = ""
+	s.health.Incomplete = false
+	s.reader = nil
+	s.resolver = nil
+}
+
+// setBuildProgress publishes extraction progress for an in-flight build so
+// `loaded --json`/health can show it. A progress update for a build that has
+// already left the indexing state is ignored, so a late tick cannot resurrect
+// a finished or canceled build.
+func (s *contentVolumeState) setBuildProgress(done, total int) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.state != contentStateIndexing {
+		return
+	}
+	s.health.BuildDone = done
+	s.health.BuildTotal = total
+}
+
+// markBuildFailed leaves the volume visibly degraded (never ready with an
+// unusable index) and records the reason. It clears any decoder so a query is
+// refused rather than answered from a partial or stale base.
+func (s *contentVolumeState) markBuildFailed(reason string) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.reader = nil
+	s.resolver = nil
+	s.state = contentStateDegraded
+	s.health.State = contentStateDegraded
+	s.health.Incomplete = true
+	s.health.BuildError = reason
+}
+
+// markBuildCanceled returns an interrupted build to `unavailable` (not ready)
+// so a shutdown or aborted build is never mistaken for a usable index.
+func (s *contentVolumeState) markBuildCanceled(reason string) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.state != contentStateIndexing {
+		return
+	}
+	s.state = contentStateUnavailable
+	s.health.State = contentStateUnavailable
+	s.health.BuildError = reason
+}
+
 func (s *contentVolumeState) stateOf() string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -321,16 +394,24 @@ func (s *contentVolumeState) readerResolverView() (*contentReader, *contentResol
 // usableForQuery reports whether the volume can answer content semantics: it
 // has a decoded base index joined to records, or at least a populated delta.
 // A stale/unavailable volume with neither must be refused, never treated as
-// "no matches".
+// "no matches". An `indexing` volume is refused even with a populated delta:
+// markIndexing drops the reader/resolver but leaves the delta, so without this
+// guard a content query could serve delta-only partial results and report
+// complete while the fresh base is still being built.
 func (s *contentVolumeState) usableForQuery() bool {
 	if s == nil {
 		return false
 	}
-	reader, resolver := s.readerResolverView()
+	s.mu.RLock()
+	state := s.state
+	reader, resolver, delta := s.reader, s.resolver, s.delta
+	s.mu.RUnlock()
+	if state == contentStateIndexing {
+		return false
+	}
 	if reader != nil && resolver != nil {
 		return true
 	}
-	delta := s.deltaView()
 	return delta != nil && delta.len() > 0
 }
 
@@ -357,7 +438,10 @@ func (s *contentVolumeState) healthSnapshot(queueDepth int) contentHealth {
 func (s *contentVolumeState) markDrained() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.state != contentStateStale {
+	// stale (needs a rebuild) and indexing (a rebuild is in flight) are owned
+	// by the build lifecycle: a drain tick must not flip an indexing volume to
+	// ready with no usable index attached.
+	if s.state != contentStateStale && s.state != contentStateIndexing {
 		if s.health.Incomplete {
 			s.state = contentStateDegraded
 			s.health.State = contentStateDegraded

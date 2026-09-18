@@ -508,6 +508,9 @@ func (s *goSearchService) serviceCommandIndexUSN(w io.Writer, req *serviceReques
 	releaseServiceMemoryAfterSave()
 	s.startBackgroundNameOrderBuilds([]*serviceVolumeIndex{vol})
 	s.startBackgroundNameTrigramBuilds([]*serviceVolumeIndex{vol})
+	// A runtime-added or re-indexed volume gets content attached or scheduled
+	// (PF-3), instead of staying content-unavailable until a restart.
+	s.ensureContentBuild(vol)
 	serviceLog("index-usn complete volume=%s entries=%d", req.Volume, idx.entryCount())
 	_ = json.NewEncoder(w).Encode(serviceResponse{OK: true, Message: "indexed", Entries: idx.entryCount()})
 }
@@ -542,6 +545,7 @@ func (s *goSearchService) replaceLoadedVolume(dbPath string, idx *Index) {
 	s.indexMu.Unlock()
 	s.startBackgroundNameOrderBuilds([]*serviceVolumeIndex{vol})
 	s.startBackgroundNameTrigramBuilds([]*serviceVolumeIndex{vol})
+	s.ensureContentBuild(vol)
 }
 
 func (s *goSearchService) replaceLoadedVolumeLocked(dbPath string, idx *Index) *serviceVolumeIndex {
@@ -573,6 +577,7 @@ func replaceServiceVolumeContents(dst, src *serviceVolumeIndex) {
 	dst.volume = src.volume
 	dst.journalID = src.journalID
 	dst.checkpoint = src.checkpoint
+	dst.baseCheckpoint = src.baseCheckpoint
 	dst.state = src.state
 	dst.staleReason = src.staleReason
 	dst.frnToID = src.frnToID

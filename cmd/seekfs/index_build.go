@@ -98,14 +98,15 @@ func cmdCompactIndex(args []string) error {
 // once, from the compacted output.
 func newCompactionVolumeIndex(dbPath string, idx *Index) *serviceVolumeIndex {
 	vol := &serviceVolumeIndex{
-		dbPath:      dbPath,
-		index:       idx,
-		volume:      idx.Volume,
-		journalID:   idx.JournalID,
-		checkpoint:  idx.Checkpoint,
-		state:       "ready",
-		pathCache:   make(map[int]string),
-		lastPersist: time.Now(),
+		dbPath:         dbPath,
+		index:          idx,
+		volume:         idx.Volume,
+		journalID:      idx.JournalID,
+		checkpoint:     idx.Checkpoint,
+		baseCheckpoint: idx.Checkpoint,
+		state:          "ready",
+		pathCache:      make(map[int]string),
+		lastPersist:    time.Now(),
 	}
 	if idx.Compact && idx.Source == "usn" {
 		vol.ownedDirFRNs = ownedReplayDirFRNs(idx.Volume)

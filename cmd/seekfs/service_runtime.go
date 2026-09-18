@@ -82,7 +82,10 @@ func (s *goSearchService) loadConfiguredIndexes() error {
 	}
 	if contentSearchEnabled() {
 		for _, vol := range volumes {
-			s.attachContentForVolume(vol)
+			// Attach an existing sidecar or schedule the service-owned build
+			// (PF-3/WP1d): a fresh install with the flag on is content-ready
+			// without any manual `content-index` step.
+			s.ensureContentBuild(vol)
 		}
 	}
 	go s.replayStallWatchdog()
@@ -302,14 +305,15 @@ func ensureCompactIndexForService(idx *Index) {
 
 func newServiceVolumeIndex(dbPath string, idx *Index) *serviceVolumeIndex {
 	vol := &serviceVolumeIndex{
-		dbPath:      dbPath,
-		index:       idx,
-		volume:      idx.Volume,
-		journalID:   idx.JournalID,
-		checkpoint:  idx.Checkpoint,
-		state:       "ready",
-		pathCache:   make(map[int]string),
-		lastPersist: time.Now(),
+		dbPath:         dbPath,
+		index:          idx,
+		volume:         idx.Volume,
+		journalID:      idx.JournalID,
+		checkpoint:     idx.Checkpoint,
+		baseCheckpoint: idx.Checkpoint,
+		state:          "ready",
+		pathCache:      make(map[int]string),
+		lastPersist:    time.Now(),
 	}
 	if contentSearchEnabled() {
 		vol.content = newContentVolumeState(idx.Volume)

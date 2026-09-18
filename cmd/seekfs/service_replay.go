@@ -221,6 +221,10 @@ func (s *goSearchService) rebuildVolumeInPlace(vol *serviceVolumeIndex) error {
 	releaseServiceMemoryAfterSave()
 	s.startBackgroundNameTrigramBuilds([]*serviceVolumeIndex{vol})
 	serviceLog("rebuilt stale index volume=%s db=%s entries=%d", rebuilt.volume, rebuilt.dbPath, rebuilt.index.entryCount())
+	// WP1e/PB4: content must self-heal after a filename rebuild (a journal
+	// reset invalidated the FRN-keyed content index). Re-attach a still-valid
+	// sidecar, or schedule the background content rebuild.
+	s.ensureContentBuild(vol)
 	return nil
 }
 

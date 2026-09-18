@@ -3,10 +3,13 @@
 Branch: `content-search`. Status: P0–P5 complete and reviewed. P4's two planner
 surfaces (`sort:relevance` and snippets) are implemented and tested; P5's final
 polish (review minors, per-query budgets, entry-free counting, journal-reset
-invalidation, freshness measurement, docs) landed. P4 document-extraction
+invalidation, freshness measurement, docs) landed. PF-3 (WP1d/WP1e) landed: the
+service now builds/rebuilds and persists its own content index in the
+background, so flag-on is content-ready without a manual CLI step and a journal
+reset self-heals instead of staying `stale` (see §6e). P4 document-extraction
 quality remains deferred (see §7). Content search is off by default; with
-`SEEKFS_CONTENT_SEARCH=1` and an FRN-keyed `.gsx` attached, `content:` queries
-now work through the service.
+`SEEKFS_CONTENT_SEARCH=1`, `content:` queries work through the service once the
+service-owned build has attached an FRN-keyed `.gsx`.
 
 This document is the committed handoff for an agent continuing the work. The
 fuller working plan lives at `docs/CONTENT_SEARCH_PLAN.md`, which is
@@ -232,6 +235,68 @@ fallback path memo.
   in-process drain path, well inside the 5 s target; the production cadence adds
   only the ≤2 s quiet-window drain tick.
 
+## 6e. PF-3 — service-owned background build (WP1d/WP1e, done)
+
+The service no longer only loads a hand-built sidecar:
+
+- **Trigger/state machine.** `ensureContentBuild` (`content_service_build.go`)
+  first attaches an existing valid `.gsx`; if none is usable and the volume is a
+  ready USN volume with a live watermark, it schedules exactly one background
+  build (`contentBuildBusy` CAS). It is hooked at startup
+  (`loadConfiguredIndexes`), after a filename rebuild/journal reset
+  (`rebuildVolumeInPlace`, so `replayVolumeLoop` and `staleRecoveryLoop` both
+  self-heal), and on runtime `index-usn`/`replaceLoadedVolume`. The volume
+  enters a real `indexing` state (`contentStateIndexing`, previously never
+  assigned) with `build_done`/`build_total` progress; `markDrained` no longer
+  clobbers `indexing` or `stale`. A failed/partial/canceled build leaves the
+  volume `degraded`/`unavailable`/`indexing`, never `ready` with an unusable
+  index.
+- **Snapshot-and-release locking (chunked).** The build copies
+  FRN/path/size/modtime metadata in `contentBuildSnapshotBatch`-record windows,
+  releasing and reacquiring `s.indexMu.RLock` between batches (with a
+  `contentBuildPathCacheMax`-bounded path memo) so a persist/rebuild's
+  `indexMu.Lock` proceeds between batches instead of waiting for an O(records)
+  pass. Each batch is read only after re-checking the index pointer and the
+  base generation/journal under the read lock, so it never reads a torn or freed
+  mmap; a mid-pass change aborts and reschedules. Extraction opens no file under
+  `indexMu` or `vol.mu` and never touches the mmap. The copy is stamped with
+  `baseCheckpoint` (a `serviceVolumeIndex` field), so a base with an unfolded
+  overlay cannot overclaim; restart catch-up replays the overlay changes
+  afterward. `contentBuildCurrent` aborts the build if `replayGen` (atomic, per
+  file) or the journal id (per batch and before publish) changed.
+- **Streaming assembly (bounded memory).** Extracted docs stream one at a time
+  into `assembleContentIndexStream`; the build never accumulates a
+  `[]contentBuildDoc` of the raw corpus. Each doc's raw text is normalized into
+  the text store and tokenized into the bounded external posting builders as it
+  arrives, then released. Peak transient heap is one document's raw text plus
+  the two `contentBuildArenaBytes` posting arenas, the text store being
+  assembled, and O(docs) metadata; the offline `content-index` path still builds
+  identical `.gsx` bytes.
+- **Retry budget.** Consecutive generation-change reschedules are capped at
+  `contentBuildMaxAttempts` with `contentBuildRetryBackoff` pacing; hitting the
+  cap leaves the volume `degraded` with a `BuildError` instead of spinning. An
+  external trigger (`ensureContentBuild`) opens a fresh budget.
+- **Indexing is unusable.** `usableForQuery` refuses an `indexing` volume even
+  with a populated retained delta, so a content query cannot serve delta-only
+  partial results with `health.Incomplete=false` while the fresh base builds.
+- **IO governor.** Serial extraction paused every `contentBuildBatchSize` for
+  `contentBuildBatchPause`, cancelable through `s.stop` and the build
+  generation.
+- **Default scope (M5).** `defaultServiceContentBuildOptions` sets an extension
+  allowlist: the curated `contentDefaultTextExtensions` text/code/config set
+  unioned with every registered extractor's `Extensions()`. The offline CLI
+  still indexes any extractable file by default; the service does not.
+- **Crash-safety.** The built index is written with `contentSaveFile`
+  (temp + fsync + rename) and the v2 header carries `JournalID` +
+  `CheckpointUSN`, so a crash leaves either the old or a complete new sidecar,
+  never a half-written one that attaches.
+
+Tests: `content_service_build_test.go` covers build-and-attach with observable
+indexing/progress, the default allowlist, journal-reset self-heal, re-attach
+after a not-ready volume becomes ready, lock release across extraction,
+mid-build journal-change abort, and shutdown cancellation. PB2 (delta folding
+into the persisted base) stays in PF-5/§7.
+
 ## 7. Carried debt / known gaps
 
 - **Snippet case is not preserved on any current path.** The `.gsx` text store
@@ -278,9 +343,9 @@ Each item below is intentionally out of scope for P5; the rationale is one line.
   service change.
 - **`contentResolvePath` end-to-end test**: needs a compact index with a real
   parent chain; only its `contentLookupFRNColumn` fallback is unit-tested today.
-- **Journal-reset content rebuild scheduling**: a reset marks the index `stale`
-  (never ready-with-stale-data), but nothing schedules a rebuild, so content
-  stays unavailable until a manual rebuild/restart.
+- **Journal-reset content rebuild scheduling**: DONE in PF-3 (§6e) — a reset
+  marks the index `stale` and the rebuild chain schedules and re-attaches a
+  service-owned content build, so content self-heals.
 - **Ranking the capped positive-content candidate set**: the cap is applied in
   FRN-hash order, so an incomplete positive search returns an arbitrary subset
   (flagged incomplete); ranking the capped set is future work.

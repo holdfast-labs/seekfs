@@ -54,7 +54,11 @@ func (s *goSearchService) attachContentForVolume(vol *serviceVolumeIndex) {
 	if vol.index == nil || vol.index.Source != "usn" {
 		return
 	}
-	if vol.contentCoord != nil && vol.contentCoord.drainEnabledNow() {
+	// A volume that already has a usable base attached is done. This replaced
+	// the old "drain enabled" guard: after a journal reset invalidates the base
+	// the drain stays enabled, so keying on it would skip the re-attach of a
+	// freshly rebuilt sidecar (PF-3/WP1e).
+	if vol.content.stateOf() == contentStateReady {
 		return
 	}
 	gsx := contentIndexPathForDB(vol.dbPath)
@@ -124,8 +128,13 @@ func (s *goSearchService) attachContentForVolume(vol *serviceVolumeIndex) {
 	vol.content.setReady(idx, reader, buildContentResolver(idx.Docs, frns, ids))
 	s.indexMu.RUnlock()
 	if vol.contentCoord != nil {
+		// Start the drain loop only once per volume; a re-attach after a
+		// rebuild must not spawn a second loop. enableDrain stays idempotent.
+		startDrain := !vol.contentCoord.drainEnabledNow()
 		vol.contentCoord.enableDrain()
-		go s.contentDrainLoop(vol)
+		if startDrain {
+			go s.contentDrainLoop(vol)
+		}
 		// Catch up OFF the startup path: a far-behind base must not block
 		// startup or grow an unbounded delta. Catch-up runs after the drain is
 		// enabled so the FRNs it enqueues are actually processed; files changed

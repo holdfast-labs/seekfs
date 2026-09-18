@@ -438,10 +438,24 @@ type serviceVolumeIndex struct {
 	checkpoint  int64
 	state       string
 	staleReason string
+	// baseCheckpoint is the USN watermark of the persisted record index:
+	// the checkpoint the base record set is complete through. It trails
+	// `checkpoint` while an unfolded overlay is pending, so a service-owned
+	// content build (PF-3) can stamp a sidecar that matches exactly the
+	// records it walked; restart catch-up then replays the overlay changes.
+	baseCheckpoint int64
 	// content is the per-volume content-search state and coordinator. Both are
 	// nil unless content search is enabled (SEEKFS_CONTENT_SEARCH=1).
 	content      *contentVolumeState
 	contentCoord *contentCoordinator
+	// contentBuildBusy serializes service-owned content builds: at most one
+	// runs per volume at a time, and it is left set for the whole build.
+	contentBuildBusy atomic.Bool
+	// contentBuildAttempts counts consecutive generation-change retries of a
+	// service-owned content build. An external ensureContentBuild resets it; the
+	// retry path increments it so a volume whose generation never settles gives
+	// up (degraded + BuildError) instead of spinning builds forever.
+	contentBuildAttempts atomic.Int32
 	// ownedDirFRNs holds the NTFS file references of directories that hold
 	// seekfs's own artifacts (the seekfs dir and the name-gram spool dir) for
 	// this volume.  USN changes whose ParentFRN is in this set are consumed
