@@ -201,35 +201,63 @@ type contentRelevance struct {
 
 func contentRelevanceOf(vol *serviceVolumeIndex, entry Entry, pq parsedQuery, m *contentLeafMatcher) contentRelevance {
 	rel := contentRelevance{first: contentRelevanceNoOffset}
-	if vol == nil {
+	if vol == nil || m == nil {
 		return rel
 	}
 	text, ok := vol.contentTextForEntry(&entry)
 	if !ok {
 		return rel
 	}
-	for _, leaf := range contentPositiveLeaves(pq) {
-		if !m.match(text, leaf) {
-			continue
-		}
-		rel.score++
-		if leaf.Kind == contentLeafRegex {
-			continue
-		}
-		if off := contentLeafFirstOffset(text, leaf); off >= 0 && off < rel.first {
-			rel.first = off
-		}
+	matched := make([]bool, m.size)
+	for _, leaf := range m.leaves {
+		matched[leaf.LeafID] = m.match(text, leaf)
 	}
+	rel.score, rel.first = contentScoreAt(entry, pq, pq.MatchPath, matched, text)
 	return rel
 }
 
+// contentScoreAt counts matched positive content leaves using the SAME joint-OR
+// rule as entryMatchesContentAt: top-level positive leaves always count, and an
+// OR group contributes only the leaves of the alternative that satisfies the
+// group. A failing alternative does not inflate the score.
+func contentScoreAt(entry Entry, pq parsedQuery, matchPath bool, matched []bool, text []byte) (score, first int) {
+	first = contentRelevanceNoOffset
+	for _, leaf := range pq.Content {
+		if leaf.LeafID < 0 || leaf.LeafID >= len(matched) || !matched[leaf.LeafID] {
+			continue
+		}
+		score++
+		if leaf.Kind == contentLeafRegex {
+			continue
+		}
+		if off := contentLeafFirstOffset(text, leaf); off >= 0 && off < first {
+			first = off
+		}
+	}
+	for gi := range pq.OrGroups {
+		for ai := range pq.OrGroups[gi] {
+			alt := pq.OrGroups[gi][ai]
+			if !entryMatchesContentAt(entry, alt, matchPath || alt.MatchPath, matched) {
+				continue
+			}
+			s, f := contentScoreAt(entry, alt, matchPath || alt.MatchPath, matched, text)
+			score += s
+			if f < first {
+				first = f
+			}
+			break
+		}
+	}
+	return score, first
+}
+
 // sortContentEntriesByRelevance orders a bounded content result set by the
-// relevance rule above, falling back to the existing name/path order.
-func sortContentEntriesByRelevance(entries []Entry, volByPath map[string]*serviceVolumeIndex, pq parsedQuery) {
-	if len(entries) < 2 {
+// relevance rule above, falling back to the existing name/path order. The
+// matcher is built once per query by the caller.
+func sortContentEntriesByRelevance(entries []Entry, volByPath map[string]*serviceVolumeIndex, pq parsedQuery, m *contentLeafMatcher) {
+	if len(entries) < 2 || m == nil {
 		return
 	}
-	m := newContentLeafMatcher(pq)
 	rel := make([]contentRelevance, len(entries))
 	order := make([]int, len(entries))
 	for i := range entries {

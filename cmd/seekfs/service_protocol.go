@@ -73,6 +73,18 @@ type serviceResponse struct {
 	Content                  *contentHealth      `json:"content,omitempty"`
 }
 
+// redactContentText clears local-only matched content text (snippets) from the
+// response rows. A non-local transport calls this at the command boundary so a
+// future projection cannot leak document text even if it forgets to strip it.
+func (r *serviceResponse) redactContentText() {
+	if r == nil {
+		return
+	}
+	for i := range r.Rows {
+		r.Rows[i].Snippet = ""
+	}
+}
+
 // servicePrincipal describes the caller of a service command and the
 // capabilities derived from its Windows identity.  A principal is produced by
 // impersonating the pipe client token (local callers) or by authenticating a

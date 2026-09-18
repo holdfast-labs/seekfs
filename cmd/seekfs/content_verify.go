@@ -53,11 +53,13 @@ func boundContentPathCache(cache map[int]string) map[int]string {
 var errContentIncomplete = errors.New("content count is incomplete: candidate budget exceeded; add a more selective term or filter")
 
 // contentLeafMatcher precompiles the query's content leaves once so evaluating
-// every candidate is a lookup plus a substring/regex test.
+// every candidate is a lookup plus a substring/regex test. Needles are
+// lowercased once here, not per candidate.
 type contentLeafMatcher struct {
 	leaves []contentLeaf
 	size   int
 	regex  map[int]*regexp.Regexp
+	needle map[int][]byte
 }
 
 func newContentLeafMatcher(pq parsedQuery) *contentLeafMatcher {
@@ -69,19 +71,31 @@ func newContentLeafMatcher(pq parsedQuery) *contentLeafMatcher {
 		}
 	}
 	for _, leaf := range leaves {
-		if leaf.Kind != contentLeafRegex {
+		if leaf.Kind == contentLeafRegex {
+			re, err := regexp.Compile("(?i)" + leaf.Text)
+			if err != nil {
+				continue
+			}
+			if m.regex == nil {
+				m.regex = make(map[int]*regexp.Regexp)
+			}
+			m.regex[leaf.LeafID] = re
 			continue
 		}
-		re, err := regexp.Compile("(?i)" + leaf.Text)
-		if err != nil {
-			continue
+		if m.needle == nil {
+			m.needle = make(map[int][]byte)
 		}
-		if m.regex == nil {
-			m.regex = make(map[int]*regexp.Regexp)
-		}
-		m.regex[leaf.LeafID] = re
+		m.needle[leaf.LeafID] = []byte(strings.ToLower(leaf.Text))
 	}
 	return m
+}
+
+// needleOf returns the precomputed lowercased bytes a term/phrase leaf matches.
+func (m *contentLeafMatcher) needleOf(leaf contentLeaf) []byte {
+	if b, ok := m.needle[leaf.LeafID]; ok {
+		return b
+	}
+	return []byte(strings.ToLower(leaf.Text))
 }
 
 func (m *contentLeafMatcher) match(text []byte, leaf contentLeaf) bool {
@@ -90,7 +104,7 @@ func (m *contentLeafMatcher) match(text []byte, leaf contentLeaf) bool {
 		return re != nil && re.Match(text)
 	}
 	// Stored text is contentNormalizeText output (lowercased + repaired).
-	return bytes.Contains(text, []byte(strings.ToLower(leaf.Text)))
+	return bytes.Contains(text, m.needleOf(leaf))
 }
 
 // entryMatchesWithContent mirrors entryMatches but also enforces content leaves
@@ -211,14 +225,16 @@ func contentCollectPositiveLeaves(pq parsedQuery, out *[]contentLeaf) {
 }
 
 // contentSnippet returns a bounded window around the first matching term/phrase
-// content leaf. A query whose only content matches are regexes yields "".
-func contentSnippet(text []byte, pq parsedQuery, m *contentLeafMatcher) string {
-	for _, leaf := range contentPositiveLeaves(pq) {
+// content leaf. A query whose only content matches are regexes yields "". The
+// positive-leaf list and matcher are hoisted by the caller so this is O(leaves)
+// per result, not O(leaves) plus matcher construction.
+func contentSnippet(text []byte, src *contentSnippetSource, positive []contentLeaf, m *contentLeafMatcher) string {
+	for _, leaf := range positive {
 		if leaf.Kind == contentLeafRegex || !m.match(text, leaf) {
 			continue
 		}
 		if off := contentLeafFirstOffset(text, leaf); off >= 0 {
-			return contentSnippetWindow(text, off, len(strings.ToLower(leaf.Text)))
+			return contentSnippetWindowSource(text, src, off, len(m.needleOf(leaf)))
 		}
 	}
 	return ""
@@ -226,18 +242,18 @@ func contentSnippet(text []byte, pq parsedQuery, m *contentLeafMatcher) string {
 
 // attachContentSnippets fills Entry.Snippet for content-query results. It is
 // called after the result set is bounded by the limit, so the work is O(results).
-func attachContentSnippets(entries []Entry, volByPath map[string]*serviceVolumeIndex, pq parsedQuery) {
-	if len(entries) == 0 || len(volByPath) == 0 || !queryHasAnyContentLeaf(pq) {
+// The matcher and positive-leaf list are built once per query by the caller.
+func attachContentSnippets(entries []Entry, volByPath map[string]*serviceVolumeIndex, positive []contentLeaf, m *contentLeafMatcher) {
+	if len(entries) == 0 || len(volByPath) == 0 || m == nil || len(positive) == 0 {
 		return
 	}
-	m := newContentLeafMatcher(pq)
 	for i := range entries {
 		vol := volByPath[entries[i].Path]
 		if vol == nil {
 			continue
 		}
 		if text, ok := vol.contentTextForEntry(&entries[i]); ok {
-			entries[i].Snippet = contentSnippet(text, pq, m)
+			entries[i].Snippet = contentSnippet(text, nil, positive, m)
 		}
 	}
 }
@@ -528,6 +544,27 @@ func (vol *serviceVolumeIndex) searchContentVolume(opts queryOptions, countOnly 
 	return filterImplicitUnderExisting(matches, opts, countOnly), nil
 }
 
+// contentRelevanceWindow is the enlarged per-volume result window fetched
+// before relevance ranking. It is min(contentCandidateBudget, max(limit*100,
+// 4096)), computed without overflow: once limit exceeds budget/100 the product
+// cannot fall below the budget, so the budget is the min.
+func contentRelevanceWindow(limit int) int {
+	if limit <= 0 {
+		return 0
+	}
+	if limit > contentCandidateBudget/100 {
+		return contentCandidateBudget
+	}
+	window := limit * 100
+	if window < 4096 {
+		window = 4096
+	}
+	if window > contentCandidateBudget {
+		window = contentCandidateBudget
+	}
+	return window
+}
+
 // searchContentServiceVolumes merges the per-volume content results in the same
 // order/limit semantics as the other multi-volume paths: per-volume results are
 // concatenated, globally sorted when they span volumes, and the user limit is
@@ -536,6 +573,18 @@ func (vol *serviceVolumeIndex) searchContentVolume(opts queryOptions, countOnly 
 func searchContentServiceVolumes(volumes []*serviceVolumeIndex, opts queryOptions, countOnly bool, pq parsedQuery) ([]Entry, error) {
 	postVerify := !countOnly && queryHasAnyContentLeaf(pq)
 	relevance := postVerify && pq.SortColumn == "relevance"
+	userLimit := 0
+	if !countOnly {
+		userLimit = normalizedLimit(opts.Limit, false)
+	}
+	// Relevance must rank the best matches, not an arbitrary candidate-order
+	// page: fetch an enlarged per-volume window, rank it, then trim to the user
+	// limit. Reaching the window means more matches may exist, which is surfaced
+	// as an incomplete (degraded) result rather than a silent truncation.
+	window := 0
+	if relevance {
+		window = contentRelevanceWindow(userLimit)
+	}
 	var volByPath map[string]*serviceVolumeIndex
 	if postVerify {
 		volByPath = make(map[string]*serviceVolumeIndex)
@@ -545,9 +594,16 @@ func searchContentServiceVolumes(volumes []*serviceVolumeIndex, opts queryOption
 		if queryCanceled(parsedQuery{DeadlineUnix: opts.DeadlineUnix, Cancel: opts.Cancel}) {
 			return nil, errQueryCanceled
 		}
-		matches, err := vol.searchContentVolume(opts, countOnly)
+		volOpts := opts
+		if window > 0 {
+			volOpts.Limit = window
+		}
+		matches, err := vol.searchContentVolume(volOpts, countOnly)
 		if err != nil {
 			return nil, err
+		}
+		if window > 0 && len(matches) >= window {
+			opts.Trace.setContentIncomplete()
 		}
 		if postVerify {
 			for i := range matches {
@@ -558,19 +614,23 @@ func searchContentServiceVolumes(volumes []*serviceVolumeIndex, opts queryOption
 		}
 		results = append(results, matches...)
 	}
+	var contentMatcher *contentLeafMatcher
+	var positive []contentLeaf
+	if postVerify {
+		contentMatcher = newContentLeafMatcher(pq)
+		positive = contentPositiveLeaves(pq)
+	}
 	if !countOnly && relevance {
-		sortContentEntriesByRelevance(results, volByPath, pq)
+		sortContentEntriesByRelevance(results, volByPath, pq, contentMatcher)
 	} else if !countOnly && entriesSpanMultipleVolumes(results) {
 		sortSearchAllEntries(results, pq)
 	}
-	if !countOnly {
-		if limit := normalizedLimit(opts.Limit, false); limit > 0 && len(results) > limit {
-			results = results[:limit]
-		}
+	if !countOnly && userLimit > 0 && len(results) > userLimit {
+		results = results[:userLimit]
 	}
 	// Snippets are attached last so the work is bounded by the returned set.
 	if postVerify {
-		attachContentSnippets(results, volByPath, pq)
+		attachContentSnippets(results, volByPath, positive, contentMatcher)
 	}
 	opts.Trace.setPlannerMode("service-content")
 	opts.Trace.setComplete(opts.Trace == nil || (!opts.Trace.ContentPartial && !opts.Trace.ContentIncomplete))

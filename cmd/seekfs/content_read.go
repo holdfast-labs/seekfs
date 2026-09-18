@@ -27,42 +27,84 @@ type contentHit struct {
 	Snippet string
 }
 
+// contentSnippetSource is an optional case-preserving decoded copy of a
+// document's text. fixups maps an offset in the normalized (lowercased, lossy
+// repaired) text used for matching back into text, so a snippet can show
+// original case/source where the mapping is exact.
+type contentSnippetSource struct {
+	text   []byte
+	fixups contentLossyFixups
+}
+
 // contentSnippetWindow returns a bounded window of text around the match at byte
 // offset off. Newlines and tabs are collapsed to spaces so the snippet stays one
-// line. text must be valid UTF-8 (the stored/normalized form).
+// line. Only the bytes around the window are decoded, so the work is O(window)
+// rather than O(len(text)); the start and end snap to rune boundaries so a
+// multibyte rune is never split. text must be valid UTF-8 (the stored form).
 func contentSnippetWindow(text []byte, off, matchLen int) string {
 	if off < 0 || off > len(text) {
 		return ""
+	}
+	if matchLen < 0 {
+		matchLen = 0
 	}
 	end := off + matchLen
 	if end > len(text) {
 		end = len(text)
 	}
-	runes := []rune(string(text))
-	start := utf8.RuneCount(text[:off])
-	matchRunes := utf8.RuneCount(text[off:end])
-	from := start - contentSnippetContextRunes
-	if from < 0 {
-		from = 0
+	// Snap to rune boundaries: a caller offset can land inside a multibyte rune
+	// (and a boundary-cut window must not split one).
+	for off > 0 && !utf8.RuneStart(text[off]) {
+		off--
 	}
-	to := from + contentSnippetMaxRunes
-	if to > len(runes) {
-		to = len(runes)
-		if from = to - contentSnippetMaxRunes; from < 0 {
-			from = 0
-		}
+	for end > off && end < len(text) && !utf8.RuneStart(text[end]) {
+		end++
 	}
-	if to < start+matchRunes {
-		to = min(len(runes), start+matchRunes)
+	// Up to contentSnippetContextRunes runes of context before the match.
+	start := off
+	for n := 0; n < contentSnippetContextRunes && start > 0; n++ {
+		_, size := utf8.DecodeLastRune(text[:start])
+		start -= size
 	}
-	window := []rune(contentSnippetSpace.Replace(string(runes[from:to])))
-	if from > 0 {
+	// The window is contentSnippetMaxRunes runes starting at start.
+	stop := start
+	for n := 0; n < contentSnippetMaxRunes && stop < len(text); n++ {
+		_, size := utf8.DecodeRune(text[stop:])
+		stop += size
+	}
+	if stop < end {
+		stop = end
+	}
+	window := []rune(contentSnippetSpace.Replace(string(text[start:stop])))
+	if start > 0 {
 		window = append([]rune("..."), window...)
 	}
-	if to < len(runes) {
+	if stop < len(text) {
 		window = append(window, []rune("...")...)
 	}
 	return string(window)
+}
+
+// contentSnippetWindowSource renders the snippet from the case-preserving source
+// when the match offsets map exactly; region-level failures fall back to the
+// normalized text rather than fabricating bytes that were never in the source.
+func contentSnippetWindowSource(normalized []byte, src *contentSnippetSource, off, matchLen int) string {
+	if src == nil || len(src.text) == 0 || off < 0 || off > len(normalized) {
+		return contentSnippetWindow(normalized, off, matchLen)
+	}
+	end := off + matchLen
+	if end > len(normalized) {
+		end = len(normalized)
+	}
+	if end < off || !src.fixups.exact(off) || !src.fixups.exact(end) {
+		return contentSnippetWindow(normalized, off, matchLen)
+	}
+	srcOff := src.fixups.toSourceOffset(off)
+	srcEnd := src.fixups.toSourceOffset(end)
+	if srcOff < 0 || srcEnd < srcOff || srcEnd > len(src.text) {
+		return contentSnippetWindow(normalized, off, matchLen)
+	}
+	return contentSnippetWindow(src.text, srcOff, srcEnd-srcOff)
 }
 
 // contentReader is a decoded `.gsx` ready to query.
@@ -152,10 +194,12 @@ func (r *contentReader) search(term string, limit int) []contentHit {
 		}
 		if off := strings.Index(string(lower), t); off >= 0 {
 			hits = append(hits, contentHit{
-				Path:    r.docPath(id),
-				DocID:   id,
-				Offset:  off,
-				Snippet: contentSnippetWindow(lower, off, len(t)),
+				Path:   r.docPath(id),
+				DocID:  id,
+				Offset: off,
+				// Preserve the stored text's case: matching runs on the
+				// lowercased view, the window is taken from the original bytes.
+				Snippet: contentSnippetWindowSource(lower, &contentSnippetSource{text: text}, off, len(t)),
 			})
 			if limit > 0 && len(hits) >= limit {
 				break

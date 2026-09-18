@@ -1,9 +1,10 @@
 # Content Search — Design, Status, and Handoff
 
-Branch: `content-search`. Status: P0–P3 complete and reviewed; **P4 (snippets,
-`sort:relevance`, document-extraction quality) is the next work item.** Content
-search is off by default; with `SEEKFS_CONTENT_SEARCH=1` and an FRN-keyed
-`.gsx` attached, `content:` queries now work through the service.
+Branch: `content-search`. Status: P0–P3 complete and reviewed; P4's two planner
+surfaces (`sort:relevance` and snippets) are implemented and tested, pending
+review; P4 document-extraction quality is still open. Content search is off by
+default; with `SEEKFS_CONTENT_SEARCH=1` and an FRN-keyed `.gsx` attached,
+`content:` queries now work through the service.
 
 This document is the committed handoff for an agent continuing the work. The
 fuller working plan lives at `docs/CONTENT_SEARCH_PLAN.md`, which is
@@ -142,10 +143,10 @@ fallback path memo.
 
 ## 6b. P4 — remaining work (next)
 
-1. **Snippets.** Return surrounding text for matched content leaves (gated on
-   authorization, per plan §8) and a `Matches` span list.
-2. **`sort:relevance`.** Rank content results (post-verify); add the arm to
-   `rankForQuery` (`planner_rank.go`). BM25 stays gated on the engine review.
+1. **Snippets.** LANDED (see §6c): a bounded local-only window around the first
+   matching term/phrase leaf. A `Matches` span list is still open.
+2. **`sort:relevance`.** LANDED (see §6c): bounded post-verify content rank.
+   BM25 stays gated on the engine review.
 3. **Document-extraction quality:** PDF xref/object-streams and font coverage
    (the current extractor is a spike); decide on legacy OLE.
 4. **Scale follow-ups from review:** stream/cap the posting decode in
@@ -157,8 +158,52 @@ fallback path memo.
 6. **Tests:** multi-leaf AND (`content:a content:b`) and content nested inside
    OR/NOT.
 
+## 6c. P4 surfaces — implemented (pending review)
+
+- **`sort:relevance`.** Only meaningful for content queries; ranked post-verify
+  over the bounded result set by `contentRelevanceOf` / `sortContentEntriesByRelevance`
+  (`planner_rank.go`), called from `searchContentServiceVolumes`. Rule (minimal,
+  deterministic): score = number of matched positive content leaves under the
+  SAME joint-OR rule as verification (top-level AND leaves plus the leaves of the
+  alternative that actually satisfied each OR group; a failing alternative never
+  inflates the score; NOT leaves excluded); higher score first, then earlier
+  earliest first-match offset among term/phrase leaves, then the existing
+  name/path order. No BM25 or corpus statistics. The rank is not an index-wide
+  per-record array, so `rankForQuery` deliberately returns nil for a content
+  query with `sort:relevance` (a record scan would be unbounded); the content
+  path applies the bounded sort instead. A non-content query with
+  `sort:relevance` keeps the default order, like the other sort columns.
+  Ranking must not be a top-of-page illusion: before scoring, each volume is
+  fetched with an enlarged window `min(contentCandidateBudget, max(limit*100,
+  4096))` (overflow-safe), ranked, then trimmed to the user limit. A per-volume
+  match count that reaches the window means more matches may exist and is
+  surfaced as incomplete/degraded, never a silent truncation.
+- **Snippets.** `Entry.Snippet` (and `jsonResult.Snippet`) is filled by
+  `attachContentSnippets` after the result set is bounded by the limit, so the
+  work is O(results). It is a ~200-rune window around the first matching
+  term/phrase content leaf, with `...` on a truncated side; regex-only matches
+  yield no snippet. The window decodes only the bytes around the match
+  (`contentSnippetWindow`), so per-result work is O(window), not O(docLen), and
+  it snaps to rune boundaries so a multibyte rune is never split. Where a
+  case-preserving decoded source is available it is mapped through
+  `contentLossyFixups` (`contentSnippetWindowSource`); an inexact mapping falls
+  back to the normalized text rather than fabricating. The offline `content`
+  command keeps `results` as an array of path strings and adds a parallel
+  `snippets` array in `--json`; plain stdout stays path-only unless `--snippet`
+  is passed.
+- **Authorization.** Snippets are local-only. The remote projection
+  (`remoteResponseFromService` → `remoteResultRow`) copies only
+  path/size/modified/is-dir, and `resp.Results` is path-only, so neither the
+  matched text nor any other `Entry` text field reaches a remote caller. No new
+  capability is granted.
+
 ## 7. Carried debt / known gaps
 
+- The `.gsx` text store is lowercased (`contentNormalizeText`), so service
+  snippets have no case-preserving source to map back to and fall back to the
+  normalized text. `contentSnippetWindowSource` + `contentLossyFixups` are in
+  place for a case-preserving source section/build; until one lands, only the
+  offline reader path can preserve case when its stored text already carries it.
 - The service reads the whole `.gsx` into heap (`contentLoadFile`); mmap-ing it
   is deferred to the ARCHITECTURE_REVIEW R1/R5 engine work.
 - Journal-reset content invalidation (`contentCoordinator.invalidate`) is

@@ -367,6 +367,12 @@ func (s *goSearchService) serviceCommandSearch(w io.Writer, caps serviceCapabili
 			resp.Results[i] = entry.Path
 		}
 		resp.Rows = entriesToJSON(matches)
+		if caps.Remote {
+			// Content text is local-only. Strip it at the command boundary so a
+			// future transport cannot leak a snippet even if its own projection
+			// forgets to.
+			resp.redactContentText()
+		}
 	}
 	resp.Content = s.searchContentHealth(trace)
 	_ = json.NewEncoder(w).Encode(resp)
@@ -507,7 +513,7 @@ func (s *goSearchService) serviceCommandIndexUSN(w io.Writer, req *serviceReques
 }
 
 func (s *goSearchService) serviceCommandStatus(w io.Writer) {
-		_ = json.NewEncoder(w).Encode(serviceInfoResponseFor(serviceResponse{OK: true, Message: "service running", Content: s.contentHealthSnapshot()}, s.pipeName, s.processMode))
+	_ = json.NewEncoder(w).Encode(serviceInfoResponseFor(serviceResponse{OK: true, Message: "service running", Content: s.contentHealthSnapshot()}, s.pipeName, s.processMode))
 }
 
 func serviceResidentBackgroundLoading(volumes []*serviceVolumeIndex) bool {

@@ -85,11 +85,15 @@ func cmdContentIndex(args []string) error {
 	return nil
 }
 
-// contentCLIResult is the additive JSON shape for the offline `content` command:
-// path plus the matched-text snippet when one is available.
-type contentCLIResult struct {
-	Path    string `json:"path"`
-	Snippet string `json:"snippet,omitempty"`
+// contentCLIResponse is the additive JSON shape for the offline `content`
+// command: `results` stays an array of path strings (the original shape) and
+// `snippets` is a parallel array of matched-text windows, aligned to `results`.
+// Consumers that only know the old shape are unaffected.
+type contentCLIResponse struct {
+	OK       bool     `json:"ok"`
+	Count    int      `json:"count"`
+	Results  []string `json:"results"`
+	Snippets []string `json:"snippets"`
 }
 
 func cmdContent(args []string) error {
@@ -97,6 +101,7 @@ func cmdContent(args []string) error {
 	db := fs.String("db", "", "content index (.gsx) to query")
 	n := fs.Int("n", 100, "maximum results")
 	asJSON := fs.Bool("json", false, "emit JSON")
+	withSnippet := fs.Bool("snippet", false, "append the matched-text snippet to each line")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -121,19 +126,21 @@ func cmdContent(args []string) error {
 	hits := r.search(term, *n)
 
 	if *asJSON {
-		results := make([]contentCLIResult, 0, len(hits))
+		resp := contentCLIResponse{
+			OK:       true,
+			Count:    len(hits),
+			Results:  make([]string, 0, len(hits)),
+			Snippets: make([]string, 0, len(hits)),
+		}
 		for _, h := range hits {
-			results = append(results, contentCLIResult{Path: h.Path, Snippet: h.Snippet})
+			resp.Results = append(resp.Results, h.Path)
+			resp.Snippets = append(resp.Snippets, h.Snippet)
 		}
 		enc := json.NewEncoder(os.Stdout)
-		return enc.Encode(struct {
-			OK      bool               `json:"ok"`
-			Count   int                `json:"count"`
-			Results []contentCLIResult `json:"results"`
-		}{OK: true, Count: len(results), Results: results})
+		return enc.Encode(resp)
 	}
 	for _, h := range hits {
-		if h.Snippet != "" {
+		if *withSnippet && h.Snippet != "" {
 			fmt.Fprintf(os.Stdout, "%s\t%s\n", h.Path, h.Snippet)
 			continue
 		}
