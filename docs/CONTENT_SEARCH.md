@@ -278,6 +278,17 @@ Each item below is intentionally out of scope for P5; the rationale is one line.
   service change.
 - **`contentResolvePath` end-to-end test**: needs a compact index with a real
   parent chain; only its `contentLookupFRNColumn` fallback is unit-tested today.
+- **Journal-reset content rebuild scheduling**: a reset marks the index `stale`
+  (never ready-with-stale-data), but nothing schedules a rebuild, so content
+  stays unavailable until a manual rebuild/restart.
+- **Ranking the capped positive-content candidate set**: the cap is applied in
+  FRN-hash order, so an incomplete positive search returns an arbitrary subset
+  (flagged incomplete); ranking the capped set is future work.
+- **Multi-leaf AND / deep OR/NOT nesting tests**: `content:a content:b` and
+  content nested inside OR/NOT are covered only in combination today.
+- **`count == len(search)` exception**: for `sort:relevance` whose per-volume
+  window fills, search is marked incomplete while count remains exact; the two
+  intentionally differ in that one case.
 
 ## 8. Review process used
 
