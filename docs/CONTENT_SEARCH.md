@@ -1,8 +1,9 @@
 # Content Search — Design, Status, and Handoff
 
-Branch: `content-search`. Status: P0–P2.5 complete and reviewed; **P3 (planner
-query integration) is the next work item.** Content search is off by default and
-is not yet user-visible through the service.
+Branch: `content-search`. Status: P0–P3 complete and reviewed; **P4 (snippets,
+`sort:relevance`, document-extraction quality) is the next work item.** Content
+search is off by default; with `SEEKFS_CONTENT_SEARCH=1` and an FRN-keyed
+`.gsx` attached, `content:` queries now work through the service.
 
 This document is the committed handoff for an agent continuing the work. The
 fuller working plan lives at `docs/CONTENT_SEARCH_PLAN.md`, which is
@@ -47,7 +48,9 @@ disabled"; the rest of seekfs is unchanged.
 
 Service health: when the flag is on but no valid `.gsx` is attached, the service
 reports `content.state = "unavailable"` — never `"ready"` with an unusable
-index. Query integration is P3, so the service does not yet answer `content:`.
+index. Content queries are served once a volume is usable; when some (not all)
+eligible volumes are unusable the response is marked degraded/incomplete, and
+when none is usable the query errors rather than returning empty.
 
 ## 3. Architecture map
 
@@ -108,42 +111,51 @@ The offline path has oracle parity vs brute-force file reads. `-race` needs a C
 toolchain (not available in this environment). Current measurement on the seekfs
 source tree: ~3.2 MB encoded `.gsx` for ~5 MB raw, peak heap ~34 MB.
 
-## 6. P3 — remaining work (next)
+## 6. P3 — ACCEPTED (planner integration)
 
-The design is specified in `docs/CONTENT_SEARCH_PLAN.md` §5–7. The reviewer
-pre-cleared the approach and stressed that a wrong gate makes queries return
-**silently wrong results**. Order:
+`content:` now works through the service. What landed (see the git history for
+exact files):
 
-1. **Parser.** In `applyQueryToken` (`query_parse.go`), replace the current
-   unconditional `contentUnavailableError()` with real parsing into
-   `parsedQuery.Content`; wire `isEmpty`, `mergeSubquery`, and call
-   `contentAssignLeafIDs` (already implemented/tested in `content_query.go`).
-2. **Gate sweep.** Make each lane content-aware or make it decline when
-   `pq.Content != nil`: `globalExtOnlySupported`, `globalExtDefaultSupported`,
-   `globalComponentQuerySupported`, `globalComponentQuerySupportedMulti`,
-   `globalComponentDefaultSupported`, `globalNameQuerySupported`,
-   `globalScalarQuerySupported`; the count lanes
-   `countServiceVolumesGlobalOnlySnapshot`, `...GlobalNameSnapshot`,
-   `...GlobalScalarSnapshot`, `...GlobalBoundedFallbackSnapshot`,
-   `overlayAwareFastCount`, `postingCountCandidate`,
-   `completeFilenameCountPosting`; the fuzzy rewrite; plus
-   `compactRecordPrecheck` (do not early-return false on content) and
-   `compactCandidateCanSkipEntryMatches` (return false whenever `Content != nil`).
-3. **Candidate driver.** Insert `contentAwareCandidates` as the **first
-   statement** of `nameTermCandidates` (`search_compact.go`, before the
-   `plannedCandidates` branch at ~line 588): if `queryHasPositiveContentLeaf(pq)`,
-   return `(contentAwareCandidates(pq), true)`. It must UNION across
-   `OrGroups` alternatives (content alternatives via postings, others via their
-   normal source) and return `ok=true` even when empty (no fallback scan).
-4. **Verification.** Add `FRN uint64`, `RecordID uint32` (`0xFFFFFFFF` none), and
-   `Content *EntryContent{Evaluated bool, Matched map[int]bool, Score, Matches}`
-   to `Entry`; evaluate **all** content leaves (positive/OR/NOT) at the
-   volume-aware sites — base `compactCandidateEntryIfMatch`, overlay
-   `overlayEntry` (add the leaf set as a parameter; update its two callers) —
-   and make `entryMatches` validate attached results only. Merge the in-memory
-   `contentDelta` into results.
-5. **Surfaces.** Gated snippets, `sort:relevance` (add to `applyQueryToken`
-   sort and `rankForQuery`), then measure the p95 ≤ 5s freshness bound.
+- **Parser** parses `content:` term/phrase/regex leaves and the disabled-flag
+  error is preserved; `sort:relevance` is accepted (stored, not yet ranked).
+- **Inline verification** (`entryMatchesWithContent`, new `content_verify.go`)
+  mirrors `entryMatches` and enforces content at every recursion level: all
+  positive top-level leaves, OR groups satisfied by the *same* alternative,
+  NOT groups dropped on a full content-aware match. It runs BEFORE an entry is
+  appended or counted, so the user limit counts only content matches.
+- **Candidates** (`contentCandidates`) come from term/trigram postings plus the
+  delta; a mixed-OR / regex / negated query falls back to an ordered scan.
+- **Boundedness:** `contentCandidateBudget` / `contentScanVisitBudget` (4M
+  default) and a 4096-entry path memo. An incomplete scan is never silent —
+  search marks the trace/health incomplete (`Complete=false`, `degraded`), and
+  count returns `errContentIncomplete`.
+- **Multi-volume** content search + count run per-volume and merge; a volume
+  with no usable index is skipped and named in the degraded set; only an
+  all-unusable query errors.
+- **Safety:** every fast/global/fuzzy/count lane declines content queries;
+  non-content behavior is unchanged with the flag off.
+
+Review history: four rounds; blockers found and fixed were (1) the limit being
+applied before content verification, (2) multi-volume decline, (3) mixed-OR
+dropped matches, (4) unbounded candidate/Entry materialization, (5) unbounded
+fallback path memo.
+
+## 6b. P4 — remaining work (next)
+
+1. **Snippets.** Return surrounding text for matched content leaves (gated on
+   authorization, per plan §8) and a `Matches` span list.
+2. **`sort:relevance`.** Rank content results (post-verify); add the arm to
+   `rankForQuery` (`planner_rank.go`). BM25 stays gated on the engine review.
+3. **Document-extraction quality:** PDF xref/object-streams and font coverage
+   (the current extractor is a spike); decide on legacy OLE.
+4. **Scale follow-ups from review:** stream/cap the posting decode in
+   `contentCandidates` before the budget (a common-gram list can be large);
+   make the scan budgets per-query/options instead of mutable package vars;
+   rank the capped positive-content candidate set (it currently caps in
+   FRN-hash order); entry-free counting so count does not materialize `[]Entry`.
+5. **Freshness:** measure the p95 ≤ 5 s USN→result bound.
+6. **Tests:** multi-leaf AND (`content:a content:b`) and content nested inside
+   OR/NOT.
 
 ## 7. Carried debt / known gaps
 
@@ -158,6 +170,15 @@ pre-cleared the approach and stressed that a wrong gate makes queries return
 - No per-volume drain cancellation (loops end at `s.stop`).
 - PDF extraction is a best-effort spike (no xref/object streams, Flate only,
   simple fonts only); quality is a P4 decision.
+- Content query tests attach with `setReady` directly; an end-to-end test of
+  `attachContentForVolume` (origin guard + persisted FRN resolver) is still
+  missing.
+- The posting decode in `contentCandidates` is not streamed, so a very common
+  gram is fully decoded before the candidate cap; bounded per query but large.
+- The remote response sanitizer omits `Content`, so remote callers of a partial
+  content query see only `Complete=false`, not the degraded-volume detail.
+- A biased content search (`RootBias`/`CWDIBias`) disables the incremental
+  early-stop and scans up to the match budget before the limit is applied.
 
 ## 8. Review process used
 
