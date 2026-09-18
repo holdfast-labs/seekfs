@@ -275,6 +275,13 @@ func buildContentIndexForIndex(ctx context.Context, idx *Index, opts contentBuil
 		return nil, err
 	}
 	cidx.Origin = contentOriginUSN
+	// Stamp the content USN checkpoint from the record index metadata: the
+	// base is complete as of the .gsi checkpoint, so restart catch-up resumes
+	// from here rather than re-reading the whole journal (WP0/PB3).
+	cidx.JournalID = idx.JournalID
+	if idx.Checkpoint > 0 {
+		cidx.CheckpointUSN = uint64(idx.Checkpoint)
+	}
 	return cidx, nil
 }
 

@@ -6,10 +6,13 @@ package main
 // Everything here is inert unless SEEKFS_CONTENT_SEARCH=1.
 
 import (
+	"fmt"
 	"path/filepath"
 	"sort"
 	"strings"
 	"time"
+
+	"golang.org/x/sys/windows"
 )
 
 // contentIndexPathForDB returns the `.gsx` sidecar path for a `.gsi`.
@@ -42,7 +45,7 @@ func contentBaseFRNColumns(idx *Index) ([]uint64, []uint32, bool) {
 // A missing or unreadable index leaves the volume in the `unavailable` state, so
 // queries are refused rather than reported as no matches.
 func (s *goSearchService) attachContentForVolume(vol *serviceVolumeIndex) {
-	if vol == nil || !contentSearchEnabled() {
+	if vol == nil || !contentSearchEnabled() || vol.content == nil {
 		return
 	}
 	// Only USN volumes can join content docs (keyed by FRN) to records. Walk
@@ -69,26 +72,270 @@ func (s *goSearchService) attachContentForVolume(vol *serviceVolumeIndex) {
 		serviceLog("content index for volume %s is not FRN-keyed (origin=%d); leaving unavailable", vol.volume, idx.Origin)
 		return
 	}
+	// A USN-origin base with no journal generation or no checkpoint watermark
+	// cannot be joined or caught up: a zero watermark would attach `ready` and
+	// never catch up. Treat it as stale/needs-rebuild instead; PF-3 schedules
+	// the rebuild.
+	if idx.JournalID == 0 || idx.CheckpointUSN == 0 {
+		reason := "content base has no USN watermark"
+		serviceLog("content index for volume %s %s; leaving stale", vol.volume, reason)
+		vol.content.markStale(reason)
+		return
+	}
 	reader, err := openContentReader(idx)
 	if err != nil {
 		serviceLog("content index unreadable for volume %s: %v", vol.volume, err)
 		return
 	}
-	// Read the record table under the same lock the search path uses, so a
-	// concurrent rebuild cannot unmap it underneath us.
+	// Validate and publish under indexMu. Every base rebuild and content
+	// invalidation runs under indexMu.Lock (see replaceServiceVolumeContents),
+	// so holding it here rejects a base swapped or marked stale while this
+	// attach was in flight instead of overwriting a `stale`/rebuilding volume
+	// with an old `ready`.
 	s.indexMu.RLock()
+	if vol.state != "ready" {
+		state := vol.state
+		s.indexMu.RUnlock()
+		// A non-ready volume is owned by a rebuild (stale recovery). Do not
+		// publish content for it. Re-attaching after the rebuild finishes is
+		// PF-3 (service-owned build + rebuild scheduling); until then the
+		// volume's content stays unavailable until the next restart.
+		serviceLog("content attach skipped volume=%s state=%s; let the rebuild finish (PF-3 re-attach)", vol.volume, state)
+		return
+	}
 	frns, ids, ok := contentBaseFRNColumns(vol.index)
-	s.indexMu.RUnlock()
+	journalID := vol.journalID
 	if !ok {
+		s.indexMu.RUnlock()
 		serviceLog("content index for volume %s has no FRN column; leaving unavailable", vol.volume)
 		return
 	}
+	// WP0/PB3: a base built against a different USN journal generation can
+	// never be joined to this volume's current FRNs. Refuse it (stale) rather
+	// than advertise ready with docs that resolve to nothing; PF-3 schedules
+	// the rebuild.
+	if idx.JournalID != journalID {
+		s.indexMu.RUnlock()
+		reason := fmt.Sprintf("content base journal %d != volume journal %d", idx.JournalID, journalID)
+		serviceLog("content index journal mismatch for volume %s: %s", vol.volume, reason)
+		vol.content.markStale(reason)
+		return
+	}
 	vol.content.setReady(idx, reader, buildContentResolver(idx.Docs, frns, ids))
+	s.indexMu.RUnlock()
 	if vol.contentCoord != nil {
 		vol.contentCoord.enableDrain()
 		go s.contentDrainLoop(vol)
+		// Catch up OFF the startup path: a far-behind base must not block
+		// startup or grow an unbounded delta. Catch-up runs after the drain is
+		// enabled so the FRNs it enqueues are actually processed; files changed
+		// while the service was stopped become findable in content, matching
+		// filename search.
+		contentCatchUpAsync(func() { s.contentCatchUpAfterAttach(vol, idx) })
 	}
 	serviceLog("content index loaded for volume %s docs=%d", vol.volume, len(idx.Docs))
+}
+
+// contentCatchUpMaxChanges and contentCatchUpMaxBytes bound restart catch-up so
+// a base far behind a busy journal cannot make startup do unbounded work or
+// queue an unbounded delta (a record count alone permits 1M files times the
+// 16 MiB text cap). Hitting either cap marks the volume incomplete/degraded
+// rather than silently serving a partial delta. Vars so tests can lower them.
+var (
+	contentCatchUpMaxChanges = 1 << 20
+	contentCatchUpMaxBytes   = int64(256 << 20)
+)
+
+// contentCatchUpAsync schedules restart catch-up off the startup path, like the
+// drain loop. It is a package var so tests can run catch-up synchronously and
+// deterministically.
+var contentCatchUpAsync = func(fn func()) { go fn() }
+
+// contentCatchUpJournal returns the live journal bounds for a volume. It is a
+// package var so tests can drive the wrap/generation-mismatch branches without
+// a real journal.
+var contentCatchUpJournal = func(volume string) (usnJournalDataV0, error) {
+	handle, err := openVolume(volume)
+	if err != nil {
+		return usnJournalDataV0{}, err
+	}
+	defer windows.CloseHandle(handle)
+	return queryUSNJournal(handle)
+}
+
+// contentCatchUpUSNRead reads one USN batch for restart catch-up. It is a
+// package var so tests can drive catch-up without a real NTFS journal. The
+// production path opens a fresh volume handle per batch (it does not hold one
+// reader open across the catch-up).
+var contentCatchUpUSNRead = func(volume string, journalID uint64, startUSN int64, buffer []byte) (int64, []usnChange, error) {
+	handle, err := openVolume(volume)
+	if err != nil {
+		return startUSN, nil, err
+	}
+	defer windows.CloseHandle(handle)
+	return readUSNChanges(handle, journalID, startUSN, buffer)
+}
+
+// contentCatchUpAfterAttach replays the USN records the base missed while the
+// service was stopped, enqueueing each changed FRN for extraction. The drain
+// must already be enabled (attach does this first). A base with no USN
+// watermark, or one already at/ahead of the volume checkpoint, needs no work.
+func (s *goSearchService) contentCatchUpAfterAttach(vol *serviceVolumeIndex, idx *contentIndex) {
+	if vol == nil || vol.contentCoord == nil || idx == nil || vol.volume == "" {
+		return
+	}
+	from := int64(idx.CheckpointUSN)
+	if idx.JournalID == 0 || from <= 0 {
+		// Not USN-valid (a hand-built or walk-derived base). Leave it alone;
+		// PF-3 owns the rebuild that would stamp a checkpoint.
+		return
+	}
+	// Validate the base's watermark against the live journal before reading. A
+	// wrapped journal (checkpoint below FirstUsn/LowestValidUsn) or a reset
+	// generation must be stale/needs-rebuild, never a normal read that silently
+	// misses records. validateUSNCheckpoint is the same bound check the record
+	// index uses (service_replay.go).
+	journal, err := contentCatchUpJournal(vol.volume)
+	if err != nil {
+		serviceLog("content catch-up journal query error volume=%s err=%v", vol.volume, err)
+		vol.content.markCatchUpIncomplete()
+		return
+	}
+	probe := &serviceVolumeIndex{journalID: idx.JournalID, checkpoint: from}
+	if err := validateUSNCheckpoint(probe, journal); err != nil {
+		serviceLog("content catch-up checkpoint invalid volume=%s from=%d err=%v", vol.volume, from, err)
+		vol.content.markStale(err.Error())
+		return
+	}
+	vol.mu.Lock()
+	target := vol.checkpoint
+	volumeJournal := vol.journalID
+	vol.mu.Unlock()
+	if volumeJournal != 0 && volumeJournal != idx.JournalID {
+		// A journal reset raced the attach; the base is not this generation.
+		vol.content.markStale(fmt.Sprintf("content base journal %d != volume journal %d", idx.JournalID, volumeJournal))
+		return
+	}
+	if from >= target {
+		return
+	}
+	buffer := make([]byte, 4*1024*1024)
+	cur := from
+	processed := 0
+	var processedBytes int64
+	for cur < target {
+		if !s.contentCatchUpGenerationCurrent(vol, idx.JournalID) {
+			// A journal reset or base swap landed mid-loop; the rest of the
+			// read is for a generation these FRNs can no longer join. Abort
+			// instead of enqueueing wasted extraction work.
+			reason := fmt.Sprintf("content base journal %d no longer current", idx.JournalID)
+			serviceLog("content catch-up aborted volume=%s %s", vol.volume, reason)
+			vol.content.markStale(reason)
+			return
+		}
+		next, changes, err := contentCatchUpUSNRead(vol.volume, idx.JournalID, cur, buffer)
+		if err != nil {
+			serviceLog("content catch-up read error volume=%s from=%d err=%v", vol.volume, cur, err)
+			vol.content.markCatchUpIncomplete()
+			return
+		}
+		if next <= cur {
+			break
+		}
+		processed += len(changes)
+		processedBytes += s.contentCatchUpBatchBytes(vol, changes)
+		if processed > contentCatchUpMaxChanges || processedBytes > contentCatchUpMaxBytes {
+			serviceLog("content catch-up cap hit volume=%s from=%d target=%d processed=%d bytes=%d", vol.volume, from, target, processed, processedBytes)
+			vol.content.markCatchUpIncomplete()
+			return
+		}
+		vol.contentCoord.observeChanges(changes)
+		vol.contentCoord.promoteAll()
+		cur = next
+	}
+}
+
+// contentCatchUpGenerationCurrent reports whether the volume's live journal
+// generation still matches the base catch-up is reading. A base swap with the
+// same generation is fine (content is generation-independent); a journal reset
+// is not, so the loop aborts. indexMu is taken before vol.mu, the documented
+// order, and is the lock a base swap holds while it rewrites vol.journalID.
+func (s *goSearchService) contentCatchUpGenerationCurrent(vol *serviceVolumeIndex, journalID uint64) bool {
+	if vol == nil {
+		return false
+	}
+	s.indexMu.RLock()
+	defer s.indexMu.RUnlock()
+	vol.mu.Lock()
+	defer vol.mu.Unlock()
+	return vol.journalID == 0 || vol.journalID == journalID
+}
+
+// contentCatchUpUnknownFileBytes is the conservative per-file byte budget used
+// when a changed file has no size in the base or the overlay: a create or
+// move-in the base predates whose metadata refresh did not run. It is the
+// extractor's per-document text cap, a true upper bound on what the delta can
+// retain, so an all-create catch-up (base records absent) is still bounded
+// instead of counting every file as 0 bytes. A var so tests can lower it.
+var contentCatchUpUnknownFileBytes int64 = contentExtractMaxTextBytes
+
+// contentCatchUpBatchBytes estimates the extracted-text volume a catch-up batch
+// could enqueue from each changed file's size, so catch-up is bounded by bytes
+// as well as records. A file with no base or overlay record (created/moved in
+// while the service was stopped) is charged the conservative per-file bound.
+func (s *goSearchService) contentCatchUpBatchBytes(vol *serviceVolumeIndex, changes []usnChange) int64 {
+	s.indexMu.RLock()
+	defer s.indexMu.RUnlock()
+	if vol.index == nil {
+		return 0
+	}
+	vol.mu.Lock()
+	defer vol.mu.Unlock()
+	var total int64
+	for i := range changes {
+		ch := &changes[i]
+		if ch.FRN == 0 || ch.Reason&(usnReasonNeedsContentRefresh|usnReasonRenameNew) == 0 {
+			continue
+		}
+		if !contentEligibleForExtraction(0, ch.Attr) {
+			continue
+		}
+		size, known := vol.contentFRNSizeLocked(ch.FRN)
+		if !known {
+			size = contentCatchUpUnknownFileBytes
+		}
+		total += size
+	}
+	return total
+}
+
+// contentFRNSizeLocked returns the best-known byte size for an FRN and whether
+// any record (live overlay slot or base record) describes it. The overlay is
+// consulted first: a file created or moved in while the service was stopped has
+// no base record, but startup replay stat'd its size into the overlay, so it
+// must not budget as 0. Caller holds indexMu.RLock and vol.mu.
+func (vol *serviceVolumeIndex) contentFRNSizeLocked(frn uint64) (int64, bool) {
+	if vol == nil || vol.index == nil || frn == 0 {
+		return 0, false
+	}
+	if vol.overlay != nil {
+		if slot, ok := vol.overlay.byFRN[frn]; ok && slot >= 0 && int(slot) < len(vol.overlay.records) {
+			rec := vol.overlay.records[slot]
+			if rec.Deleted {
+				return 0, true
+			}
+			return rec.Size, true
+		}
+	}
+	id, ok := vol.recordIDForFRN(frn)
+	if !ok || id < 0 || id >= vol.index.compactRecordCount() {
+		return 0, false
+	}
+	size := vol.index.compactRecord(id).Size
+	if size < 0 {
+		size = 0
+	}
+	return size, true
 }
 
 // contentDrainInterval is the quiet-window + drain cadence.

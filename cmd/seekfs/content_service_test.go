@@ -31,7 +31,7 @@ func contentTestState() *contentVolumeState {
 	}
 	r, _ := openContentReader(idx)
 	s := newContentVolumeState("C:")
-	s.setReady(idx, r, nil)
+	s.setReady(idx, r, buildContentResolver(idx.Docs, []uint64{100, 200}, []uint32{0, 1}))
 	return s
 }
 
@@ -82,11 +82,28 @@ func TestContentCoordinatorSkipsIneligibleAndRename(t *testing.T) {
 		{FRN: 1, Reason: usnReasonFileCreate, Attr: contentAttrDirectory},
 		{FRN: 2, Reason: usnReasonDataOverwrite, Attr: contentAttrOffline},
 		{FRN: 3, Reason: usnReasonDataOverwrite, Attr: contentAttrRecallOnDataAccess},
-		{FRN: 4, Reason: usnReasonRenameNew, Attr: 0},
 		{FRN: 5, Reason: usnReasonClose, Attr: 0},
 	})
 	if c.dirtyCount() != 0 {
-		t.Fatalf("dirty=%d; want 0 (dirs, cloud, rename, bare close must not mark)", c.dirtyCount())
+		t.Fatalf("dirty=%d; want 0 (dirs, cloud, bare close must not mark)", c.dirtyCount())
+	}
+
+	// A rename-new for an FRN that already has a content doc is an intra-volume
+	// rename: the bytes are unchanged, so it must not be re-extracted.
+	c.observeChanges([]usnChange{{FRN: 100, Reason: usnReasonRenameNew, Attr: 0}})
+	if c.dirtyCount() != 0 {
+		t.Fatalf("dirty=%d; an intra-volume rename with an existing doc must not mark", c.dirtyCount())
+	}
+
+	// A rename-new for an FRN with no content doc is a file moved into the
+	// volume while stopped; it must be extracted.
+	c.observeChanges([]usnChange{{FRN: 999, Reason: usnReasonRenameNew, Attr: 0}})
+	if c.dirtyCount() != 1 {
+		t.Fatalf("dirty=%d; a moved-in file (no doc) must mark", c.dirtyCount())
+	}
+	c.promoteAll()
+	if q := c.takeQueued(); len(q) != 1 || q[0] != 999 {
+		t.Fatalf("queued = %v; want [999]", q)
 	}
 }
 

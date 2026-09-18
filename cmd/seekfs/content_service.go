@@ -170,6 +170,14 @@ func (d *contentDelta) priorHash(frn uint64) ([contentHashLen]byte, bool) {
 	return [contentHashLen]byte{}, false
 }
 
+// has reports whether a live (non-deleted) delta doc exists for the FRN.
+func (d *contentDelta) has(frn uint64) bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	i, ok := d.byFRN[frn]
+	return ok && !d.docs[i].Deleted
+}
+
 func (d *contentDelta) len() int {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -259,6 +267,9 @@ func (s *contentVolumeState) setReady(idx *contentIndex, reader *contentReader, 
 	s.resolver = resolver
 	s.state = contentStateReady
 	s.health.State = contentStateReady
+	// A freshly attached base is complete as of its checkpoint; any earlier
+	// catch-up truncation belonged to the replaced base.
+	s.health.Incomplete = false
 	s.health.Docs = len(idx.Docs)
 	s.health.LastRebuild = time.Now().UTC().Format(time.RFC3339)
 }
@@ -341,12 +352,19 @@ func (s *contentVolumeState) healthSnapshot(queueDepth int) contentHealth {
 }
 
 // markDrained records a completed drain pass and returns the volume to ready.
+// A truncated catch-up keeps the volume degraded: a later drain cannot make the
+// records catch-up missed reappear, so health.Incomplete must stay visible.
 func (s *contentVolumeState) markDrained() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.state != contentStateStale {
-		s.state = contentStateReady
-		s.health.State = contentStateReady
+		if s.health.Incomplete {
+			s.state = contentStateDegraded
+			s.health.State = contentStateDegraded
+		} else {
+			s.state = contentStateReady
+			s.health.State = contentStateReady
+		}
 	}
 	s.health.LastDrain = time.Now().UTC().Format(time.RFC3339)
 }
@@ -355,6 +373,58 @@ func (s *contentVolumeState) noteExtractionError() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.health.ExtractionErrors++
+}
+
+// markCatchUpIncomplete flags that restart catch-up stopped before reaching
+// the volume checkpoint, so the volume is surfaced as degraded/incomplete
+// instead of silently treated as fully caught up. health.Incomplete survives
+// markDrained, so a completed drain does not hide the truncation. The volume
+// stays usable: the base plus the partial delta is still a superset of what it
+// served before catch-up.
+func (s *contentVolumeState) markCatchUpIncomplete() {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.health.Incomplete = true
+	if s.state != contentStateStale {
+		s.state = contentStateDegraded
+		s.health.State = contentStateDegraded
+	}
+}
+
+// healthIncomplete reports whether a truncated restart catch-up left this
+// volume missing records. The query path turns this into the trace-level
+// incomplete signal so a query does not report complete while `loaded --json`
+// says incomplete.
+func (s *contentVolumeState) healthIncomplete() bool {
+	if s == nil {
+		return false
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.health.Incomplete
+}
+
+// hasContentForFRN reports whether a live content doc already exists for the
+// FRN, in the base or the delta. A rename-new for an FRN with no doc is a file
+// moved into the volume that has never been extracted; an intra-volume rename
+// keeps its FRN, so it already has a doc and must not re-extract.
+func (s *contentVolumeState) hasContentForFRN(frn uint64) bool {
+	if s == nil || frn == 0 {
+		return false
+	}
+	s.mu.RLock()
+	resolver := s.resolver
+	delta := s.delta
+	s.mu.RUnlock()
+	if resolver != nil {
+		if _, ok := resolver.docForFRN(frn); ok {
+			return true
+		}
+	}
+	return delta != nil && delta.has(frn)
 }
 
 // contentCoordinator turns the USN change stream into content work. Dirty files
@@ -410,6 +480,15 @@ func (c *contentCoordinator) observeChanges(changes []usnChange) {
 			continue
 		}
 		if ch.Reason&usnReasonNeedsContentRefresh != 0 {
+			if _, queued := c.queue[ch.FRN]; !queued {
+				c.dirty[ch.FRN] = struct{}{}
+			}
+		}
+		// A file moved into the volume while the service was stopped has no
+		// content doc for its (stable) FRN, so enqueue it and let the drain
+		// extract it. An intra-volume rename already has a doc, so it is
+		// skipped here and never re-extracted.
+		if ch.Reason&usnReasonRenameNew != 0 && !c.state.hasContentForFRN(ch.FRN) {
 			if _, queued := c.queue[ch.FRN]; !queued {
 				c.dirty[ch.FRN] = struct{}{}
 			}

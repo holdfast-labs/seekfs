@@ -393,6 +393,7 @@ func searchServiceVolumes(volumes []*serviceVolumeIndex, opts queryOptions, coun
 			return nil, contentUnavailableError()
 		}
 		markContentQueryDegraded(opts.Trace, skipped)
+		markContentQueryIncomplete(opts.Trace, usable)
 		return searchContentServiceVolumes(usable, opts, countOnly, pq)
 	}
 	snapshot := newGlobalQuerySnapshot(volumes, opts.Trace)

@@ -17,11 +17,13 @@ import (
 	"time"
 )
 
-// contentIndexMagic identifies a `.gsx` file. The trailing 01 is the format
-// version encoded in the magic as well as the header, matching the v9 habit.
-var contentIndexMagic = [8]byte{'G', 'O', 'S', 'C', 'X', '0', '0', '1'}
+// contentIndexMagic identifies a `.gsx` file. The trailing digits are the
+// format version encoded in the magic as well as the header, matching the v9
+// habit. The 02 bump added the content USN checkpoint (WP0); a 001 sidecar is
+// rejected on load so it can never be attached as ready.
+var contentIndexMagic = [8]byte{'G', 'O', 'S', 'C', 'X', '0', '0', '2'}
 
-const contentIndexVersion = 1
+const contentIndexVersion = 2
 
 // contentOrigin records what the doc keys are, so a `.gsx` can never be
 // attached to a key space it does not join.
@@ -72,11 +74,19 @@ type contentDoc struct {
 // P1 populates terms/grams/text/rank/delta; P0 round-trips the container and
 // doc table.
 type contentIndex struct {
-	Version  int
-	Origin   uint32
-	BuiltAt  time.Time
-	Docs     []contentDoc
-	Sections map[uint32][]byte
+	Version int
+	Origin  uint32
+	// JournalID and CheckpointUSN are the content USN watermark (WP0): the
+	// NTFS journal generation and the next-USN the base is known complete at.
+	// A zero CheckpointUSN means the base is not USN-valid (a walk/path-keyed
+	// base); the service never attaches such a base as FRN-joinable. Restart
+	// catch-up resumes from CheckpointUSN, so a base ahead of the volume
+	// checkpoint needs no work.
+	JournalID     uint64
+	CheckpointUSN uint64
+	BuiltAt       time.Time
+	Docs          []contentDoc
+	Sections      map[uint32][]byte
 }
 
 func newContentIndex() *contentIndex {
@@ -195,8 +205,8 @@ type contentSectionEntry struct {
 
 const contentSectionEntrySize = 28 // tag(4)+offset(8)+length(8)+flags(4)+pad(4)
 
-// contentHeaderSize is magic(8)+version(4)+flags(4)+docCount(4)+pad(4)+built(8)+tableOffset(8)+sectionCount(4) = 44.
-func contentHeaderSize() int { return 44 }
+// contentHeaderSize is magic(8)+version(4)+flags(4)+docCount(4)+pad(4)+built(8)+tableOffset(8)+sectionCount(4)+journalID(8)+checkpointUSN(8) = 60.
+func contentHeaderSize() int { return 60 }
 
 func contentWriteHeader(b []byte, idx *contentIndex, tableOffset uint64, sectionCount int) {
 	copy(b[0:8], contentIndexMagic[:])
@@ -207,6 +217,8 @@ func contentWriteHeader(b []byte, idx *contentIndex, tableOffset uint64, section
 	binary.LittleEndian.PutUint64(b[24:], uint64(idx.BuiltAt.UnixNano()))
 	binary.LittleEndian.PutUint64(b[32:], tableOffset)
 	binary.LittleEndian.PutUint32(b[40:], uint32(sectionCount))
+	binary.LittleEndian.PutUint64(b[44:], idx.JournalID)
+	binary.LittleEndian.PutUint64(b[52:], idx.CheckpointUSN)
 }
 
 // contentSectionOrder returns a deterministic tag order (sorted), so encoding
@@ -237,6 +249,8 @@ func contentIndexDecode(data []byte) (*contentIndex, error) {
 	built := int64(binary.LittleEndian.Uint64(data[24:]))
 	tableOffset := binary.LittleEndian.Uint64(data[32:])
 	sectionCount := int(binary.LittleEndian.Uint32(data[40:]))
+	journalID := binary.LittleEndian.Uint64(data[44:])
+	checkpointUSN := binary.LittleEndian.Uint64(data[52:])
 	if tableOffset > uint64(len(data)) || sectionCount < 0 {
 		return nil, errors.New("content index section table out of range")
 	}
@@ -245,10 +259,12 @@ func contentIndexDecode(data []byte) (*contentIndex, error) {
 		return nil, errors.New("content index section table truncated")
 	}
 	idx := &contentIndex{
-		Version:  version,
-		Origin:   binary.LittleEndian.Uint32(data[12:]),
-		BuiltAt:  time.Unix(0, built),
-		Sections: make(map[uint32][]byte, sectionCount),
+		Version:       version,
+		Origin:        binary.LittleEndian.Uint32(data[12:]),
+		JournalID:     journalID,
+		CheckpointUSN: checkpointUSN,
+		BuiltAt:       time.Unix(0, built),
+		Sections:      make(map[uint32][]byte, sectionCount),
 	}
 	for i := 0; i < sectionCount; i++ {
 		p := int(tableOffset) + 4 + i*contentSectionEntrySize

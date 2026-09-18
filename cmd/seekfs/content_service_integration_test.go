@@ -78,9 +78,13 @@ func TestContentLookupFRNColumn(t *testing.T) {
 
 func TestContentAttachRequiresFRNKeyedIndex(t *testing.T) {
 	t.Setenv("SEEKFS_CONTENT_SEARCH", "1")
+	stubContentCatchUpSync(t)
+	stubContentCatchUpJournal(t, usnJournalDataV0{UsnJournalID: 5, FirstUsn: 1, LowestValidUsn: 1, NextUsn: 60})
 	dir := t.TempDir()
 	idx := commonSearchFixture()
 	contentIndexFRNs(idx)
+	idx.JournalID = 5
+	idx.Checkpoint = 50
 	vol := newServiceVolumeIndex(filepath.Join(dir, "seekfs_c.gsi"), idx)
 	if vol.content == nil {
 		t.Fatal("content state should exist when the flag is on")
@@ -102,9 +106,12 @@ func TestContentAttachRequiresFRNKeyedIndex(t *testing.T) {
 		t.Fatalf("walk-keyed sidecar attached as %q; want unavailable", got)
 	}
 
-	// An FRN-keyed sidecar attaches and its resolver maps docs to records.
+	// A USN-keyed sidecar with a watermark attaches and its resolver maps docs
+	// to records.
 	usn := newContentIndex()
 	usn.Origin = contentOriginUSN
+	usn.JournalID = 5
+	usn.CheckpointUSN = 50
 	usn.Docs = []contentDoc{{DocID: 0, FRN: 5}, {DocID: 1, FRN: 6}}
 	if err := contentSaveFile(gsx, usn); err != nil {
 		t.Fatal(err)
@@ -121,16 +128,22 @@ func TestContentAttachRequiresFRNKeyedIndex(t *testing.T) {
 
 func TestContentResolverRebindsAfterBaseSwap(t *testing.T) {
 	t.Setenv("SEEKFS_CONTENT_SEARCH", "1")
+	stubContentCatchUpSync(t)
+	stubContentCatchUpJournal(t, usnJournalDataV0{UsnJournalID: 5, FirstUsn: 1, LowestValidUsn: 1, NextUsn: 60})
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "seekfs_c.gsi")
 	idx := commonSearchFixture()
 	contentIndexFRNs(idx)
+	idx.JournalID = 5
+	idx.Checkpoint = 50
 	vol := newServiceVolumeIndex(dbPath, idx)
 	s := &goSearchService{stop: make(chan struct{})}
 	defer close(s.stop)
 
 	usn := newContentIndex()
 	usn.Origin = contentOriginUSN
+	usn.JournalID = 5
+	usn.CheckpointUSN = 50
 	usn.Docs = []contentDoc{{DocID: 0, FRN: 5}}
 	if err := contentSaveFile(contentIndexPathForDB(dbPath), usn); err != nil {
 		t.Fatal(err)
@@ -142,7 +155,7 @@ func TestContentResolverRebindsAfterBaseSwap(t *testing.T) {
 
 	// A base swap that renumbers the record table: FRN 5 now points at record 0
 	// of a two-record index. The resolver must follow without re-extracting.
-	swapped := &Index{Source: "usn", Volume: "C:", Compact: true}
+	swapped := &Index{Source: "usn", Volume: "C:", Compact: true, JournalID: 5}
 	swapped.Records = []CompactRecord{
 		{FRN: 5, ParentFRN: 5, Parent: -1, Name: "swapped", Mode: 0, Size: 10},
 		{FRN: 77, ParentFRN: 5, Parent: 0, Name: "other", Mode: 0, Size: 10},

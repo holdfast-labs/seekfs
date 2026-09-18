@@ -331,6 +331,22 @@ func markContentQueryDegraded(trace *searchTrace, skipped []string) {
 	trace.ContentSkippedVolumes = append([]string(nil), skipped...)
 }
 
+// markContentQueryIncomplete surfaces a volume whose restart catch-up was
+// truncated (health.Incomplete): the base is missing records, so the answer is
+// not complete even though it was evaluated. Without this the query reported
+// complete while `loaded --json` reported incomplete.
+func markContentQueryIncomplete(trace *searchTrace, volumes []*serviceVolumeIndex) {
+	if trace == nil {
+		return
+	}
+	for _, vol := range volumes {
+		if vol != nil && vol.content != nil && vol.content.healthIncomplete() {
+			trace.setContentIncomplete()
+			return
+		}
+	}
+}
+
 // contentCandidates returns compact record indices that are a superset of the
 // records matching the query's positive content constraints, capped at the
 // query's candidate budget. ok=false means the caller should fall back to a

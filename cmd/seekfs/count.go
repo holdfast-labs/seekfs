@@ -49,6 +49,7 @@ func countServiceVolumes(volumes []*serviceVolumeIndex, opts queryOptions) (int,
 			return 0, true, contentUnavailableError()
 		}
 		markContentQueryDegraded(opts.Trace, skipped)
+		markContentQueryIncomplete(opts.Trace, usable)
 		total := 0
 		for _, vol := range usable {
 			if queryCanceled(parsedQuery{DeadlineUnix: opts.DeadlineUnix, Cancel: opts.Cancel}) {
