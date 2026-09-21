@@ -591,6 +591,14 @@ func (s *goSearchService) runContentBuild(vol *serviceVolumeIndex) {
 		return
 	}
 	if err := contentSaveFile(gsx, cidx); err != nil {
+		var sizeErr *contentGSXSizeError
+		if errors.As(err, &sizeErr) {
+			// Over the size cap: refuse to publish rather than truncate. The
+			// volume is surfaced degraded with the size in health; no base is
+			// written, so no content is silently dropped.
+			vol.content.markSidecarCapped(sizeErr.size, sizeErr.cap)
+			return
+		}
 		vol.content.markBuildFailed(err.Error())
 		return
 	}

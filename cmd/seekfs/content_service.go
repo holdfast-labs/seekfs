@@ -17,6 +17,7 @@ package main
 import (
 	"context"
 	"crypto/sha256"
+	"fmt"
 	"sync"
 	"time"
 )
@@ -99,6 +100,11 @@ type contentHealth struct {
 	MaxText   int64 `json:"max_text,omitempty"`
 	Skipped   int   `json:"skipped,omitempty"`
 	Truncated int   `json:"truncated,omitempty"`
+	// SidecarBytes/SidecarCap report the attached `.gsx` encoded size and the
+	// size cap (WP10/M7), so unbounded sidecar growth is observable in
+	// `loaded --json` instead of only failing silently.
+	SidecarBytes int64 `json:"sidecar_bytes,omitempty"`
+	SidecarCap   int64 `json:"sidecar_cap,omitempty"`
 }
 
 // contentDeltaDoc is an extracted document for a file changed since the base,
@@ -149,6 +155,11 @@ func (d *contentDelta) upsert(doc contentDeltaDoc) {
 	d.liveTextBytes += int64(len(doc.Text))
 }
 
+// delete tombstones an FRN. A base-indexed file deleted without a prior delta
+// entry has no slot, so one is created: without a tombstone the fold would keep
+// re-encoding the deleted base doc forever (M7/WP10). The tombstone is dropped
+// by the next fold; foldDue counts total entries, so a burst of deletes still
+// triggers a fold instead of growing the delta slice without bound.
 func (d *contentDelta) delete(frn uint64) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -159,7 +170,10 @@ func (d *contentDelta) delete(frn uint64) {
 		}
 		d.docs[i].Deleted = true
 		d.docs[i].Text = nil
+		return
 	}
+	d.byFRN[frn] = len(d.docs)
+	d.docs = append(d.docs, contentDeltaDoc{FRN: frn, Deleted: true})
 }
 
 func (d *contentDelta) live() []contentDeltaDoc {
@@ -206,6 +220,25 @@ func (d *contentDelta) has(frn uint64) bool {
 	defer d.mu.Unlock()
 	i, ok := d.byFRN[frn]
 	return ok && !d.docs[i].Deleted
+}
+
+// contains reports whether the FRN has a delta slot at all (live or tombstoned).
+// Used by the hard-bound admission gate: updating an existing slot does not grow
+// the resident entry count, admitting a new FRN does.
+func (d *contentDelta) contains(frn uint64) bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	_, ok := d.byFRN[frn]
+	return ok
+}
+
+// atHardBound reports whether the resident delta has reached the absolute
+// ceiling. It is consulted only while the sidecar is capped, when the normal
+// fold that would drain the delta cannot publish.
+func (d *contentDelta) atHardBound(maxDocs int, maxBytes int64) bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return len(d.docs) >= maxDocs || d.liveTextBytes >= maxBytes
 }
 
 func (d *contentDelta) len() int {
@@ -288,6 +321,11 @@ type contentVolumeState struct {
 	// catch-up never clears it, so the volume stays gated and degraded until a
 	// rebuild.
 	catchUpPending bool
+	// sidecarCapped is set when the encoded `.gsx` exceeds contentGSXMaxBytes
+	// (WP10/M7). The attached base and the delta are left in place, so content
+	// stays correct and usable; the flag only keeps the volume surfaced as
+	// degraded across drain ticks until a base that fits is published.
+	sidecarCapped bool
 }
 
 func newContentVolumeState(volume string) *contentVolumeState {
@@ -364,6 +402,11 @@ func (s *contentVolumeState) setReady(idx *contentIndex, reader *contentReader, 
 	// catch-up truncation belonged to the replaced base.
 	s.health.Incomplete = false
 	s.health.Docs = len(idx.Docs)
+	s.health.SidecarBytes = idx.EncodedSize
+	s.health.SidecarCap = contentGSXMaxBytes
+	// A base that attached is not over cap and has no build fault.
+	s.sidecarCapped = false
+	s.health.BuildError = ""
 	if idx.Policy != (contentBuildPolicy{}) {
 		s.health.MaxRaw = idx.Policy.MaxRaw
 		s.health.MaxText = idx.Policy.MaxText
@@ -447,6 +490,60 @@ func (s *contentVolumeState) markBuildFailed(reason string) {
 	s.health.State = contentStateDegraded
 	s.health.Incomplete = true
 	s.health.BuildError = reason
+}
+
+// markSidecarCapped surfaces an index whose encoded size exceeds
+// contentGSXMaxBytes (WP10/M7). A fold keeps the previous base and its decoder,
+// so content stays correct and usable and the volume's state stays ready (a
+// later fold that fits clears it); only the health state is degraded. A build
+// has no publishable base, so its decoder is dropped and the state becomes
+// degraded exactly like a build failure.
+func (s *contentVolumeState) markSidecarCapped(size, cap int64) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.sidecarCapped = true
+	s.health.SidecarBytes = size
+	s.health.SidecarCap = cap
+	s.health.BuildError = fmt.Sprintf("content index exceeds size cap (%d bytes > %d)", size, cap)
+	s.health.State = contentStateDegraded
+	if s.state == contentStateIndexing {
+		s.reader = nil
+		s.resolver = nil
+		s.state = contentStateDegraded
+	}
+}
+
+// markDeltaCapped flags that the delta reached its hard ceiling while the
+// sidecar is over cap, so a new distinct document was not admitted. The volume
+// is surfaced incomplete/degraded (base+delta are still served by search)
+// rather than the resident delta growing without bound. The deferred change is
+// not lost: the base checkpoint is not advanced, so it is replayed once the cap
+// is raised and the volume rebuilt.
+func (s *contentVolumeState) markDeltaCapped() {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.health.Incomplete = true
+	if s.state != contentStateStale && s.state != contentStateIndexing {
+		s.state = contentStateDegraded
+		s.health.State = contentStateDegraded
+	}
+}
+
+// sidecarCappedNow reports whether the attached base's fold is currently
+// refused for exceeding contentGSXMaxBytes (WP10/M7).
+func (s *contentVolumeState) sidecarCappedNow() bool {
+	if s == nil {
+		return false
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.sidecarCapped
 }
 
 // markBuildCanceled returns an interrupted build to `unavailable` (not ready)
@@ -537,10 +634,16 @@ func (s *contentVolumeState) markDrained() {
 	// by the build lifecycle: a drain tick must not flip an indexing volume to
 	// ready with no usable index attached.
 	if s.state != contentStateStale && s.state != contentStateIndexing {
-		if s.health.Incomplete {
+		switch {
+		case s.health.Incomplete:
 			s.state = contentStateDegraded
 			s.health.State = contentStateDegraded
-		} else {
+		case s.sidecarCapped:
+			// The base is still attached and usable; keep the volume's state
+			// (ready after a fold over cap, so a later fold can retry) and only
+			// report the health state as degraded.
+			s.health.State = contentStateDegraded
+		default:
 			s.state = contentStateReady
 			s.health.State = contentStateReady
 		}
@@ -842,7 +945,10 @@ func (c *contentCoordinator) foldDue(maxDocs int, maxBytes int64) bool {
 		return false
 	}
 	delta := c.state.deltaView()
-	return delta.liveCount() >= maxDocs || delta.liveBytes() >= maxBytes
+	// Count every entry, not just live ones: a burst of deletes of base-indexed
+	// files adds tombstones with no resident text, so liveCount/liveBytes alone
+	// would never trigger the fold that prunes them.
+	return delta.len() >= maxDocs || delta.liveBytes() >= maxBytes
 }
 
 func (c *contentCoordinator) foldSucceeded() {
@@ -942,7 +1048,19 @@ func (c *contentCoordinator) processQueue(resolvePath func(frn uint64) (string, 
 		if !didChange {
 			continue
 		}
-		c.state.deltaView().upsert(doc)
+		// While the sidecar is capped no fold can publish, so the delta cannot
+		// drain. Admit a distinct document only up to the hard ceiling: past it
+		// the new document is deferred (replayed after a cap raise + rebuild)
+		// and the volume is surfaced incomplete, rather than growing without
+		// bound. Updating an existing slot is always allowed, so acknowledged
+		// content is never dropped.
+		delta := c.state.deltaView()
+		if c.state.sidecarCappedNow() && !delta.contains(frn) &&
+			delta.atHardBound(contentDeltaHardMaxDocs, contentDeltaHardMaxBytes) {
+			c.state.markDeltaCapped()
+			continue
+		}
+		delta.upsert(doc)
 		changed++
 	}
 	c.state.markDrained()

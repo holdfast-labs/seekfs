@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 )
 
 // contentFoldFixture is a ready content volume backed by a real on-disk base
@@ -76,6 +78,198 @@ func (f *contentFoldFixture) churn(t *testing.T, frn uint64, usn int64, text str
 		p, ok := f.paths[frn]
 		return p, ok
 	})
+}
+
+// M7 (WP10): an over-cap folded index is never published. The previous base and
+// the delta are kept, so content stays correct and usable, and the volume is
+// surfaced degraded with the attempted size in health: the cap is visible rather
+// than a silent truncation or a content loss.
+func TestContentFoldOverCapKeepsBaseAndDelta(t *testing.T) {
+	f := newContentFoldFixture(t, []contentFixtureFile{
+		{10, "alpha.txt", "alphaold base"},
+		{20, "beta.txt", "betaneedle base"},
+	})
+	f.churn(t, 10, 105, "gammanew needlegamma")
+
+	restoreCap := contentGSXMaxBytes
+	contentGSXMaxBytes = 64
+	t.Cleanup(func() { contentGSXMaxBytes = restoreCap })
+
+	f.s.runContentFold(f.vol)
+
+	reloaded, err := contentLoadFile(contentIndexPathForDB(f.dbPath))
+	if err != nil {
+		t.Fatalf("reload sidecar: %v", err)
+	}
+	if reloaded.CheckpointUSN != 100 {
+		t.Fatalf("over-cap fold published the sidecar: checkpoint=%d; want 100", reloaded.CheckpointUSN)
+	}
+	if got := f.vol.content.deltaView().liveCount(); got != 1 {
+		t.Fatalf("over-cap fold dropped the delta: live=%d; want 1", got)
+	}
+	if hits, _ := contentServiceSearch(t, f.vol, "content:needlegamma", false); len(hits) != 1 {
+		t.Fatalf("content lost after an over-cap fold: %v", hits)
+	}
+	h := f.vol.content.healthSnapshot(0)
+	if h.State != contentStateDegraded || !strings.Contains(h.BuildError, "size cap") {
+		t.Fatalf("health after over-cap fold = %+v; want degraded with a size-cap reason", h)
+	}
+	if h.SidecarBytes <= contentGSXMaxBytes || h.SidecarCap != contentGSXMaxBytes {
+		t.Fatalf("health sidecar size/cap = %d/%d; want >%d / %d", h.SidecarBytes, h.SidecarCap, contentGSXMaxBytes, contentGSXMaxBytes)
+	}
+	// A drain tick must not hide the degradation while the cap is still exceeded.
+	f.vol.content.markDrained()
+	if h := f.vol.content.healthSnapshot(0); h.State != contentStateDegraded {
+		t.Fatalf("health after drain = %+v; want degraded (cap still exceeded)", h)
+	}
+}
+
+// M7 (WP10): health reports the attached sidecar's encoded size and the cap, so
+// drift is observable in `loaded --json`.
+func TestContentHealthSurfacesSidecarSize(t *testing.T) {
+	restoreCap := contentGSXMaxBytes
+	contentGSXMaxBytes = 1 << 30
+	t.Cleanup(func() { contentGSXMaxBytes = restoreCap })
+
+	f := newContentFoldFixture(t, []contentFixtureFile{
+		{10, "alpha.txt", "alphaold base"},
+	})
+	h := f.vol.content.healthSnapshot(0)
+	info, err := os.Stat(contentIndexPathForDB(f.dbPath))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if h.SidecarBytes != info.Size() || h.SidecarCap != contentGSXMaxBytes {
+		t.Fatalf("health sidecar = %d/%d; want %d / %d", h.SidecarBytes, h.SidecarCap, info.Size(), contentGSXMaxBytes)
+	}
+}
+
+// M7 (WP10): while the sidecar is capped the fold must not re-run the
+// whole-corpus assembly/encode on the normal cadence, and the resident delta
+// must stop at its hard ceiling instead of growing without bound. Content
+// already acknowledged in base+delta stays searchable; a deferred document is
+// surfaced incomplete, never silently dropped.
+func TestContentFoldCappedBackoffBoundsDelta(t *testing.T) {
+	files := make([]contentFixtureFile, 0, 8)
+	for i := 0; i < 8; i++ {
+		files = append(files, contentFixtureFile{frn: uint64(100 + i), name: fmt.Sprintf("f%02d.txt", i), text: "baseonly"})
+	}
+	f := newContentFoldFixture(t, files)
+
+	// An acknowledged edit before the cap is exceeded, so base+delta has content
+	// that must survive the capped backoff.
+	f.churn(t, 100, 105, "needlealpha admitted")
+
+	restoreCap := contentGSXMaxBytes
+	contentGSXMaxBytes = 64
+	t.Cleanup(func() { contentGSXMaxBytes = restoreCap })
+	// The soft fold bound triggers readily; the normal retry backoff is zero so
+	// only the capped backoff can be what suppresses the re-attempt.
+	restoreDocs := contentDeltaFoldMaxDocs
+	contentDeltaFoldMaxDocs = 1
+	t.Cleanup(func() { contentDeltaFoldMaxDocs = restoreDocs })
+	restoreBytes := contentDeltaFoldMaxBytes
+	contentDeltaFoldMaxBytes = int64(1) << 40
+	t.Cleanup(func() { contentDeltaFoldMaxBytes = restoreBytes })
+	restoreRetry := contentFoldRetryBackoff
+	contentFoldRetryBackoff = 0
+	t.Cleanup(func() { contentFoldRetryBackoff = restoreRetry })
+	restoreBackoff := contentFoldCappedBackoff
+	contentFoldCappedBackoff = time.Hour
+	t.Cleanup(func() { contentFoldCappedBackoff = restoreBackoff })
+	restoreHard := contentDeltaHardMaxDocs
+	contentDeltaHardMaxDocs = 3
+	t.Cleanup(func() { contentDeltaHardMaxDocs = restoreHard })
+
+	restoreHook := contentFoldAssembleHook
+	attempts := 0
+	contentFoldAssembleHook = func() { attempts++ }
+	t.Cleanup(func() { contentFoldAssembleHook = restoreHook })
+
+	// The first fold attempts the over-cap encode and is refused.
+	f.s.maybeFoldContentDelta(f.vol)
+	if attempts != 1 {
+		t.Fatalf("first capped fold assembled %d times; want 1", attempts)
+	}
+	h := f.vol.content.healthSnapshot(0)
+	if h.State != contentStateDegraded || !strings.Contains(h.BuildError, "size cap") {
+		t.Fatalf("health after capped fold = %+v; want degraded with a size-cap reason", h)
+	}
+
+	// Churn many distinct documents while capped. Each drain tick must not
+	// re-run the assembly, and the delta must stop at the hard ceiling.
+	for i := 1; i < 8; i++ {
+		f.churn(t, uint64(100+i), int64(105+i), fmt.Sprintf("needle%d deferred", i))
+		f.s.maybeFoldContentDelta(f.vol)
+	}
+	if got := f.vol.content.deltaView().len(); got > contentDeltaHardMaxDocs {
+		t.Fatalf("delta grew to %d entries while capped; hard bound is %d", got, contentDeltaHardMaxDocs)
+	}
+	if attempts != 1 {
+		t.Fatalf("capped fold assembled %d times within the capped backoff; want 1", attempts)
+	}
+	if h := f.vol.content.healthSnapshot(0); h.State != contentStateDegraded ||
+		!strings.Contains(h.BuildError, "size cap") || !h.Incomplete {
+		t.Fatalf("health after capped churn = %+v; want degraded + size-cap reason + incomplete", h)
+	}
+
+	// Base and already-admitted delta content stay searchable; nothing is lost.
+	if hits, _ := contentServiceSearch(t, f.vol, "content:baseonly", false); len(hits) == 0 {
+		t.Fatal("base content not searchable while capped")
+	}
+	if hits, _ := contentServiceSearch(t, f.vol, "content:needlealpha", false); len(hits) != 1 {
+		t.Fatalf("acknowledged delta content lost while capped: %v", hits)
+	}
+}
+
+// deleteFRN removes a file's record and drives a delete through the coordinator,
+// as a live replay would for a base-indexed file that was never edited in this
+// session (so it has no prior delta entry).
+func (f *contentFoldFixture) deleteFRN(t *testing.T, frn uint64, usn int64) {
+	t.Helper()
+	delete(f.paths, frn)
+	kept := f.idx.Records[:0]
+	for _, r := range f.idx.Records {
+		if r.FRN != frn {
+			kept = append(kept, r)
+		}
+	}
+	f.idx.Records = kept
+	f.idx.Derived.FRNs = nil
+	f.idx.Derived.FRNRecordIDs = nil
+	contentIndexFRNs(f.idx)
+	f.vol.contentCoord.observeChanges([]usnChange{{FRN: frn, USN: usn, Reason: usnReasonFileDelete}})
+}
+
+// M7 (WP10): a fold must evict a base document whose file was deleted, even when
+// the FRN never appeared in the delta before the delete (the common case: a file
+// indexed by the base, deleted later with no intervening edit). The delete must
+// become a tombstone that reaches the fold, and the re-encoded base must drop it.
+func TestContentFoldEvictsDeletedBaseDoc(t *testing.T) {
+	f := newContentFoldFixture(t, []contentFixtureFile{
+		{10, "alpha.txt", "alpha needlealpha base"},
+		{20, "beta.txt", "beta needlebeta base"},
+	})
+	f.deleteFRN(t, 10, 105)
+
+	f.s.runContentFold(f.vol)
+
+	reloaded, err := contentLoadFile(contentIndexPathForDB(f.dbPath))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(reloaded.Docs) != 1 {
+		t.Fatalf("folded doc table has %d docs; want 1 (deleted FRN must be evicted)", len(reloaded.Docs))
+	}
+	if _, ok := contentLookupFRN(reloaded.Docs, 10); ok {
+		t.Fatal("deleted FRN 10 still present in the folded .gsx")
+	}
+	if _, ok := contentLookupFRN(reloaded.Docs, 20); !ok {
+		t.Fatal("untouched FRN 20 lost from the folded .gsx")
+	}
+	if hits, _ := contentServiceSearch(t, f.vol, "content:needlealpha", false); len(hits) != 0 {
+		t.Fatalf("deleted content still findable after fold: %v", hits)
+	}
 }
 
 // PB2/WP1c: churn, fold, and the `.gsx` reload carries the edit and advances the

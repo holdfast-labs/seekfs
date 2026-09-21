@@ -39,6 +39,24 @@ const (
 // contentIndexMaxSection bounds one decoded section allocation.
 const contentIndexMaxSection = 8 << 30
 
+// contentGSXMaxBytes caps the encoded `.gsx` sidecar (WP10/M7). It is generous
+// so it does not bite in normal use; tests lower it. A var so it can be tuned
+// without a format change. An over-cap index is refused, never truncated.
+var contentGSXMaxBytes int64 = 4 << 30
+
+// contentGSXSizeError is returned by contentSaveFile when an index's encoded
+// size exceeds contentGSXMaxBytes. Callers surface it as degraded and keep the
+// previous base (and delta) instead of publishing a truncated sidecar, so no
+// acknowledged content is lost and the condition is never silent.
+type contentGSXSizeError struct {
+	size int64
+	cap  int64
+}
+
+func (e *contentGSXSizeError) Error() string {
+	return fmt.Sprintf("content index exceeds size cap (%d bytes > %d)", e.size, e.cap)
+}
+
 // Content section tags. Same 4-byte tag discipline as the v9 index.
 const (
 	contentSectionDocTable uint32 = 'C'<<24 | 'X'<<16 | 'D'<<8 | 'T'
@@ -127,6 +145,10 @@ type contentIndex struct {
 	Sections      map[uint32][]byte
 	// Policy is the build's extraction policy + skip/truncation counts (CXPL).
 	Policy contentBuildPolicy
+	// EncodedSize is the encoded `.gsx` byte size: set by decode from the file
+	// length and by encode from the produced bytes. Not persisted; surfaced in
+	// content health so sidecar growth is observable (WP10/M7).
+	EncodedSize int64
 }
 
 func newContentIndex() *contentIndex {
@@ -236,6 +258,7 @@ func contentIndexEncode(idx *contentIndex) []byte {
 
 	out := body.Bytes()
 	contentWriteHeader(out[:headerSize], idx, tableOffset, len(tags))
+	idx.EncodedSize = int64(len(out))
 	return out
 }
 
@@ -308,6 +331,7 @@ func contentIndexDecode(data []byte) (*contentIndex, error) {
 		CheckpointUSN: checkpointUSN,
 		BuiltAt:       time.Unix(0, built),
 		Sections:      make(map[uint32][]byte, sectionCount),
+		EncodedSize:   int64(len(data)),
 	}
 	for i := 0; i < sectionCount; i++ {
 		p := int(tableOffset) + 4 + i*contentSectionEntrySize
@@ -354,8 +378,14 @@ func contentLookupFRN(docs []contentDoc, frn uint64) (int, bool) {
 }
 
 // contentSaveFile writes the index to path atomically (temp + fsync + rename),
-// so a crash never leaves a half-written sidecar.
+// so a crash never leaves a half-written sidecar. An encoded index over
+// contentGSXMaxBytes is refused with contentGSXSizeError: nothing is written and
+// the caller keeps the previous base (and delta) rather than a truncated sidecar.
 func contentSaveFile(path string, idx *contentIndex) error {
+	encoded := contentIndexEncode(idx)
+	if contentGSXMaxBytes > 0 && int64(len(encoded)) > contentGSXMaxBytes {
+		return &contentGSXSizeError{size: int64(len(encoded)), cap: contentGSXMaxBytes}
+	}
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
@@ -365,7 +395,7 @@ func contentSaveFile(path string, idx *contentIndex) error {
 		return err
 	}
 	name := tmp.Name()
-	if _, err := tmp.Write(contentIndexEncode(idx)); err != nil {
+	if _, err := tmp.Write(encoded); err != nil {
 		_ = tmp.Close()
 		_ = os.Remove(name)
 		return err

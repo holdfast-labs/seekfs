@@ -13,6 +13,7 @@ package main
 // lost.
 
 import (
+	"errors"
 	"os"
 	"sort"
 	"time"
@@ -30,6 +31,28 @@ var (
 // run without the delay.
 var contentFoldRetryBackoff = 5 * time.Second
 
+// contentFoldCappedBackoff paces a fold retry after the encoded sidecar was
+// refused for exceeding contentGSXMaxBytes. Re-running the whole-corpus
+// assembly + encode on the normal cadence can never succeed while the live
+// content is over cap, so a capped volume retries on a long cadence instead;
+// this is the recovery hook for a cap that was raised. A var so tests run
+// without the delay.
+var contentFoldCappedBackoff = 15 * time.Minute
+
+// contentDeltaHardMaxDocs / contentDeltaHardMaxBytes are the absolute ceiling
+// on the resident delta while the sidecar is capped and no fold can publish.
+// contentDeltaFoldMaxDocs/MaxBytes trigger a fold far earlier; the hard bound
+// only bites when that fold cannot commit, so a distinct document past the
+// ceiling is deferred and the volume surfaced incomplete rather than the delta
+// growing without bound. Existing entries are still updated, so acknowledged
+// content is never dropped; a deferred change stays replayable from the
+// persisted base checkpoint once the cap is raised and the volume rebuilt. Vars
+// so tests can lower them.
+var (
+	contentDeltaHardMaxDocs  = 32768
+	contentDeltaHardMaxBytes = int64(256 << 20)
+)
+
 // contentFoldSave is contentSaveFile for the fold, a var so tests can inject a
 // save failure and prove the delta is kept.
 var contentFoldSave = contentSaveFile
@@ -38,6 +61,12 @@ var contentFoldSave = contentSaveFile
 // base text is read. Tests use it to mutate the delta mid-fold (an
 // observeChanges delete) and prove the change is not lost.
 var contentFoldSnapshotHook = func(*serviceVolumeIndex) {}
+
+// contentFoldAssembleHook runs after the fold's snapshot and base reader are
+// resolved and immediately before the streaming assembly. Tests use it to prove
+// an over-cap fold is not re-attempted on the normal cadence (and so the
+// whole-corpus assembly/encode does not run every drain tick).
+var contentFoldAssembleHook = func() {}
 
 // maybeFoldContentDelta folds the delta when it has grown past the thresholds.
 // It is called from the drain loop after processQueue, so extraction work from
@@ -100,6 +129,7 @@ func (s *goSearchService) runContentFold(vol *serviceVolumeIndex) {
 		vol.contentCoord.foldFailed(contentFoldRetryBackoff)
 		return
 	}
+	contentFoldAssembleHook()
 	cidx, err := assembleContentIndexStream(newContentFoldSource(reader, snap).next, tmpDir)
 	_ = os.RemoveAll(tmpDir)
 	if err != nil {
@@ -131,6 +161,17 @@ func (s *goSearchService) runContentFold(vol *serviceVolumeIndex) {
 	}
 	if err := contentFoldSave(gsx, cidx); err != nil {
 		serviceLog("content fold save failed volume=%s err=%v", vol.volume, err)
+		var sizeErr *contentGSXSizeError
+		if errors.As(err, &sizeErr) {
+			// The folded base would exceed the cap. Keep the previous base and
+			// the delta (content stays correct/usable) and surface the size in
+			// health instead of publishing a truncated sidecar.
+			vol.content.markSidecarCapped(sizeErr.size, sizeErr.cap)
+			// The same over-cap encode would fail every tick; retry on the long
+			// capped cadence so the encoder is not run on the normal cadence.
+			vol.contentCoord.foldFailed(contentFoldCappedBackoff)
+			return
+		}
 		vol.contentCoord.foldFailed(contentFoldRetryBackoff)
 		return
 	}

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -57,6 +58,45 @@ func contentBuildTestVolume(t *testing.T, dir string, journal, checkpoint uint64
 	contentIndexFRNs(idx)
 	dbPath := filepath.Join(t.TempDir(), "seekfs_c.gsi")
 	return newServiceVolumeIndex(dbPath, idx), contentIndexPathForDB(dbPath)
+}
+
+// M7 (WP10): a service build whose encoded sidecar exceeds the cap must refuse
+// to publish and surface the size in health, never write a truncated index.
+func TestContentServiceBuildOverCapRefuses(t *testing.T) {
+	t.Setenv("SEEKFS_CONTENT_SEARCH", "1")
+	stubContentCatchUpSync(t)
+	stubContentBuildSync(t)
+
+	dir := t.TempDir()
+	note := filepath.Join(dir, "note.txt")
+	if err := os.WriteFile(note, []byte("hello needle world"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	const journal = uint64(0xABC)
+	const cp = int64(120)
+	stubContentCatchUpJournal(t, usnJournalDataV0{UsnJournalID: journal, FirstUsn: 1, LowestValidUsn: 1, NextUsn: cp})
+
+	vol, gsx := contentBuildTestVolume(t, dir, journal, uint64(cp), []CompactRecord{
+		{FRN: 10, ParentFRN: 10, Parent: -1, Name: "note.txt", Size: 18},
+	})
+
+	restoreCap := contentGSXMaxBytes
+	contentGSXMaxBytes = 64
+	t.Cleanup(func() { contentGSXMaxBytes = restoreCap })
+
+	s := contentTestService(t)
+	s.ensureContentBuild(vol)
+
+	if _, err := os.Stat(gsx); !os.IsNotExist(err) {
+		t.Fatalf("over-cap build wrote a sidecar (stat err=%v)", err)
+	}
+	if got := vol.content.stateOf(); got != contentStateDegraded {
+		t.Fatalf("state after over-cap build = %q; want degraded", got)
+	}
+	h := vol.content.healthSnapshot(0)
+	if !strings.Contains(h.BuildError, "size cap") || h.SidecarCap != contentGSXMaxBytes {
+		t.Fatalf("health after over-cap build = %+v; want a size-cap reason and cap", h)
+	}
 }
 
 // A drain tick during a background build must not flip an indexing volume to

@@ -342,6 +342,32 @@ PF-3 path rebuilds it.
   always use the 32 MiB / 16 MiB defaults; `-max-raw`/`-max-text` are
   offline-CLI flags (the service caps are not env-exposed yet).
 
+## 6g. PF-5c — `.gsx` size cap + fold over-cap hardening (WP10/M7, done)
+
+The sidecar is capped at `contentGSXMaxBytes` (4 GiB default; a package var so
+tests can lower it). `contentSaveFile` refuses an encoded index over the cap
+with `contentGSXSizeError` and writes nothing, so an over-cap build or fold is
+never a truncated sidecar: a build's volume goes degraded, and a fold keeps the
+previous base and the delta (content stays correct and usable) with the volume
+health degraded. Health surfaces `sidecar_bytes` and `sidecar_cap` alongside the
+size-cap `build_error`, so the condition is visible in `loaded --json`. A
+base-indexed file deleted without a prior delta entry gets an in-memory tombstone
+(M7/WP10), so the next fold evicts it instead of re-encoding it forever;
+`foldDue` counts all delta entries, so a burst of deletes still triggers the
+pruning fold.
+
+An over-cap fold retries on `contentFoldCappedBackoff` (15 min), not the normal
+5 s fold retry, so the whole-corpus assembly + encode is not re-run every 2 s
+drain tick. While capped the resident delta is bounded by
+`contentDeltaHardMaxDocs` / `contentDeltaHardMaxBytes`: past that ceiling a
+distinct new document is deferred and the volume is marked incomplete/degraded,
+rather than the delta growing without bound. Existing entries are still updated,
+so no acknowledged content is dropped, and a deferred change is not lost — the
+persisted base checkpoint is not advanced, so it is replayed once recovery
+happens. Recovery is to raise the cap (or reduce the indexed content) and
+rebuild, which re-extracts the deferred USN range and clears the cap and the
+incomplete flag.
+
 ## 7. Carried debt / known gaps
 
 - **Snippet case is not preserved on any current path.** The `.gsx` text store
