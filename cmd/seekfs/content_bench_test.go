@@ -249,6 +249,39 @@ func BenchmarkContentVsFilename(b *testing.B) {
 	}
 }
 
+// BenchmarkContentCountVsFilename measures the count path on the same synthetic
+// corpus as BenchmarkContentVsFilename. Counts tally in place and never
+// materialize Entries or apply a result window; a broad content count is bounded
+// by the candidate/visit budgets, not by any limit, so its cost tracks the
+// budget rather than the result count.
+func BenchmarkContentCountVsFilename(b *testing.B) {
+	vols := contentBenchVolumes(b, 1)
+	cases := []struct{ name, query string }{
+		{"filename-broad", "nrrd"},
+		{"content-broad", "content:download"},
+		{"content-selective", "content:pelican"},
+	}
+	for _, tc := range cases {
+		b.Run(tc.name, func(b *testing.B) {
+			n, ok, err := countServiceVolumes(vols, queryOptions{Query: tc.query})
+			if err != nil || !ok {
+				b.Fatalf("count %q = %d, %v, %v", tc.query, n, ok, err)
+			}
+			if n == 0 {
+				b.Fatalf("count %q = 0", tc.query)
+			}
+			b.ReportMetric(float64(n), "results")
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				if _, ok, err := countServiceVolumes(vols, queryOptions{Query: tc.query}); err != nil || !ok {
+					b.Fatalf("count %q: ok=%v err=%v", tc.query, ok, err)
+				}
+			}
+		})
+	}
+}
+
 // contentBenchMeasureAllocBytes returns the total bytes allocated per call of fn,
 // measured with runtime.MemStats so the regression gate is framework-free and
 // deterministic.

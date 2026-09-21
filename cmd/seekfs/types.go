@@ -229,6 +229,7 @@ type jsonSearchResponse struct {
 	Declines                 []traceDecline `json:"declines,omitempty"`
 	Fallback                 string         `json:"fallback,omitempty"`
 	Complete                 *bool          `json:"complete,omitempty"`
+	Content                  *contentHealth `json:"content,omitempty"`
 	Results                  []jsonResult   `json:"results,omitempty"`
 }
 

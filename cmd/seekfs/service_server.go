@@ -714,50 +714,7 @@ func searchService(pipeName string, opts queryOptions, countOnly bool, jsonOut b
 		return errors.New(resp.Message)
 	}
 	if jsonOut {
-		jsonResp := jsonSearchResponse{
-			OK:                       true,
-			Query:                    opts.Query,
-			Count:                    resp.Count,
-			Limit:                    opts.Limit,
-			SearchMS:                 resp.SearchMS,
-			Source:                   resp.Source,
-			Decline:                  resp.Decline,
-			Candidates:               resp.Candidates,
-			BlocksDecoded:            resp.BlocksDecoded,
-			BlocksSkipped:            resp.BlocksSkipped,
-			ScalarDriver:             resp.ScalarDriver,
-			ScalarInterval:           resp.ScalarInterval,
-			RecordsVerified:          resp.RecordsVerified,
-			ComponentDriver:          resp.ComponentDriver,
-			ComponentRoots:           resp.ComponentRoots,
-			ComponentIntervals:       resp.ComponentIntervals,
-			ComponentCardinality:     resp.ComponentCardinality,
-			ComponentSelfHits:        resp.ComponentSelfHits,
-			ComponentBounds:          resp.ComponentBounds,
-			ComponentRecordsVerified: resp.ComponentRecordsVerified,
-			FilenameDriver:           resp.FilenameDriver,
-			FilenameRequiredGrams:    resp.FilenameRequiredGrams,
-			FilenamePostingHint:      resp.FilenamePostingHint,
-			FilenameRecordsVerified:  resp.FilenameRecordsVerified,
-			OverlayBaseWindow:        resp.OverlayBaseWindow,
-			PostingPrefetchBytes:     resp.PostingPrefetchBytes,
-			PostingPrefetchRanges:    resp.PostingPrefetchRanges,
-			PostingPrefetchPages:     resp.PostingPrefetchPages,
-			PlannerMode:              resp.PlannerMode,
-			Fuzzy:                    resp.Fuzzy,
-			EligibleVolumes:          resp.EligibleVolumes,
-			Terms:                    resp.Terms,
-			Declines:                 resp.Declines,
-			Fallback:                 resp.Fallback,
-			Complete:                 resp.Complete,
-		}
-		if !countOnly {
-			if len(resp.Rows) > 0 {
-				jsonResp.Results = resp.Rows
-			} else {
-				jsonResp.Results = pathsToJSON(resp.Results)
-			}
-		}
+		jsonResp := newJSONSearchResponse(resp, opts, countOnly)
 		return writeJSON(os.Stdout, jsonResp)
 	}
 	if countOnly {
@@ -772,4 +729,58 @@ func searchService(pipeName string, opts queryOptions, countOnly bool, jsonOut b
 		fmt.Fprintln(w, result)
 	}
 	return w.Flush()
+}
+
+// newJSONSearchResponse projects a service response onto the CLI JSON shape. It
+// carries the content health (state/partial/incomplete/count_divergent and the
+// degraded volumes) that the service already surfaces on serviceResponse, so a
+// CLI/JSON caller can tell why a content result is not complete instead of
+// seeing only complete=false.
+func newJSONSearchResponse(resp serviceResponse, opts queryOptions, countOnly bool) jsonSearchResponse {
+	out := jsonSearchResponse{
+		OK:                       true,
+		Query:                    opts.Query,
+		Count:                    resp.Count,
+		Limit:                    opts.Limit,
+		SearchMS:                 resp.SearchMS,
+		Source:                   resp.Source,
+		Decline:                  resp.Decline,
+		Candidates:               resp.Candidates,
+		BlocksDecoded:            resp.BlocksDecoded,
+		BlocksSkipped:            resp.BlocksSkipped,
+		ScalarDriver:             resp.ScalarDriver,
+		ScalarInterval:           resp.ScalarInterval,
+		RecordsVerified:          resp.RecordsVerified,
+		ComponentDriver:          resp.ComponentDriver,
+		ComponentRoots:           resp.ComponentRoots,
+		ComponentIntervals:       resp.ComponentIntervals,
+		ComponentCardinality:     resp.ComponentCardinality,
+		ComponentSelfHits:        resp.ComponentSelfHits,
+		ComponentBounds:          resp.ComponentBounds,
+		ComponentRecordsVerified: resp.ComponentRecordsVerified,
+		FilenameDriver:           resp.FilenameDriver,
+		FilenameRequiredGrams:    resp.FilenameRequiredGrams,
+		FilenamePostingHint:      resp.FilenamePostingHint,
+		FilenameRecordsVerified:  resp.FilenameRecordsVerified,
+		OverlayBaseWindow:        resp.OverlayBaseWindow,
+		PostingPrefetchBytes:     resp.PostingPrefetchBytes,
+		PostingPrefetchRanges:    resp.PostingPrefetchRanges,
+		PostingPrefetchPages:     resp.PostingPrefetchPages,
+		PlannerMode:              resp.PlannerMode,
+		Fuzzy:                    resp.Fuzzy,
+		EligibleVolumes:          resp.EligibleVolumes,
+		Terms:                    resp.Terms,
+		Declines:                 resp.Declines,
+		Fallback:                 resp.Fallback,
+		Complete:                 resp.Complete,
+		Content:                  resp.Content,
+	}
+	if !countOnly {
+		if len(resp.Rows) > 0 {
+			out.Results = resp.Rows
+		} else {
+			out.Results = pathsToJSON(resp.Results)
+		}
+	}
+	return out
 }

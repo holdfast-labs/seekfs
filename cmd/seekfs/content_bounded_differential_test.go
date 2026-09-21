@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"os"
 	"strings"
 	"testing"
 )
@@ -139,28 +140,50 @@ func TestContentBoundedCandidatesDifferential(t *testing.T) {
 	}
 }
 
-// The count path must stay identical too: count == len(search) for the
-// non-stat shapes, and the bounded candidate logic must not change the number.
+// The count path must stay identical too: count == len(search) for every
+// non-stat shape (broad/selective/phrase/regex/OR/negation), single and multi
+// volume, and the bounded candidate logic must not change the number. Counts
+// never route through the page-limited bounded path (that requires !CountOnly);
+// they tally in place over the full match set.
 func TestContentBoundedCountMatchesSearchDifferential(t *testing.T) {
 	t.Setenv("SEEKFS_CONTENT_SEARCH", "1")
-	vol := newContentRecordVolume(t, "C:", contentBoundedDifferentialRecords("C:", 4_300, 1_000_000))
-	vols := []*serviceVolumeIndex{vol}
+	volC := newContentRecordVolume(t, "C:", contentBoundedDifferentialRecords("C:", 4_300, 1_000_000))
+	volF := newContentRecordVolume(t, "F:", contentBoundedDifferentialRecords("F:", 4_300, 2_000_000))
+	scopes := []struct {
+		name string
+		vols []*serviceVolumeIndex
+	}{
+		{"single", []*serviceVolumeIndex{volC}},
+		{"multi", []*serviceVolumeIndex{volC, volF}},
+	}
+	queries := []string{
+		"content:download",                 // broad: every document
+		"content:pelican",                  // selective: a handful
+		`content:"quick brown fox"`,        // phrase
+		"content:/down.*ad/",               // regex: no postings superset
+		"content:download|content:pelican", // content-driven OR group
+		"!content:pelican download",        // content negation
+	}
 
-	for _, query := range []string{"content:download", "content:pelican", `content:"quick brown fox"`} {
-		full, okFull, errFull := countServiceVolumes(vols, queryOptions{Query: query, contentFullCandidates: true})
-		bounded, okBounded, errBounded := countServiceVolumes(vols, queryOptions{Query: query})
-		if errFull != nil || errBounded != nil || !okFull || !okBounded {
-			t.Fatalf("%q: count errors full=%v/%v bounded=%v/%v", query, okFull, errFull, okBounded, errBounded)
-		}
-		if full != bounded {
-			t.Fatalf("%q: count full=%d bounded=%d", query, full, bounded)
-		}
-		matches, err := searchServiceVolumes(vols, queryOptions{Query: query, Limit: 10_000}, false)
-		if err != nil {
-			t.Fatalf("%q: search: %v", query, err)
-		}
-		if len(matches) != bounded {
-			t.Fatalf("%q: count=%d but len(search)=%d", query, bounded, len(matches))
+	for _, scope := range scopes {
+		for _, query := range queries {
+			t.Run(scope.name+"/"+query, func(t *testing.T) {
+				full, okFull, errFull := countServiceVolumes(scope.vols, queryOptions{Query: query, contentFullCandidates: true, Trace: &searchTrace{}})
+				bounded, okBounded, errBounded := countServiceVolumes(scope.vols, queryOptions{Query: query, Trace: &searchTrace{}})
+				if errFull != nil || errBounded != nil || !okFull || !okBounded {
+					t.Fatalf("%q: count errors full=%v/%v bounded=%v/%v", query, okFull, errFull, okBounded, errBounded)
+				}
+				if full != bounded {
+					t.Fatalf("%q: count full=%d bounded=%d", query, full, bounded)
+				}
+				matches, err := searchServiceVolumes(scope.vols, queryOptions{Query: query, Limit: 10_000}, false)
+				if err != nil {
+					t.Fatalf("%q: search: %v", query, err)
+				}
+				if len(matches) != bounded {
+					t.Fatalf("%q: count=%d but len(search)=%d", query, bounded, len(matches))
+				}
+			})
 		}
 	}
 }
@@ -314,5 +337,243 @@ func TestContentBoundedPathShapeCompletenessDifferential(t *testing.T) {
 			}
 			assertBoundedDifferentialEqual(t, fmt.Sprintf("%s limit=%d", shape.name, limit), oldOpts.Trace, newOpts.Trace, oldMatches, newMatches)
 		}
+	}
+}
+
+// Item 9 (PB8): a bias only re-ranks, so the early stop must not change
+// membership or the biased order. A biased broad query scans in biased order
+// and stops once the limit is filled; contentFullCandidates selects the
+// historical arm, which never takes the bias early stop and re-ranks the full
+// candidate set under the same bias. Single volume: the caller applies the
+// stable bias to the candidate slice, so the early stop's top-limit in biased
+// order is exactly the non-early-stop result's prefix.
+func TestContentBoundedBiasedDifferential(t *testing.T) {
+	t.Setenv("SEEKFS_CONTENT_SEARCH", "1")
+	vol := newContentRecordVolume(t, "C:", contentBoundedDifferentialRecords("C:", 4_300, 1_000_000))
+	vols := []*serviceVolumeIndex{vol}
+	queries := []string{
+		"content:download",
+		"content:pelican",
+		`content:"quick brown fox"`,
+		"content:/down.*ad/",
+	}
+	sorts := []string{"", "sort:relevance", "sort:size", "sort:modified", "sort:extension", "sort:type", "sort:path"}
+	biases := []string{`C:\alpha`, `C:\does-not-exist`, `C:\gamma`}
+	for _, q := range queries {
+		for _, s := range sorts {
+			for _, bias := range biases {
+				for _, limit := range []int{20, 5_000} {
+					query := strings.TrimSpace(q + " " + s)
+					t.Run(fmt.Sprintf("%s/%s/limit=%d", query, bias, limit), func(t *testing.T) {
+						oldTrace := &searchTrace{}
+						newTrace := &searchTrace{}
+						oldOpts := queryOptions{Query: query, Limit: limit, RootBias: bias, contentFullCandidates: true, Trace: oldTrace}
+						newOpts := queryOptions{Query: query, Limit: limit, RootBias: bias, Trace: newTrace}
+						oldMatches, err := searchServiceVolumes(vols, oldOpts, false)
+						if err != nil {
+							t.Fatalf("full %q: %v", query, err)
+						}
+						newMatches, err := searchServiceVolumes(vols, newOpts, false)
+						if err != nil {
+							t.Fatalf("early-stop %q: %v", query, err)
+						}
+						assertBoundedDifferentialEqual(t, fmt.Sprintf("%s bias=%s limit=%d", query, bias, limit), oldTrace, newTrace, oldMatches, newMatches)
+					})
+				}
+			}
+		}
+	}
+}
+
+// contentBiasedNestedRecords mirrors contentBoundedDifferentialRecords but adds
+// a real directory record per top-level dir, so the compact path reconstruction
+// that RootBias/CWDBias match against yields <volume>\<dir>\<name> instead of
+// <volume>\<name>. The flat fixture is fine for shape coverage, but its records
+// do not sit under any bias root, so a bias never actually reorders it.
+func contentBiasedNestedRecords(volume string, baseFRN uint64, filesPerDir int) []contentVolRecord {
+	dirs := []string{"alpha", "beta", "gamma", "delta"}
+	exts := []string{".txt", ".md", ".go", ".nrrd"}
+	recs := make([]contentVolRecord, 0, len(dirs)+len(dirs)*filesPerDir)
+	dirIndex := make(map[string]int32, len(dirs))
+	dirFRN := make(map[string]uint64, len(dirs))
+	for _, d := range dirs {
+		frn := baseFRN + uint64(len(recs)) + 1
+		dirIndex[d] = int32(len(recs))
+		dirFRN[d] = frn
+		recs = append(recs, contentVolRecord{
+			frn: frn, parent: -1, parentFRN: 1,
+			name: d, mode: uint32(os.ModeDir),
+			path: volume + `\` + d,
+		})
+	}
+	for i := 0; i < len(dirs)*filesPerDir; i++ {
+		d := dirs[i%len(dirs)]
+		name := fmt.Sprintf("scan-%06d%s", i, exts[i%4])
+		var body strings.Builder
+		for r := 0; r <= i%7; r++ {
+			body.WriteString("the archive worker syncs the download cache to the remote volume every interval ")
+		}
+		if i%50 == 0 {
+			body.WriteString("the quick brown fox jumps over the lazy dog ")
+		}
+		if i%3125 == 0 {
+			body.WriteString("pelican ")
+		}
+		recs = append(recs, contentVolRecord{
+			frn:       baseFRN + 1000 + uint64(i),
+			parent:    dirIndex[d],
+			parentFRN: dirFRN[d],
+			name:      name,
+			mode:      0,
+			size:      int64((i*37)%997) + 1,
+			modUnix:   int64(1_600_000_000 + (i*13)%100_000),
+			path:      volume + `\` + d + `\` + name,
+			content:   body.String(),
+		})
+	}
+	return recs
+}
+
+// Item 9 blocker: the bias early stop verifies against the base record's
+// Deleted flag but not the pending overlay hidden set. Hidden base records fill
+// the page, the verify loop then drops every one of them, and the early stop
+// cannot recover the non-hidden matches it never scanned. Hides every alpha
+// file, more than a page, and uses an explicit sort so the page limit reaches
+// the scan without the default-order window. The early-stop arm must equal the
+// full-candidate arm byte-for-byte. Covers content (regex: no posting superset,
+// so the bounded scan is the source) and filename shapes, single and multi
+// volume.
+func TestContentBoundedBiasedHiddenDifferential(t *testing.T) {
+	t.Setenv("SEEKFS_CONTENT_SEARCH", "1")
+	volC := newContentRecordVolume(t, "C:", contentBiasedNestedRecords("C:", 1_000_000, 1_100))
+	volF := newContentRecordVolume(t, "F:", contentBiasedNestedRecords("F:", 2_000_000, 1_100))
+	// Hide every alpha file (i%4==0, frn = base + 1000 + i), far more than a
+	// page, so a biased early stop can fill entirely with records the verify
+	// loop will drop.
+	hideAlpha := func(vol *serviceVolumeIndex, base uint64) {
+		changes := make([]usnChange, 0, 1_100)
+		for i := 0; i < 4*1_100; i += 4 {
+			changes = append(changes, usnChange{FRN: base + 1000 + uint64(i), USN: int64(i) + 7, Reason: usnReasonFileDelete})
+		}
+		vol.applyUSNChanges(changes)
+		if vol.snapshotHiddenBaseIDs().empty() {
+			t.Fatal("pending deletes did not hide base records")
+		}
+	}
+	hideAlpha(volC, 1_000_000)
+	hideAlpha(volF, 2_000_000)
+
+	scopes := []struct {
+		name string
+		vols []*serviceVolumeIndex
+	}{
+		{"single", []*serviceVolumeIndex{volC}},
+		{"multi", []*serviceVolumeIndex{volC, volF}},
+	}
+	queries := []string{
+		`content:/archive/`, // regex content: no posting superset -> bounded scan
+		"content:download",  // posting superset: hidden-aware bounded cap
+		"type:file",         // filename, no term -> bounded scan
+		"scan",              // filename posting superset
+	}
+	sorts := []string{"", "sort:size", "sort:path"}
+	biases := []string{`C:\alpha`, `C:\gamma`, `C:\does-not-exist`}
+	for _, scope := range scopes {
+		for _, query := range queries {
+			for _, sort := range sorts {
+				q := strings.TrimSpace(query + " " + sort)
+				for _, bias := range biases {
+					for _, limit := range []int{20, 5_000} {
+						t.Run(fmt.Sprintf("%s/%s/%s/limit=%d", scope.name, q, bias, limit), func(t *testing.T) {
+							oldTrace := &searchTrace{}
+							newTrace := &searchTrace{}
+							oldOpts := queryOptions{Query: q, Limit: limit, RootBias: bias, contentFullCandidates: true, Trace: oldTrace}
+							newOpts := queryOptions{Query: q, Limit: limit, RootBias: bias, Trace: newTrace}
+							oldMatches, err := searchServiceVolumes(scope.vols, oldOpts, false)
+							if err != nil {
+								t.Fatalf("full %q: %v", q, err)
+							}
+							newMatches, err := searchServiceVolumes(scope.vols, newOpts, false)
+							if err != nil {
+								t.Fatalf("early-stop %q: %v", q, err)
+							}
+							assertBoundedDifferentialEqual(t, fmt.Sprintf("%s %s bias=%s limit=%d", scope.name, q, bias, limit), oldTrace, newTrace, oldMatches, newMatches)
+						})
+					}
+				}
+			}
+		}
+	}
+}
+
+// Item 9 coverage: the biased differential above was content + single volume
+// only. A bias is query-shape agnostic, so filename queries and multiple
+// volumes must be byte-identical to the full-candidate arm too. Uses the nested
+// fixture so a hit under the bias root actually reorders the result.
+func TestContentBoundedBiasedFilenameMultiVolumeDifferential(t *testing.T) {
+	t.Setenv("SEEKFS_CONTENT_SEARCH", "1")
+	volC := newContentRecordVolume(t, "C:", contentBiasedNestedRecords("C:", 1_000_000, 1_100))
+	volF := newContentRecordVolume(t, "F:", contentBiasedNestedRecords("F:", 2_000_000, 1_100))
+	scopes := []struct {
+		name string
+		vols []*serviceVolumeIndex
+	}{
+		{"single", []*serviceVolumeIndex{volC}},
+		{"multi", []*serviceVolumeIndex{volC, volF}},
+	}
+	queries := []string{"scan", "scan-000001", "ext:txt", "type:file"}
+	sorts := []string{"", "sort:size", "sort:path"}
+	biases := []string{`C:\alpha`, `C:\gamma`, `C:\does-not-exist`}
+	for _, scope := range scopes {
+		for _, query := range queries {
+			for _, sort := range sorts {
+				q := strings.TrimSpace(query + " " + sort)
+				for _, bias := range biases {
+					for _, limit := range []int{20, 5_000} {
+						t.Run(fmt.Sprintf("%s/%s/%s/limit=%d", scope.name, q, bias, limit), func(t *testing.T) {
+							oldTrace := &searchTrace{}
+							newTrace := &searchTrace{}
+							oldOpts := queryOptions{Query: q, Limit: limit, RootBias: bias, contentFullCandidates: true, Trace: oldTrace}
+							newOpts := queryOptions{Query: q, Limit: limit, RootBias: bias, Trace: newTrace}
+							oldMatches, err := searchServiceVolumes(scope.vols, oldOpts, false)
+							if err != nil {
+								t.Fatalf("full %q: %v", q, err)
+							}
+							newMatches, err := searchServiceVolumes(scope.vols, newOpts, false)
+							if err != nil {
+								t.Fatalf("early-stop %q: %v", q, err)
+							}
+							assertBoundedDifferentialEqual(t, fmt.Sprintf("%s %s bias=%s limit=%d", scope.name, q, bias, limit), oldTrace, newTrace, oldMatches, newMatches)
+						})
+					}
+				}
+			}
+		}
+	}
+}
+
+// Item 9: when the bias root holds matches, a biased broad query stops the scan
+// as soon as the biased page is full, instead of scanning to the candidate
+// budget. The candidate count in the trace is the scan's output size. Uses the
+// nested fixture (real <volume>\<dir>\<name> paths) so the bias root actually
+// has matches and the early stop is exercised, with no overlay so the guard
+// does not disable it.
+func TestContentBoundedBiasedEarlyStopStopsNearLimit(t *testing.T) {
+	t.Setenv("SEEKFS_CONTENT_SEARCH", "1")
+	vol := newContentRecordVolume(t, "C:", contentBiasedNestedRecords("C:", 1_000_000, 1_100))
+	const limit = 20
+	trace := &searchTrace{}
+	matches, err := searchServiceVolumes([]*serviceVolumeIndex{vol}, queryOptions{Query: "content:download", Limit: limit, RootBias: `C:\alpha`, Trace: trace}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(matches) != limit {
+		t.Fatalf("results = %d; want %d", len(matches), limit)
+	}
+	if trace.Source != "content-scan" {
+		t.Fatalf("source = %q; want content-scan", trace.Source)
+	}
+	if trace.Candidates > limit {
+		t.Fatalf("biased early stop scanned %d candidates; want <= %d (the limit)", trace.Candidates, limit)
 	}
 }
