@@ -225,6 +225,7 @@ func searchCompactWithCacheHidden(idx *Index, opts queryOptions, countOnly bool,
 	limit := normalizedLimit(opts.Limit, countOnly)
 	pq.Limit = limit
 	pq.CountOnly = countOnly
+	pq.contentCandidateMeta = &contentCandidateMeta{}
 	var contentMatcher *contentLeafMatcher
 	if contentVol != nil && queryHasAnyContentLeaf(pq) {
 		contentMatcher = newContentLeafMatcher(pq)
@@ -265,7 +266,18 @@ func searchCompactWithCacheHidden(idx *Index, opts queryOptions, countOnly bool,
 		pathCache = make(map[int]string)
 	}
 	skipEntryMatches := compactCandidateCanSkipEntryMatches(pq, usedCandidates)
-	if usedCandidates && !countOnly && len(order) >= serviceTrigramParallelVerifyMinIDs {
+	// The rank-ordered bounded content scan (used when the posting superset is
+	// capped to the window) already ran the full name+content predicate inline,
+	// so the verify loop below must not repeat it.
+	if contentMatcher != nil && !countOnly && pq.contentCandidateMeta.verified {
+		skipEntryMatches = true
+	}
+	// Content verification is inline and must stop at the limit: the parallel
+	// verifier runs every worker over its full range and only caps the merged
+	// output, so it verifies the whole candidate order. The serial range walk
+	// below stops as soon as the limit is reached, which keeps a broad content
+	// query's work proportional to the window rather than the candidate set.
+	if usedCandidates && !countOnly && contentMatcher == nil && len(order) >= serviceTrigramParallelVerifyMinIDs {
 		return verifyCompactCandidateOrderParallel(idx, pq, order, pathCache, limit, skipEntryMatches, hidden, contentVol, contentMatcher)
 	}
 	for pos := 0; pos < compactOrderLen(order, idx.compactRecordCount()); pos++ {
@@ -492,6 +504,31 @@ func compactCandidateEntryIfMatchIn(vol *serviceVolumeIndex, idx *Index, pq pars
 	return entry, true
 }
 
+// scanCandidateMatches reports whether recIndex satisfies the ordered-scan
+// predicate. For a content scan whose query reads no path (a plain content
+// query), it verifies against a path-free Entry: the scan discards the Entry,
+// and the returned candidate reconstructs its path downstream, so building one
+// here would be wasted work. Any query that reads a path keeps the full entry.
+func scanCandidateMatches(vol *serviceVolumeIndex, idx *Index, pq parsedQuery, recIndex int, pathCache map[int]string, matcher *contentLeafMatcher) bool {
+	if matcher != nil && !queryNeedsEntryPath(pq) {
+		rec := idx.compactRecord(recIndex)
+		if rec.Deleted || !compactRecordPrecheck(rec, pq, pq.MatchPath) {
+			return false
+		}
+		entry := Entry{
+			Name:        rec.Name,
+			Mode:        rec.Mode,
+			Size:        rec.Size,
+			ModUnix:     rec.ModUnix,
+			IndexSource: idx.Source,
+			FRN:         rec.FRN,
+		}
+		return entryMatchesWithContentMatcher(vol, entry, pq, pq.MatchPath, matcher)
+	}
+	_, ok := compactCandidateEntryIfMatchIn(vol, idx, pq, recIndex, pathCache, true, false, matcher)
+	return ok
+}
+
 func dropSatisfiedVolumeTerms(pq *parsedQuery, volume string) {
 	if pq == nil || volume == "" || len(pq.Terms) == 0 {
 		return
@@ -635,24 +672,73 @@ func (vol *serviceVolumeIndex) nameTermCandidates(pq parsedQuery) ([]int, bool) 
 	// an empty set is a real answer, not a fallback.
 	if queryHasAnyContentLeaf(pq) {
 		if queryHasPositiveContentLeaf(pq) {
-			if candidates, ok := vol.contentCandidates(pq); ok {
-				// Single-volume filename parity: the filename path orders its
-				// candidates by rankForQuery(pq) (name rank for the default
-				// order; size/modified/extension/type/path for explicit sorts),
-				// so order the content posting set the same way. sort:relevance
-				// keeps its own post-verify ranking (rankForQuery returns nil
-				// for it), so it is left in candidate order here.
-				if pq.SortColumn != "relevance" {
-					sortCandidateIDs(candidates, pq, vol.index, vol.rankForQuery(pq))
+			// Bounded candidate materialization (PB8). For a non-count query
+			// that only needs its top window and does not re-rank by relevance
+			// after verification, the result ordering equals the candidate
+			// ordering, so the posting intersection may be capped at the
+			// window. When the cap is hit the set is broad and ordered by
+			// docID, not by rank: using the truncated set would drop a
+			// candidate that verification could still promote into the window.
+			// The rank-ordered bounded scan below is the exact superset-ordered
+			// substitute: it walks the same rank/result order and verifies
+			// inline, stopping at the window.
+			bounded := !pq.contentFullCandidates && !pq.CountOnly && pq.Limit > 0 &&
+				pq.SortColumn != "relevance" && vol.snapshotHiddenBaseIDs().empty()
+			candidateCap := 0
+			if bounded {
+				// Probe broadness against the completeness window, not the
+				// verify limit: a single-volume default-order query verifies
+				// only its page limit but must still surface a candidate
+				// superset that exceeds the window as incomplete.
+				candidateCap = pq.Limit
+				if pq.contentWindow > candidateCap {
+					candidateCap = pq.contentWindow
 				}
-				pq.Trace.setSource("content-candidates", len(candidates))
-				return candidates, true
+			}
+			if candidates, ok, capped := vol.contentCandidatesBounded(pq, candidateCap); ok {
+				if capped && bounded && pq.contentWindow > 0 && pq.contentProbe != nil {
+					// The reduced default-order path caps materialization at the
+					// completeness window, so when the posting superset exceeds
+					// it the caller can no longer probe the window with
+					// len(matches) >= window (matches is page-bounded). Record
+					// the cap for the driver; it marks incomplete only if the
+					// page actually filled, i.e. the extra window candidates
+					// could hold more matches.
+					pq.contentProbe.windowCapped = true
+				}
+				if !capped || !bounded {
+					// A fully materialized superset strictly smaller than the
+					// completeness window proves every match fits below it, so
+					// the reduced path is complete without widening.
+					if !capped && bounded && pq.contentWindow > 0 && pq.contentProbe != nil &&
+						len(candidates) < pq.contentWindow {
+						pq.contentProbe.supersetBelowWindow = true
+					}
+					// Single-volume filename parity: the filename path orders
+					// its candidates by rankForQuery(pq) (name rank for the
+					// default order; size/modified/extension/type/path for
+					// explicit sorts), so order the content posting set the same
+					// way. sort:relevance keeps its own post-verify ranking and
+					// is left in candidate (docID) order here.
+					if pq.SortColumn != "relevance" {
+						sortCandidateIDs(candidates, pq, vol.index, vol.rankForQuery(pq))
+					}
+					pq.Trace.setSource("content-candidates", len(candidates))
+					return candidates, true
+				}
+				// Capped and broad: fall through to the rank-ordered bounded
+				// scan, which is a complete superset in result order.
 			}
 		}
 		// The bounded scan is already produced in orderForQuery(pq) order, which
-		// is the same rank sequence for every sort column.
+		// is the same rank sequence for every sort column. It also runs the full
+		// name+content predicate inline, so for a search (not a count) it can
+		// report the candidate set as already verified.
 		if candidates, ok := vol.boundedScanCandidates(pq); ok {
 			pq.Trace.setSource("content-scan", len(candidates))
+			if !pq.CountOnly && pq.contentCandidateMeta != nil {
+				pq.contentCandidateMeta.verified = true
+			}
 			return candidates, true
 		}
 		return nil, false

@@ -1756,6 +1756,9 @@ func parseQuery(opts queryOptions) (parsedQuery, error) {
 		Trace:                  opts.Trace,
 		ContentCandidateBudget: opts.ContentCandidateBudget,
 		ContentScanVisitBudget: opts.ContentScanVisitBudget,
+		contentFullCandidates:  opts.contentFullCandidates,
+		contentWindow:          opts.contentWindow,
+		contentProbe:           opts.contentProbe,
 	}
 	if opts.ModifiedAfter != "" {
 		t, err := parseTimeValue(opts.ModifiedAfter)

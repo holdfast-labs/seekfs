@@ -441,7 +441,7 @@ func (vol *serviceVolumeIndex) boundedScanCandidatesFiltered(pq parsedQuery, fil
 			if contentQuery {
 				visited++
 			}
-			if _, ok := compactCandidateEntryIfMatchIn(vol, vol.index, pq, id, cache, true, false, contentMatcher); !ok {
+			if !scanCandidateMatches(vol, vol.index, pq, id, cache, contentMatcher) {
 				continue
 			}
 			out = append(out, id)

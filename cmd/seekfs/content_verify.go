@@ -155,6 +155,32 @@ func (m *contentLeafMatcher) match(raw, folded []byte, leaf contentLeaf) bool {
 	return bytes.Contains(m.haystackFor(raw, folded), m.needleOf(leaf))
 }
 
+// matchRawFirst is match with a lazy fold: a case-insensitive leaf whose
+// lowercased needle already appears verbatim in the raw text is a match without
+// folding, and only the first leaf that misses the raw fast path pays for the
+// once-per-entry fold (cached through folded/foldedReady). A corpus of
+// already-lowercase documents (the common case) then never folds at all. The
+// match decision is identical to match: folding then testing a superset cannot
+// introduce or drop a match.
+func (m *contentLeafMatcher) matchRawFirst(raw []byte, folded *[]byte, foldedReady *bool, leaf contentLeaf) bool {
+	if leaf.Kind == contentLeafRegex {
+		re := m.regex[leaf.LeafID]
+		return re != nil && re.Match(raw)
+	}
+	needle := m.needleOf(leaf)
+	if bytes.Contains(raw, needle) {
+		return true
+	}
+	if m.caseSensitive {
+		return false
+	}
+	if !*foldedReady {
+		*folded = contentFoldText(raw)
+		*foldedReady = true
+	}
+	return bytes.Contains(*folded, needle)
+}
+
 // entryMatchesWithContent mirrors entryMatches but also enforces content leaves
 // at every recursion level. Hot loops use entryMatchesWithContentMatcher with a
 // matcher hoisted out of the loop.
@@ -174,15 +200,13 @@ func entryMatchesWithContentMatcher(vol *serviceVolumeIndex, entry Entry, pq par
 	}
 	matched := make([]bool, m.size)
 	if text, ok := vol.contentTextForEntry(&entry); ok {
-		// Fold the document once for the whole entry and reuse it for every
-		// case-insensitive leaf; case-sensitive leaves read the raw text. No
-		// per-leaf allocation.
+		// Fold the document at most once for the whole entry, and only if a
+		// case-insensitive leaf actually needs it; case-sensitive leaves read
+		// the raw text. No per-leaf allocation.
 		var folded []byte
-		if !m.caseSensitive {
-			folded = contentFoldText(text)
-		}
+		foldedReady := false
 		for _, leaf := range m.leaves {
-			matched[leaf.LeafID] = m.match(text, folded, leaf)
+			matched[leaf.LeafID] = m.matchRawFirst(text, &folded, &foldedReady, leaf)
 		}
 	}
 	return entryMatchesContentAt(entry, pq, matchPath, matched)
@@ -490,12 +514,24 @@ func markContentQueryIncomplete(trace *searchTrace, volumes []*serviceVolumeInde
 // slice means there are genuinely no content matches and the caller must NOT
 // fall back. A capped set marks the trace incomplete.
 func (vol *serviceVolumeIndex) contentCandidates(pq parsedQuery) ([]int, bool) {
+	out, ok, _ := vol.contentCandidatesBounded(pq, 0)
+	return out, ok
+}
+
+// contentCandidatesBounded is contentCandidates with an explicit materialization
+// cap. cap > 0 stops the posting intersection (and the final set) at cap
+// candidates; the third return reports whether the superset was truncated
+// (capped) rather than fully materialized. A caller that only needs its top
+// window can pass the window as cap and, on truncation, switch to the
+// rank-ordered bounded scan: a truncated posting set is ordered by docID, not by
+// rank, so it must not be used as the result ordering.
+func (vol *serviceVolumeIndex) contentCandidatesBounded(pq parsedQuery, cap int) ([]int, bool, bool) {
 	if !contentSearchEnabled() || vol == nil || vol.content == nil {
-		return nil, false
+		return nil, false, false
 	}
 	reader, resolver := vol.content.readerResolverView()
 	if reader == nil || resolver == nil {
-		return nil, false
+		return nil, false, false
 	}
 	// Each positive content leaf contributes a lazy docID stream (the
 	// merge-intersection of its trigrams); intersecting the streams and
@@ -513,7 +549,7 @@ func (vol *serviceVolumeIndex) contentCandidates(pq parsedQuery) ([]int, bool) {
 			if !contentTermTrigramSafe(term) {
 				// A gram the builder skipped (control byte) would look up
 				// empty and falsely report zero; fall back to a scan.
-				return nil, false
+				return nil, false, false
 			}
 			streams = append(streams, reader.candidateStream(term))
 		}
@@ -525,7 +561,7 @@ func (vol *serviceVolumeIndex) contentCandidates(pq parsedQuery) ([]int, bool) {
 		for _, group := range pq.OrGroups {
 			docs, groupDriven, ok := contentOrGroupCandidateDocs(reader, group)
 			if !ok {
-				return nil, false
+				return nil, false, false
 			}
 			if !groupDriven {
 				continue
@@ -536,27 +572,47 @@ func (vol *serviceVolumeIndex) contentCandidates(pq parsedQuery) ([]int, bool) {
 			}
 		}
 		if !driven {
-			return nil, false
+			return nil, false, false
 		}
 	}
 	if len(streams) == 0 {
 		// Every positive content leaf is a regex or otherwise unconstrained:
 		// no postings superset exists. Decline so the ordered content scan
 		// handles it with inline verification.
-		return nil, false
+		return nil, false, false
 	}
 	budget := contentCandidateBudgetOf(pq)
-	// Pull one past the budget so an over-budget set is still detected as capped
-	// (today's len > budget check) without materializing the whole list.
-	limit := budget + 1
+	// materialize bounds how much of the posting intersection is decoded: the
+	// explicit cap when the caller only needs its top window, else the full
+	// query budget. Pull one past it so an over-cap set is still detected
+	// without decoding the whole list.
+	materialize := budget
+	if cap > 0 && cap < materialize {
+		materialize = cap
+	}
+	limit := materialize + 1
 	if limit <= 0 {
-		limit = budget
+		limit = materialize
 	}
 	candidates := collectDocIDStream(intersectDocIDStreams(streams), limit)
+	// capped reports that the returned superset was truncated by the
+	// materialization cap and must not be used as a complete ordered set. It is
+	// deliberately separate from incompleteness: the page/window cap is an
+	// internal optimization the in-order bounded scan compensates for (it finds
+	// the true top page), so exceeding it is NOT by itself a completeness
+	// failure. Only exceeding the true query budget sets ContentIncomplete, the
+	// pre-PB8 contract; the caller's window probe covers the rest.
 	capped := false
-	if budget > 0 && len(candidates) > budget {
-		candidates = candidates[:budget]
+	budgetExceeded := false
+	if materialize > 0 && len(candidates) > materialize {
+		candidates = candidates[:materialize]
 		capped = true
+		// Materializing to the full budget and still overflowing is a real
+		// budget overrun; a smaller explicit cap only truncates a superset the
+		// caller still verifies.
+		if materialize >= budget {
+			budgetExceeded = true
+		}
 	}
 	out := make([]int, 0, len(candidates))
 	for _, docID := range candidates {
@@ -576,14 +632,15 @@ func (vol *serviceVolumeIndex) contentCandidates(pq parsedQuery) ([]int, bool) {
 	}
 	sort.Ints(out)
 	out = uniqueSortedInts(out)
-	if len(out) > budget {
+	if budget > 0 && len(out) > budget {
 		out = out[:budget]
 		capped = true
+		budgetExceeded = true
 	}
-	if capped {
+	if budgetExceeded {
 		pq.Trace.setContentIncomplete()
 	}
-	return out, true
+	return out, true, capped
 }
 
 // contentOrGroupCandidateDocs unions the content candidate doc sets of an OR
@@ -819,6 +876,29 @@ func contentRelevanceWindow(limit, budget int) int {
 	return window
 }
 
+// nameLowerNameShared reports whether more than one record in the volume has
+// the given lowercased name. A page-limited per-volume search can split a shared
+// name group, and the cross-volume merge breaks name ties by path while a volume
+// breaks them by record id, so such a volume must widen to the window to stay
+// byte-identical with the unbounded search. An unknown or unsorted order reports
+// shared (conservative): widening is always the correct fallback.
+func (vol *serviceVolumeIndex) nameLowerNameShared(lowerName string) bool {
+	if vol == nil || vol.index == nil || lowerName == "" {
+		return true
+	}
+	order := vol.mappedOrCompactNameOrder()
+	if len(order) == 0 {
+		return true
+	}
+	lo := sort.Search(len(order), func(i int) bool {
+		return vol.index.compactLowerNameAt(int(order[i])) >= lowerName
+	})
+	if lo >= len(order) || vol.index.compactLowerNameAt(int(order[lo])) != lowerName {
+		return false
+	}
+	return lo+1 < len(order) && vol.index.compactLowerNameAt(int(order[lo+1])) == lowerName
+}
+
 // searchContentServiceVolumes merges the per-volume content results in the same
 // order/limit semantics as the other multi-volume paths: per-volume results are
 // concatenated, globally sorted when they span volumes, and the user limit is
@@ -870,10 +950,55 @@ func searchContentServiceVolumes(volumes []*serviceVolumeIndex, opts queryOption
 			volOpts.Limit = window
 		}
 		contentVolume := vol != nil && vol.contentUsableForQuery()
+		// A non-relevance query has candidate order == result order, so the
+		// first userLimit verified candidates are exactly the page, single- or
+		// multi-volume: verify only the page and probe the window separately for
+		// the completeness signal. The multi-volume merge reorders by (name,
+		// path) while a volume orders by (name, record id); if the page boundary
+		// splits a shared name that difference could drop a globally-ranked
+		// entry, so a volume whose boundary name is shared anywhere in the index
+		// falls back to the window below. A pending overlay disables the bounded
+		// candidate fast path, so it must also disable the page reduction:
+		// otherwise the window probe below (len(matches) >= window) can never
+		// fire and a window-full query reports complete.
+		reduced := !opts.contentFullCandidates && defaultOrder && contentVolume &&
+			userLimit > 0 && userLimit < window && vol.snapshotHiddenBaseIDs().empty()
+		if reduced {
+			volOpts.Limit = userLimit
+			volOpts.contentWindow = window
+		}
+		probe := &contentCompletenessProbe{}
+		volOpts.contentProbe = probe
 		var matches []Entry
 		var err error
 		if contentVolume {
 			matches, err = vol.searchContentVolume(volOpts, countOnly)
+			// The page-limit reduction is safe only when the completeness signal
+			// survives it: a capped superset (window-capped, page full) carries
+			// it here, and a provably-under-window superset is already complete.
+			// Anything else (an unbounded source such as a regex, or a superset
+			// exactly at the window) must widen back to the window so the
+			// len(matches) >= window probe can decide, exactly as pre-PB8. A
+			// shared boundary name forces the widen for merge-tie parity.
+			//
+			// Gate on the page being filled (len >= userLimit), not on an exact
+			// equality: a pending overlay addition is merged in after the base
+			// page and makes the merged count exceed userLimit even though the
+			// base page filled, so equality would skip the widen for an
+			// unknown-probe query and report complete=true for a window that was
+			// never evaluated. The boundary is the last entry the global limit
+			// keeps (index userLimit-1 of the name/path-sorted merged set), not
+			// the merged tail, which an overlay addition can occupy.
+			widen := err == nil && reduced && len(matches) >= userLimit &&
+				((!probe.windowCapped && !probe.supersetBelowWindow) ||
+					vol.nameLowerNameShared(entryLowerName(matches[userLimit-1])))
+			if widen {
+				volOpts.Limit = window
+				volOpts.contentWindow = 0
+				probe = &contentCompletenessProbe{}
+				volOpts.contentProbe = probe
+				matches, err = vol.searchContentVolume(volOpts, countOnly)
+			}
 		} else if filenameOnly && vol != nil {
 			matches, err = vol.searchFilenameOnlyVolume(volOpts, countOnly, pq)
 		} else {
@@ -882,7 +1007,15 @@ func searchContentServiceVolumes(volumes []*serviceVolumeIndex, opts queryOption
 		if err != nil {
 			return nil, err
 		}
+		// The window probe is the pre-PB8 completeness signal: a match set that
+		// reaches the window may have more beyond it. The reduced path cannot run
+		// it (matches is page-bounded), so when it truncated the superset at the
+		// window and the page filled, the window-capped flag carries the same
+		// signal. A page that did not fill proves all matches are below the
+		// window, so it stays complete even though the superset was capped.
 		if window > 0 && len(matches) >= window {
+			opts.Trace.setContentIncomplete()
+		} else if reduced && probe.windowCapped && len(matches) >= userLimit {
 			opts.Trace.setContentIncomplete()
 		}
 		if postVerify && contentVolume {

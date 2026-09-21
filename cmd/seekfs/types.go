@@ -457,6 +457,34 @@ type queryOptions struct {
 	// content index is unusable needs a stripped query that cannot be expressed
 	// as a Query string. Local-only; nil on every normal request.
 	parsedOverride *parsedQuery `json:"-"`
+	// contentFullCandidates disables the bounded content-candidate fast path
+	// (bounded posting materialization + broad rank-ordered scan) so a
+	// differential test can compare it against the historical full-budget
+	// candidate logic. Local-only; false on every normal request.
+	contentFullCandidates bool `json:"-"`
+	// contentWindow is the enlarged content window the completeness signal is
+	// measured against when the verify limit itself is smaller (a single-volume
+	// default-order query verifies only its page limit but must still report
+	// incompleteness when the candidate superset exceeds the window).
+	// Local-only; 0 on every normal request.
+	contentWindow int `json:"-"`
+	// contentProbe, when non-nil, is the per-volume channel the reduced content
+	// path uses to report whether it truncated the posting superset at the
+	// completeness window or proved the superset below it. The driver creates a
+	// fresh probe per volume search so the signal is never shared across
+	// queries. Local-only; nil on every normal request.
+	contentProbe *contentCompletenessProbe `json:"-"`
+}
+
+// contentCompletenessProbe carries the reduced default-order path's
+// completeness evidence from the candidate source back to the volume driver.
+// windowCapped means the posting superset exceeded the window and was truncated
+// there (so the driver must decide from the page); supersetBelowWindow means the
+// whole superset was materialized and is strictly smaller than the window (so
+// every match fits below it and the result is complete).
+type contentCompletenessProbe struct {
+	windowCapped        bool
+	supersetBelowWindow bool
 }
 
 type parsedQuery struct {
@@ -495,6 +523,24 @@ type parsedQuery struct {
 	// Per-query content budgets copied from queryOptions; 0 means use default.
 	ContentCandidateBudget int
 	ContentScanVisitBudget int
+	// contentFullCandidates mirrors queryOptions.contentFullCandidates so
+	// nameTermCandidates can bypass the bounded content-candidate fast path.
+	contentFullCandidates bool
+	// contentWindow mirrors queryOptions.contentWindow: the completeness window
+	// when the verify limit is smaller than it.
+	contentWindow int
+	// contentProbe mirrors queryOptions.contentProbe: the per-volume channel a
+	// reduced content search reports its completeness evidence through.
+	contentProbe *contentCompletenessProbe
+	// contentCandidateMeta carries a candidate source's self-report back to
+	// searchCompact for the current search call (never shared across queries).
+	contentCandidateMeta *contentCandidateMeta
+}
+
+// contentCandidateMeta is the per-search-call channel a candidate source uses to
+// tell searchCompact that it already ran the full inline content predicate.
+type contentCandidateMeta struct {
+	verified bool
 }
 
 type searchTrace struct {
@@ -539,6 +585,11 @@ type searchTrace struct {
 	// shapes: a count never stats, so it can exceed the search result set. The
 	// count is still returned; this only makes the divergence visible.
 	ContentCountDivergent bool
+	// ContentCandidatesVerified records that the content candidate source
+	// already ran the full inline content predicate (the rank-ordered bounded
+	// content scan), so the downstream verify loop can skip re-evaluating it.
+	// Local-only plumbing; never serialized.
+	ContentCandidatesVerified bool `json:"-"`
 }
 
 type traceTerm struct {
