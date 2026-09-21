@@ -114,11 +114,14 @@ type contentDeltaDoc struct {
 
 // contentDelta is the in-memory overlay of changed documents. Its own mutex
 // guards docs/byFRN so the coordinator and a drain can mutate it without a
-// shared lock regime.
+// shared lock regime. liveDocCount/liveTextBytes track the resident live
+// payload so the M1 fold trigger is O(1) rather than a scan.
 type contentDelta struct {
-	mu    sync.Mutex
-	docs  []contentDeltaDoc
-	byFRN map[uint64]int
+	mu            sync.Mutex
+	docs          []contentDeltaDoc
+	byFRN         map[uint64]int
+	liveDocCount  int
+	liveTextBytes int64
 }
 
 func newContentDelta() *contentDelta {
@@ -130,17 +133,30 @@ func (d *contentDelta) upsert(doc contentDeltaDoc) {
 	defer d.mu.Unlock()
 	doc.Deleted = false
 	if i, ok := d.byFRN[doc.FRN]; ok {
+		old := &d.docs[i]
+		if old.Deleted {
+			d.liveDocCount++
+			d.liveTextBytes += int64(len(doc.Text))
+		} else {
+			d.liveTextBytes += int64(len(doc.Text)) - int64(len(old.Text))
+		}
 		d.docs[i] = doc
 		return
 	}
 	d.byFRN[doc.FRN] = len(d.docs)
 	d.docs = append(d.docs, doc)
+	d.liveDocCount++
+	d.liveTextBytes += int64(len(doc.Text))
 }
 
 func (d *contentDelta) delete(frn uint64) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if i, ok := d.byFRN[frn]; ok {
+		if !d.docs[i].Deleted {
+			d.liveDocCount--
+			d.liveTextBytes -= int64(len(d.docs[i].Text))
+		}
 		d.docs[i].Deleted = true
 		d.docs[i].Text = nil
 	}
@@ -198,6 +214,62 @@ func (d *contentDelta) len() int {
 	return len(d.docs)
 }
 
+// liveCount returns the number of non-tombstoned entries (the resident content
+// payload the fold trigger cares about).
+func (d *contentDelta) liveCount() int {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.liveDocCount
+}
+
+// liveBytes returns the resident live normalized-text byte count.
+func (d *contentDelta) liveBytes() int64 {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.liveTextBytes
+}
+
+// snapshot copies every entry (live and tombstoned) under one lock, so a fold
+// can build from a consistent view and later remove exactly what it folded.
+func (d *contentDelta) snapshot() []contentDeltaDoc {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return append([]contentDeltaDoc(nil), d.docs...)
+}
+
+// removeUnchanged drops the entries that are identical (FRN, path, content
+// hash, and deleted state) to the fold snapshot, then compacts the backing
+// slice so tombstoned slots do not accumulate. An entry mutated after the
+// snapshot (an edit, a delete, a rename, or a resurrect) differs and is left for
+// the next fold, so a change racing the fold is never lost.
+func (d *contentDelta) removeUnchanged(snapshot []contentDeltaDoc) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if len(snapshot) == 0 {
+		return
+	}
+	folded := make(map[uint64]contentDeltaDoc, len(snapshot))
+	for _, s := range snapshot {
+		folded[s.FRN] = s
+	}
+	kept := d.docs[:0]
+	d.byFRN = make(map[uint64]int, len(d.docs))
+	d.liveDocCount = 0
+	d.liveTextBytes = 0
+	for _, cur := range d.docs {
+		if s, ok := folded[cur.FRN]; ok && s.Deleted == cur.Deleted && s.Hash == cur.Hash && s.Path == cur.Path {
+			continue
+		}
+		d.byFRN[cur.FRN] = len(kept)
+		kept = append(kept, cur)
+		if !cur.Deleted {
+			d.liveDocCount++
+			d.liveTextBytes += int64(len(cur.Text))
+		}
+	}
+	d.docs = kept
+}
+
 // contentVolumeState holds one volume's decoded content index plus the overlay
 // delta and the resolver that maps docs to record IDs.
 type contentVolumeState struct {
@@ -209,6 +281,13 @@ type contentVolumeState struct {
 	delta    *contentDelta
 	state    string
 	health   contentHealth
+	// catchUpPending is true from a base attach until restart catch-up reaches
+	// the volume checkpoint. observedUSN spans the live replay and the catch-up
+	// streams, so while catch-up is pending the watermark can run ahead of the
+	// delta's coverage; a fold must not publish then. A capped or aborted
+	// catch-up never clears it, so the volume stays gated and degraded until a
+	// rebuild.
+	catchUpPending bool
 }
 
 func newContentVolumeState(volume string) *contentVolumeState {
@@ -315,6 +394,7 @@ func (s *contentVolumeState) markStale(reason string) {
 	s.reader = nil
 	s.resolver = nil
 	s.delta = newContentDelta()
+	s.catchUpPending = false
 }
 
 // markIndexing is the service-owned background build's visible state. A
@@ -332,6 +412,7 @@ func (s *contentVolumeState) markIndexing(total int) {
 	s.health.Incomplete = false
 	s.reader = nil
 	s.resolver = nil
+	s.catchUpPending = false
 }
 
 // setBuildProgress publishes extraction progress for an in-flight build so
@@ -505,6 +586,41 @@ func (s *contentVolumeState) healthIncomplete() bool {
 	return s.health.Incomplete
 }
 
+// markCatchUpPending records that restart catch-up for the just-attached base
+// has not finished. observedUSN spans the live replay and catch-up streams, so
+// a fold must not publish a checkpoint until catch-up completes.
+func (s *contentVolumeState) markCatchUpPending() {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.catchUpPending = true
+}
+
+// markCatchUpComplete clears the catch-up gate after catch-up replayed every
+// record up to the volume checkpoint. A capped or failed catch-up never calls
+// this, so health.Incomplete keeps the volume degraded and the fold gated.
+func (s *contentVolumeState) markCatchUpComplete() {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.catchUpPending = false
+}
+
+// catchUpIncomplete reports whether a fold must wait: catch-up is still in
+// progress, or it was capped/failed and may have skipped records.
+func (s *contentVolumeState) catchUpIncomplete() bool {
+	if s == nil {
+		return false
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.catchUpPending || s.health.Incomplete
+}
+
 // hasContentForFRN reports whether a live content doc already exists for the
 // FRN, in the base or the delta. A rename-new for an FRN with no doc is a file
 // moved into the volume that has never been extracted; an intra-volume rename
@@ -534,6 +650,13 @@ type contentCoordinator struct {
 	dirty        map[uint64]struct{}
 	queue        map[uint64]struct{}
 	drainEnabled bool
+	// observedUSN is the highest change USN handed to observeChanges. It is a
+	// contiguous persistence bound only when no observed-but-unextracted work
+	// remains and catch-up is complete, which foldSnapshot enforces before a
+	// fold may durably claim it (PB2/WP1c).
+	observedUSN uint64
+	// foldRetryAfter paces fold retries after a failure; the delta is kept.
+	foldRetryAfter time.Time
 }
 
 func newContentCoordinator(state *contentVolumeState) *contentCoordinator {
@@ -565,6 +688,13 @@ func (c *contentCoordinator) observeChanges(changes []usnChange) {
 	}
 	for i := range changes {
 		ch := &changes[i]
+		// The watermark advances for every observed record (even an ineligible
+		// one, which carries no content). It is only a fold checkpoint once the
+		// fold gate confirms no observed-but-unextracted work remains and
+		// catch-up is complete; see foldSnapshot.
+		if ch.USN > 0 && uint64(ch.USN) > c.observedUSN {
+			c.observedUSN = uint64(ch.USN)
+		}
 		if ch.FRN == 0 {
 			continue
 		}
@@ -668,6 +798,63 @@ func (c *contentCoordinator) dirtyCount() int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return len(c.dirty)
+}
+
+// foldSnapshot captures the observed watermark and a copy of every delta entry
+// under one coordinator lock, so a fold's checkpoint and its input stay
+// consistent even while observeChanges keeps running. It refuses (ok=false)
+// while observedUSN is not yet a contiguous persistence bound: pending content
+// work (dirty/queue) has been observed but not extracted, and restart catch-up
+// may still be replaying records below the watermark. In both cases the
+// checkpoint would run ahead of the folded content and the next restart would
+// skip those USNs. An ineligible record (directory, non-content extension)
+// never enters dirty/queue and needs no content representation, so it does not
+// block the fold.
+func (c *contentCoordinator) foldSnapshot() (uint64, []contentDeltaDoc, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.dirty) > 0 || len(c.queue) > 0 {
+		return 0, nil, false
+	}
+	if c.state.catchUpIncomplete() {
+		return 0, nil, false
+	}
+	return c.observedUSN, c.state.deltaView().snapshot(), true
+}
+
+// commitFold drops the delta entries the fold persisted unchanged. Entries
+// mutated or added after the snapshot are kept.
+func (c *contentCoordinator) commitFold(snapshot []contentDeltaDoc) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.state.deltaView().removeUnchanged(snapshot)
+}
+
+// foldDue reports whether the live delta has grown past either bound and is not
+// in a retry backoff.
+func (c *contentCoordinator) foldDue(maxDocs int, maxBytes int64) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !c.drainEnabled {
+		return false
+	}
+	if !c.foldRetryAfter.IsZero() && time.Now().Before(c.foldRetryAfter) {
+		return false
+	}
+	delta := c.state.deltaView()
+	return delta.liveCount() >= maxDocs || delta.liveBytes() >= maxBytes
+}
+
+func (c *contentCoordinator) foldSucceeded() {
+	c.mu.Lock()
+	c.foldRetryAfter = time.Time{}
+	c.mu.Unlock()
+}
+
+func (c *contentCoordinator) foldFailed(backoff time.Duration) {
+	c.mu.Lock()
+	c.foldRetryAfter = time.Now().Add(backoff)
+	c.mu.Unlock()
 }
 
 // contentExtractDeltaDoc extracts a changed file into a delta document. When the

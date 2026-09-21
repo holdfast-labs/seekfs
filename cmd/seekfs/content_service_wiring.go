@@ -128,6 +128,10 @@ func (s *goSearchService) attachContentForVolume(vol *serviceVolumeIndex) {
 	vol.content.setReady(idx, reader, buildContentResolver(idx.Docs, frns, ids))
 	s.indexMu.RUnlock()
 	if vol.contentCoord != nil {
+		// Gate folds until catch-up finishes: observedUSN spans the live replay
+		// and catch-up streams, so a fold before this completes could persist a
+		// checkpoint ahead of the delta's coverage (PB2/WP1c).
+		vol.content.markCatchUpPending()
 		// Start the drain loop only once per volume; a re-attach after a
 		// rebuild must not spawn a second loop. enableDrain stays idempotent.
 		startDrain := !vol.contentCoord.drainEnabledNow()
@@ -196,7 +200,9 @@ func (s *goSearchService) contentCatchUpAfterAttach(vol *serviceVolumeIndex, idx
 	from := int64(idx.CheckpointUSN)
 	if idx.JournalID == 0 || from <= 0 {
 		// Not USN-valid (a hand-built or walk-derived base). Leave it alone;
-		// PF-3 owns the rebuild that would stamp a checkpoint.
+		// PF-3 owns the rebuild that would stamp a checkpoint. Nothing to
+		// replay, so the fold gate may clear.
+		vol.content.markCatchUpComplete()
 		return
 	}
 	// Validate the base's watermark against the live journal before reading. A
@@ -226,6 +232,7 @@ func (s *goSearchService) contentCatchUpAfterAttach(vol *serviceVolumeIndex, idx
 		return
 	}
 	if from >= target {
+		vol.content.markCatchUpComplete()
 		return
 	}
 	buffer := make([]byte, 4*1024*1024)
@@ -262,6 +269,10 @@ func (s *goSearchService) contentCatchUpAfterAttach(vol *serviceVolumeIndex, idx
 		vol.contentCoord.promoteAll()
 		cur = next
 	}
+	// Every record from the base checkpoint to the volume checkpoint has been
+	// observed and enqueued; the fold gate may open. A capped/errored catch-up
+	// returned above without reaching here, so it stays gated and degraded.
+	vol.content.markCatchUpComplete()
 }
 
 // contentCatchUpGenerationCurrent reports whether the volume's live journal
@@ -368,6 +379,9 @@ func (s *goSearchService) contentDrainLoop(vol *serviceVolumeIndex) {
 			vol.contentCoord.processQueue(func(frn uint64) (string, bool) {
 				return s.contentResolvePath(vol, frn, pathCache)
 			})
+			// M1: after the tick's extractions, fold if the delta has grown
+			// past its bound. A fold failure keeps the delta and backs off.
+			s.maybeFoldContentDelta(vol)
 		}
 	}
 }
