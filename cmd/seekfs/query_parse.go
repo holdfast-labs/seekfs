@@ -308,7 +308,7 @@ func applyQueryToken(pq *parsedQuery, raw string) error {
 		}
 		return nil
 	case isUnknownFilterToken(raw):
-		return fmt.Errorf("unsupported filter %q; supported: path: parent: ext: dir: glob: regex: type: case: size: dm: attrib: sort:size sort:modified sort:extension sort:type sort:path sort:relevance (and !term, a|b)", raw)
+		return fmt.Errorf("unsupported filter %q; supported: path: parent: ext: dir: glob: regex: type: case: size: dm: attrib: content: (needs SEEKFS_CONTENT_SEARCH=1) sort:size sort:modified sort:extension sort:type sort:path sort:relevance (and !term, a|b)", raw)
 	case looksLikeImplicitFilenameGlob(raw):
 		pq.Globs = append(pq.Globs, normalizeCase(raw, pq.CaseSensitive))
 	default:

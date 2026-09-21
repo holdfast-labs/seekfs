@@ -27,20 +27,12 @@ type contentHit struct {
 	Snippet string
 }
 
-// contentSnippetSource is an optional case-preserving decoded copy of a
-// document's text. fixups maps an offset in the normalized (lowercased, lossy
-// repaired) text used for matching back into text, so a snippet can show
-// original case/source where the mapping is exact.
-type contentSnippetSource struct {
-	text   []byte
-	fixups contentLossyFixups
-}
-
 // contentSnippetWindow returns a bounded window of text around the match at byte
 // offset off. Newlines and tabs are collapsed to spaces so the snippet stays one
 // line. Only the bytes around the window are decoded, so the work is O(window)
 // rather than O(len(text)); the start and end snap to rune boundaries so a
-// multibyte rune is never split. text must be valid UTF-8 (the stored form).
+// multibyte rune is never split. text must be valid UTF-8 (the stored form),
+// which preserves case since PF-6a, so no case-carrying source is needed.
 func contentSnippetWindow(text []byte, off, matchLen int) string {
 	// off == len(text) is not a match start: there is no byte to window around,
 	// and indexing text[off] below would panic.
@@ -86,28 +78,6 @@ func contentSnippetWindow(text []byte, off, matchLen int) string {
 		window = append(window, []rune("...")...)
 	}
 	return string(window)
-}
-
-// contentSnippetWindowSource renders the snippet from the case-preserving source
-// when the match offsets map exactly; region-level failures fall back to the
-// normalized text rather than fabricating bytes that were never in the source.
-func contentSnippetWindowSource(normalized []byte, src *contentSnippetSource, off, matchLen int) string {
-	if src == nil || len(src.text) == 0 || off < 0 || off > len(normalized) {
-		return contentSnippetWindow(normalized, off, matchLen)
-	}
-	end := off + matchLen
-	if end > len(normalized) {
-		end = len(normalized)
-	}
-	if end < off || !src.fixups.exact(off) || !src.fixups.exact(end) {
-		return contentSnippetWindow(normalized, off, matchLen)
-	}
-	srcOff := src.fixups.toSourceOffset(off)
-	srcEnd := src.fixups.toSourceOffset(end)
-	if srcOff < 0 || srcEnd < srcOff || srcEnd > len(src.text) {
-		return contentSnippetWindow(normalized, off, matchLen)
-	}
-	return contentSnippetWindow(src.text, srcOff, srcEnd-srcOff)
 }
 
 // contentReader is a decoded `.gsx` ready to query.

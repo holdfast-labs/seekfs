@@ -651,7 +651,14 @@ func (vol *serviceVolumeIndex) searchContentVolume(opts queryOptions, countOnly 
 	}
 	// Search applies the Entry.Exists/implicit-:under filesystem re-check; a
 	// count deliberately does not stat, so for those two shapes count and search
-	// can diverge. Every other content shape agrees exactly.
+	// can diverge (count may exceed search). Every other content shape agrees
+	// exactly. This function is only reached through the content path, so the
+	// query always carries a content leaf: flag the divergence on a count so it
+	// is visible, but still return the count (ContentIncomplete is what refuses
+	// an inexact count; this is not that).
+	if countOnly && opts.Trace != nil && (opts.Under != "" || opts.Exists) {
+		opts.Trace.ContentCountDivergent = true
+	}
 	return filterImplicitUnderExisting(matches, opts, countOnly), nil
 }
 

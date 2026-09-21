@@ -292,19 +292,6 @@ type contentShift struct {
 
 func (f contentLossyFixups) isEmpty() bool { return len(f.shifts) == 0 }
 
-// exact reports whether decoded lies on a replacement boundary or outside every
-// replacement, so toSourceOffset is a faithful inverse there. An offset inside
-// a replacement can only be clamped, so callers that need real source bytes
-// must fall back for that region.
-func (f contentLossyFixups) exact(decoded int) bool {
-	for _, s := range f.shifts {
-		if decoded > s.at && decoded < s.at+contentReplacementLen {
-			return false
-		}
-	}
-	return true
-}
-
 // toSourceOffset maps an offset in the decoded text to the source bytes. An
 // offset may land inside a replacement rather than on its boundary; such an
 // offset is clamped to the replacement's source position.

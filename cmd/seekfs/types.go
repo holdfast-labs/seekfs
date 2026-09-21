@@ -530,6 +530,10 @@ type searchTrace struct {
 	// candidate superset within the memory budget. The result is a visible
 	// degradation, never a silent truncation; a count refuses outright.
 	ContentIncomplete bool
+	// ContentCountDivergent is set on a content count for the `under:`/Exists
+	// shapes: a count never stats, so it can exceed the search result set. The
+	// count is still returned; this only makes the divergence visible.
+	ContentCountDivergent bool
 }
 
 type traceTerm struct {

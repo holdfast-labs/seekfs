@@ -279,6 +279,81 @@ func TestContentServiceCountParity(t *testing.T) {
 	}
 }
 
+// M4: content matching is a case-insensitive literal substring, not a
+// token/word-boundary/stemming match. `foo` matches inside `foobar` and
+// `xfoox`; a document containing only `fo` or `oo` is not a match.
+func TestContentSubstringSemantics(t *testing.T) {
+	vol := newContentQueryVolume(t, []contentFixtureFile{
+		{2, "fo.txt", "fo only"},
+		{3, "oo.txt", "oo only"},
+		{4, "prefix.txt", "foobar"},
+		{5, "both.txt", "xfoox"},
+		{6, "exact.txt", "foo"},
+	})
+	matches, err := contentServiceSearch(t, vol, "content:foo", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]bool{}
+	for _, m := range matches {
+		got[m.Name] = true
+	}
+	for _, want := range []string{"prefix.txt", "both.txt", "exact.txt"} {
+		if !got[want] {
+			t.Fatalf("content:foo did not match the substring in %s: %v", want, namesOf(matches))
+		}
+	}
+	for _, bad := range []string{"fo.txt", "oo.txt"} {
+		if got[bad] {
+			t.Fatalf("content:foo matched %s; want a substring, not a whole-word match", bad)
+		}
+	}
+}
+
+// M9: a content count that carries under:/Exists never stats, so it can exceed
+// the search result set. The divergence is surfaced (trace + content health)
+// without changing or refusing the count.
+func TestContentCountDivergenceFlagged(t *testing.T) {
+	vol := newContentQueryVolume(t, []contentFixtureFile{
+		{2, "notes.txt", "alpha needle beta"},
+		{3, "b.md", "Needle in markdown"},
+	})
+
+	// A plain content count agrees with search: no divergence flag.
+	plain := &searchTrace{}
+	count, ok, err := countServiceVolumes([]*serviceVolumeIndex{vol}, queryOptions{Query: "content:needle", Trace: plain})
+	if err != nil || !ok {
+		t.Fatalf("plain content count = %d, ok=%v, err=%v", count, ok, err)
+	}
+	if count != 2 {
+		t.Fatalf("plain content count = %d; want 2", count)
+	}
+	if plain.ContentCountDivergent {
+		t.Fatal("plain content count flagged a divergence")
+	}
+	s := &goSearchService{volumes: []*serviceVolumeIndex{vol}}
+	if h := s.searchContentHealth(plain); h != nil && h.CountDivergent {
+		t.Fatalf("plain content health = %+v; want no count_divergent", h)
+	}
+
+	// under: adds a filesystem re-check to search only; the count does not
+	// stat. The count is still returned and the divergence is flagged.
+	trace := &searchTrace{}
+	count, ok, err = countServiceVolumes([]*serviceVolumeIndex{vol}, queryOptions{Query: "content:needle", Under: `C:\`, Trace: trace})
+	if err != nil || !ok {
+		t.Fatalf("under content count = %d, ok=%v, err=%v", count, ok, err)
+	}
+	if count != 2 {
+		t.Fatalf("under content count = %d; want 2 (count still returned)", count)
+	}
+	if !trace.ContentCountDivergent {
+		t.Fatal("under content count did not flag the count/search divergence")
+	}
+	if h := s.searchContentHealth(trace); h == nil || !h.CountDivergent {
+		t.Fatalf("content health = %+v; want count_divergent", h)
+	}
+}
+
 // M-minor: unusable volumes are always named in the degraded set, including
 // nil and empty entries that would otherwise be silently dropped.
 func TestContentServiceUsableVolumesReportsNilAndEmpty(t *testing.T) {

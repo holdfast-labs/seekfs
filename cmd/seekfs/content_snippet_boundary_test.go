@@ -86,32 +86,33 @@ func TestContentSnippetWindowRolloverPastCap(t *testing.T) {
 	}
 }
 
-// m1: when a case-preserving source is available the snippet reflects the
-// original case; without one it falls back to the normalized text, and an
-// inexact mapping also falls back rather than fabricating.
-func TestContentSnippetWindowSourcePreservesCase(t *testing.T) {
-	source := []byte("Café Needle Here")
-	normalized := []byte(strings.ToLower(string(source)))
-	off := bytes.Index(normalized, []byte("needle"))
+// The snippet window is rendered from the case-preserving stored text (PF-6a
+// preserves case), so the real path keeps original case even though the match
+// is found by folding the haystack. There is no case-carrying source to map
+// back from, so contentSnippetWindow is the only path.
+func TestContentSnippetWindowPreservesCase(t *testing.T) {
+	text := []byte("Café Needle Here")
+	off := bytes.Index(text, []byte("Needle"))
 	if off < 0 {
-		t.Fatal("fixture has no needle")
+		t.Fatal("fixture has no Needle")
 	}
-	got := contentSnippetWindowSource(normalized, &contentSnippetSource{text: source}, off, len("needle"))
+	got := contentSnippetWindow(text, off, len("Needle"))
 	if !strings.Contains(got, "Needle") {
-		t.Fatalf("sourced snippet %q lost original case", got)
+		t.Fatalf("snippet %q lost original case", got)
 	}
 
-	// No source: the normalized text is used verbatim.
-	plain := contentSnippetWindowSource(normalized, nil, off, len("needle"))
-	if !strings.Contains(plain, "needle") || strings.Contains(plain, "Needle") {
-		t.Fatalf("fallback snippet %q; want lowercase normalized text", plain)
+	// A case-insensitive match folds the haystack, but the window is still
+	// taken from the case-preserving raw text via the folded-offset mapping.
+	folded := contentFoldText(text)
+	foldedOff := bytes.Index(folded, []byte("needle"))
+	if foldedOff < 0 {
+		t.Fatal("folded fixture has no needle")
 	}
-
-	// Inexact mapping (offset inside a replacement) must fall back, not splice.
-	inexact := &contentSnippetSource{text: source, fixups: contentLossyFixups{shifts: []contentShift{{at: 0, gained: 1}}}}
-	fallback := contentSnippetWindowSource(normalized, inexact, 1, len("af"))
-	if fallback != contentSnippetWindow(normalized, 1, len("af")) {
-		t.Fatalf("inexact mapping did not fall back: %q", fallback)
+	rawOff := contentFoldOffsetToRaw(text, folded, foldedOff)
+	rawEnd := contentFoldOffsetToRaw(text, folded, foldedOff+len("needle"))
+	got = contentSnippetWindow(text, rawOff, rawEnd-rawOff)
+	if !strings.Contains(got, "Needle") {
+		t.Fatalf("folded-offset snippet %q lost original case", got)
 	}
 }
 

@@ -86,6 +86,10 @@ type contentHealth struct {
 	// memory budget, so the answer is a visible subset, never a silent
 	// truncation. A count in this state is refused instead of answered.
 	Incomplete bool `json:"incomplete,omitempty"`
+	// CountDivergent is set on a content count whose shape (under:/Exists)
+	// would stat on search but not on count, so the count can exceed the search
+	// result set. It is a visibility flag only: the count is still returned.
+	CountDivergent bool `json:"count_divergent,omitempty"`
 	// BuildDone/BuildTotal expose a service-owned background build's progress
 	// while the volume is in the `indexing` state. BuildError records why the
 	// last build failed and left the volume degraded (PF-3).
@@ -370,10 +374,12 @@ func (s *goSearchService) contentHealthSnapshot() *contentHealth {
 
 // searchContentHealth is contentHealthSnapshot augmented with the query's
 // degraded (partial) state: a content query that had to skip an unusable volume
-// must not look complete to the caller.
+// must not look complete to the caller. It also carries the count/search
+// divergence flag, which is informational and does not by itself mark the
+// volume degraded.
 func (s *goSearchService) searchContentHealth(trace *searchTrace) *contentHealth {
 	h := s.contentHealthSnapshot()
-	if trace == nil || (!trace.ContentPartial && !trace.ContentIncomplete) {
+	if trace == nil || (!trace.ContentPartial && !trace.ContentIncomplete && !trace.ContentCountDivergent) {
 		return h
 	}
 	if h == nil {
@@ -386,7 +392,12 @@ func (s *goSearchService) searchContentHealth(trace *searchTrace) *contentHealth
 	if trace.ContentIncomplete {
 		h.Incomplete = true
 	}
-	h.State = contentStateDegraded
+	if trace.ContentCountDivergent {
+		h.CountDivergent = true
+	}
+	if trace.ContentPartial || trace.ContentIncomplete {
+		h.State = contentStateDegraded
+	}
 	return h
 }
 

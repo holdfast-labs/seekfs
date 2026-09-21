@@ -271,6 +271,10 @@ Query filters:
   case:             Enable case-sensitive matching from the query.
   type:file         Only files.
   type:dir          Only directories.
+  content:foo       Case-insensitive literal substring in file content; not a
+                    whole-word match (foo matches foobar). Needs the
+                    SEEKFS_CONTENT_SEARCH=1 env var; content:/re/ is a regex
+                    match for word boundaries or alternation.
   a|b               OR alternatives within a term, such as ext:png|jpg.
   !term, -term      Exclude a term or filter.
 

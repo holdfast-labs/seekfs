@@ -55,6 +55,22 @@ Offline build + query:
 With the flag unset, `content`/`content-index` exit 1 with "content search is
 disabled"; the rest of seekfs is unchanged.
 
+### 2b. Content matching semantics
+
+A `content:` leaf is a **case-insensitive literal substring** match by default:
+the query text is folded with Unicode `strings.ToLower` and tested for a byte
+substring anywhere in the document's stored text (`bytes.Contains`). There is
+**no tokenization, word-boundary check, or stemming**, so `content:foo` matches
+a document containing `foobar` or `xfoox` but does **not** match one containing
+only `fo` or `oo`. `content:"foo bar"` is a phrase: the space is part of the
+literal substring. `case:true` selects case-sensitive matching (the raw,
+case-preserving stored text is compared byte-for-byte with no fold). For
+precision the index cannot express literally — word boundaries, alternation,
+anchors — use the regex form `content:/pattern/`, which is compiled with `(?i)`
+unless `case:true` is set. The fold is the same on both sides because the
+builder folds documents and the query folds the leaf with the one shared
+`contentFoldText`.
+
 Service health: when the flag is on but no valid `.gsx` is attached, the service
 reports `content.state = "unavailable"` — never `"ready"` with an unusable
 index. Content queries are served once a volume is usable; when some (not all)
@@ -193,11 +209,10 @@ fallback path memo.
   term/phrase content leaf, with `...` on a truncated side; regex-only matches
   yield no snippet. The window decodes only the bytes around the match
   (`contentSnippetWindow`), so per-result work is O(window), not O(docLen), and
-  it snaps to rune boundaries so a multibyte rune is never split. The mapping
-  path `contentLossyFixups` (`contentSnippetWindowSource`) can render original
-  case from a case-preserving source, but no current build supplies one, so
-  snippets fall back to the normalized text (see §7). An inexact mapping also
-  falls back rather than fabricating. The offline `content`
+  it snaps to rune boundaries so a multibyte rune is never split. The window is
+  rendered from the case-preserving stored text (PF-6a), so it shows original
+  case even though the match is found by folding the haystack; the folded match
+  offset is mapped back to raw bytes by rune index. The offline `content`
   command keeps `results` as an array of path strings and adds a parallel
   `snippets` array in `--json`; plain stdout stays path-only unless `--snippet`
   is passed.
@@ -370,13 +385,12 @@ incomplete flag.
 
 ## 7. Carried debt / known gaps
 
-- **Snippet case is not preserved on any current path.** The `.gsx` text store
-  is lowercased (`contentNormalizeText`), and the offline reader's "source" is
-  that same normalized text, so neither the service nor the offline reader has a
-  case-carrying source to map back to and both fall back to the normalized text.
-  `contentSnippetWindowSource` + `contentLossyFixups` are in place for a
-  case-preserving source section, but a case-carrying source section must be
-  built before any snippet can show original case.
+- **Snippet case is preserved; no fixup-aware path remains.** The `.gsx` text
+  store preserves case (`contentRepairText`, PF-6a), and both the service
+  `contentSnippet` and the offline reader render the window directly from that
+  stored text, so snippets keep original case. `contentSnippetWindowSource` and
+  its `contentSnippetSource`/fixup mapping were dead once raw text was rendered
+  directly and have been removed; `contentLossyFixups` remains for the decoder.
 - The service reads the whole `.gsx` into heap (`contentLoadFile`); mmap-ing it
   is deferred to the ARCHITECTURE_REVIEW R1/R5 engine work.
 - `contentResolvePath` has no end-to-end test (needs a compact index with a
@@ -405,8 +419,6 @@ Each item below is intentionally out of scope for P5; the rationale is one line.
 - **Posting-decode streaming in `contentCandidates`**: bounded per query today;
   streaming only matters for pathologically common grams, which the budget
   already caps.
-- **Case-preserving snippet source**: needs a new `.gsx` source section and a
-  build change; without it every snippet is correctly lowercased, never wrong.
 - **mmap of `.gsx`**: the whole file is read into heap; mmap belongs with the
   ARCHITECTURE_REVIEW R1/R5 engine work.
 - **Runtime-added-volume attach**: `replaceLoadedVolumeLocked` attaches content
