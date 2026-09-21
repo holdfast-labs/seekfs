@@ -1,7 +1,11 @@
 # Content Search — Roadmap to Filename-Search Parity
 
-Status: scope for review. Companion to `docs/CONTENT_SEARCH.md` (which documents
-P0–P5, the accepted feature as it stands today).
+Status: the parity packages (PB1–PB9, M1–M10) are complete; the remaining
+optional item is PB8 items 4–7 (global-lane integration, WP7), and **WP11 —
+additional file types — is the next body of work**. Companion to
+`docs/CONTENT_SEARCH.md` (which documents P0–P5, the accepted feature as it
+stands today); the full format detail is in the gitignored
+`docs/CONTENT_SEARCH_FORMATS_PLAN.md`.
 
 ## 0. The standard
 
@@ -229,6 +233,78 @@ Streaming postings (M6) and optional mmap of `.gsx` are the easy tails.
 - **Validation:** the sidecar stays under the cap across sustained churn and
   query latency does not drift.
 
+### WP11 — Additional file types (next steps)
+The next major body of work after the parity packages: real extraction for the
+formats PB5 still drops. Full detail — parsing specifics, licensing, security,
+test strategy, open questions — lives in the gitignored
+`docs/CONTENT_SEARCH_FORMATS_PLAN.md`; this section is the durable summary.
+- **Scope & order (value-per-effort, interface frozen first):** HTML → EML
+  (+`.emlx`/`.mht`/`.mhtml`) → mbox → RTF → MSG → PDF (separate track) → legacy
+  OLE (defer). CSV/JSON/XML/YAML/log are already text; `.pst/.ost/.one/iWork/
+  images` are documented not-indexed, not implemented.
+- **Method (per format, hand-roll vs library):**
+  - **HTML** (S): adopt `golang.org/x/net/html`'s **tokenizer** (not `Parse`) —
+    BSD-3, already in the module graph, zero new download; promote
+    indirect→direct. Mandatory `SetMaxBuf` + per-token `ctx.Err()` + `maxText`
+    truncation; charset via `x/net/html/charset`.
+  - **EML** (M): pure stdlib — `net/mail`, `mime`, `mime/multipart`,
+    `mime/quotedprintable`, `encoding/base64`; RFC 2047 headers via
+    `x/text/encoding/htmlindex`. Body-only by default; attachment recursion
+    bounded, disabled unless a nested extractor claims the filename.
+  - **mbox** (S): hand-rolled `From_`-line splitter reusing the EML parser.
+  - **RTF** (S–M): hand-rolled bounded control-word/group parser (`\uN`, `\'hh`,
+    `\par`; skip `\pict`/`\objdata`); shared with MSG's compressed body.
+  - **MSG** (M–L): hand-rolled bounded CFB reader + MAPI property streams +
+    bounded LZFu — or `github.com/richardlehane/mscfb` (Apache-2.0) if the
+    maintainer prefers; reuses the RTF parser.
+  - **PDF** (separate track, L–XL write / M–L library): bounded **hand-rolled
+    text-layer** parser — the pure-Go libraries are unsatisfying
+    (`ledongthuc/pdf` panics/unbounded, `pdfcpu` has no text extraction,
+    `unipdf` commercial/cgo rejected). Bounded xref/ObjStm/filters/ToUnicode.
+  - **Legacy OLE DOC/XLS/PPT** (L): defer; per-format binary parsers (Word piece
+    table, BIFF8 SST, PPT text atoms). Document as not-indexed until demand.
+- **Pre-requisites (P1–P4) — land before the first parser:**
+  - **P1 (blocking, decision):** `ContentType`/`ExtractorVersion` are persisted
+    but never populated (`content_build.go:252-261`;
+    `content_service.go:1178`), so a per-format `Version()` bump is inert and the
+    only invalidation is a whole-`.gsx` `contentIndexVersion` rebuild. Wire both
+    fields and decide per-doc re-extraction vs whole-`.gsx` bump.
+  - **P2 (blocking):** the offline walk builder has no panic recovery
+    (`content_build.go:151`); route it through `contentBuildDocSafe` (or a local
+    `recover`) and count a panic as `Skipped`.
+  - **P3:** M2 — enforce the per-document timeout / `ctx` at the coordinator
+    boundary (goroutine + `select` on `ctx.Done()` + deadline) and apply it to
+    the offline builder too; one ctx-ignoring parser otherwise wedges the serial
+    drain.
+  - **P4 (design gate):** keep first-party parsers in-process under the existing
+    bound patterns plus one fuzz test per parser; route untrusted/third-party
+    parsers through a documented out-of-process protocol behind the same
+    `contentExtractor` interface.
+  - **Module refactor:** move extraction into `internal/contentextract`, one
+    subpackage per format; the service allowlist auto-unions each subpackage's
+    `Extensions()` (`content_service_build.go:175-186`), so a new extractor
+    auto-scopes without a central edit.
+- **Dependency decisions to record:** promote `x/net/html` to direct; PDF
+  hand-rolled vs `ledongthuc/pdf`; MSG container hand-rolled vs `go-cfb`/`mscfb`;
+  P1 per-doc invalidation vs whole-`.gsx` bump.
+- **Effort:** ~25–50 d total — HTML S, EML M, mbox S, RTF S–M, MSG M–L, PDF
+  L–XL (write) / M–L (library); legacy OLE deferred. Pre-requisites P1/P2 are
+  cheap and block item 1; P3/P4 scale with the number of parsers.
+- **Validation:** per-format synthetic fixtures (mirroring
+  `contentOOXMLTestZip`/`contentPDFTestDoc`) asserting needle-in / boilerplate-out
+  (no `<script>`, base64 noise, `\fonttbl`, control words), `Skipped`+`Reason`
+  for encrypted/scanned/malformed, `Truncated` over cap, `len(Text) ≤ maxText`;
+  one `FuzzContent<Format>Extractor` per parser (no panic, bounded, ctx honored);
+  offline differential goldens outside CI.
+- **Risks:** every new parser is a hostile-input surface (decompression bombs,
+  malformed CFB/xref loops); format-affecting changes must go through P1/WP0.
+- **Decisions already made (do not relitigate):** PDF **text-layer only, no
+  OCR**; encrypted PDF → `Skipped`; no OCR anywhere; scanned/image-only PDFs →
+  `Skipped` ("no extractable text").
+- **Note:** independent and parallelizable with the WP7 global-lane work once
+  the extractor interface/versioning is frozen; it absorbs and concretizes the
+  earlier WP2 (PDF), WP3 (email/markup), and WP5 (legacy OLE) sketches.
+
 ### 2.1 Effort summary
 
 | WP | Scope | Effort |
@@ -247,9 +323,12 @@ Streaming postings (M6) and optional mmap of `.gsx` are the easy tails.
 | WP8 | Resource hardening (with M9) | M (4–7 d) |
 | WP9 | Semantics | M–L (5–12 d) |
 | WP10 | `.gsx` eviction/size cap/dedup (M7) | M (3–6 d) |
+| WP11 | Additional file types (HTML→EML→mbox→RTF→MSG→PDF; legacy OLE deferred) | M–XL (25–50 d; per-format) |
 
 Corrected program total: **~60–110 engineer-days**, with the content-checkpoint /
-format-versioning work (WP0) on the critical path.
+format-versioning work (WP0) on the critical path. WP11 is a separate,
+independently orderable track adding **~25–50 engineer-days**; legacy OLE stays
+deferred.
 
 ## 3. Recommended order (each gated by a reviewer, implemented one at a time)
 
@@ -270,6 +349,12 @@ format-versioning work (WP0) on the critical path.
 8. **WP8** — hardening (M1, M2, M5, M9, M10).
 9. **WP10** — `.gsx` eviction/size cap/dedup (M7).
 10. **WP5** — legacy OLE (defer unless required).
+11. **WP11 — additional file types** — the next body of work after parity:
+    pre-requisites P1/P2 first (blocking), then HTML → EML → mbox → RTF → MSG,
+    with PDF on a separate track; legacy OLE stays deferred. Independent of the
+    parity packages once the extractor interface/versioning is frozen; may run
+    alongside WP7's global-lane tail. Full detail in
+    `docs/CONTENT_SEARCH_FORMATS_PLAN.md`.
 
 The originally proposed three items map to **WP2 (PDF)**, **WP3 (email)**, and
 **WP1e (journal-reset rebuild)**; the roadmap places WP0/WP1 ahead of them
