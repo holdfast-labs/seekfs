@@ -1,16 +1,22 @@
 # Content Search — Design, Status, and Handoff
 
-Branch: `content-search`. Status: P0–P5 complete and reviewed. P4's two planner
-surfaces (`sort:relevance` and snippets) are implemented and tested; P5's final
-polish (review minors, per-query budgets, entry-free counting, journal-reset
-invalidation, freshness measurement, docs) landed. PF-3 (WP1d/WP1e) landed: the
-service now builds/rebuilds and persists its own content index in the
-background, so flag-on is content-ready without a manual CLI step and a journal
-reset self-heals instead of staying `stale` (see §6e). PF-4 (WP4/WP6) landed:
-legacy single-byte encodings (Windows-1252/Latin-1) are decoded instead of
-repaired to `U+FFFD`, an explicit encoding override exists, and the per-file
-size cap is configurable and visible (see §6f). P4 document-extraction quality
-remains deferred (see §7). Content search is off by default; with
+Branch: `content-search`. Status: P0–P5 complete and reviewed, and the PF-1–PF-7
+parity packages landed. P4's two planner surfaces (`sort:relevance` and snippets)
+are implemented and tested; P5's final polish (review minors, per-query budgets,
+entry-free counting, journal-reset invalidation, freshness measurement, docs)
+landed. PF-3 (WP1d/WP1e) landed the service-owned background build/rebuild, so
+flag-on is content-ready without a manual CLI step and a journal reset self-heals
+instead of staying `stale` (see §6e); PF-4 (WP4/WP6) landed legacy single-byte
+encoding decode (instead of repair to `U+FFFD`), an explicit encoding override,
+and the configurable per-file size cap (see §6f); PF-5c (WP10/M7) landed the
+`.gsx` size cap and the bounded fold (see §6g); PF-6a/PF-7b landed the
+case-preserving text store and the filename-only fallback for a content-unusable
+volume. PB8 landed bounded content-candidate materialization, the rank-ordered
+bounded scan fallback, and the biased/overlay early-stop fix (see §6h). The only
+parity work not taken is the optional PB8 items 4–7 (global-lane integration for
+compound content + selective-filename queries, §6h), plus the documented §7
+residuals. `.gsx` is format **v4**. P4 document-extraction quality remains
+deferred (see §7). Content search is off by default; with
 `SEEKFS_CONTENT_SEARCH=1`, `content:` queries work through the service once the
 service-owned build has attached an FRN-keyed `.gsx`.
 
@@ -88,7 +94,7 @@ when none is usable the query errors rather than returning empty.
 | `content_extract.go` | `contentExtractor` interface, registry, `contentExtractorForPath` (extension → format sniffers → text fallback), binary sniff, size caps. |
 | `content_extract_text.go` / `_ooxml.go` / `_pdf.go` | Extractors: text/code; OOXML/ODF/EPUB; best-effort PDF (spike quality). |
 | `content_open_windows.go` / `_other.go` | `contentOpenNoRecall`: opens with `FILE_FLAG_OPEN_NO_RECALL` so cloud placeholders fail instead of hydrating. |
-| `content_build.go` | Offline builders + options. `buildContentIndexFromDir` (walk, `origin=walk`, path-hash keys), `buildContentIndexForIndex` (USN, `origin=usn`, record-FRN keys), `assembleContentIndex` (streams postings through the external builder), `contentNormalizeText`, `contentPathKey`, `contentTermsOf`, `contentGramsOf`, path table codec. |
+| `content_build.go` | Offline builders + options. `buildContentIndexFromDir` (walk, `origin=walk`, path-hash keys), `buildContentIndexForIndex` (USN, `origin=usn`, record-FRN keys), `assembleContentIndex` (streams postings through the external builder), `contentRepairText` (case-preserving stored text), `contentFoldText` (case-folded index view), `contentPathKey`, `contentTermsOf`, `contentGramsOf`, path table codec. |
 | `content_read.go` | `contentReader`: decode sections, trigram-intersection candidates, substring verification, `contentHit{Path,DocID,Offset}`. |
 | `content_resolver.go` | `contentResolver`: merges FRN-sorted docs against the base FRN column → `docID -> recordID` (`contentNoRecordID` = dropped). |
 | `content_query.go` | `contentLeaf`, `contentSearchEnabled`, `contentUnavailableError`, `parseContentLeaf`, `queryHasPositiveContentLeaf`, deterministic `contentAssignLeafIDs`. |
@@ -108,9 +114,11 @@ when none is usable the query errors rather than returning empty.
   report `ready` while mapping nothing.
 - **One doc per FRN, `DocID == index`** in the FRN-sorted doc table;
   `contentIndexDecode` enforces it. Cross-file content dedup is deferred.
-- **One normalization.** `contentNormalizeText` = lowercase + lossy repair; every
-  builder and the delta extractor use it, and `ContentHash = sha256Of(normalized)`
-  so base↔delta change detection compares like with like.
+- **One repair, one fold.** `contentRepairText` = lossy repair preserving case
+  (the stored text and `ContentHash = sha256Of(repaired)`, so base↔delta change
+  detection compares like with like); `contentFoldText` = `strings.ToLower`, the
+  case-folded view the term/gram index and case-insensitive matching use. The
+  prefilter is folded, verification is case-aware (`case:true` → byte-exact).
 - **Lock order.** `contentResolvePath` takes `indexMu.RLock()` then `vol.mu`
   (matching the persist/rebuild swap). The drain passes a **private** path cache;
   it must never touch `vol.pathCache` (search trims that under `searchMu`).
@@ -383,6 +391,79 @@ happens. Recovery is to raise the cap (or reduce the indexed content) and
 rebuild, which re-extracts the deferred USN range and clears the cap and the
 incomplete flag.
 
+## 6h. PB8 — bounded content candidates + residual list (done)
+
+PB8 bounds a broad content query's cost to the result window instead of the
+whole posting superset. It also carries the count-parity, remote-content-health
+(item 8), and biased-early-stop (item 9) items.
+
+- **Bounded candidate materialization.** `contentCandidatesBounded`
+  (`content_verify.go`) takes an explicit cap: a non-count, non-relevance,
+  overlay-clean query caps the posting intersection at the completeness window
+  (`max(Limit, contentWindow)`, `search_compact.go`), so a broad term no longer
+  materializes its full posting list. A cap hit means the set is "not an ordered
+  superset", so `nameTermCandidates` falls through to the **rank-ordered bounded
+  scan** (`boundedScanCandidates`), which walks the result order and verifies
+  inline, stopping at the window. The materialization cap is deliberately
+  separate from the completeness signal: only a true budget overrun or an
+  evaluated window sets `ContentIncomplete`; a page/window cap is compensated by
+  the scan and is not itself a completeness failure.
+- **Cheaper verification.** `matchRawFirst` (`content_verify.go`) skips the fold
+  when the lowercased needle already appears verbatim in the raw text (an
+  already-lowercase corpus never folds), and the scan verifies path-free unless
+  the query reads `Entry.Path` (`scanCandidateMatches`, gated by
+  `queryNeedsEntryPath`).
+- **Biased early-stop.** A biased query (`RootBias`/`CWDBias`) early-stops in
+  biased order once the limit is filled (the root subtree's matches first, the
+  deferred non-root matches after), except where it must keep the full set
+  (`sort:relevance`, the `contentFullCandidates` differential arm). Every
+  early-stop — biased and not — is guarded on `pq.hidden.empty()`: a scan page
+  filled by overlay-hidden records would otherwise under-fill the result. The
+  captured hidden set is threaded through `parsedQuery.hidden` so the scan and
+  the verify loop drop exactly the same records (no snapshot-republish race).
+  This guard is a shared-path correctness fix: it also fixes a filename
+  (non-content) under-fill that exists on `main`, not a content-gated one.
+- **Measured (50k-doc synthetic corpus, `BenchmarkContentVsFilename`).** Single
+  content-broad 18.7 ms/818 MB → ~0.34–0.54 ms/175 KB (~15× filename-broad);
+  multi 84.7 ms/331 MB → ~1.3–2.0 ms/583 KB (~9×); content-selective ~64–96 µs.
+  A `contentFullCandidates` differential arm proves the bounded path
+  byte-identical to the historical full-candidate logic (single/multi, every
+  sort column, limits 20/5000, hidden overlays).
+
+Residual / known limitations (all explicit deferrals):
+
+- **Content bypasses the global planner lanes (PB8 items 4–7).** A compound
+  content + selective-filename query (`content:<common> ext:.go under:<dir>`)
+  does not lane-intersect: the content path runs per-volume and the cost is
+  driven by the content candidates. Deferred/optional; if pursued, prototype the
+  `globalRecordID` ↔ content-docID join first.
+- **OR-alternative candidate union.** `contentAltCandidateDocs` still
+  materializes each alternative's doc set (`budget=0`); a k-way streamed union is
+  an optimization tail.
+- **`.gsx` read into heap.** `contentLoadFile` reads the whole sidecar; mmap is
+  deferred to the engine R1/R5 work.
+- **Completeness residual.** A window-capped superset whose true matches fall in
+  `[userLimit, window)` reports `incomplete` conservatively (the safe direction).
+- **M2.** A `context`-ignoring extractor can wedge the serial drain/build; the
+  per-document timeout only bounds an extractor that observes it, and the
+  offline walk builder (`buildContentIndexFromDir`) applies no per-doc timeout.
+- **M10.** A service that loses the `.gsx.lock` race at startup never
+  re-acquires it (best-effort, logged; `acquireContentVolumeLock`).
+- **Over-cap fold.** A 15-minute capped backoff (`contentFoldCappedBackoff`); a
+  volume whose live content exceeds `contentGSXMaxBytes` needs a rebuild/restart,
+  and `markDeltaCapped` does not schedule one.
+- **Capped/aborted catch-up** leaves `catchUpPending` set until
+  `ensureContentBuild`/restart.
+- **No per-volume drain cancellation** (loops end at `s.stop`).
+- **Binary-sniff edges.** BOM-less UTF-16 is rejected; a NUL-free binary file is
+  indexed as text.
+- **`contentResolvePath`** has no end-to-end test (only the FRN-column fallback
+  is unit-tested).
+- **PDF extraction** remains a best-effort spike (no xref/object streams, Flate
+  only).
+- **Dead code.** `contentPostingIndex.lookup`/`forEach` and
+  `contentLossyFixups.toSourceOffset`/`isEmpty` are test-only (annotated).
+
 ## 7. Carried debt / known gaps
 
 - **Snippet case is preserved; no fixup-aware path remains.** The `.gsx` text
@@ -395,20 +476,9 @@ incomplete flag.
   is deferred to the ARCHITECTURE_REVIEW R1/R5 engine work.
 - `contentResolvePath` has no end-to-end test (needs a compact index with a
   parent chain); only its `contentLookupFRNColumn` fallback is tested.
-- Runtime-added volumes (`replaceLoadedVolumeLocked`) get no content attach;
-  they are rebound only if previously attached.
 - No per-volume drain cancellation (loops end at `s.stop`).
 - PDF extraction is a best-effort spike (no xref/object streams, Flate only,
   simple fonts only); quality is a P4 decision.
-- Content query tests attach with `setReady` directly; an end-to-end test of
-  `attachContentForVolume` (origin guard + persisted FRN resolver) is still
-  missing.
-- The posting decode in `contentCandidates` is not streamed, so a very common
-  gram is fully decoded before the candidate cap; bounded per query but large.
-- The remote response sanitizer omits `Content`, so remote callers of a partial
-  content query see only `Complete=false`, not the degraded-volume detail.
-- A biased content search (`RootBias`/`CWDIBias`) disables the incremental
-  early-stop and scans up to the match budget before the limit is applied.
 
 ### Explicitly deferred (P5)
 
@@ -416,22 +486,29 @@ Each item below is intentionally out of scope for P5; the rationale is one line.
 
 - **PDF extraction quality** (xref/object streams, CID/Type0 fonts): the
   extractor is a best-effort spike; a real PDF engine is its own project.
-- **Posting-decode streaming in `contentCandidates`**: bounded per query today;
-  streaming only matters for pathologically common grams, which the budget
-  already caps.
+- **Posting-decode streaming in `contentCandidates`**: DONE in M6 — the posting
+  codec's `postings`/`forEach` page the 1024-doc blocks and `content_read.go`'s
+  `intersectDocIDStreams` merge-intersects lazy per-trigram streams, so a broad
+  gram is never fully decoded (peak memory is O(budget + #trigrams)).
 - **mmap of `.gsx`**: the whole file is read into heap; mmap belongs with the
   ARCHITECTURE_REVIEW R1/R5 engine work.
-- **Runtime-added-volume attach**: `replaceLoadedVolumeLocked` attaches content
-  only for previously attached volumes; wiring attach-on-add is a broader
-  service change.
+- **Runtime-added-volume attach**: DONE in PF-3 (§6e) — `ensureContentBuild`
+  runs after `index-usn` (`service_server.go:513`) and after
+  `replaceLoadedVolume` (`service_server.go:548`), so a runtime-added or
+  re-indexed volume is attached or scheduled instead of staying unavailable.
+- **`attachContentForVolume` end-to-end test**: DONE — the origin guard
+  (walk-keyed sidecar refused, USN-keyed attached) and the persisted FRN
+  resolver are covered end-to-end in `content_service_integration_test.go`, and
+  the attach + restart catch-up path in `content_restart_test.go`.
 - **`contentResolvePath` end-to-end test**: needs a compact index with a real
   parent chain; only its `contentLookupFRNColumn` fallback is unit-tested today.
 - **Journal-reset content rebuild scheduling**: DONE in PF-3 (§6e) — a reset
   marks the index `stale` and the rebuild chain schedules and re-attaches a
   service-owned content build, so content self-heals.
-- **Ranking the capped positive-content candidate set**: the cap is applied in
-  FRN-hash order, so an incomplete positive search returns an arbitrary subset
-  (flagged incomplete); ranking the capped set is future work.
+- **Ranking the capped positive-content candidate set**: DONE in PB8 (§6h) — a
+  capped posting superset is no longer used as the result order; the bounded
+  path falls through to the rank-ordered bounded scan, which is a complete
+  superset in result order.
 - **Multi-leaf AND / deep OR/NOT nesting tests**: `content:a content:b` and
   content nested inside OR/NOT are covered only in combination today.
 - **`count == len(search)` exception**: for `sort:relevance` whose per-volume
