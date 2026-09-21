@@ -290,11 +290,14 @@ type contentShift struct {
 	gained int
 }
 
+// isEmpty reports whether the fixups list is empty.
+// test-only: no production caller.
 func (f contentLossyFixups) isEmpty() bool { return len(f.shifts) == 0 }
 
 // toSourceOffset maps an offset in the decoded text to the source bytes. An
 // offset may land inside a replacement rather than on its boundary; such an
 // offset is clamped to the replacement's source position.
+// test-only: no production caller.
 func (f contentLossyFixups) toSourceOffset(decoded int) int {
 	if len(f.shifts) == 0 {
 		return decoded

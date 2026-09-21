@@ -136,23 +136,23 @@ func TestContentServiceRelevanceOrder(t *testing.T) {
 	}
 }
 
-// A non-content query with sort:relevance parses and is left in the default
-// (name/path) order, consistent with the other sort columns.
-func TestContentServiceRelevanceIgnoredForNonContent(t *testing.T) {
+// sort:relevance is a content-only ordering: a filename-only query keeps the
+// pre-content contract and rejects it as an unsupported sort, while a
+// content-token query accepts it.
+func TestContentServiceRelevanceRejectedForNonContent(t *testing.T) {
 	vol := newContentQueryVolume(t, []contentFixtureFile{
 		{2, "beta.txt", "x"},
 		{3, "alpha.txt", "y"},
 	})
-	plain, err := contentServiceSearch(t, vol, "ext:.txt", false)
-	if err != nil {
-		t.Fatal(err)
+	if _, err := contentServiceSearch(t, vol, "ext:.txt sort:relevance", false); err == nil || !strings.Contains(err.Error(), "unsupported sort") {
+		t.Fatalf("non-content sort:relevance = %v; want unsupported sort", err)
 	}
-	rel, err := contentServiceSearch(t, vol, "ext:.txt sort:relevance", false)
-	if err != nil {
-		t.Fatal(err)
+	if _, err := contentServiceSearch(t, vol, "content:x sort:relevance", false); err != nil {
+		t.Fatalf("content sort:relevance should be accepted: %v", err)
 	}
-	if !sameOrder(entryNamesInOrder(plain), entryNamesInOrder(rel)) {
-		t.Fatalf("non-content sort:relevance changed the order: %v vs %v", entryNamesInOrder(plain), entryNamesInOrder(rel))
+	t.Setenv("SEEKFS_CONTENT_SEARCH", "0")
+	if _, err := parseQuery(queryOptions{Query: "ext:.txt sort:relevance"}); err == nil || !strings.Contains(err.Error(), "unsupported sort") {
+		t.Fatalf("flag-off non-content sort:relevance = %v; want unsupported sort", err)
 	}
 }
 

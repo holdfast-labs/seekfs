@@ -756,3 +756,53 @@ func TestContentServiceDeltaInLowMemoryMode(t *testing.T) {
 		t.Fatalf("delta content search = %v; want [base1.txt]", got)
 	}
 }
+
+// Multi-volume content health must not hide a degraded sibling behind a ready
+// first volume: the aggregate reports the worst state and sums both volumes'
+// docs.
+func TestContentServiceHealthAggregatesVolumes(t *testing.T) {
+	volC := newContentQueryVolumeNamed(t, "C:", []contentFixtureFile{
+		{2, "c1.txt", "needle one"},
+		{3, "c2.txt", "needle two"},
+	})
+	volF := newContentQueryVolumeNamed(t, "F:", []contentFixtureFile{
+		{4, "f1.txt", "needle three"},
+	})
+	volF.content.markBuildFailed("extract failed on F:")
+	s := &goSearchService{volumes: []*serviceVolumeIndex{volC, volF}}
+	h := s.contentHealthSnapshot()
+	if h == nil {
+		t.Fatal("contentHealthSnapshot = nil; want an aggregate")
+	}
+	if h.State != contentStateDegraded || !h.Incomplete {
+		t.Fatalf("aggregate = %+v; want state degraded and incomplete", h)
+	}
+	if h.Docs != 3 {
+		t.Fatalf("aggregate docs = %d; want 3 (both volumes)", h.Docs)
+	}
+	if !strings.Contains(h.BuildError, "extract failed on F:") {
+		t.Fatalf("aggregate build error = %q; want the degraded volume's reason", h.BuildError)
+	}
+}
+
+// A lone content volume is reported exactly as its own snapshot, so the
+// single-volume `loaded --json` shape is unchanged by the aggregate.
+func TestContentServiceHealthSingleVolumeUnchanged(t *testing.T) {
+	vol := newContentQueryVolume(t, []contentFixtureFile{
+		{2, "a.txt", "alpha"},
+		{3, "b.txt", "beta"},
+	})
+	s := &goSearchService{volumes: []*serviceVolumeIndex{vol}}
+	h := s.contentHealthSnapshot()
+	if h == nil {
+		t.Fatal("contentHealthSnapshot = nil; want the volume's health")
+	}
+	want := vol.content.healthSnapshot(0)
+	if h.State != want.State || h.Docs != want.Docs || h.SidecarBytes != want.SidecarBytes ||
+		h.SidecarCap != want.SidecarCap || h.MaxRaw != want.MaxRaw || h.LastRebuild != want.LastRebuild {
+		t.Fatalf("single-volume aggregate = %+v; want verbatim %+v", h, want)
+	}
+	if h.State != contentStateReady {
+		t.Fatalf("single-volume state = %q; want ready", h.State)
+	}
+}

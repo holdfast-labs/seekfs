@@ -284,12 +284,18 @@ func applyQueryToken(pq *parsedQuery, raw string) error {
 	case strings.HasPrefix(raw, "sort:"):
 		sortColumn := strings.ToLower(strings.TrimSpace(strings.TrimPrefix(raw, "sort:")))
 		switch sortColumn {
-		case "size", "modified", "extension", "type", "path", "relevance":
-			// relevance is accepted but not yet ranked (P4); it keeps the token
-			// from being a parse error while falling through to default order.
+		case "size", "modified", "extension", "type", "path":
+			pq.SortColumn = sortColumn
+		case "relevance":
+			// Content relevance is implemented only by the content pipeline.
+			// A filename-only query keeps the pre-content contract and rejects
+			// it as an unsupported sort, so the flag-off behavior is unchanged.
+			if !queryHasContentToken(pq.Raw) {
+				return fmt.Errorf("unsupported sort %q; supported: sort:size, sort:modified, sort:extension, sort:type, sort:path", raw)
+			}
 			pq.SortColumn = sortColumn
 		default:
-			return fmt.Errorf("unsupported sort %q; supported: sort:size, sort:modified, sort:extension, sort:type, sort:path, sort:relevance", raw)
+			return fmt.Errorf("unsupported sort %q; supported: sort:size, sort:modified, sort:extension, sort:type, sort:path", raw)
 		}
 	case raw == "case:" || raw == "case:true":
 		pq.CaseSensitive = true
@@ -308,7 +314,7 @@ func applyQueryToken(pq *parsedQuery, raw string) error {
 		}
 		return nil
 	case isUnknownFilterToken(raw):
-		return fmt.Errorf("unsupported filter %q; supported: path: parent: ext: dir: glob: regex: type: case: size: dm: attrib: content: (needs SEEKFS_CONTENT_SEARCH=1) sort:size sort:modified sort:extension sort:type sort:path sort:relevance (and !term, a|b)", raw)
+		return fmt.Errorf("unsupported filter %q; supported: path: parent: ext: dir: glob: regex: type: case: size: dm: attrib: content: (needs SEEKFS_CONTENT_SEARCH=1) sort:size sort:modified sort:extension sort:type sort:path (and !term, a|b)", raw)
 	case looksLikeImplicitFilenameGlob(raw):
 		pq.Globs = append(pq.Globs, normalizeCase(raw, pq.CaseSensitive))
 	default:

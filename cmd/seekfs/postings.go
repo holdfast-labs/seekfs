@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"sort"
 	"strings"
@@ -1697,14 +1698,49 @@ func (idx *Index) compactPathContainsAll(i int, terms []string) bool {
 	return true
 }
 
+// cloneParsedQuery returns a deep copy of pq: every slice field gets its own
+// backing array and OR/NOT subqueries are copied recursively, so a caller can
+// mutate the result without touching pq. parseQuery uses it on the
+// parsedOverride path (the filename-only fallback), which runs only when a
+// volume's content index is unusable, not on the hot filename path.
+func cloneParsedQuery(pq parsedQuery) parsedQuery {
+	out := pq
+	out.Terms = append([]string(nil), pq.Terms...)
+	out.ImplicitPathTerms = append([]string(nil), pq.ImplicitPathTerms...)
+	out.Exts = append([]string(nil), pq.Exts...)
+	out.Dirs = append([]string(nil), pq.Dirs...)
+	out.Globs = append([]string(nil), pq.Globs...)
+	out.Regexps = append([]*regexp.Regexp(nil), pq.Regexps...)
+	out.RegexTerms = append([]string(nil), pq.RegexTerms...)
+	out.Parents = append([]string(nil), pq.Parents...)
+	out.SizeFilters = append([]sizeFilter(nil), pq.SizeFilters...)
+	out.DateFilters = append([]dateFilter(nil), pq.DateFilters...)
+	out.AttrFilters = append([]uint32(nil), pq.AttrFilters...)
+	out.Content = append([]contentLeaf(nil), pq.Content...)
+	if len(pq.OrGroups) > 0 {
+		out.OrGroups = make([][]parsedQuery, len(pq.OrGroups))
+		for i, group := range pq.OrGroups {
+			out.OrGroups[i] = make([]parsedQuery, len(group))
+			for j := range group {
+				out.OrGroups[i][j] = cloneParsedQuery(group[j])
+			}
+		}
+	}
+	if len(pq.NotGroups) > 0 {
+		out.NotGroups = make([]parsedQuery, len(pq.NotGroups))
+		for i := range pq.NotGroups {
+			out.NotGroups[i] = cloneParsedQuery(pq.NotGroups[i])
+		}
+	}
+	return out
+}
+
 func parseQuery(opts queryOptions) (parsedQuery, error) {
 	if opts.parsedOverride != nil {
 		// PF-7b: a caller supplied a pre-built tree (the stripped filename-only
-		// query). Copy it so a downstream dropSatisfiedVolumeTerms cannot mutate
-		// the shared override, and give Terms its own backing array.
-		pq := *opts.parsedOverride
-		pq.Terms = append([]string(nil), pq.Terms...)
-		return pq, nil
+		// query). Deep-copy it so a downstream in-place mutator
+		// (dropSatisfiedVolumeTerms) cannot reach the shared request-level tree.
+		return cloneParsedQuery(*opts.parsedOverride), nil
 	}
 	pq := parsedQuery{
 		Raw:                    opts.Query,
@@ -1753,9 +1789,10 @@ func parseQuery(opts queryOptions) (parsedQuery, error) {
 		}
 	}
 	promotePathExtensionTerms(&pq)
-	// Assign deterministic content LeafIDs from the parsed tree. Inert today
-	// because any content: token returns before this point, but wired so P1 can
-	// rely on stable per-leaf keys the moment parsing succeeds.
+	// Assign deterministic content LeafIDs from the parsed tree, so the content
+	// verifier and relevance ordering can key on stable per-leaf IDs. A query
+	// with no content leaves is a no-op; a content: token only returns from
+	// applyQueryToken, not from parseQuery, so this runs for content queries too.
 	contentAssignLeafIDs(&pq)
 	if pq.isEmpty() {
 		return pq, errors.New("query has no searchable terms or filters")

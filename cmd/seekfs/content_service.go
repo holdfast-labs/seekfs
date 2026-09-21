@@ -18,6 +18,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 )
@@ -349,15 +350,158 @@ func newContentVolumeState(volume string) *contentVolumeState {
 	}
 }
 
-// contentHealthSnapshot returns the content health of the first volume that has
-// content state, or nil when content search is disabled. It is surfaced through
-// `loaded --json` and the search response.
+// contentStateSeverity orders content health states from best to worst so a
+// multi-volume snapshot can report the worst one: ready and off (content
+// disabled for the volume) are benign, then unavailable (enabled but not wired),
+// a build in flight, a degraded volume, and finally stale (needs a rebuild).
+func contentStateSeverity(state string) int {
+	switch state {
+	case contentStateStale:
+		return 4
+	case contentStateDegraded:
+		return 3
+	case contentStateIndexing:
+		return 2
+	case contentStateUnavailable:
+		return 1
+	default: // ready, off, ""
+		return 0
+	}
+}
+
+// mergeContentHealth folds one volume's health into the aggregate using the
+// worst-case rules documented on contentHealthSnapshot. BuildDone/BuildTotal are
+// handled by the caller (only indexing volumes contribute).
+func mergeContentHealth(dst *contentHealth, src contentHealth) {
+	if contentStateSeverity(src.State) > contentStateSeverity(dst.State) {
+		dst.State = src.State
+	}
+	dst.Docs += src.Docs
+	dst.Bytes += src.Bytes
+	dst.QueueDepth += src.QueueDepth
+	dst.Evictions += src.Evictions
+	dst.ExtractionErrors += src.ExtractionErrors
+	dst.Skipped += src.Skipped
+	dst.Truncated += src.Truncated
+	dst.SidecarBytes += src.SidecarBytes
+	dst.SidecarCap += src.SidecarCap
+	// Extractor versions should agree across volumes; keep the highest so a
+	// version-skewed host is visible and the field never goes backwards.
+	if src.ExtractorVersion > dst.ExtractorVersion {
+		dst.ExtractorVersion = src.ExtractorVersion
+	}
+	dst.Partial = dst.Partial || src.Partial
+	dst.Incomplete = dst.Incomplete || src.Incomplete
+	dst.CountDivergent = dst.CountDivergent || src.CountDivergent
+	for _, v := range src.DegradedVolumes {
+		if !containsVolumeName(dst.DegradedVolumes, v) {
+			dst.DegradedVolumes = append(dst.DegradedVolumes, v)
+		}
+	}
+	if src.BuildError != "" && !strings.Contains(dst.BuildError, src.BuildError) {
+		if dst.BuildError == "" {
+			dst.BuildError = src.BuildError
+		} else {
+			dst.BuildError += "; " + src.BuildError
+		}
+	}
+	dst.MaxRaw = minContentCap(dst.MaxRaw, src.MaxRaw)
+	dst.MaxText = minContentCap(dst.MaxText, src.MaxText)
+	dst.LastRebuild = oldestContentTimestamp(dst.LastRebuild, src.LastRebuild)
+	dst.LastDrain = newestContentTimestamp(dst.LastDrain, src.LastDrain)
+}
+
+func containsVolumeName(list []string, want string) bool {
+	for _, v := range list {
+		if v == want {
+			return true
+		}
+	}
+	return false
+}
+
+// minContentCap returns the smaller non-zero cap: the effective extraction cap
+// when one volume allows a larger file than another. Zero means "no cap".
+func minContentCap(a, b int64) int64 {
+	switch {
+	case a == 0:
+		return b
+	case b == 0:
+		return a
+	case b < a:
+		return b
+	default:
+		return a
+	}
+}
+
+// oldestContentTimestamp compares RFC3339 UTC timestamps lexicographically (the
+// fixed-width format sorts chronologically). Empty means unset.
+func oldestContentTimestamp(a, b string) string {
+	switch {
+	case a == "":
+		return b
+	case b == "":
+		return a
+	case b < a:
+		return b
+	default:
+		return a
+	}
+}
+
+func newestContentTimestamp(a, b string) string {
+	if b > a {
+		return b
+	}
+	return a
+}
+
+// aggregateContentHealth merges per-volume health snapshots using the rules
+// documented on contentHealthSnapshot.
+func aggregateContentHealth(healths []contentHealth) contentHealth {
+	out := healths[0]
+	// Build progress is only meaningful while a volume is indexing; a ready
+	// volume can carry a stale BuildTotal from its last build, so only indexing
+	// volumes contribute.
+	out.BuildDone, out.BuildTotal = 0, 0
+	for i, h := range healths {
+		if h.State == contentStateIndexing {
+			out.BuildDone += h.BuildDone
+			out.BuildTotal += h.BuildTotal
+		}
+		if i > 0 {
+			mergeContentHealth(&out, h)
+		}
+	}
+	return out
+}
+
+// contentHealthSnapshot aggregates content health across every content-enabled
+// volume, or returns nil when content search is disabled or no volume carries
+// content state. Exactly one content volume is returned verbatim, so the
+// single-volume shape is unchanged; with more than one the snapshots merge
+// worst-case:
+//
+//   - State is the most severe state: ready/off < unavailable < indexing <
+//     degraded < stale (contentStateSeverity).
+//   - Docs, Bytes, QueueDepth, Evictions, ExtractionErrors, Skipped, Truncated,
+//     SidecarBytes and SidecarCap are summed; BuildDone/BuildTotal sum only
+//     while indexing.
+//   - Partial, Incomplete and CountDivergent are OR-ed.
+//   - DegradedVolumes is the deduped stable union.
+//   - ExtractorVersion takes the highest.
+//   - BuildError joins the distinct non-empty reasons with "; ".
+//   - MaxRaw/MaxText keep the smallest non-zero cap (the effective cap).
+//   - LastRebuild takes the oldest, so "stale since" stays visible; LastDrain
+//     takes the newest.
 func (s *goSearchService) contentHealthSnapshot() *contentHealth {
 	if s == nil || !contentSearchEnabled() {
 		return nil
 	}
 	s.indexMu.RLock()
 	defer s.indexMu.RUnlock()
+	var healths []contentHealth
 	for _, vol := range s.volumes {
 		if vol == nil || vol.content == nil {
 			continue
@@ -366,10 +510,18 @@ func (s *goSearchService) contentHealthSnapshot() *contentHealth {
 		if vol.contentCoord != nil {
 			depth = vol.contentCoord.queued()
 		}
-		h := vol.content.healthSnapshot(depth)
+		healths = append(healths, vol.content.healthSnapshot(depth))
+	}
+	switch len(healths) {
+	case 0:
+		return nil
+	case 1:
+		h := healths[0]
+		return &h
+	default:
+		h := aggregateContentHealth(healths)
 		return &h
 	}
-	return nil
 }
 
 // searchContentHealth is contentHealthSnapshot augmented with the query's

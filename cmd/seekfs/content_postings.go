@@ -259,6 +259,7 @@ func (idx *contentPostingIndex) postings(key string) (next func() (uint32, uint3
 // forEach invokes fn for each posting of key in docID order, stopping early when
 // fn returns false. found reports whether the key exists (a truncated/corrupt
 // list still reports found). It never allocates the full posting list.
+// test-only: driven by the content postings tests through lookup.
 func (idx *contentPostingIndex) forEach(key string, fn func(docID, tf uint32) bool) bool {
 	next, found := idx.postings(key)
 	if !found {
@@ -276,6 +277,7 @@ func (idx *contentPostingIndex) forEach(key string, fn func(docID, tf uint32) bo
 }
 
 // lookup returns the postings for key, decoded, in docID order.
+// test-only: no production caller.
 func (idx *contentPostingIndex) lookup(key string) ([]contentDocFreq, bool) {
 	var out []contentDocFreq
 	found := idx.forEach(key, func(docID, tf uint32) bool {
