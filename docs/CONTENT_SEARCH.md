@@ -532,3 +532,20 @@ No bundled/forked tgrep binary; no semantic/embedding layer (see
 `docs/FUZZY_RANKED_SEARCH_PLAN.md`); no CID/Type0 CJK PDF text; no AST/symbol
 search; no network/client-server content search; content stays opt-in and
 size-capped, never whole-disk by default.
+
+### Considered and rejected
+
+- **LLM/BPE tokenizers (e.g. `gigatoken`, `tiktoken`, HuggingFace
+  `tokenizers`, SentencePiece) as the index tokenizer.** These encode text into
+  model-specific subword IDs for language-model input. Our index is lexical:
+  `contentTermsOf` word runs plus `contentGramsOf` trigrams as a candidate
+  prefilter, with literal-substring verification (§2b). BPE merges subwords
+  against a model vocab, so `content:foo` would stop matching `foobar`, the
+  index would be bound to one model's vocab, and the Rust/Python-ABI ecosystem
+  does not fit the Windows-first, no-C-toolchain, single-binary build. It also
+  solves a cost we do not have (PB8 showed candidate materialization, not
+  tokenization, was the bottleneck). A fast tokenizer becomes relevant only if
+  semantic/embedding search is ever added — a separate design (embeddings +
+  vector store), and a current non-goal. If lexical indexing needs more speed,
+  the levers are SIMD trigram extraction, posting compression with block-max
+  skipping (the postings are already 1024-doc block-paged), and `.gsx` mmap.
