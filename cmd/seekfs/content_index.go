@@ -370,6 +370,33 @@ func contentIndexDecode(data []byte) (*contentIndex, error) {
 	return idx, nil
 }
 
+// contentIndexExtractorMismatch reports whether a decoded index contains a doc
+// whose extractor identity no longer matches the registry, so the volume must
+// be rebuilt rather than served. A doc with ContentType==0 is an older `.gsx`
+// written before these fields were populated. A class whose registered version
+// differs means that extractor's Version() was bumped, so re-extract. Per-doc
+// incremental re-extraction is a future optimization; a mismatch rebuilds the
+// whole volume (safe, simple), never serving stale extracted text.
+func contentIndexExtractorMismatch(idx *contentIndex) (string, bool) {
+	if idx == nil {
+		return "nil content index", true
+	}
+	for i := range idx.Docs {
+		d := &idx.Docs[i]
+		if d.ContentType == 0 {
+			return "content doc has no content type", true
+		}
+		want, ok := contentExtractorVersionForClass(d.ContentType)
+		if !ok {
+			return fmt.Sprintf("content doc class %d has no registered extractor", d.ContentType), true
+		}
+		if d.ExtractorVersion != want {
+			return fmt.Sprintf("content doc class %d version %d != %d", d.ContentType, d.ExtractorVersion, want), true
+		}
+	}
+	return "", false
+}
+
 // contentLookupFRN binary-searches the FRN-sorted doc table.
 func contentLookupFRN(docs []contentDoc, frn uint64) (int, bool) {
 	i := sort.Search(len(docs), func(i int) bool { return docs[i].FRN >= frn })

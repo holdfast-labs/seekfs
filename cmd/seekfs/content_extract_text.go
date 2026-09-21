@@ -13,6 +13,7 @@ type contentTextExtractor struct{}
 
 func (contentTextExtractor) Name() string    { return "text" }
 func (contentTextExtractor) Version() uint16 { return 1 }
+func (contentTextExtractor) Class() uint16   { return contentClassText }
 
 // Extensions is empty: the text extractor is the fallback for any file whose
 // extension is not claimed by a richer extractor and which is not binary.

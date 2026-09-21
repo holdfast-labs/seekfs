@@ -264,7 +264,7 @@ func (m *contentFoldSource) next() (contentBuildDoc, bool, error) {
 			if d.Deleted {
 				continue
 			}
-			return contentBuildDoc{frn: d.FRN, path: d.Path, text: d.Text}, true, nil
+			return contentBuildDoc{frn: d.FRN, path: d.Path, text: d.Text, class: d.ContentType, version: d.ExtractorVersion}, true, nil
 		case haveBase && (!haveDelta || baseFRN < deltaFRN):
 			doc := m.base[m.i]
 			m.i++
@@ -272,7 +272,7 @@ func (m *contentFoldSource) next() (contentBuildDoc, bool, error) {
 			if len(text) == 0 {
 				continue
 			}
-			return contentBuildDoc{frn: doc.FRN, path: m.reader.docPath(doc.DocID), text: text, modUnix: doc.ModUnix}, true, nil
+			return contentBuildDoc{frn: doc.FRN, path: m.reader.docPath(doc.DocID), text: text, modUnix: doc.ModUnix, class: doc.ContentType, version: doc.ExtractorVersion}, true, nil
 		case haveBase && haveDelta:
 			// Same FRN: the delta replaces the base doc; a tombstone drops it.
 			d := m.delta[m.j]
@@ -281,7 +281,7 @@ func (m *contentFoldSource) next() (contentBuildDoc, bool, error) {
 			if d.Deleted {
 				continue
 			}
-			return contentBuildDoc{frn: d.FRN, path: d.Path, text: d.Text}, true, nil
+			return contentBuildDoc{frn: d.FRN, path: d.Path, text: d.Text, class: d.ContentType, version: d.ExtractorVersion}, true, nil
 		default:
 			return contentBuildDoc{}, false, nil
 		}

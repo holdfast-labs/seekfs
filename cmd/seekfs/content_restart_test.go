@@ -91,8 +91,8 @@ func TestContentRestartCatchUpAfterDrain(t *testing.T) {
 	vol := newServiceVolumeIndex(dbPath, idx)
 
 	base, err := assembleContentIndex([]contentBuildDoc{
-		{path: `C:\alpha.txt`, frn: 10, text: []byte("alpha old needlealpha")},
-		{path: `C:\beta.txt`, frn: 20, text: []byte("beta needlebeta")},
+		{path: `C:\alpha.txt`, frn: 10, text: []byte("alpha old needlealpha"), class: contentClassText, version: 1},
+		{path: `C:\beta.txt`, frn: 20, text: []byte("beta needlebeta"), class: contentClassText, version: 1},
 	}, t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -187,7 +187,7 @@ func TestContentAttachCheckpointBranches(t *testing.T) {
 	}
 	writeBase := func(t *testing.T, gsx string, journal, cp uint64) {
 		t.Helper()
-		cidx, err := assembleContentIndex([]contentBuildDoc{{path: `C:\a.txt`, frn: 10, text: []byte("alpha")}}, t.TempDir())
+		cidx, err := assembleContentIndex([]contentBuildDoc{{path: `C:\a.txt`, frn: 10, text: []byte("alpha"), class: contentClassText, version: 1}}, t.TempDir())
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -315,7 +315,7 @@ func TestContentAttachSkipsNonReadyVolume(t *testing.T) {
 	idx.Records = []CompactRecord{{FRN: 10, ParentFRN: 1, Parent: -1, Name: "a.txt", Size: 10}}
 	contentIndexFRNs(idx)
 	vol := newServiceVolumeIndex(filepath.Join(dir, "seekfs_c.gsi"), idx)
-	cidx, err := assembleContentIndex([]contentBuildDoc{{path: `C:\a.txt`, frn: 10, text: []byte("alpha")}}, t.TempDir())
+	cidx, err := assembleContentIndex([]contentBuildDoc{{path: `C:\a.txt`, frn: 10, text: []byte("alpha"), class: contentClassText, version: 1}}, t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -362,7 +362,7 @@ func TestContentAttachRacesJournalReset(t *testing.T) {
 	idx.Records = []CompactRecord{{FRN: 10, ParentFRN: 1, Parent: -1, Name: "a.txt", Size: 10}}
 	contentIndexFRNs(idx)
 	vol := newServiceVolumeIndex(dbPath, idx)
-	cidx, err := assembleContentIndex([]contentBuildDoc{{path: `C:\a.txt`, frn: 10, text: []byte("alpha")}}, t.TempDir())
+	cidx, err := assembleContentIndex([]contentBuildDoc{{path: `C:\a.txt`, frn: 10, text: []byte("alpha"), class: contentClassText, version: 1}}, t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -414,7 +414,7 @@ func TestContentCatchUpCapsDegrade(t *testing.T) {
 		idx.Records = []CompactRecord{{FRN: 10, ParentFRN: 1, Parent: -1, Name: "a.txt", Size: 10}}
 		contentIndexFRNs(idx)
 		vol := newServiceVolumeIndex(filepath.Join(dir, "seekfs_c.gsi"), idx)
-		cidx, err := assembleContentIndex([]contentBuildDoc{{path: `C:\a.txt`, frn: 10, text: []byte("alpha")}}, t.TempDir())
+		cidx, err := assembleContentIndex([]contentBuildDoc{{path: `C:\a.txt`, frn: 10, text: []byte("alpha"), class: contentClassText, version: 1}}, t.TempDir())
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -494,7 +494,7 @@ func TestContentCatchUpAllCreateByteCapDegrade(t *testing.T) {
 	idx.Records = []CompactRecord{{FRN: 10, ParentFRN: 1, Parent: -1, Name: "base.txt", Size: 10}}
 	contentIndexFRNs(idx)
 	vol := newServiceVolumeIndex(filepath.Join(dir, "seekfs_c.gsi"), idx)
-	cidx, err := assembleContentIndex([]contentBuildDoc{{path: `C:\base.txt`, frn: 10, text: []byte("base")}}, t.TempDir())
+	cidx, err := assembleContentIndex([]contentBuildDoc{{path: `C:\base.txt`, frn: 10, text: []byte("base"), class: contentClassText, version: 1}}, t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -543,7 +543,7 @@ func TestContentCatchUpReadErrorDegraded(t *testing.T) {
 	idx.Records = []CompactRecord{{FRN: 10, ParentFRN: 1, Parent: -1, Name: "a.txt", Size: 10}}
 	contentIndexFRNs(idx)
 	vol := newServiceVolumeIndex(filepath.Join(dir, "seekfs_c.gsi"), idx)
-	cidx, err := assembleContentIndex([]contentBuildDoc{{path: `C:\a.txt`, frn: 10, text: []byte("alpha")}}, t.TempDir())
+	cidx, err := assembleContentIndex([]contentBuildDoc{{path: `C:\a.txt`, frn: 10, text: []byte("alpha"), class: contentClassText, version: 1}}, t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -621,7 +621,7 @@ func TestContentRestartCatchUpCreateAndRename(t *testing.T) {
 	}
 	contentIndexFRNs(idx)
 	vol := newServiceVolumeIndex(filepath.Join(dir, "seekfs_c.gsi"), idx)
-	base, err := assembleContentIndex([]contentBuildDoc{{path: `C:\existing.txt`, frn: 10, text: []byte("existing")}}, t.TempDir())
+	base, err := assembleContentIndex([]contentBuildDoc{{path: `C:\existing.txt`, frn: 10, text: []byte("existing"), class: contentClassText, version: 1}}, t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -752,7 +752,7 @@ func TestContentCatchUpCapSelfHealsRebuild(t *testing.T) {
 	base.Origin = contentOriginUSN
 	base.JournalID = journal
 	base.CheckpointUSN = 50
-	base.Docs = []contentDoc{{DocID: 0, FRN: 10}}
+	base.Docs = []contentDoc{{DocID: 0, FRN: 10, ContentType: contentClassText, ExtractorVersion: 1}}
 	if err := contentSaveFile(contentIndexPathForDB(vol.dbPath), base); err != nil {
 		t.Fatal(err)
 	}

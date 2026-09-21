@@ -377,7 +377,7 @@ func contentBuildDocSafe(ctx context.Context, item contentBuildItem) (doc conten
 	defer func() {
 		if recover() != nil {
 			doc = contentBuildDoc{}
-			res = contentExtractResult{}
+			res = contentExtractResult{Skipped: true, Reason: "extractor panic"}
 			ok = false
 		}
 	}()
@@ -397,14 +397,13 @@ func contentBuildDocSafe(ctx context.Context, item contentBuildItem) (doc conten
 		return contentBuildDoc{}, contentExtractResult{}, false
 	}
 	// Bound one document's extraction so a hang cannot stall the serial build;
-	// the deadline nests inside the build's stop/cancel context.
-	ctx, cancel := contentWithExtractDocTimeout(ctx)
-	defer cancel()
-	res, err = e.Extract(ctx, f, size)
+	// contentExtractSafely nests the deadline inside the build's stop/cancel
+	// context and isolates a parser panic.
+	res, err = contentExtractSafely(ctx, e, f, size)
 	if err != nil || res.Skipped || len(res.Text) == 0 {
 		return contentBuildDoc{}, res, false
 	}
-	return contentBuildDoc{path: item.path, frn: item.frn, text: res.Text, modUnix: info.ModTime().Unix()}, res, true
+	return contentBuildDoc{path: item.path, frn: item.frn, text: res.Text, modUnix: info.ModTime().Unix(), class: res.Class, version: e.Version()}, res, true
 }
 
 // contentBuildCurrent reports whether a build may still publish: the per-volume

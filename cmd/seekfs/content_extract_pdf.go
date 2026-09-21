@@ -21,6 +21,7 @@ type contentPDFExtractor struct{}
 
 func (contentPDFExtractor) Name() string    { return "pdf" }
 func (contentPDFExtractor) Version() uint16 { return 1 }
+func (contentPDFExtractor) Class() uint16   { return contentClassPDF }
 
 func (contentPDFExtractor) Extensions() []string { return []string{".pdf"} }
 

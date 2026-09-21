@@ -40,7 +40,7 @@ func newContentFoldFixture(t *testing.T, files []contentFixtureFile) *contentFol
 		}
 		paths[f.frn] = p
 		idx.Records = append(idx.Records, CompactRecord{FRN: f.frn, ParentFRN: 1, Parent: -1, Name: f.name, Size: int64(len(f.text))})
-		build = append(build, contentBuildDoc{path: `C:\` + f.name, frn: f.frn, text: []byte(f.text)})
+		build = append(build, contentBuildDoc{path: `C:\` + f.name, frn: f.frn, text: []byte(f.text), class: contentClassText, version: contentTextExtractor{}.Version()})
 	}
 	contentIndexFRNs(idx)
 

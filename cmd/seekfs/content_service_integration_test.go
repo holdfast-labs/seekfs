@@ -112,7 +112,7 @@ func TestContentAttachRequiresFRNKeyedIndex(t *testing.T) {
 	usn.Origin = contentOriginUSN
 	usn.JournalID = 5
 	usn.CheckpointUSN = 50
-	usn.Docs = []contentDoc{{DocID: 0, FRN: 5}, {DocID: 1, FRN: 6}}
+	usn.Docs = []contentDoc{{DocID: 0, FRN: 5, ContentType: contentClassText, ExtractorVersion: 1}, {DocID: 1, FRN: 6, ContentType: contentClassText, ExtractorVersion: 1}}
 	if err := contentSaveFile(gsx, usn); err != nil {
 		t.Fatal(err)
 	}
@@ -144,7 +144,7 @@ func TestContentResolverRebindsAfterBaseSwap(t *testing.T) {
 	usn.Origin = contentOriginUSN
 	usn.JournalID = 5
 	usn.CheckpointUSN = 50
-	usn.Docs = []contentDoc{{DocID: 0, FRN: 5}}
+	usn.Docs = []contentDoc{{DocID: 0, FRN: 5, ContentType: contentClassText, ExtractorVersion: 1}}
 	if err := contentSaveFile(contentIndexPathForDB(dbPath), usn); err != nil {
 		t.Fatal(err)
 	}

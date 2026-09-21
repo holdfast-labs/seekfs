@@ -234,16 +234,39 @@ func (r *contentReader) allDocIDStream() func() (uint32, bool) {
 // contentEmptyDocIDStream yields nothing.
 func contentEmptyDocIDStream() (uint32, bool) { return 0, false }
 
-// sliceDocIDStream adapts a materialized ascending docID slice to a stream.
-func sliceDocIDStream(ids []uint32) func() (uint32, bool) {
-	i := 0
+// unionDocIDStreams lazily k-way unions ascending docID streams into one
+// ascending stream of DISTINCT docIDs, holding one cursor per stream rather than
+// any stream's full list. Every stream sitting on an emitted docID is advanced
+// before the next value, so duplicates collapse. A consumer that stops at a
+// budget (the candidate cap) stops pulling every source, so no alternative's
+// postings are decoded in full.
+func unionDocIDStreams(streams []func() (uint32, bool)) func() (uint32, bool) {
+	if len(streams) == 0 {
+		return contentEmptyDocIDStream
+	}
+	cur := make([]uint32, len(streams))
+	live := make([]bool, len(streams))
+	for i, s := range streams {
+		cur[i], live[i] = s()
+	}
 	return func() (uint32, bool) {
-		if i >= len(ids) {
+		var minID uint32
+		any := false
+		for i := range streams {
+			if live[i] && (!any || cur[i] < minID) {
+				minID = cur[i]
+				any = true
+			}
+		}
+		if !any {
 			return 0, false
 		}
-		id := ids[i]
-		i++
-		return id, true
+		for i := range streams {
+			if live[i] && cur[i] == minID {
+				cur[i], live[i] = streams[i]()
+			}
+		}
+		return minID, true
 	}
 }
 

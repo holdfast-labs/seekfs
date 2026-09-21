@@ -559,7 +559,7 @@ func (vol *serviceVolumeIndex) contentCandidatesBounded(pq parsedQuery, cap int)
 		// content, so no postings superset exists; fall back.
 		driven := false
 		for _, group := range pq.OrGroups {
-			docs, groupDriven, ok := contentOrGroupCandidateDocs(reader, group)
+			groupStream, groupDriven, ok := contentOrGroupCandidateStream(reader, group)
 			if !ok {
 				return nil, false, false
 			}
@@ -567,8 +567,8 @@ func (vol *serviceVolumeIndex) contentCandidatesBounded(pq parsedQuery, cap int)
 				continue
 			}
 			driven = true
-			if docs != nil {
-				streams = append(streams, sliceDocIDStream(docs))
+			if groupStream != nil {
+				streams = append(streams, groupStream)
 			}
 		}
 		if !driven {
@@ -643,15 +643,17 @@ func (vol *serviceVolumeIndex) contentCandidatesBounded(pq parsedQuery, cap int)
 	return out, true, capped
 }
 
-// contentOrGroupCandidateDocs unions the content candidate doc sets of an OR
-// group's alternatives. ok=false means a non-content alternative makes the
-// group unbounded; docs==nil with driven=true means the union is unconstrained
-// (a regex alternative).
-func contentOrGroupCandidateDocs(reader *contentReader, group []parsedQuery) (docs []uint32, driven, ok bool) {
-	var union []uint32
-	have := false
+// contentOrGroupCandidateStream is the streaming form of the OR group union: a
+// lazy ascending stream over the distinct docIDs of the group's alternatives,
+// capped only by the caller's collector budget. ok=false means a non-content
+// alternative makes the group unbounded; a nil stream with driven=true means
+// the union is unconstrained (a regex alternative). It is the same k-way union
+// as the historical pairwise unionSortedDocIDs merge, but it materializes no
+// alternative: the caller's budget+1 cap stops it before any full list decodes.
+func contentOrGroupCandidateStream(reader *contentReader, group []parsedQuery) (stream func() (uint32, bool), driven, ok bool) {
+	var streams []func() (uint32, bool)
 	for i := range group {
-		altDocs, altDriven, altOK := contentAltCandidateDocs(reader, group[i])
+		altStream, altDriven, altOK := contentAltCandidateStream(reader, group[i])
 		if !altOK {
 			return nil, false, false
 		}
@@ -659,26 +661,24 @@ func contentOrGroupCandidateDocs(reader *contentReader, group []parsedQuery) (do
 			return nil, false, false
 		}
 		driven = true
-		if altDocs == nil {
+		if altStream == nil {
 			return nil, true, true
 		}
-		if !have {
-			union = altDocs
-			have = true
-		} else {
-			union = unionSortedDocIDs(union, altDocs)
-		}
+		streams = append(streams, altStream)
 	}
-	if !have {
+	if len(streams) == 0 {
 		return nil, true, true
 	}
-	return union, true, true
+	return unionDocIDStreams(streams), true, true
 }
 
-// contentAltCandidateDocs intersects an alternative's own positive Content leaf
-// postings with its nested content-driven OR groups (AND semantics). driven
-// reports whether the alternative has any content constraint at all.
-func contentAltCandidateDocs(reader *contentReader, alt parsedQuery) (docs []uint32, driven, ok bool) {
+// contentAltCandidateStream intersects an alternative's own positive Content
+// leaf postings with its nested content-driven OR groups (AND semantics) into a
+// lazy ascending stream. driven reports whether the alternative has any content
+// constraint at all; a nil stream with driven=true means the constraint is
+// unconstrained (a regex leaf). Every source is a posting-backed stream, so an
+// alternative is never materialized in full.
+func contentAltCandidateStream(reader *contentReader, alt parsedQuery) (stream func() (uint32, bool), driven, ok bool) {
 	var streams []func() (uint32, bool)
 	for _, leaf := range alt.Content {
 		driven = true
@@ -692,15 +692,15 @@ func contentAltCandidateDocs(reader *contentReader, alt parsedQuery) (docs []uin
 		streams = append(streams, reader.candidateStream(term))
 	}
 	for _, group := range alt.OrGroups {
-		groupDocs, groupDriven, groupOK := contentOrGroupCandidateDocs(reader, group)
+		groupStream, groupDriven, groupOK := contentOrGroupCandidateStream(reader, group)
 		if !groupOK {
 			return nil, false, false
 		}
-		if !groupDriven || groupDocs == nil {
+		if !groupDriven || groupStream == nil {
 			continue // non-content or unconstrained: no postings constraint here
 		}
 		driven = true
-		streams = append(streams, sliceDocIDStream(groupDocs))
+		streams = append(streams, groupStream)
 	}
 	if !driven {
 		return nil, false, true
@@ -708,7 +708,7 @@ func contentAltCandidateDocs(reader *contentReader, alt parsedQuery) (docs []uin
 	if len(streams) == 0 {
 		return nil, true, true
 	}
-	return collectDocIDStream(intersectDocIDStreams(streams), 0), true, true
+	return intersectDocIDStreams(streams), true, true
 }
 
 // contentTermTrigramSafe reports whether every trigram of term is indexable.
@@ -724,6 +724,9 @@ func contentTermTrigramSafe(text string) bool {
 	return true
 }
 
+// unionSortedDocIDs is the historical pairwise union of two ascending docID
+// slices. The OR candidate path now streams (unionDocIDStreams); this remains
+// the reference the streamed union is differentially tested against.
 func unionSortedDocIDs(a, b []uint32) []uint32 {
 	out := make([]uint32, 0, len(a)+len(b))
 	i, j := 0, 0

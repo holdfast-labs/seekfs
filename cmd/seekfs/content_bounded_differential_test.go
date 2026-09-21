@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -631,6 +632,139 @@ func TestContentBoundedNonBiasedHiddenDifferential(t *testing.T) {
 				t.Fatalf("default arm under-filled: got %d; want %d", len(gotMatches), limit)
 			}
 			assertBoundedDifferentialEqual(t, shape.name, fullTrace, gotTrace, fullMatches, gotMatches)
+		})
+	}
+}
+
+// P5: the OR-group candidate union is a streaming k-way union, not a
+// materialized pairwise merge. A broad OR query with a small budget must stop
+// after budget+1 distinct docIDs without decoding any alternative's full posting
+// list. The decode hook counts decoded postings; a materializing union would
+// pull every posting of both alternatives (n).
+func TestContentOrUnionStreamStopsEarly(t *testing.T) {
+	const n = contentPostingBlockSize*3 + 7
+	full := make([]contentDocFreq, n)
+	for i := range full {
+		full[i] = contentDocFreq{docID: uint32(i), tf: 1}
+	}
+	r := contentReaderFromGrams(t, n, map[string][]contentDocFreq{
+		"abc": full, "bcd": full, "bce": full,
+	})
+	group := []parsedQuery{
+		{Content: []contentLeaf{{Kind: contentLeafTerm, Text: "abcd", LeafID: 0}}},
+		{Content: []contentLeaf{{Kind: contentLeafTerm, Text: "abce", LeafID: 1}}},
+	}
+	const budget = 5
+	decoded := 0
+	contentPostingDecodeHook = func() { decoded++ }
+	defer func() { contentPostingDecodeHook = nil }()
+
+	stream, driven, ok := contentOrGroupCandidateStream(r, group)
+	if !ok || !driven || stream == nil {
+		t.Fatalf("group stream driven=%v ok=%v nil=%v; want a driven stream", driven, ok, stream == nil)
+	}
+	got := collectDocIDStream(stream, budget+1)
+	if len(got) != budget+1 {
+		t.Fatalf("capped union = %v; want %d distinct docIDs", got, budget+1)
+	}
+	for i := range got {
+		if got[i] != uint32(i) {
+			t.Fatalf("union[%d] = %d; want %d (ascending distinct)", i, got[i], i)
+		}
+	}
+	// Both alternatives are 2-gram intersections, so a full materialization
+	// would decode ~4n postings; the cap must keep it O(budget).
+	if decoded > 4*(budget+1)+16 {
+		t.Fatalf("decoded %d postings for budget %d (n=%d); want a bounded early stop", decoded, budget, n)
+	}
+	if decoded >= n {
+		t.Fatalf("decoded the whole %d-posting list despite the budget", n)
+	}
+}
+
+// P5 differential: the streamed OR union must equal the historical
+// unionSortedDocIDs merge of the fully materialized alternatives, both
+// under-budget (complete) and over-budget (capped at budget+1), for a single
+// alternative, multiple alternatives, multi-leaf intersections and nested
+// content-driven OR groups -- the shapes the OR-in-content queries in this file
+// cover.
+func TestContentOrUnionStreamMatchesMaterializedUnion(t *testing.T) {
+	const n = contentPostingBlockSize + 11
+	docs := func(pred func(int) bool) []contentDocFreq {
+		var out []contentDocFreq
+		for i := 0; i < n; i++ {
+			if pred(i) {
+				out = append(out, contentDocFreq{docID: uint32(i), tf: 1})
+			}
+		}
+		return out
+	}
+	r := contentReaderFromGrams(t, n, map[string][]contentDocFreq{
+		"abc": docs(func(int) bool { return true }),
+		"bcd": docs(func(i int) bool { return i%2 == 0 }),
+		"cde": docs(func(i int) bool { return i%3 == 0 }),
+		"def": docs(func(i int) bool { return i%5 == 0 }),
+	})
+	leaf := func(id int, text string) contentLeaf {
+		return contentLeaf{Kind: contentLeafTerm, Text: text, LeafID: id}
+	}
+	groups := []struct {
+		name  string
+		group []parsedQuery
+	}{
+		{"single-alt", []parsedQuery{{Content: []contentLeaf{leaf(0, "abc")}}}},
+		{"multi-alt", []parsedQuery{
+			{Content: []contentLeaf{leaf(0, "abc")}},
+			{Content: []contentLeaf{leaf(1, "bcd")}},
+			{Content: []contentLeaf{leaf(2, "cde")}},
+		}},
+		{"multi-alt-intersect", []parsedQuery{
+			{Content: []contentLeaf{leaf(0, "abcd")}}, // abc ∩ bcd = even
+			{Content: []contentLeaf{leaf(1, "bcde")}}, // bcd ∩ cde = multiple of 6
+		}},
+		{"nested-or", []parsedQuery{
+			{Content: []contentLeaf{leaf(0, "abcd")}, OrGroups: [][]parsedQuery{{
+				{Content: []contentLeaf{leaf(1, "cde")}}, // abc ∩ bcd ∩ cde
+			}}},
+			{Content: []contentLeaf{leaf(2, "def")}},
+		}},
+	}
+	for _, g := range groups {
+		t.Run(g.name, func(t *testing.T) {
+			var want []uint32
+			for i, alt := range g.group {
+				altStream, driven, ok := contentAltCandidateStream(r, alt)
+				if !ok || !driven {
+					t.Fatalf("alt %d driven=%v ok=%v; want a content-driven alternative", i, driven, ok)
+				}
+				var altDocs []uint32
+				if altStream != nil {
+					altDocs = collectDocIDStream(altStream, 0)
+				}
+				if i == 0 {
+					want = altDocs
+				} else {
+					want = unionSortedDocIDs(want, altDocs)
+				}
+			}
+			underStream, driven, ok := contentOrGroupCandidateStream(r, g.group)
+			if !ok || !driven || underStream == nil {
+				t.Fatalf("group stream driven=%v ok=%v nil=%v", driven, ok, underStream == nil)
+			}
+			if got := collectDocIDStream(underStream, 0); !slices.Equal(got, want) {
+				t.Fatalf("full streamed union = %v; want %v", got, want)
+			}
+			for _, budget := range []int{0, 1, 2, 5} {
+				stream, _, _ := contentOrGroupCandidateStream(r, g.group)
+				got := collectDocIDStream(stream, budget+1)
+				exp := want
+				if budget+1 < len(exp) {
+					exp = exp[:budget+1]
+				}
+				if !slices.Equal(got, exp) {
+					t.Fatalf("budget=%d streamed union = %v; want %v", budget, got, exp)
+				}
+			}
 		})
 	}
 }

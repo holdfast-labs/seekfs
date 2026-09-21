@@ -77,6 +77,14 @@ func (s *goSearchService) attachContentForVolume(vol *serviceVolumeIndex) {
 		serviceLog("content index for volume %s is not FRN-keyed (origin=%d); leaving unavailable", vol.volume, idx.Origin)
 		return
 	}
+	// P1: a base whose docs were produced by an older/other extractor version
+	// (or written before the class was populated) would serve stale text. Treat
+	// it as stale so PF-3 schedules a rebuild instead of attaching it.
+	if reason, mismatch := contentIndexExtractorMismatch(idx); mismatch {
+		serviceLog("content index for volume %s %s; leaving stale", vol.volume, reason)
+		vol.content.markStale(reason)
+		return
+	}
 	// A USN-origin base with no journal generation or no checkpoint watermark
 	// cannot be joined or caught up: a zero watermark would attach `ready` and
 	// never catch up. Treat it as stale/needs-rebuild instead; PF-3 schedules

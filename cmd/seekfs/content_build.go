@@ -94,6 +94,11 @@ type contentBuildDoc struct {
 	frn     uint64
 	text    []byte
 	modUnix int64
+	// class and version identify the extractor that produced text: the
+	// contentClass* and its Version(). assembleContentIndexStream stamps them
+	// into the doc table so per-class invalidation can see a version bump.
+	class   uint16
+	version uint16
 }
 
 // buildContentIndexFromDir builds an in-memory `.gsx` for root.
@@ -147,8 +152,10 @@ func buildContentIndexFromDir(ctx context.Context, root string, opts contentBuil
 		}
 		// The extractor applies the raw/text policy: an over-cap container is
 		// Skipped with a reason, an over-cap text file contributes a bounded,
-		// Truncated prefix. Both are tallied into the policy section.
-		res, eerr := e.Extract(ctx, f, size)
+		// Truncated prefix. Both are tallied into the policy section. The call
+		// is panic-isolated and deadline-bounded (contentExtractSafely), so one
+		// hostile file cannot crash or wedge the CLI build.
+		res, eerr := contentExtractSafely(ctx, e, f, size)
 		if eerr != nil {
 			skipped++
 			return nil
@@ -167,7 +174,7 @@ func buildContentIndexFromDir(ctx context.Context, root string, opts contentBuil
 		if rerr != nil {
 			rel = path
 		}
-		docs = append(docs, contentBuildDoc{path: filepath.ToSlash(rel), frn: contentPathKey(rel), text: res.Text, modUnix: info.ModTime().Unix()})
+		docs = append(docs, contentBuildDoc{path: filepath.ToSlash(rel), frn: contentPathKey(rel), text: res.Text, modUnix: info.ModTime().Unix(), class: res.Class, version: e.Version()})
 		return nil
 	})
 	if err != nil {
@@ -250,14 +257,16 @@ func assembleContentIndexStream(source contentBuildSource, tmpDir string) (*cont
 		folded := contentFoldText(stored)
 		textStore.Write(stored)
 		idx.Docs = append(idx.Docs, contentDoc{
-			DocID:       docID,
-			FRN:         d.frn,
-			DocLen:      uint32(len(folded)),
-			RawSize:     int64(len(stored)),
-			ModUnix:     d.modUnix,
-			ContentHash: sha256Of(stored),
-			TextOff:     uint64(textStore.Len() - len(stored)),
-			TextLen:     uint32(len(stored)),
+			DocID:            docID,
+			FRN:              d.frn,
+			ContentType:      d.class,
+			ExtractorVersion: d.version,
+			DocLen:           uint32(len(folded)),
+			RawSize:          int64(len(stored)),
+			ModUnix:          d.modUnix,
+			ContentHash:      sha256Of(stored),
+			TextOff:          uint64(textStore.Len() - len(stored)),
+			TextLen:          uint32(len(stored)),
 		})
 		// Documents arrive in ascending docID order, so each key's Adds arrive
 		// in ascending docID order as the builder requires.

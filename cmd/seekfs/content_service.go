@@ -121,6 +121,10 @@ type contentDeltaDoc struct {
 	LastUSN int64
 	Deleted bool
 	Hash    [contentHashLen]byte
+	// ContentType/ExtractorVersion mirror the base doc fields so a fold carries
+	// the same extractor identity the base would have (P1).
+	ContentType      uint16
+	ExtractorVersion uint16
 }
 
 // contentDelta is the in-memory overlay of changed documents. Its own mutex
@@ -567,6 +571,15 @@ func (s *contentVolumeState) setReady(idx *contentIndex, reader *contentReader, 
 	s.health.Docs = len(idx.Docs)
 	s.health.SidecarBytes = idx.EncodedSize
 	s.health.SidecarCap = contentGSXMaxBytes
+	// Surface the highest attached extractor version (P1), so `loaded --json`
+	// shows which extractor generation produced the base.
+	var version uint16
+	for i := range idx.Docs {
+		if idx.Docs[i].ExtractorVersion > version {
+			version = idx.Docs[i].ExtractorVersion
+		}
+	}
+	s.health.ExtractorVersion = int(version)
 	// A base that attached is not over cap and has no build fault.
 	s.sidecarCapped = false
 	s.health.BuildError = ""
@@ -1162,11 +1175,12 @@ func contentExtractDeltaDoc(frn uint64, path string, prior [contentHashLen]byte,
 	if e == nil {
 		return contentDeltaDoc{}, false, nil
 	}
-	// The timeout nests inside the settings context so the extractor still sees
-	// the service's encoding/cap policy while a hanging file is bounded.
-	ctx, cancel := contentWithExtractDocTimeout(contentWithExtractSettings(context.Background(), contentServiceExtractSettings()))
-	defer cancel()
-	res, err := e.Extract(ctx, f, size)
+	// The settings context carries the service's encoding/cap policy. The
+	// call goes through contentExtractSafely so the drain shares the build's
+	// isolation: a parser panic is a skip, and a ctx-ignoring parser is cut off
+	// by the boundary-enforced deadline instead of wedging the serial drain.
+	ctx := contentWithExtractSettings(context.Background(), contentServiceExtractSettings())
+	res, err := contentExtractSafely(ctx, e, f, size)
 	if err != nil || res.Skipped || len(res.Text) == 0 {
 		return contentDeltaDoc{}, false, err
 	}
@@ -1175,7 +1189,7 @@ func contentExtractDeltaDoc(frn uint64, path string, prior [contentHashLen]byte,
 	if havePrior && h == prior {
 		return contentDeltaDoc{}, false, nil
 	}
-	return contentDeltaDoc{FRN: frn, Path: path, Text: stored, Hash: h}, true, nil
+	return contentDeltaDoc{FRN: frn, Path: path, Text: stored, Hash: h, ContentType: res.Class, ExtractorVersion: e.Version()}, true, nil
 }
 
 // sha256Of is the shared content hash: sha256 truncated to contentHashLen bytes

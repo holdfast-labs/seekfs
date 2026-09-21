@@ -122,6 +122,11 @@ type contentExtractResult struct {
 type contentExtractor interface {
 	Name() string
 	Version() uint16
+	// Class declares the contentClass* this extractor produces. It is stamped
+	// into each doc's ContentType; a class's registered version is what
+	// invalidation compares against, so a Version() bump forces the volume to
+	// be rebuilt rather than serving text from the old extractor.
+	Class() uint16
 	// Extensions lists lowercase extensions including the dot, e.g. ".docx".
 	Extensions() []string
 	// Sniff reports whether this extractor claims a file whose first bytes are
@@ -139,6 +144,21 @@ func contentRegisterExtractor(e contentExtractor) { contentExtractors = append(c
 
 func init() {
 	contentRegisterExtractor(contentTextExtractor{})
+}
+
+// contentExtractorVersionForClass returns the current registered extractor
+// version for a content class, and whether any registered extractor declares
+// that class. A zero class (an older `.gsx`) has no extractor and reports false.
+func contentExtractorVersionForClass(class uint16) (uint16, bool) {
+	if class == 0 {
+		return 0, false
+	}
+	for _, e := range contentExtractors {
+		if e.Class() == class {
+			return e.Version(), true
+		}
+	}
+	return 0, false
 }
 
 // contentExtractorForPath selects an extractor for a path. Extension match
@@ -188,6 +208,49 @@ func contentPathExtension(path string) string {
 		return ""
 	}
 	return strings.ToLower(base[dot:])
+}
+
+// contentExtractPanicError is returned when an extractor panics. The caller
+// treats it as a per-document skip with a reason, never a crash.
+var contentExtractPanicError = errors.New("content extractor panic")
+
+// contentExtractSafely runs one extractor over an already-open file with the
+// per-document deadline and panic isolation shared by the offline walk builder
+// and the service build. The deadline is enforced at this boundary rather than
+// trusted to the extractor: extraction runs in a goroutine and the caller stops
+// waiting when the deadline fires, so even a parser that ignores ctx cannot
+// wedge the serial build. A panic is recovered and mapped to a skip.
+//
+// ponytail: an extractor that ignores ctx keeps its goroutine until it returns;
+// the raw/text caps bound what it can allocate, and P4's out-of-process path
+// would replace the abandoned goroutine with a hard kill. There is also a
+// close-race ceiling: on timeout the caller's deferred f.Close() can run while
+// the abandoned goroutine is still reading the same io.ReaderAt. That is safe
+// for *os.File (its ReadAt/Close are concurrency-safe) but not for a
+// non-close-safe library ReaderAt; P4's hard kill removes the sharing.
+func contentExtractSafely(ctx context.Context, e contentExtractor, r io.ReaderAt, size int64) (contentExtractResult, error) {
+	type outcome struct {
+		res contentExtractResult
+		err error
+	}
+	ectx, cancel := contentWithExtractDocTimeout(ctx)
+	defer cancel()
+	done := make(chan outcome, 1)
+	go func() {
+		defer func() {
+			if recover() != nil {
+				done <- outcome{res: contentExtractResult{Skipped: true, Reason: "extractor panic"}, err: contentExtractPanicError}
+			}
+		}()
+		res, err := e.Extract(ectx, r, size)
+		done <- outcome{res: res, err: err}
+	}()
+	select {
+	case out := <-done:
+		return out.res, out.err
+	case <-ectx.Done():
+		return contentExtractResult{Skipped: true, Reason: "extraction timeout"}, ectx.Err()
+	}
 }
 
 // contentHasBOM reports whether b starts with a UTF-8/UTF-16 BOM. A BOM-marked

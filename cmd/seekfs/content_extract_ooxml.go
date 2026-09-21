@@ -26,6 +26,7 @@ type contentOOXMLExtractor struct{}
 
 func (contentOOXMLExtractor) Name() string    { return "ooxml" }
 func (contentOOXMLExtractor) Version() uint16 { return 1 }
+func (contentOOXMLExtractor) Class() uint16   { return contentClassOOXML }
 
 func (contentOOXMLExtractor) Extensions() []string {
 	return []string{

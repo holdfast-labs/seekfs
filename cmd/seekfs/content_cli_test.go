@@ -106,7 +106,7 @@ func TestContentServiceOwnsVolumeLockAfterAttach(t *testing.T) {
 	usn.Origin = contentOriginUSN
 	usn.JournalID = 5
 	usn.CheckpointUSN = 50
-	usn.Docs = []contentDoc{{DocID: 0, FRN: 10}}
+	usn.Docs = []contentDoc{{DocID: 0, FRN: 10, ContentType: contentClassText, ExtractorVersion: 1}}
 	if err := contentSaveFile(gsx, usn); err != nil {
 		t.Fatal(err)
 	}

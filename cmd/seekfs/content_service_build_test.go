@@ -227,7 +227,7 @@ func TestContentServiceBuildSelfHealsAfterJournalReset(t *testing.T) {
 	})
 
 	// A valid base for journal 7 attaches without a build.
-	base, err := assembleContentIndex([]contentBuildDoc{{path: note, frn: 10, text: []byte("selfheal needle")}}, t.TempDir())
+	base, err := assembleContentIndex([]contentBuildDoc{{path: note, frn: 10, text: []byte("selfheal needle"), class: contentClassText, version: 1}}, t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -295,7 +295,7 @@ func TestContentOldVersionSidecarRebuiltNotAttached(t *testing.T) {
 
 	// Write a well-formed sidecar, then downgrade its magic+version to the
 	// previous format (a pre-PF-4 v2 file).
-	old, err := assembleContentIndex([]contentBuildDoc{{path: note, frn: 10, text: []byte("upgrade needle")}}, t.TempDir())
+	old, err := assembleContentIndex([]contentBuildDoc{{path: note, frn: 10, text: []byte("upgrade needle"), class: contentClassText, version: 1}}, t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -746,5 +746,66 @@ func TestContentServiceBuildGivesUpAfterRepeatedGenerationChanges(t *testing.T) 
 	h := vol.content.healthSnapshot(0)
 	if h.State != contentStateDegraded || h.BuildError == "" {
 		t.Fatalf("health after give-up = %+v; want degraded with BuildError", h)
+	}
+}
+
+// The service build must isolate a panicking extractor (skip, no crash) and a
+// ctx-ignoring hanging extractor (deadline, no wedge): it still publishes the
+// good document and records both skips in the policy.
+func TestContentServiceBuildPanicAndTimeoutIsolated(t *testing.T) {
+	t.Setenv("SEEKFS_CONTENT_SEARCH", "1")
+	stubContentCatchUpSync(t)
+	stubContentBuildSync(t)
+
+	restoreTimeout := contentExtractDocTimeout
+	contentExtractDocTimeout = 50 * time.Millisecond
+	t.Cleanup(func() { contentExtractDocTimeout = restoreTimeout })
+	restoreExtractors := contentExtractors
+	contentExtractors = append(append([]contentExtractor(nil), contentExtractors...), contentPanicExtractor{}, contentSpinExtractor{})
+	t.Cleanup(func() { contentExtractors = restoreExtractors })
+
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "a.panic"), []byte("boom"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "b.spin"), []byte("hang"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "c.txt"), []byte("needle"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	const journal = uint64(77)
+	const cp = int64(90)
+	stubContentCatchUpJournal(t, usnJournalDataV0{UsnJournalID: journal, FirstUsn: 1, LowestValidUsn: 1, NextUsn: cp})
+	vol, gsx := contentBuildTestVolume(t, dir, journal, uint64(cp), []CompactRecord{
+		{FRN: 10, ParentFRN: 10, Parent: -1, Name: "a.panic", Size: 4},
+		{FRN: 20, ParentFRN: 10, Parent: -1, Name: "b.spin", Size: 4},
+		{FRN: 30, ParentFRN: 10, Parent: -1, Name: "c.txt", Size: 6},
+	})
+	s := contentTestService(t)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		s.ensureContentBuild(vol)
+	}()
+	select {
+	case <-done:
+	case <-time.After(30 * time.Second):
+		t.Fatal("service build wedged on a panicking or hanging extractor")
+	}
+
+	if got := vol.content.stateOf(); got != contentStateReady {
+		t.Fatalf("state after build = %q; want ready", got)
+	}
+	built, err := contentLoadFile(gsx)
+	if err != nil {
+		t.Fatalf("load built sidecar: %v", err)
+	}
+	if len(built.Docs) != 1 {
+		t.Fatalf("built %d docs; want 1 (only c.txt)", len(built.Docs))
+	}
+	if built.Policy.Skipped < 2 {
+		t.Fatalf("policy skipped = %d; want the panic and the hang both skipped", built.Policy.Skipped)
 	}
 }
