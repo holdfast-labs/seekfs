@@ -309,8 +309,8 @@ func TestContentCLIJSONSnippetShape(t *testing.T) {
 	if len(decoded.Snippets) != len(decoded.Results) {
 		t.Fatalf("snippets %v not aligned to results %v", decoded.Snippets, decoded.Results)
 	}
-	if len(decoded.Snippets) != 1 || !strings.Contains(decoded.Snippets[0], "needle") {
-		t.Fatalf("snippets = %v; want the matched window", decoded.Snippets)
+	if len(decoded.Snippets) != 1 || !strings.Contains(decoded.Snippets[0], "Needle") {
+		t.Fatalf("snippets = %v; want the matched window with original case", decoded.Snippets)
 	}
 
 	plain := captureStdout(t, func() error { return cmdContent([]string{"-db", db, "needle"}) })
@@ -319,8 +319,8 @@ func TestContentCLIJSONSnippetShape(t *testing.T) {
 	}
 
 	withSnippet := captureStdout(t, func() error { return cmdContent([]string{"-db", db, "--snippet", "needle"}) })
-	if !strings.Contains(withSnippet, "doc.txt\t") || !strings.Contains(withSnippet, "needle") {
-		t.Fatalf("--snippet stdout = %q; want path and matched text", withSnippet)
+	if !strings.Contains(withSnippet, "doc.txt\t") || !strings.Contains(withSnippet, "Needle") {
+		t.Fatalf("--snippet stdout = %q; want path and the case-preserved match", withSnippet)
 	}
 }
 

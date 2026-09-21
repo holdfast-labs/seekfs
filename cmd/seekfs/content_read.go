@@ -191,18 +191,22 @@ func (r *contentReader) search(term string, limit int) []contentHit {
 		if len(text) == 0 {
 			continue
 		}
-		lower := text
-		if !isLowerASCII(lower) {
-			lower = []byte(strings.ToLower(string(text)))
-		}
+		// The stored text preserves case (PF-6a), so fold it for the
+		// case-insensitive match; the window is still taken from the original.
+		lower := contentFoldText(text)
 		if off := strings.Index(string(lower), t); off >= 0 {
+			// Folding preserves the rune index but not the byte offset: a
+			// byte-length-changing fold rune (İ 2->1, ẞ 3->2, KELVIN 3->1)
+			// shifts every later offset. Map both window boundaries back to
+			// the raw text, exactly as contentSnippet does, so the snippet
+			// windows the real bytes and Offset points at the raw match start.
+			rawOff := contentFoldOffsetToRaw(text, lower, off)
+			rawEnd := contentFoldOffsetToRaw(text, lower, off+len(t))
 			hits = append(hits, contentHit{
-				Path:   r.docPath(id),
-				DocID:  id,
-				Offset: off,
-				// Preserve the stored text's case: matching runs on the
-				// lowercased view, the window is taken from the original bytes.
-				Snippet: contentSnippetWindowSource(lower, &contentSnippetSource{text: text}, off, len(t)),
+				Path:    r.docPath(id),
+				DocID:   id,
+				Offset:  rawOff,
+				Snippet: contentSnippetWindow(text, rawOff, rawEnd-rawOff),
 			})
 			if limit > 0 && len(hits) >= limit {
 				break
@@ -263,15 +267,6 @@ func intersectSortedDocIDs(a, b []uint32) []uint32 {
 		}
 	}
 	return out
-}
-
-func isLowerASCII(b []byte) bool {
-	for _, c := range b {
-		if c >= 'A' && c <= 'Z' {
-			return false
-		}
-	}
-	return true
 }
 
 // contentDocCount is a convenience for telemetry and tests.

@@ -17,7 +17,7 @@ import (
 	"errors"
 	"regexp"
 	"sort"
-	"strings"
+	"unicode/utf8"
 )
 
 // Default per-query content budgets. They cap materialized content candidates
@@ -70,18 +70,21 @@ func boundContentPathCache(cache map[int]string) map[int]string {
 var errContentIncomplete = errors.New("content count is incomplete: candidate budget exceeded; add a more selective term or filter")
 
 // contentLeafMatcher precompiles the query's content leaves once so evaluating
-// every candidate is a lookup plus a substring/regex test. Needles are
-// lowercased once here, not per candidate.
+// every candidate is a lookup plus a substring/regex test. The needle is folded
+// (or kept raw for a case-sensitive query) once here, not per candidate. Case is
+// a query-level property (pq.CaseSensitive from `case:`), so every leaf shares
+// it.
 type contentLeafMatcher struct {
-	leaves []contentLeaf
-	size   int
-	regex  map[int]*regexp.Regexp
-	needle map[int][]byte
+	leaves        []contentLeaf
+	size          int
+	caseSensitive bool
+	regex         map[int]*regexp.Regexp
+	needle        map[int][]byte
 }
 
 func newContentLeafMatcher(pq parsedQuery) *contentLeafMatcher {
 	leaves := contentAllLeaves(pq)
-	m := &contentLeafMatcher{leaves: leaves}
+	m := &contentLeafMatcher{leaves: leaves, caseSensitive: pq.CaseSensitive}
 	for i := range leaves {
 		if leaves[i].LeafID+1 > m.size {
 			m.size = leaves[i].LeafID + 1
@@ -89,7 +92,11 @@ func newContentLeafMatcher(pq parsedQuery) *contentLeafMatcher {
 	}
 	for _, leaf := range leaves {
 		if leaf.Kind == contentLeafRegex {
-			re, err := regexp.Compile("(?i)" + leaf.Text)
+			pat := leaf.Text
+			if !pq.CaseSensitive {
+				pat = "(?i)" + pat
+			}
+			re, err := regexp.Compile(pat)
 			if err != nil {
 				continue
 			}
@@ -102,26 +109,50 @@ func newContentLeafMatcher(pq parsedQuery) *contentLeafMatcher {
 		if m.needle == nil {
 			m.needle = make(map[int][]byte)
 		}
-		m.needle[leaf.LeafID] = []byte(strings.ToLower(leaf.Text))
+		b := []byte(leaf.Text)
+		if !pq.CaseSensitive {
+			b = contentFoldText(b)
+		}
+		m.needle[leaf.LeafID] = b
 	}
 	return m
 }
 
-// needleOf returns the precomputed lowercased bytes a term/phrase leaf matches.
+// needleOf returns the precomputed bytes a term/phrase leaf matches: the raw
+// leaf text for a case-sensitive query, the folded text otherwise. It is also
+// the needle a snippet searches with, so the snippet uses the same case policy
+// as verification.
 func (m *contentLeafMatcher) needleOf(leaf contentLeaf) []byte {
 	if b, ok := m.needle[leaf.LeafID]; ok {
 		return b
 	}
-	return []byte(strings.ToLower(leaf.Text))
+	b := []byte(leaf.Text)
+	if !m.caseSensitive {
+		b = contentFoldText(b)
+	}
+	return b
 }
 
-func (m *contentLeafMatcher) match(text []byte, leaf contentLeaf) bool {
+// haystackFor returns the text a leaf is matched against: the case-preserving
+// raw text for a case-sensitive query, the folded text otherwise. The caller
+// folds the document once per entry and reuses it for every leaf, so a
+// case-insensitive query costs one fold per record, not one per leaf.
+func (m *contentLeafMatcher) haystackFor(raw, folded []byte) []byte {
+	if m.caseSensitive {
+		return raw
+	}
+	return folded
+}
+
+// match tests one leaf against a document. Regex leaves always run on the raw
+// (case-preserving) text; the compiled pattern carries the (?i) flag when the
+// query is case-insensitive.
+func (m *contentLeafMatcher) match(raw, folded []byte, leaf contentLeaf) bool {
 	if leaf.Kind == contentLeafRegex {
 		re := m.regex[leaf.LeafID]
-		return re != nil && re.Match(text)
+		return re != nil && re.Match(raw)
 	}
-	// Stored text is contentNormalizeText output (lowercased + repaired).
-	return bytes.Contains(text, m.needleOf(leaf))
+	return bytes.Contains(m.haystackFor(raw, folded), m.needleOf(leaf))
 }
 
 // entryMatchesWithContent mirrors entryMatches but also enforces content leaves
@@ -143,8 +174,15 @@ func entryMatchesWithContentMatcher(vol *serviceVolumeIndex, entry Entry, pq par
 	}
 	matched := make([]bool, m.size)
 	if text, ok := vol.contentTextForEntry(&entry); ok {
+		// Fold the document once for the whole entry and reuse it for every
+		// case-insensitive leaf; case-sensitive leaves read the raw text. No
+		// per-leaf allocation.
+		var folded []byte
+		if !m.caseSensitive {
+			folded = contentFoldText(text)
+		}
 		for _, leaf := range m.leaves {
-			matched[leaf.LeafID] = m.match(text, leaf)
+			matched[leaf.LeafID] = m.match(text, folded, leaf)
 		}
 	}
 	return entryMatchesContentAt(entry, pq, matchPath, matched)
@@ -242,19 +280,52 @@ func contentCollectPositiveLeaves(pq parsedQuery, out *[]contentLeaf) {
 	}
 }
 
+// contentFoldOffsetToRaw maps a byte offset in a folded (lowercased) copy back
+// to the case-preserving text it was folded from. strings.ToLower maps one rune
+// to one rune, so the rune index is preserved; invalid-UTF-8 edge cases can only
+// cost snippet precision, never a match.
+func contentFoldOffsetToRaw(raw, folded []byte, off int) int {
+	if off <= 0 {
+		return 0
+	}
+	if off > len(folded) {
+		off = len(folded)
+	}
+	n := utf8.RuneCount(folded[:off])
+	i := 0
+	for ; n > 0 && i < len(raw); n-- {
+		_, size := utf8.DecodeRune(raw[i:])
+		i += size
+	}
+	return i
+}
+
 // contentSnippet returns a bounded window around the first matching term/phrase
-// content leaf. A query whose only content matches are regexes yields "". The
-// positive-leaf list and matcher are hoisted by the caller so this is O(leaves)
-// per result, not O(leaves) plus matcher construction.
-func contentSnippet(text []byte, src *contentSnippetSource, positive []contentLeaf, m *contentLeafMatcher) string {
+// content leaf, rendered from the case-preserving text. A query whose only
+// content matches are regexes yields "". The positive-leaf list and matcher are
+// hoisted by the caller so this is O(leaves) per result, not O(leaves) plus
+// matcher construction. The caller passes the raw text and, for a
+// case-insensitive query, the once-per-entry folded copy (nil otherwise).
+func contentSnippet(raw, folded []byte, positive []contentLeaf, m *contentLeafMatcher) string {
 	for _, leaf := range positive {
-		if leaf.Kind == contentLeafRegex || !m.match(text, leaf) {
+		if leaf.Kind == contentLeafRegex || !m.match(raw, folded, leaf) {
 			continue
 		}
 		needle := m.needleOf(leaf)
-		if off := contentLeafFirstOffset(text, needle); off >= 0 {
-			return contentSnippetWindowSource(text, src, off, len(needle))
+		hay := m.haystackFor(raw, folded)
+		off := contentLeafFirstOffset(hay, needle)
+		if off < 0 {
+			continue
 		}
+		if m.caseSensitive {
+			return contentSnippetWindow(raw, off, len(needle))
+		}
+		// The folded offset maps to the raw offset by rune index; the match
+		// length is the raw span between the two mapped boundaries, so a
+		// case-changing fold (é -> É) still windows the real bytes.
+		rawOff := contentFoldOffsetToRaw(raw, folded, off)
+		rawEnd := contentFoldOffsetToRaw(raw, folded, off+len(needle))
+		return contentSnippetWindow(raw, rawOff, rawEnd-rawOff)
 	}
 	return ""
 }
@@ -272,7 +343,11 @@ func attachContentSnippets(entries []Entry, volByPath map[string]*serviceVolumeI
 			continue
 		}
 		if text, ok := vol.contentTextForEntry(&entries[i]); ok {
-			entries[i].Snippet = contentSnippet(text, nil, positive, m)
+			var folded []byte
+			if !m.caseSensitive {
+				folded = contentFoldText(text)
+			}
+			entries[i].Snippet = contentSnippet(text, folded, positive, m)
 		}
 	}
 }
@@ -369,7 +444,7 @@ func (vol *serviceVolumeIndex) contentCandidates(pq parsedQuery) ([]int, bool) {
 			if leaf.Kind == contentLeafRegex {
 				continue
 			}
-			term := strings.ToLower(leaf.Text)
+			term := string(contentFoldText([]byte(leaf.Text)))
 			if !contentTermTrigramSafe(term) {
 				// A gram the builder skipped (control byte) would look up
 				// empty and falsely report zero; fall back to a scan.
@@ -488,7 +563,7 @@ func contentAltCandidateDocs(reader *contentReader, alt parsedQuery) (docs []uin
 		if leaf.Kind == contentLeafRegex {
 			continue
 		}
-		term := strings.ToLower(leaf.Text)
+		term := string(contentFoldText([]byte(leaf.Text)))
 		if !contentTermTrigramSafe(term) {
 			return nil, false, false
 		}

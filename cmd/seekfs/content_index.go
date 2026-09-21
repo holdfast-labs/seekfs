@@ -21,12 +21,14 @@ import (
 // format version encoded in the magic as well as the header, matching the v9
 // habit. The 02 bump added the content USN checkpoint (WP0); the 03 bump is
 // PF-4's encoding breadth + size policy, which changes normalized text and the
-// policy section. A sidecar whose version does not match is rejected on load,
+// policy section; the 04 bump (PF-6a) makes the text store case-preserving (the
+// index stays case-folded), so a v3 text store must not be read as if it were
+// case-preserving. A sidecar whose version does not match is rejected on load,
 // so it can never be attached stale: the service sees no usable base and its
 // PF-3 build path rebuilds it.
-var contentIndexMagic = [8]byte{'G', 'O', 'S', 'C', 'X', '0', '0', '3'}
+var contentIndexMagic = [8]byte{'G', 'O', 'S', 'C', 'X', '0', '0', '4'}
 
-const contentIndexVersion = 3
+const contentIndexVersion = 4
 
 // contentOrigin records what the doc keys are, so a `.gsx` can never be
 // attached to a key space it does not join.
@@ -120,9 +122,9 @@ type contentDoc struct {
 	ExtractorVersion uint16
 	ContentHash      [contentHashLen]byte
 	RawSize          int64
-	DocLen           uint32 // token count, for scoring
+	DocLen           uint32 // byte length of the case-folded text, for scoring
 	ModUnix          int64
-	TextOff          uint64 // offset into the CXST text store
+	TextOff          uint64 // offset into the case-preserving CXST text store
 	TextLen          uint32
 }
 

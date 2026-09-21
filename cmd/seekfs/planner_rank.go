@@ -208,19 +208,25 @@ func contentRelevanceOf(vol *serviceVolumeIndex, entry Entry, pq parsedQuery, m 
 	if !ok {
 		return rel
 	}
+	var folded []byte
+	if !m.caseSensitive {
+		folded = contentFoldText(text)
+	}
 	matched := make([]bool, m.size)
 	for _, leaf := range m.leaves {
-		matched[leaf.LeafID] = m.match(text, leaf)
+		matched[leaf.LeafID] = m.match(text, folded, leaf)
 	}
-	rel.score, rel.first = contentScoreAt(entry, pq, pq.MatchPath, matched, text, m)
+	rel.score, rel.first = contentScoreAt(entry, pq, pq.MatchPath, matched, text, folded, m)
 	return rel
 }
 
 // contentScoreAt counts matched positive content leaves using the SAME joint-OR
 // rule as entryMatchesContentAt: top-level positive leaves always count, and an
 // OR group contributes only the leaves of the alternative that satisfies the
-// group. A failing alternative does not inflate the score.
-func contentScoreAt(entry Entry, pq parsedQuery, matchPath bool, matched []bool, text []byte, m *contentLeafMatcher) (score, first int) {
+// group. A failing alternative does not inflate the score. text is the
+// case-preserving bytes; folded is its once-per-entry fold (nil for a
+// case-sensitive query), matched by the same case policy as the leaf.
+func contentScoreAt(entry Entry, pq parsedQuery, matchPath bool, matched []bool, text, folded []byte, m *contentLeafMatcher) (score, first int) {
 	first = contentRelevanceNoOffset
 	for _, leaf := range pq.Content {
 		if leaf.LeafID < 0 || leaf.LeafID >= len(matched) || !matched[leaf.LeafID] {
@@ -230,7 +236,7 @@ func contentScoreAt(entry Entry, pq parsedQuery, matchPath bool, matched []bool,
 		if leaf.Kind == contentLeafRegex {
 			continue
 		}
-		if off := contentLeafFirstOffset(text, m.needleOf(leaf)); off >= 0 && off < first {
+		if off := contentLeafFirstOffset(m.haystackFor(text, folded), m.needleOf(leaf)); off >= 0 && off < first {
 			first = off
 		}
 	}
@@ -240,7 +246,7 @@ func contentScoreAt(entry Entry, pq parsedQuery, matchPath bool, matched []bool,
 			if !entryMatchesContentAt(entry, alt, matchPath || alt.MatchPath, matched) {
 				continue
 			}
-			s, f := contentScoreAt(entry, alt, matchPath || alt.MatchPath, matched, text, m)
+			s, f := contentScoreAt(entry, alt, matchPath || alt.MatchPath, matched, text, folded, m)
 			score += s
 			if f < first {
 				first = f

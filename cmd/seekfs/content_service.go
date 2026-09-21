@@ -1007,7 +1007,7 @@ func contentExtractDeltaDoc(frn uint64, path string, prior [contentHashLen]byte,
 	if err != nil || res.Skipped || len(res.Text) == 0 {
 		return contentDeltaDoc{}, false, err
 	}
-	stored := contentNormalizeText(res.Text)
+	stored := contentRepairText(res.Text)
 	h := sha256Of(stored)
 	if havePrior && h == prior {
 		return contentDeltaDoc{}, false, nil

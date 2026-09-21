@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"testing"
 )
 
@@ -65,6 +66,37 @@ func TestContentBuildAndSearch(t *testing.T) {
 	}
 	if hits := r.search("needle", 1); len(hits) != 1 {
 		t.Fatalf("limit=1 returned %d hits", len(hits))
+	}
+}
+
+// Offline `content -db` search: a byte-length-changing fold rune (İ 2->1 byte)
+// before the match must not shift the reported Offset or the snippet window.
+// The folded match offset is mapped back to the raw text for both, so the
+// snippet still contains the match and Offset is its raw start.
+func TestContentOfflineSnippetOffsetMapsFoldedToRaw(t *testing.T) {
+	raw := strings.Repeat("İ", 300) + " needle " + strings.Repeat("x", 600)
+	idx := buildTestContentIndex(t, map[string]string{"doc.txt": raw})
+	path := filepath.Join(t.TempDir(), "content.gsx")
+	if err := contentSaveFile(path, idx); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := contentLoadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, err := openContentReader(loaded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hits := r.search("needle", 0)
+	if len(hits) != 1 {
+		t.Fatalf("search returned %d hits; want 1", len(hits))
+	}
+	if want := strings.Index(raw, "needle"); hits[0].Offset != want {
+		t.Fatalf("Offset = %d; want raw match start %d", hits[0].Offset, want)
+	}
+	if !strings.Contains(hits[0].Snippet, "needle") {
+		t.Fatalf("snippet %q does not contain the match", hits[0].Snippet)
 	}
 }
 

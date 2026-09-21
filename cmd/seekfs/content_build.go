@@ -241,27 +241,30 @@ func assembleContentIndexStream(source contentBuildSource, tmpDir string) (*cont
 		}
 		docID := uint32(len(idx.Docs))
 		paths = append(paths, d.path)
-		// Index and store lowercased text so grams, terms, and verification all
-		// agree on a case-insensitive match. v1 content search is always
-		// case-insensitive; per-leaf case handling is a later addition.
-		lower := contentNormalizeText(d.text)
-		textStore.Write(lower)
+		// Store case-preserving repaired text (PF-6a): a case-sensitive query
+		// verifies against these exact bytes, and snippets show the real case.
+		// The index (terms and grams) is built from a case-folded copy, so the
+		// case-insensitive prefilter stays a superset of every case-sensitive
+		// match (tgrep's merged-case index, case-aware verify).
+		stored := contentRepairText(d.text)
+		folded := contentFoldText(stored)
+		textStore.Write(stored)
 		idx.Docs = append(idx.Docs, contentDoc{
 			DocID:       docID,
 			FRN:         d.frn,
-			DocLen:      uint32(len(lower)),
-			RawSize:     int64(len(lower)),
+			DocLen:      uint32(len(folded)),
+			RawSize:     int64(len(stored)),
 			ModUnix:     d.modUnix,
-			ContentHash: sha256Of(lower),
-			TextOff:     uint64(textStore.Len() - len(lower)),
-			TextLen:     uint32(len(lower)),
+			ContentHash: sha256Of(stored),
+			TextOff:     uint64(textStore.Len() - len(stored)),
+			TextLen:     uint32(len(stored)),
 		})
 		// Documents arrive in ascending docID order, so each key's Adds arrive
 		// in ascending docID order as the builder requires.
-		for term, tf := range contentTermsOf(lower) {
+		for term, tf := range contentTermsOf(folded) {
 			termBuilder.Add(term, docID, tf)
 		}
-		for gram := range contentGramsOf(lower) {
+		for gram := range contentGramsOf(folded) {
 			gramBuilder.Add(gram, docID, 1)
 		}
 		contentAssembleStreamHook(int(docID))
@@ -363,19 +366,31 @@ func buildContentIndexForIndex(ctx context.Context, idx *Index, opts contentBuil
 	return cidx, nil
 }
 
-// contentNormalizeText is the one normalization every builder and the delta
-// extractor must share: lowercase, then a defensive re-decode under the auto
-// (legacy-aware) policy. The input is already-decoded text, so the re-decode is
+// contentRepairText is the repair half of the old contentNormalizeText: it
+// decodes under the auto (legacy-aware) policy and PRESERVES CASE. This is the
+// one repair every builder, the delta extractor, and a later search must share,
+// so the bytes stored in the text store and the bytes a query matches against
+// are identical. The input is already-decoded text, so the re-decode is
 // normally the identity. It deliberately uses contentAutoEncoding here -- not
 // the extractor's own mode -- which is not the same decode as the extractor's
 // under -encoding <label> or none, but is benign: those modes already produce
 // valid UTF-8, which auto returns unchanged. Using auto (rather than the bare
 // lossy-repair zero mode) keeps base and delta from decoding a stray byte
-// differently. Hashing the normalized text makes base and delta ContentHash
-// comparable, so a touch-only write is recognized as unchanged.
-func contentNormalizeText(decoded []byte) []byte {
-	lower := []byte(strings.ToLower(string(decoded)))
-	return []byte(contentDecodeForIndex(lower, contentAutoEncoding, false))
+// differently. Hashing the repaired text makes base and delta ContentHash
+// comparable, so a touch-only write is recognized as unchanged (and a
+// case-only change is, correctly, a change).
+func contentRepairText(decoded []byte) []byte {
+	return []byte(contentDecodeForIndex(decoded, contentAutoEncoding, false))
+}
+
+// contentFoldText is the case-fold half of the old contentNormalizeText: the
+// lowercase view the index (terms and grams) and case-insensitive verification
+// use. strings.ToLower is Unicode-aware (one rune in, one rune out), so a
+// case-insensitive query folds both sides with the same rule and never loses a
+// case-sensitive candidate. The input is the repaired, case-preserving stored
+// text; a query leaf is folded directly.
+func contentFoldText(repaired []byte) []byte {
+	return []byte(strings.ToLower(string(repaired)))
 }
 
 // contentPathKey is the stable 64-bit identity of a walk-relative path: FNV-1a

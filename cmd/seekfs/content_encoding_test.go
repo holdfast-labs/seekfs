@@ -304,19 +304,25 @@ func TestContentEncodingLegacyCP1252StillDecodes(t *testing.T) {
 	}
 }
 
-// Normalization must reuse the extractor's auto (legacy-aware) mode; for
-// already-decoded text that is exactly lowercasing, but it must not re-repair a
-// valid accented rune. This pins index and delta to the same normalization.
-func TestContentNormalizeTextMatchesExtractorDecode(t *testing.T) {
+// The old single normalization is split (PF-6a): contentRepairText reuses the
+// extractor's auto (legacy-aware) mode and preserves case, and contentFoldText
+// is the lowercase view the case-insensitive index and verify use. For
+// already-decoded text the repair is the identity, so the split is exactly the
+// old normalize plus the raw bytes it dropped. This pins index and delta to the
+// same pair.
+func TestContentRepairAndFoldTextSplit(t *testing.T) {
 	for _, raw := range [][]byte{
 		[]byte("Caf\xe9 Needle"),
 		[]byte("Valid Caf\xc3\xa9\n"),
 		[]byte{0x81, 'X', 0x92},
 	} {
 		extracted := contentDecodeForIndex(raw, contentAutoEncoding, false)
+		if got := contentRepairText([]byte(extracted)); string(got) != string(extracted) {
+			t.Fatalf("repair(decode(%q)) = %q; want identity %q", raw, got, extracted)
+		}
 		want := []byte(strings.ToLower(extracted))
-		if got := contentNormalizeText([]byte(extracted)); string(got) != string(want) {
-			t.Fatalf("normalize(decode(%q)) = %q; want %q", raw, got, want)
+		if got := contentFoldText([]byte(extracted)); string(got) != string(want) {
+			t.Fatalf("fold(decode(%q)) = %q; want %q", raw, got, want)
 		}
 	}
 }
