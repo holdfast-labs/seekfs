@@ -154,7 +154,7 @@ func (r *contentReader) search(term string, limit int) []contentHit {
 	if t == "" {
 		return nil
 	}
-	candidates := r.candidates(t)
+	candidates := r.candidates(t, 0)
 	var hits []contentHit
 	for _, id := range candidates {
 		text := r.docText(id)
@@ -188,55 +188,122 @@ func (r *contentReader) search(term string, limit int) []contentHit {
 
 // candidates returns the docIDs that could contain term: trigram intersection
 // when the term has at least three bytes, otherwise every document. The result
-// is always a superset; verification decides.
-func (r *contentReader) candidates(term string) []uint32 {
-	if len(term) >= 3 && r.grams != nil {
-		var current []uint32
-		first := true
-		for i := 0; i+3 <= len(term); i++ {
-			postings, ok := r.grams.lookup(term[i : i+3])
-			if !ok || len(postings) == 0 {
-				return nil
-			}
-			ids := make([]uint32, len(postings))
-			for j := range postings {
-				ids[j] = postings[j].docID
-			}
-			if first {
-				current = ids
-				first = false
-			} else {
-				current = intersectSortedDocIDs(current, ids)
-			}
-			if len(current) == 0 {
-				return nil
-			}
-		}
-		return current
-	}
-	all := make([]uint32, len(r.idx.Docs))
-	for i := range all {
-		all[i] = uint32(i)
-	}
-	return all
+// is always a superset; verification decides. At most budget docIDs are
+// materialized (budget <= 0 means all), so a broad list is not decoded in full.
+func (r *contentReader) candidates(term string, budget int) []uint32 {
+	return collectDocIDStream(r.candidateStream(term), budget)
 }
 
-func intersectSortedDocIDs(a, b []uint32) []uint32 {
-	out := a[:0:0]
-	i, j := 0, 0
-	for i < len(a) && j < len(b) {
-		switch {
-		case a[i] == b[j]:
-			out = append(out, a[i])
-			i++
-			j++
-		case a[i] < b[j]:
-			i++
-		default:
-			j++
+// candidateStream returns a lazy, ascending stream of the docIDs that could
+// contain term: the merge-intersection of its trigram lists, or every document
+// when the term has no trigram constraint. Each trigram list is pulled block by
+// block, so the lists are never held in memory at once.
+func (r *contentReader) candidateStream(term string) func() (uint32, bool) {
+	if len(term) < 3 || r.grams == nil {
+		return r.allDocIDStream()
+	}
+	streams := make([]func() (uint32, bool), 0, len(term)-2)
+	for i := 0; i+3 <= len(term); i++ {
+		postings, found := r.grams.postings(term[i : i+3])
+		if !found {
+			return contentEmptyDocIDStream
+		}
+		streams = append(streams, func() (uint32, bool) {
+			docID, _, ok := postings()
+			return docID, ok
+		})
+	}
+	return intersectDocIDStreams(streams)
+}
+
+// allDocIDStream yields every document index in ascending order without
+// materializing the slice.
+func (r *contentReader) allDocIDStream() func() (uint32, bool) {
+	next := uint32(0)
+	total := uint32(len(r.idx.Docs))
+	return func() (uint32, bool) {
+		if next >= total {
+			return 0, false
+		}
+		id := next
+		next++
+		return id, true
+	}
+}
+
+// contentEmptyDocIDStream yields nothing.
+func contentEmptyDocIDStream() (uint32, bool) { return 0, false }
+
+// sliceDocIDStream adapts a materialized ascending docID slice to a stream.
+func sliceDocIDStream(ids []uint32) func() (uint32, bool) {
+	i := 0
+	return func() (uint32, bool) {
+		if i >= len(ids) {
+			return 0, false
+		}
+		id := ids[i]
+		i++
+		return id, true
+	}
+}
+
+// intersectDocIDStreams lazily merge-intersects ascending docID streams, holding
+// one cursor per stream rather than the posting lists themselves. A stream that
+// has no common doc left stops the intersection.
+func intersectDocIDStreams(streams []func() (uint32, bool)) func() (uint32, bool) {
+	cur := make([]uint32, len(streams))
+	live := make([]bool, len(streams))
+	for i, s := range streams {
+		cur[i], live[i] = s()
+	}
+	return func() (uint32, bool) {
+		for {
+			var maxID uint32
+			for i := range streams {
+				if !live[i] {
+					return 0, false
+				}
+				if cur[i] > maxID {
+					maxID = cur[i]
+				}
+			}
+			equal := true
+			for i := range streams {
+				if cur[i] != maxID {
+					equal = false
+					break
+				}
+			}
+			if equal {
+				for i := range streams {
+					cur[i], live[i] = streams[i]()
+				}
+				return maxID, true
+			}
+			for i := range streams {
+				for live[i] && cur[i] < maxID {
+					cur[i], live[i] = streams[i]()
+				}
+			}
 		}
 	}
-	return out
+}
+
+// collectDocIDStream materializes up to budget docIDs from an ascending stream
+// (budget <= 0 means all). Callers that pass a budget never pull the rest of the
+// stream, so its blocks are never decoded.
+func collectDocIDStream(next func() (uint32, bool), budget int) []uint32 {
+	var out []uint32
+	for {
+		id, ok := next()
+		if !ok {
+			return out
+		}
+		out = append(out, id)
+		if budget > 0 && len(out) >= budget {
+			return out
+		}
+	}
 }
 
 // contentDocCount is a convenience for telemetry and tests.

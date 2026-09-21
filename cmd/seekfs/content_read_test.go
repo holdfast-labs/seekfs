@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"testing"
@@ -230,5 +231,150 @@ func TestContentIndexFileBuildRoundTrip(t *testing.T) {
 	}
 	if hits := r.search("needle", 0); len(hits) != 1 || hits[0].Path != "x.txt" {
 		t.Fatalf("reloaded search = %v", contentPathsOf(hits))
+	}
+}
+
+// contentReaderFromGrams builds a queryable reader whose gram section is the
+// given posting lists, with docs documents and no text.
+func contentReaderFromGrams(t *testing.T, docs int, grams map[string][]contentDocFreq) *contentReader {
+	t.Helper()
+	idx := &contentIndex{Docs: make([]contentDoc, docs), Sections: map[uint32][]byte{}}
+	if len(grams) > 0 {
+		idx.Sections[contentSectionGrams] = encodeContentPostingSection(grams)
+	}
+	r, err := openContentReader(idx)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	return r
+}
+
+// refContentCandidates is the pre-streaming algorithm: decode every trigram list
+// in full and intersect, so the streaming result can be compared against it.
+func refContentCandidates(r *contentReader, term string) []uint32 {
+	if len(term) < 3 || r.grams == nil {
+		all := make([]uint32, len(r.idx.Docs))
+		for i := range all {
+			all[i] = uint32(i)
+		}
+		return all
+	}
+	var current []uint32
+	for i := 0; i+3 <= len(term); i++ {
+		postings, ok := r.grams.lookup(term[i : i+3])
+		if !ok || len(postings) == 0 {
+			return nil
+		}
+		ids := make([]uint32, len(postings))
+		for j := range postings {
+			ids[j] = postings[j].docID
+		}
+		if i == 0 {
+			current = ids
+		} else {
+			current = refIntersectSortedDocIDs(current, ids)
+		}
+		if len(current) == 0 {
+			return nil
+		}
+	}
+	return current
+}
+
+func refIntersectSortedDocIDs(a, b []uint32) []uint32 {
+	out := a[:0:0]
+	i, j := 0, 0
+	for i < len(a) && j < len(b) {
+		switch {
+		case a[i] == b[j]:
+			out = append(out, a[i])
+			i++
+			j++
+		case a[i] < b[j]:
+			i++
+		default:
+			j++
+		}
+	}
+	return out
+}
+
+// The streamed trigram intersection must equal the full-decode intersection
+// exactly, including when the caller's budget truncates it.
+func TestContentCandidatesStreamingMatchesFullDecode(t *testing.T) {
+	grams := map[string][]contentDocFreq{}
+	add := func(key string, ids ...uint32) {
+		list := make([]contentDocFreq, len(ids))
+		for i, id := range ids {
+			list[i] = contentDocFreq{docID: id, tf: 1}
+		}
+		grams[key] = list
+	}
+	var evens, bcd, cde []uint32
+	for i := uint32(0); i < 20; i += 2 {
+		evens = append(evens, i)
+	}
+	for i := uint32(5); i < 20; i++ {
+		bcd = append(bcd, i)
+	}
+	for i := uint32(10); i < 20; i++ {
+		cde = append(cde, i)
+	}
+	add("abc", evens...)
+	add("bcd", bcd...)
+	add("cde", cde...)
+	r := contentReaderFromGrams(t, 20, grams)
+
+	// abc ∩ bcd ∩ cde = even docIDs at or above 10.
+	full := refContentCandidates(r, "abcde")
+	want := []uint32{10, 12, 14, 16, 18}
+	if !slices.Equal(full, want) {
+		t.Fatalf("reference intersection = %v; want %v", full, want)
+	}
+	if got := r.candidates("abcde", 0); !slices.Equal(got, full) {
+		t.Fatalf("candidates budget=0 = %v; want %v", got, full)
+	}
+	if got := r.candidates("abcde", 10); !slices.Equal(got, full) {
+		t.Fatalf("under-budget candidates = %v; want %v", got, full)
+	}
+	for _, budget := range []int{1, 2, 3} {
+		if got := r.candidates("abcde", budget); !slices.Equal(got, full[:budget]) {
+			t.Fatalf("over-budget candidates(%d) = %v; want %v", budget, got, full[:budget])
+		}
+	}
+	// A single-trigram term caps at the budget, matching the full list prefix.
+	if got := r.candidates("abc", 3); !slices.Equal(got, evens[:3]) {
+		t.Fatalf("single-gram candidates = %v; want %v", got, evens[:3])
+	}
+	// A missing gram is a real empty candidate set, not an error.
+	if got := r.candidates("zzz", 5); got != nil {
+		t.Fatalf("missing-gram candidates = %v; want nil", got)
+	}
+}
+
+// A broad key with a small budget must yield the capped set without decoding the
+// whole posting list.
+func TestContentCandidatesBroadKeyStopsEarly(t *testing.T) {
+	const n = contentPostingBlockSize*3 + 7
+	list := make([]contentDocFreq, n)
+	for i := range list {
+		list[i] = contentDocFreq{docID: uint32(i), tf: 1}
+	}
+	r := contentReaderFromGrams(t, n, map[string][]contentDocFreq{"brd": list})
+
+	decoded := 0
+	contentPostingDecodeHook = func() { decoded++ }
+	defer func() { contentPostingDecodeHook = nil }()
+
+	const budget = 5
+	got := r.candidates("brd", budget)
+	if len(got) != budget || got[0] != 0 || got[budget-1] != budget-1 {
+		t.Fatalf("candidates = %v; want the first %d docIDs", got, budget)
+	}
+	if decoded > budget+1 {
+		t.Fatalf("decoded %d postings for budget %d; want at most %d", decoded, budget, budget+1)
+	}
+	if decoded >= n {
+		t.Fatalf("decoded the whole %d-posting list despite the budget", n)
 	}
 }

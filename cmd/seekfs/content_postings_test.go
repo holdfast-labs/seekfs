@@ -80,3 +80,44 @@ func TestContentPostingCodecMultipleBlocks(t *testing.T) {
 		}
 	}
 }
+
+// A broad key must be paged, not decoded in full: forEach stops once the
+// callback says so, and the decode hook sees only the postings actually visited.
+func TestContentPostingForEachStopsEarly(t *testing.T) {
+	const n = contentPostingBlockSize*3 + 11
+	list := make([]contentDocFreq, n)
+	for i := range list {
+		list[i] = contentDocFreq{docID: uint32(i), tf: 1}
+	}
+	idx, err := decodeContentPostingIndex(encodeContentPostingSection(map[string][]contentDocFreq{"broad": list}))
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	decoded := 0
+	contentPostingDecodeHook = func() { decoded++ }
+	defer func() { contentPostingDecodeHook = nil }()
+
+	seen := 0
+	if !idx.forEach("broad", func(docID, tf uint32) bool {
+		if docID != uint32(seen) || tf != 1 {
+			t.Fatalf("posting %d = (%d, %d)", seen, docID, tf)
+		}
+		seen++
+		return seen < 5
+	}) {
+		t.Fatal("forEach did not report the key as found")
+	}
+	if seen != 5 {
+		t.Fatalf("callback ran %d times; want 5", seen)
+	}
+	if decoded != 5 {
+		t.Fatalf("decoded %d postings; want 5 (decode did not stop early)", decoded)
+	}
+
+	// lookup still materializes the whole list, proving the key is much longer.
+	contentPostingDecodeHook = nil
+	if got, ok := idx.lookup("broad"); !ok || len(got) != n {
+		t.Fatalf("lookup = %d, %v; want %d", len(got), ok, n)
+	}
+}

@@ -196,51 +196,91 @@ func (idx *contentPostingIndex) key(e contentPostingEntry) string {
 	return string(idx.keyBlob[e.keyOff:end])
 }
 
-// lookup returns the postings for key, decoded, in docID order.
-func (idx *contentPostingIndex) lookup(key string) ([]contentDocFreq, bool) {
+// contentPostingDecodeHook, when non-nil, is called for every posting the
+// streaming iterator decodes. Tests set it to assert a bounded decode stops
+// early instead of materializing the whole list.
+var contentPostingDecodeHook func()
+
+// postings returns a forward iterator over key's postings in docID order. found
+// is false when the key is absent or its block range is out of bounds, matching
+// lookup. The iterator decodes one block at a time; callers that stop early
+// never touch the remaining blocks, so a broad term's list is never fully
+// materialized.
+func (idx *contentPostingIndex) postings(key string) (next func() (uint32, uint32, bool), found bool) {
 	i := sort.Search(len(idx.entries), func(i int) bool { return idx.key(idx.entries[i]) >= key })
 	if i >= len(idx.entries) || idx.key(idx.entries[i]) != key {
 		return nil, false
 	}
 	e := idx.entries[i]
-	// Bound the allocation by what the blocks can actually hold, so a corrupt
-	// count cannot request a huge slice.
-	capHint := int64(e.count)
-	if maxByBlocks := int64(e.blockCount) * contentPostingBlockSize; capHint > maxByBlocks {
-		capHint = maxByBlocks
-	}
-	if capHint > 1<<20 {
-		capHint = 1 << 20
-	}
 	if int64(e.firstBlock)+int64(e.blockCount) > int64(len(idx.blocks)) {
 		return nil, false
 	}
-	out := make([]contentDocFreq, 0, capHint)
-	for b := e.firstBlock; b < e.firstBlock+e.blockCount; b++ {
-		if int(b) >= len(idx.blocks) {
-			break
-		}
-		meta := idx.blocks[b]
-		if meta.byteOffset+uint64(meta.byteLen) > uint64(len(idx.blockBlob)) {
-			break
-		}
-		block := idx.blockBlob[meta.byteOffset : meta.byteOffset+uint64(meta.byteLen)]
-		prev := int64(meta.firstDocID) - 1
-		for len(block) > 0 && len(out) < int(e.count) {
-			d, n := binary.Uvarint(block)
+	block, endBlock := e.firstBlock, e.firstBlock+e.blockCount
+	left := e.count
+	var buf []byte
+	var prev int64
+	next = func() (uint32, uint32, bool) {
+		for left > 0 {
+			if len(buf) == 0 {
+				if block >= endBlock {
+					return 0, 0, false
+				}
+				meta := idx.blocks[block]
+				block++
+				if meta.byteOffset+uint64(meta.byteLen) > uint64(len(idx.blockBlob)) {
+					return 0, 0, false
+				}
+				buf = idx.blockBlob[meta.byteOffset : meta.byteOffset+uint64(meta.byteLen)]
+				prev = int64(meta.firstDocID) - 1
+			}
+			d, n := binary.Uvarint(buf)
 			if n <= 0 {
-				return out, true
+				return 0, 0, false
 			}
-			block = block[n:]
-			tf, n2 := binary.Uvarint(block)
+			buf = buf[n:]
+			tf, n2 := binary.Uvarint(buf)
 			if n2 <= 0 {
-				return out, true
+				return 0, 0, false
 			}
-			block = block[n2:]
+			buf = buf[n2:]
 			docID := uint32(prev + 1 + int64(d))
 			prev = int64(docID)
-			out = append(out, contentDocFreq{docID: docID, tf: uint32(tf)})
+			left--
+			if contentPostingDecodeHook != nil {
+				contentPostingDecodeHook()
+			}
+			return docID, uint32(tf), true
+		}
+		return 0, 0, false
+	}
+	return next, true
+}
+
+// forEach invokes fn for each posting of key in docID order, stopping early when
+// fn returns false. found reports whether the key exists (a truncated/corrupt
+// list still reports found). It never allocates the full posting list.
+func (idx *contentPostingIndex) forEach(key string, fn func(docID, tf uint32) bool) bool {
+	next, found := idx.postings(key)
+	if !found {
+		return false
+	}
+	for {
+		docID, tf, ok := next()
+		if !ok {
+			return true
+		}
+		if !fn(docID, tf) {
+			return true
 		}
 	}
-	return out, true
+}
+
+// lookup returns the postings for key, decoded, in docID order.
+func (idx *contentPostingIndex) lookup(key string) ([]contentDocFreq, bool) {
+	var out []contentDocFreq
+	found := idx.forEach(key, func(docID, tf uint32) bool {
+		out = append(out, contentDocFreq{docID: docID, tf: tf})
+		return true
+	})
+	return out, found
 }

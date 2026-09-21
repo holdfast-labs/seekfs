@@ -436,7 +436,11 @@ func (vol *serviceVolumeIndex) contentCandidates(pq parsedQuery) ([]int, bool) {
 	if reader == nil || resolver == nil {
 		return nil, false
 	}
-	sets := make([][]uint32, 0, len(pq.Content)+len(pq.OrGroups))
+	// Each positive content leaf contributes a lazy docID stream (the
+	// merge-intersection of its trigrams); intersecting the streams and
+	// materializing only up to the budget keeps peak memory O(budget + streams)
+	// instead of decoding every posting list in full.
+	var streams []func() (uint32, bool)
 	if len(pq.Content) > 0 {
 		// A top-level Content leaf is a conjunct, so its postings alone are a
 		// superset of the whole query; OR groups only narrow it further.
@@ -450,7 +454,7 @@ func (vol *serviceVolumeIndex) contentCandidates(pq parsedQuery) ([]int, bool) {
 				// empty and falsely report zero; fall back to a scan.
 				return nil, false
 			}
-			sets = append(sets, reader.candidates(term))
+			streams = append(streams, reader.candidateStream(term))
 		}
 	} else {
 		// No top-level Content: coverage must come from content-driven OR
@@ -467,29 +471,29 @@ func (vol *serviceVolumeIndex) contentCandidates(pq parsedQuery) ([]int, bool) {
 			}
 			driven = true
 			if docs != nil {
-				sets = append(sets, docs)
+				streams = append(streams, sliceDocIDStream(docs))
 			}
 		}
 		if !driven {
 			return nil, false
 		}
 	}
-	if len(sets) == 0 {
+	if len(streams) == 0 {
 		// Every positive content leaf is a regex or otherwise unconstrained:
 		// no postings superset exists. Decline so the ordered content scan
 		// handles it with inline verification.
 		return nil, false
 	}
-	candidates := sets[0]
-	for _, set := range sets[1:] {
-		candidates = intersectSortedDocIDs(candidates, set)
-		if len(candidates) == 0 {
-			break
-		}
-	}
 	budget := contentCandidateBudgetOf(pq)
+	// Pull one past the budget so an over-budget set is still detected as capped
+	// (today's len > budget check) without materializing the whole list.
+	limit := budget + 1
+	if limit <= 0 {
+		limit = budget
+	}
+	candidates := collectDocIDStream(intersectDocIDStreams(streams), limit)
 	capped := false
-	if len(candidates) > budget {
+	if budget > 0 && len(candidates) > budget {
 		candidates = candidates[:budget]
 		capped = true
 	}
@@ -557,7 +561,7 @@ func contentOrGroupCandidateDocs(reader *contentReader, group []parsedQuery) (do
 // postings with its nested content-driven OR groups (AND semantics). driven
 // reports whether the alternative has any content constraint at all.
 func contentAltCandidateDocs(reader *contentReader, alt parsedQuery) (docs []uint32, driven, ok bool) {
-	var sets [][]uint32
+	var streams []func() (uint32, bool)
 	for _, leaf := range alt.Content {
 		driven = true
 		if leaf.Kind == contentLeafRegex {
@@ -567,7 +571,7 @@ func contentAltCandidateDocs(reader *contentReader, alt parsedQuery) (docs []uin
 		if !contentTermTrigramSafe(term) {
 			return nil, false, false
 		}
-		sets = append(sets, reader.candidates(term))
+		streams = append(streams, reader.candidateStream(term))
 	}
 	for _, group := range alt.OrGroups {
 		groupDocs, groupDriven, groupOK := contentOrGroupCandidateDocs(reader, group)
@@ -578,19 +582,15 @@ func contentAltCandidateDocs(reader *contentReader, alt parsedQuery) (docs []uin
 			continue // non-content or unconstrained: no postings constraint here
 		}
 		driven = true
-		sets = append(sets, groupDocs)
+		streams = append(streams, sliceDocIDStream(groupDocs))
 	}
 	if !driven {
 		return nil, false, true
 	}
-	if len(sets) == 0 {
+	if len(streams) == 0 {
 		return nil, true, true
 	}
-	docs = sets[0]
-	for _, set := range sets[1:] {
-		docs = intersectSortedDocIDs(docs, set)
-	}
-	return docs, true, true
+	return collectDocIDStream(intersectDocIDStreams(streams), 0), true, true
 }
 
 // contentTermTrigramSafe reports whether every trigram of term is indexable.
