@@ -22,6 +22,7 @@ func cmdContentIndex(args []string) error {
 	out := fs.String("out", "", "output .gsx path")
 	under := fs.String("under", "", "only index files under this path")
 	exts := fs.String("ext", "", "comma-separated extension allowlist, e.g. .go,.md,.txt")
+	all := fs.Bool("all", false, "with -db, explicitly opt in to a whole-volume build (every extractable file)")
 	encoding := fs.String("encoding", "auto", "text encoding override: auto, none, or a WHATWG label (latin1, windows-1252, utf-16le, sjis, ...)")
 	maxRaw := fs.Int64("max-raw", 0, "max raw source bytes per file (0 = default 32 MiB, clamped to the hard ceiling)")
 	maxText := fs.Int64("max-text", 0, "max extracted text bytes per file (0 = default 16 MiB, clamped to the hard ceiling)")
@@ -62,11 +63,34 @@ func cmdContentIndex(args []string) error {
 			return fmt.Errorf("content-index: specify exactly one of -db or -root")
 		}
 	}
+	// M5: a -db build with no scope indexes the whole volume, which is a
+	// resource/semantics footgun. Require an explicit scope or opt-in.
+	if *db != "" && !*all && strings.TrimSpace(*under) == "" && len(opts.Exts) == 0 {
+		return fmt.Errorf("content-index: -db without -ext/-under would index the whole volume; pass -ext <list>, -under <path>, or -all to opt in")
+	}
+
+	outPath := *out
+	if outPath == "" {
+		if *db != "" {
+			outPath = contentIndexPathForDB(*db)
+		} else {
+			outPath = filepath.Join(*root, ".seekfs-content.gsx")
+		}
+	}
+	// M10: building the service-owned sidecar must not race a live service's
+	// persist/swap. Hold the same advisory lock the service holds; fail fast
+	// with a clear message when a service (or another build) owns the volume.
+	if *db != "" && samePath(outPath, contentIndexPathForDB(*db)) {
+		lk, lerr := acquireContentVolumeLock(outPath)
+		if lerr != nil {
+			return fmt.Errorf("content-index: %w: %s; stop the running service or index through it", lerr, outPath)
+		}
+		defer lk.release()
+	}
 
 	var (
-		idx     *contentIndex
-		outPath = *out
-		err     error
+		idx *contentIndex
+		err error
 	)
 	if *db != "" {
 		rec, lerr := loadIndex(*db)
@@ -74,20 +98,11 @@ func cmdContentIndex(args []string) error {
 			return fmt.Errorf("content-index: load %s: %w", *db, lerr)
 		}
 		idx, err = buildContentIndexForIndex(context.Background(), rec, opts)
-		if outPath == "" {
-			outPath = contentIndexPathForDB(*db)
-		}
 	} else {
 		idx, err = buildContentIndexFromDir(context.Background(), *root, opts)
-		if outPath == "" {
-			outPath = filepath.Join(*root, ".seekfs-content.gsx")
-		}
 	}
 	if err != nil {
 		return err
-	}
-	if outPath == "" {
-		return fmt.Errorf("content-index: no output path")
 	}
 	if err := contentSaveFile(outPath, idx); err != nil {
 		return err

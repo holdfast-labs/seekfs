@@ -54,6 +54,7 @@ func (s *goSearchService) attachContentForVolume(vol *serviceVolumeIndex) {
 	if vol.index == nil || vol.index.Source != "usn" {
 		return
 	}
+	s.acquireContentVolumeLock(vol)
 	// A volume that already has a usable base attached is done. This replaced
 	// the old "drain enabled" guard: after a journal reset invalidates the base
 	// the drain stays enabled, so keying on it would skip the re-attach of a
@@ -149,6 +150,37 @@ func (s *goSearchService) attachContentForVolume(vol *serviceVolumeIndex) {
 	serviceLog("content index loaded for volume %s docs=%d", vol.volume, len(idx.Docs))
 }
 
+// acquireContentVolumeLock records this service as the owner of vol's content
+// sidecar (M10) by taking the `.gsx.lock` advisory lock, held for the process
+// lifetime. It is idempotent and best-effort: a lock already held for the path
+// is reused, and a path owned by another process is logged and skipped so the
+// service still attaches (the atomic sidecar write keeps the file intact, and
+// the CLI refuses when it finds the service's lock). A nil receiver or volume is
+// a no-op.
+func (s *goSearchService) acquireContentVolumeLock(vol *serviceVolumeIndex) {
+	if s == nil || vol == nil {
+		return
+	}
+	gsx := contentIndexPathForDB(vol.dbPath)
+	if gsx == "" {
+		return
+	}
+	s.contentLocksMu.Lock()
+	defer s.contentLocksMu.Unlock()
+	if _, ok := s.contentLocks[gsx]; ok {
+		return
+	}
+	lk, err := acquireContentVolumeLock(gsx)
+	if err != nil {
+		serviceLog("content sidecar lock volume=%s path=%s not acquired: %v", vol.volume, gsx, err)
+		return
+	}
+	if s.contentLocks == nil {
+		s.contentLocks = make(map[string]*contentVolumeLock)
+	}
+	s.contentLocks[gsx] = lk
+}
+
 // contentCatchUpMaxChanges and contentCatchUpMaxBytes bound restart catch-up so
 // a base far behind a busy journal cannot make startup do unbounded work or
 // queue an unbounded delta (a record count alone permits 1M files times the
@@ -203,6 +235,7 @@ func (s *goSearchService) contentCatchUpAfterAttach(vol *serviceVolumeIndex, idx
 		// PF-3 owns the rebuild that would stamp a checkpoint. Nothing to
 		// replay, so the fold gate may clear.
 		vol.content.markCatchUpComplete()
+		vol.contentBuildAttempts.Store(0)
 		return
 	}
 	// Validate the base's watermark against the live journal before reading. A
@@ -213,7 +246,7 @@ func (s *goSearchService) contentCatchUpAfterAttach(vol *serviceVolumeIndex, idx
 	journal, err := contentCatchUpJournal(vol.volume)
 	if err != nil {
 		serviceLog("content catch-up journal query error volume=%s err=%v", vol.volume, err)
-		vol.content.markCatchUpIncomplete()
+		s.contentCatchUpFailed(vol, "journal query error")
 		return
 	}
 	probe := &serviceVolumeIndex{journalID: idx.JournalID, checkpoint: from}
@@ -233,6 +266,7 @@ func (s *goSearchService) contentCatchUpAfterAttach(vol *serviceVolumeIndex, idx
 	}
 	if from >= target {
 		vol.content.markCatchUpComplete()
+		vol.contentBuildAttempts.Store(0)
 		return
 	}
 	buffer := make([]byte, 4*1024*1024)
@@ -252,7 +286,7 @@ func (s *goSearchService) contentCatchUpAfterAttach(vol *serviceVolumeIndex, idx
 		next, changes, err := contentCatchUpUSNRead(vol.volume, idx.JournalID, cur, buffer)
 		if err != nil {
 			serviceLog("content catch-up read error volume=%s from=%d err=%v", vol.volume, cur, err)
-			vol.content.markCatchUpIncomplete()
+			s.contentCatchUpFailed(vol, "read error")
 			return
 		}
 		if next <= cur {
@@ -262,7 +296,7 @@ func (s *goSearchService) contentCatchUpAfterAttach(vol *serviceVolumeIndex, idx
 		processedBytes += s.contentCatchUpBatchBytes(vol, changes)
 		if processed > contentCatchUpMaxChanges || processedBytes > contentCatchUpMaxBytes {
 			serviceLog("content catch-up cap hit volume=%s from=%d target=%d processed=%d bytes=%d", vol.volume, from, target, processed, processedBytes)
-			vol.content.markCatchUpIncomplete()
+			s.contentCatchUpFailed(vol, "hit the record/byte cap")
 			return
 		}
 		vol.contentCoord.observeChanges(changes)
@@ -273,6 +307,25 @@ func (s *goSearchService) contentCatchUpAfterAttach(vol *serviceVolumeIndex, idx
 	// observed and enqueued; the fold gate may open. A capped/errored catch-up
 	// returned above without reaching here, so it stays gated and degraded.
 	vol.content.markCatchUpComplete()
+	vol.contentBuildAttempts.Store(0)
+}
+
+// contentCatchUpFailed handles a capped or errored restart catch-up. It keeps
+// the volume visibly incomplete/degraded, then schedules a full rebuild so the
+// volume self-heals instead of staying gated forever with an ever-growing
+// delta. contentBuildAttempts bounds retries, so a volume whose catch-up can
+// never keep up gives up with a BuildError rather than spinning rebuilds; a
+// successful catch-up resets the budget.
+func (s *goSearchService) contentCatchUpFailed(vol *serviceVolumeIndex, reason string) {
+	if vol == nil {
+		return
+	}
+	vol.content.markCatchUpIncomplete()
+	if vol.contentBuildAttempts.Add(1) > contentBuildMaxAttempts {
+		vol.content.markBuildFailed(fmt.Sprintf("content catch-up %s; rebuild gave up after %d attempts", reason, contentBuildMaxAttempts))
+		return
+	}
+	s.scheduleContentRebuild(vol)
 }
 
 // contentCatchUpGenerationCurrent reports whether the volume's live journal

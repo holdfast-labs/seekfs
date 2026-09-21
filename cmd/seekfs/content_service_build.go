@@ -262,6 +262,33 @@ func (s *goSearchService) scheduleContentBuild(vol *serviceVolumeIndex) {
 	contentBuildRun(func() { s.runContentBuild(vol) })
 }
 
+// scheduleContentRebuild schedules a content rebuild for vol without first
+// trying to re-attach the existing sidecar. It is the self-heal path for a
+// capped or errored restart catch-up: that sidecar is still valid but
+// incomplete, so re-attaching it (scheduleContentBuild) would leave the volume
+// permanently degraded with a gated fold and an ever-growing delta.
+// contentCatchUpFailed bounds its use with contentBuildAttempts.
+func (s *goSearchService) scheduleContentRebuild(vol *serviceVolumeIndex) {
+	if s == nil || vol == nil || !contentSearchEnabled() || vol.content == nil {
+		return
+	}
+	s.indexMu.RLock()
+	ready := vol.state == "ready" && vol.index != nil && vol.index.Source == "usn"
+	journalID := vol.journalID
+	checkpoint := vol.baseCheckpoint
+	if checkpoint <= 0 && vol.index != nil {
+		checkpoint = vol.index.Checkpoint
+	}
+	s.indexMu.RUnlock()
+	if !ready || journalID == 0 || checkpoint <= 0 {
+		return
+	}
+	if !vol.contentBuildBusy.CompareAndSwap(false, true) {
+		return
+	}
+	contentBuildRun(func() { s.runContentBuild(vol) })
+}
+
 // snapshotContentBuildItems copies the FRN/path/size/modtime metadata for every
 // in-scope, eligible file, but only ever holds s.indexMu.RLock for one
 // contentBuildSnapshotBatch-record window at a time: it reacquires the read
@@ -369,6 +396,10 @@ func contentBuildDocSafe(ctx context.Context, item contentBuildItem) (doc conten
 	if e == nil {
 		return contentBuildDoc{}, contentExtractResult{}, false
 	}
+	// Bound one document's extraction so a hang cannot stall the serial build;
+	// the deadline nests inside the build's stop/cancel context.
+	ctx, cancel := contentWithExtractDocTimeout(ctx)
+	defer cancel()
 	res, err = e.Extract(ctx, f, size)
 	if err != nil || res.Skipped || len(res.Text) == 0 {
 		return contentBuildDoc{}, res, false

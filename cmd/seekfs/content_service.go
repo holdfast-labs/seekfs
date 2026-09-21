@@ -857,6 +857,23 @@ func (c *contentCoordinator) foldFailed(backoff time.Duration) {
 	c.mu.Unlock()
 }
 
+// contentExtractDocTimeout bounds one document's extraction so a single
+// pathological file cannot stall the serial drain (or the serial build path,
+// which uses contentBuildDocSafe). A timeout is treated as an extraction error:
+// the caller skips the document and moves on. It is a package var so tests can
+// lower it; a non-positive value disables the bound.
+var contentExtractDocTimeout = 2 * time.Minute
+
+// contentWithExtractDocTimeout nests a per-document deadline inside ctx,
+// preserving the extraction settings it carries. Returns ctx unchanged when the
+// bound is disabled.
+func contentWithExtractDocTimeout(ctx context.Context) (context.Context, context.CancelFunc) {
+	if contentExtractDocTimeout <= 0 {
+		return ctx, func() {}
+	}
+	return context.WithTimeout(ctx, contentExtractDocTimeout)
+}
+
 // contentExtractDeltaDoc extracts a changed file into a delta document. When the
 // file's content hash matches prior, changed is false and the caller can skip it
 // (touch-only writes never reindex).
@@ -876,7 +893,10 @@ func contentExtractDeltaDoc(frn uint64, path string, prior [contentHashLen]byte,
 	if e == nil {
 		return contentDeltaDoc{}, false, nil
 	}
-	ctx := contentWithExtractSettings(context.Background(), contentServiceExtractSettings())
+	// The timeout nests inside the settings context so the extractor still sees
+	// the service's encoding/cap policy while a hanging file is bounded.
+	ctx, cancel := contentWithExtractDocTimeout(contentWithExtractSettings(context.Background(), contentServiceExtractSettings()))
+	defer cancel()
 	res, err := e.Extract(ctx, f, size)
 	if err != nil || res.Skipped || len(res.Text) == 0 {
 		return contentDeltaDoc{}, false, err

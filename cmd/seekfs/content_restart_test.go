@@ -33,6 +33,19 @@ func stubContentCatchUpRead(t *testing.T, fn func(volume string, journalID uint6
 	t.Cleanup(func() { contentCatchUpUSNRead = restore })
 }
 
+// stubContentBuildSchedule captures scheduled content builds without running
+// them, so a test can assert that a capped/errored catch-up requested a rebuild
+// while the volume's degraded/incomplete state stays deterministically
+// observable.
+func stubContentBuildSchedule(t *testing.T) *int {
+	t.Helper()
+	n := 0
+	restore := contentBuildRun
+	contentBuildRun = func(fn func()) { n++ }
+	t.Cleanup(func() { contentBuildRun = restore })
+	return &n
+}
+
 // The WP0 checkpoint must round-trip through the .gsx header so restart
 // catch-up can resume from it.
 func TestContentIndexCheckpointRoundTrip(t *testing.T) {
@@ -425,6 +438,7 @@ func TestContentCatchUpCapsDegrade(t *testing.T) {
 		restore := contentCatchUpMaxChanges
 		contentCatchUpMaxChanges = 1
 		t.Cleanup(func() { contentCatchUpMaxChanges = restore })
+		scheduled := stubContentBuildSchedule(t)
 		vol := newVolume(t)
 		s := &goSearchService{stop: make(chan struct{})}
 		defer close(s.stop)
@@ -435,18 +449,25 @@ func TestContentCatchUpCapsDegrade(t *testing.T) {
 		if got := vol.content.stateOf(); got != contentStateDegraded {
 			t.Fatalf("state = %q; want degraded", got)
 		}
+		if *scheduled == 0 {
+			t.Fatal("a capped catch-up must schedule a rebuild")
+		}
 	})
 
 	t.Run("bytes", func(t *testing.T) {
 		restore := contentCatchUpMaxBytes
 		contentCatchUpMaxBytes = 0
 		t.Cleanup(func() { contentCatchUpMaxBytes = restore })
+		scheduled := stubContentBuildSchedule(t)
 		vol := newVolume(t)
 		s := &goSearchService{stop: make(chan struct{})}
 		defer close(s.stop)
 		s.attachContentForVolume(vol)
 		if !vol.content.healthIncomplete() {
 			t.Fatal("hitting the byte cap must mark the volume incomplete")
+		}
+		if *scheduled == 0 {
+			t.Fatal("a capped catch-up must schedule a rebuild")
 		}
 	})
 }
@@ -465,6 +486,7 @@ func TestContentCatchUpAllCreateByteCapDegrade(t *testing.T) {
 	restore := contentCatchUpMaxBytes
 	contentCatchUpMaxBytes = 1
 	t.Cleanup(func() { contentCatchUpMaxBytes = restore })
+	scheduled := stubContentBuildSchedule(t)
 
 	dir := t.TempDir()
 	idx := &Index{Source: "usn", Volume: "C:", Compact: true, JournalID: 7, Checkpoint: 100}
@@ -504,6 +526,9 @@ func TestContentCatchUpAllCreateByteCapDegrade(t *testing.T) {
 	if q, d := vol.contentCoord.queued(), vol.content.deltaView().len(); q != 0 || d != 0 {
 		t.Fatalf("cap tripped but work was enqueued: queue=%d delta=%d", q, d)
 	}
+	if *scheduled == 0 {
+		t.Fatal("a capped catch-up must schedule a rebuild")
+	}
 }
 
 // A USN read error during catch-up is a degraded (incomplete) volume, never a
@@ -531,6 +556,7 @@ func TestContentCatchUpReadErrorDegraded(t *testing.T) {
 	stubContentCatchUpRead(t, func(volume string, journalID uint64, startUSN int64, buffer []byte) (int64, []usnChange, error) {
 		return startUSN, nil, errors.New("journal read failed")
 	})
+	scheduled := stubContentBuildSchedule(t)
 
 	s := &goSearchService{stop: make(chan struct{})}
 	defer close(s.stop)
@@ -540,6 +566,9 @@ func TestContentCatchUpReadErrorDegraded(t *testing.T) {
 	}
 	if got := vol.content.stateOf(); got != contentStateDegraded {
 		t.Fatalf("state = %q; want degraded", got)
+	}
+	if *scheduled == 0 {
+		t.Fatal("an errored catch-up must schedule a rebuild")
 	}
 }
 
@@ -697,5 +726,61 @@ func TestContentAttachRejectsOldFormat(t *testing.T) {
 	}
 	if vol.content.usableForQuery() {
 		t.Fatal("old-format sidecar must not be usable")
+	}
+}
+
+// A capped restart catch-up must schedule a rebuild that advances the base to
+// the live checkpoint, so the volume self-heals instead of staying permanently
+// degraded with a gated fold and an ever-growing delta.
+func TestContentCatchUpCapSelfHealsRebuild(t *testing.T) {
+	t.Setenv("SEEKFS_CONTENT_SEARCH", "1")
+	stubContentCatchUpSync(t)
+	stubContentBuildSync(t)
+
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "note.txt"), []byte("needle"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	const journal = uint64(0xABC)
+	const live = uint64(120)
+	stubContentCatchUpJournal(t, usnJournalDataV0{UsnJournalID: journal, FirstUsn: 1, LowestValidUsn: 1, NextUsn: int64(live)})
+
+	vol, _ := contentBuildTestVolume(t, dir, journal, live, []CompactRecord{
+		{FRN: 10, ParentFRN: 10, Parent: -1, Name: "note.txt", Size: 6},
+	})
+	base := newContentIndex()
+	base.Origin = contentOriginUSN
+	base.JournalID = journal
+	base.CheckpointUSN = 50
+	base.Docs = []contentDoc{{DocID: 0, FRN: 10}}
+	if err := contentSaveFile(contentIndexPathForDB(vol.dbPath), base); err != nil {
+		t.Fatal(err)
+	}
+
+	restore := contentCatchUpMaxChanges
+	contentCatchUpMaxChanges = 1
+	t.Cleanup(func() { contentCatchUpMaxChanges = restore })
+	stubContentCatchUpRead(t, func(volume string, journalID uint64, startUSN int64, buffer []byte) (int64, []usnChange, error) {
+		return int64(live), []usnChange{
+			{FRN: 10, Reason: usnReasonDataOverwrite},
+			{FRN: 11, Reason: usnReasonDataOverwrite},
+		}, nil
+	})
+
+	s := contentTestService(t)
+	s.attachContentForVolume(vol)
+
+	if got := vol.content.stateOf(); got != contentStateReady {
+		t.Fatalf("state after capped catch-up self-heal = %q; want ready", got)
+	}
+	if vol.content.healthIncomplete() {
+		t.Fatal("a completed rebuild must clear the incomplete flag")
+	}
+	rebuilt, err := contentLoadFile(contentIndexPathForDB(vol.dbPath))
+	if err != nil {
+		t.Fatalf("load rebuilt sidecar: %v", err)
+	}
+	if rebuilt.CheckpointUSN != live {
+		t.Fatalf("rebuilt checkpoint = %d; want %d", rebuilt.CheckpointUSN, live)
 	}
 }

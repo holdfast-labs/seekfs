@@ -417,6 +417,13 @@ type goSearchService struct {
 	// empty (disabled) by default.
 	remoteAddr string
 	remoteSrv  *remoteLoopbackServer
+	// contentLocks holds the advisory `.gsx.lock` locks this service owns for
+	// the volumes it has attached or built, keyed by the `.gsx` path. They are
+	// held for the volume's lifetime so a concurrent `content-index -db` fails
+	// fast rather than clobbering the service's sidecar (M10). Bounded by the
+	// distinct sidecar paths; released at process exit.
+	contentLocksMu sync.Mutex
+	contentLocks   map[string]*contentVolumeLock
 }
 
 // signalServiceStop closes the stop channel exactly once.  It is safe to call
