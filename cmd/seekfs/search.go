@@ -387,14 +387,16 @@ func searchServiceVolumes(volumes []*serviceVolumeIndex, opts queryOptions, coun
 		// Content has its own candidate + post-filter path. It runs on every
 		// content-usable volume; an unusable volume degrades the result rather
 		// than bricking the whole service, but if none is usable the query is
-		// refused instead of reported as no matches.
+		// refused instead of reported as no matches. A query that remains
+		// answerable without content still gets the unusable volume's filename
+		// matches (PF-7b); an unanswerable one skips it.
 		usable, skipped := contentUsableVolumes(volumes, pq)
-		if len(usable) == 0 {
+		if len(usable) == 0 && !filenameAnswerable(pq) {
 			return nil, contentUnavailableError()
 		}
 		markContentQueryDegraded(opts.Trace, skipped)
 		markContentQueryIncomplete(opts.Trace, usable)
-		return searchContentServiceVolumes(usable, opts, countOnly, pq)
+		return searchContentServiceVolumes(volumes, opts, countOnly, pq)
 	}
 	snapshot := newGlobalQuerySnapshot(volumes, opts.Trace)
 	if matches, handled, err := searchServiceVolumesGlobalExtOnlySnapshot(snapshot, opts, countOnly); handled {

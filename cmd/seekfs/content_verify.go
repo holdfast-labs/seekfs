@@ -395,6 +395,67 @@ func contentUsableVolumes(volumes []*serviceVolumeIndex, pq parsedQuery) (usable
 	return usable, skipped
 }
 
+// filenameAnswerable reports whether a volume whose content index is unusable
+// can still answer pq filename-only, treating every content leaf as false.
+// Soundness (PF-7b):
+//   - a top-level content leaf is a conjunct, so the query cannot match without
+//     content;
+//   - an OR group is satisfiable only if some alternative is itself answerable
+//     without content;
+//   - a NOT group that mentions content cannot be decided (treating its content
+//     leaf as false would wrongly satisfy the exclusion), so the whole query is
+//     refused;
+//   - anything else is a pure filename/scalar predicate.
+func filenameAnswerable(pq parsedQuery) bool {
+	if len(pq.Content) > 0 {
+		return false
+	}
+	for _, group := range pq.OrGroups {
+		ok := false
+		for i := range group {
+			if filenameAnswerable(group[i]) {
+				ok = true
+				break
+			}
+		}
+		if !ok {
+			return false
+		}
+	}
+	for i := range pq.NotGroups {
+		if queryHasAnyContentLeaf(pq.NotGroups[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+// stripContentLeaves returns a copy of pq with every content leaf removed:
+// top-level Content is dropped, each OR group keeps only its filename-answerable
+// alternatives (a kept content-only alternative would otherwise become
+// match-all under entryMatches, which ignores Content), and NOT groups are
+// copied as-is (filenameAnswerable guarantees none carries content). The result
+// evaluates to exactly the original predicate under "all content leaves false",
+// so it can never introduce a false positive.
+func stripContentLeaves(pq parsedQuery) parsedQuery {
+	out := pq
+	out.Content = nil
+	out.Terms = append([]string(nil), pq.Terms...)
+	if len(pq.OrGroups) > 0 {
+		out.OrGroups = make([][]parsedQuery, 0, len(pq.OrGroups))
+		for _, group := range pq.OrGroups {
+			stripped := make([]parsedQuery, 0, len(group))
+			for i := range group {
+				if filenameAnswerable(group[i]) {
+					stripped = append(stripped, stripContentLeaves(group[i]))
+				}
+			}
+			out.OrGroups = append(out.OrGroups, stripped)
+		}
+	}
+	return out
+}
+
 // markContentQueryDegraded records that a content query answered from only a
 // subset of the eligible volumes, so the response can say the result is partial
 // instead of implying completeness.
@@ -662,6 +723,26 @@ func (vol *serviceVolumeIndex) searchContentVolume(opts queryOptions, countOnly 
 	return filterImplicitUnderExisting(matches, opts, countOnly), nil
 }
 
+// searchFilenameOnlyVolume evaluates pq's filename-answerable subset on a volume
+// whose content index is unusable. It strips every content leaf and reuses the
+// content per-volume scan, so candidate generation, overlay merge, the bounded
+// window and the Exists/under re-check match the normal filename path exactly.
+// The caller has already checked filenameAnswerable(pq).
+func (vol *serviceVolumeIndex) searchFilenameOnlyVolume(opts queryOptions, countOnly bool, pq parsedQuery) ([]Entry, error) {
+	stripped := stripContentLeaves(pq)
+	opts.parsedOverride = &stripped
+	return vol.searchContentVolume(opts, countOnly)
+}
+
+// countFilenameOnlyVolume is countContentVolume for the filename-only fallback:
+// the stripped query is threaded through the same tally path so count == len of
+// the filename-only search on the same volume.
+func (vol *serviceVolumeIndex) countFilenameOnlyVolume(opts queryOptions, pq parsedQuery) (int, error) {
+	stripped := stripContentLeaves(pq)
+	opts.parsedOverride = &stripped
+	return vol.countContentVolume(opts)
+}
+
 // queryNeedsEntryPath reports whether any level of the query reads Entry.Path
 // (a path match, :under, Exists, parent/dir filters or a regexp). When false, a
 // content count can evaluate the query from the record's name/metadata alone
@@ -743,6 +824,13 @@ func contentRelevanceWindow(limit, budget int) int {
 // concatenated, globally sorted when they span volumes, and the user limit is
 // applied only after inline content verification. It checks cancellation
 // between volumes so a superseded query does not start the next full scan.
+//
+// A volume whose content index is unusable contributes its filename-answerable
+// matches (PF-7b): the content matches are still missing and the volume is
+// surfaced as degraded by the caller, but the filename matches it can answer are
+// no longer dropped. When pq is not filename-answerable (a required top-level
+// content leaf, a content-only OR, or a content negation) the volume is skipped
+// exactly as before.
 func searchContentServiceVolumes(volumes []*serviceVolumeIndex, opts queryOptions, countOnly bool, pq parsedQuery) ([]Entry, error) {
 	postVerify := !countOnly && queryHasAnyContentLeaf(pq)
 	relevance := postVerify && pq.SortColumn == "relevance"
@@ -767,6 +855,7 @@ func searchContentServiceVolumes(volumes []*serviceVolumeIndex, opts queryOption
 	if relevance || defaultOrder {
 		window = contentRelevanceWindow(userLimit, contentCandidateBudgetOf(pq))
 	}
+	filenameOnly := filenameAnswerable(pq)
 	var volByPath map[string]*serviceVolumeIndex
 	if postVerify {
 		volByPath = make(map[string]*serviceVolumeIndex)
@@ -780,14 +869,26 @@ func searchContentServiceVolumes(volumes []*serviceVolumeIndex, opts queryOption
 		if window > 0 {
 			volOpts.Limit = window
 		}
-		matches, err := vol.searchContentVolume(volOpts, countOnly)
+		contentVolume := vol != nil && vol.contentUsableForQuery()
+		var matches []Entry
+		var err error
+		if contentVolume {
+			matches, err = vol.searchContentVolume(volOpts, countOnly)
+		} else if filenameOnly && vol != nil {
+			matches, err = vol.searchFilenameOnlyVolume(volOpts, countOnly, pq)
+		} else {
+			continue
+		}
 		if err != nil {
 			return nil, err
 		}
 		if window > 0 && len(matches) >= window {
 			opts.Trace.setContentIncomplete()
 		}
-		if postVerify {
+		if postVerify && contentVolume {
+			// A filename-only volume is deliberately left out of volByPath: it
+			// has no content matches, so it must not gain a content snippet or
+			// content relevance from a stale/delta document.
 			for i := range matches {
 				if _, ok := volByPath[matches[i].Path]; !ok {
 					volByPath[matches[i].Path] = vol

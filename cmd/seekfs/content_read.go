@@ -251,6 +251,9 @@ func sliceDocIDStream(ids []uint32) func() (uint32, bool) {
 // one cursor per stream rather than the posting lists themselves. A stream that
 // has no common doc left stops the intersection.
 func intersectDocIDStreams(streams []func() (uint32, bool)) func() (uint32, bool) {
+	if len(streams) == 0 {
+		return contentEmptyDocIDStream
+	}
 	cur := make([]uint32, len(streams))
 	live := make([]bool, len(streams))
 	for i, s := range streams {

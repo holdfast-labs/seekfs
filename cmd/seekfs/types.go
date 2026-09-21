@@ -452,6 +452,11 @@ type queryOptions struct {
 	// contentCount, when non-nil, makes the content compact scan count matches
 	// in place instead of materializing and retaining []Entry. Local-only.
 	contentCount *int `json:"-"`
+	// parsedOverride, when non-nil, makes parseQuery return this tree instead of
+	// re-parsing Query. PF-7b: the filename-only evaluation of a volume whose
+	// content index is unusable needs a stripped query that cannot be expressed
+	// as a Query string. Local-only; nil on every normal request.
+	parsedOverride *parsedQuery `json:"-"`
 }
 
 type parsedQuery struct {

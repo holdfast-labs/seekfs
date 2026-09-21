@@ -1698,6 +1698,14 @@ func (idx *Index) compactPathContainsAll(i int, terms []string) bool {
 }
 
 func parseQuery(opts queryOptions) (parsedQuery, error) {
+	if opts.parsedOverride != nil {
+		// PF-7b: a caller supplied a pre-built tree (the stripped filename-only
+		// query). Copy it so a downstream dropSatisfiedVolumeTerms cannot mutate
+		// the shared override, and give Terms its own backing array.
+		pq := *opts.parsedOverride
+		pq.Terms = append([]string(nil), pq.Terms...)
+		return pq, nil
+	}
 	pq := parsedQuery{
 		Raw:                    opts.Query,
 		MatchPath:              opts.MatchPath || queryLooksPathScoped(opts.Query),

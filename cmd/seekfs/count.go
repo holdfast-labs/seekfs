@@ -43,19 +43,29 @@ func countServiceVolumes(volumes []*serviceVolumeIndex, opts queryOptions) (int,
 		// Content counts run the exact same per-volume candidate + inline
 		// verification path as content searches so count == len(search results)
 		// for every shape that does not require a stat. Unusable volumes degrade
-		// the result; only an all-unusable query is refused.
+		// the result; only an all-unusable query is refused. A query still
+		// answerable without content also counts the unusable volume's filename
+		// matches (PF-7b).
 		usable, skipped := contentUsableVolumes(volumes, pq)
-		if len(usable) == 0 {
+		if len(usable) == 0 && !filenameAnswerable(pq) {
 			return 0, true, contentUnavailableError()
 		}
 		markContentQueryDegraded(opts.Trace, skipped)
 		markContentQueryIncomplete(opts.Trace, usable)
 		total := 0
-		for _, vol := range usable {
+		for _, vol := range volumes {
 			if queryCanceled(parsedQuery{DeadlineUnix: opts.DeadlineUnix, Cancel: opts.Cancel}) {
 				return 0, true, errQueryCanceled
 			}
-			n, err := vol.countContentVolume(opts)
+			var n int
+			var err error
+			if vol != nil && vol.contentUsableForQuery() {
+				n, err = vol.countContentVolume(opts)
+			} else if filenameAnswerable(pq) && vol != nil {
+				n, err = vol.countFilenameOnlyVolume(opts, pq)
+			} else {
+				continue
+			}
 			if err != nil {
 				return 0, true, err
 			}
