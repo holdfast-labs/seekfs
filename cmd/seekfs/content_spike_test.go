@@ -49,8 +49,8 @@ func TestContentSpike(t *testing.T) {
 
 	var (
 		files, extracted, skippedBinary, skippedCap, unclaimed int
-		rawBytes, textBytes                                   int64
-		start                                                 = time.Now()
+		rawBytes, textBytes                                    int64
+		start                                                  = time.Now()
 	)
 	texts := make([]string, 0, 1024)
 	textParts := make([][]byte, 0, 1024)
