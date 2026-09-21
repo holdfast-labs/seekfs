@@ -30,11 +30,11 @@ func contentQueryIndex(volume string, files []contentFixtureFile) *Index {
 
 // newContentQueryVolume attaches an FRN-keyed content index to a fresh
 // service volume, so searchServiceVolumes exercises the full P3 path.
-func newContentQueryVolume(t *testing.T, files []contentFixtureFile) *serviceVolumeIndex {
+func newContentQueryVolume(t testing.TB, files []contentFixtureFile) *serviceVolumeIndex {
 	return newContentQueryVolumeNamed(t, "C:", files)
 }
 
-func newContentQueryVolumeNamed(t *testing.T, volume string, files []contentFixtureFile) *serviceVolumeIndex {
+func newContentQueryVolumeNamed(t testing.TB, volume string, files []contentFixtureFile) *serviceVolumeIndex {
 	t.Helper()
 	t.Setenv("SEEKFS_CONTENT_SEARCH", "1")
 	idx := contentQueryIndex(volume, files)
