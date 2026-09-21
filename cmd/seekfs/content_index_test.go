@@ -65,6 +65,19 @@ func TestContentIndexRoundTrip(t *testing.T) {
 	}
 }
 
+func TestContentIndexPolicyRoundTrip(t *testing.T) {
+	idx := newContentIndex()
+	idx.Docs = contentTestDocs()
+	idx.Policy = contentBuildPolicy{MaxRaw: 1 << 20, MaxText: 1 << 19, Skipped: 3, Truncated: 2}
+	got, err := contentIndexDecode(contentIndexEncode(idx))
+	if err != nil {
+		t.Fatalf("contentDecode: %v", err)
+	}
+	if got.Policy != idx.Policy {
+		t.Fatalf("policy = %+v; want %+v", got.Policy, idx.Policy)
+	}
+}
+
 func TestContentIndexEncodingIsDeterministic(t *testing.T) {
 	mk := func() *contentIndex {
 		idx := newContentIndex()

@@ -27,10 +27,14 @@ func (contentPDFExtractor) Extensions() []string { return []string{".pdf"} }
 func (contentPDFExtractor) Sniff(head []byte) bool { return bytes.HasPrefix(head, []byte("%PDF-")) }
 
 func (contentPDFExtractor) Extract(ctx context.Context, r io.ReaderAt, size int64) (contentExtractResult, error) {
-	if size > contentExtractMaxRawBytes {
+	s := contentExtractSettingsFromContext(ctx)
+	// A PDF's cross-reference (and often its text objects) can live anywhere,
+	// so a bounded prefix is not a usable document: an over-cap PDF is skipped
+	// with a visible reason rather than prefix-indexed.
+	if size > s.maxRaw {
 		return contentExtractResult{Skipped: true, Reason: "raw size over cap", Class: contentClassPDF}, nil
 	}
-	raw, err := contentReadBounded(r, size, contentExtractMaxRawBytes)
+	raw, err := contentReadBounded(r, size, int(s.maxRaw))
 	if err != nil {
 		return contentExtractResult{}, err
 	}
@@ -39,6 +43,7 @@ func (contentPDFExtractor) Extract(ctx context.Context, r io.ReaderAt, size int6
 	}
 
 	var text []byte
+	truncated := false
 	for i := 0; i < len(raw); {
 		if err := ctx.Err(); err != nil {
 			return contentExtractResult{}, err
@@ -86,14 +91,15 @@ func (contentPDFExtractor) Extract(ctx context.Context, r io.ReaderAt, size int6
 
 		data := raw[start:end]
 		if bytes.Contains(dict, []byte("/FlateDecode")) {
-			data = contentPDFInflate(data)
+			data = contentPDFInflate(data, s.maxRaw)
 		}
 		if len(data) > 0 {
 			text = contentPDFExtractStreamText(data, text)
 			// Cap inside the loop: many inflated streams must not accumulate
 			// past the text budget before the single end-of-function truncate.
-			if len(text) >= contentExtractMaxTextBytes {
-				text = []byte(truncateUTF8(string(text), contentExtractMaxTextBytes))
+			if int64(len(text)) >= s.maxText {
+				text = []byte(truncateUTF8(string(text), int(s.maxText)))
+				truncated = true
 				break
 			}
 		}
@@ -103,29 +109,34 @@ func (contentPDFExtractor) Extract(ctx context.Context, r io.ReaderAt, size int6
 	if len(text) == 0 {
 		return contentExtractResult{Skipped: true, Reason: "no extractable text", Class: contentClassPDF}, nil
 	}
-	if len(text) > contentExtractMaxTextBytes {
-		text = []byte(truncateUTF8(string(text), contentExtractMaxTextBytes))
+	if int64(len(text)) > s.maxText {
+		text = []byte(truncateUTF8(string(text), int(s.maxText)))
+		truncated = true
 	}
-	return contentExtractResult{Text: text, Class: contentClassPDF}, nil
+	res := contentExtractResult{Text: text, Class: contentClassPDF, Truncated: truncated}
+	if truncated {
+		res.Reason = "indexed bounded prefix up to policy cap"
+	}
+	return res, nil
 }
 
 // contentPDFInflate best-effort decompresses a stream. zlib framing is tried
 // first (the spec's /FlateDecode), then raw deflate for writers that omit the
 // header. A partial decode still yields whatever text came out before the
 // error, which is more useful than nothing for a search index.
-func contentPDFInflate(data []byte) []byte {
+func contentPDFInflate(data []byte, maxRaw int64) []byte {
 	if len(data) == 0 {
 		return nil
 	}
 	if zr, err := zlib.NewReader(bytes.NewReader(data)); err == nil {
-		b := contentPDFReadLimit(zr)
+		b := contentPDFReadLimit(zr, maxRaw)
 		zr.Close()
 		if len(b) > 0 {
 			return b
 		}
 	}
 	fr := flate.NewReader(bytes.NewReader(data))
-	b := contentPDFReadLimit(fr)
+	b := contentPDFReadLimit(fr, maxRaw)
 	fr.Close()
 	if len(b) > 0 {
 		return b
@@ -134,9 +145,9 @@ func contentPDFInflate(data []byte) []byte {
 }
 
 // contentPDFReadLimit caps decompression output so a zip bomb cannot exhaust
-// memory; the raw cap is a cheap bound for a spike.
-func contentPDFReadLimit(r io.Reader) []byte {
-	b, _ := io.ReadAll(io.LimitReader(r, contentExtractMaxRawBytes))
+// memory; the policy raw cap is the bound.
+func contentPDFReadLimit(r io.Reader, maxRaw int64) []byte {
+	b, _ := io.ReadAll(io.LimitReader(r, maxRaw))
 	return b
 }
 

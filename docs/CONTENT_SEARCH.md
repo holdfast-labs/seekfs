@@ -6,8 +6,11 @@ polish (review minors, per-query budgets, entry-free counting, journal-reset
 invalidation, freshness measurement, docs) landed. PF-3 (WP1d/WP1e) landed: the
 service now builds/rebuilds and persists its own content index in the
 background, so flag-on is content-ready without a manual CLI step and a journal
-reset self-heals instead of staying `stale` (see §6e). P4 document-extraction
-quality remains deferred (see §7). Content search is off by default; with
+reset self-heals instead of staying `stale` (see §6e). PF-4 (WP4/WP6) landed:
+legacy single-byte encodings (Windows-1252/Latin-1) are decoded instead of
+repaired to `U+FFFD`, an explicit encoding override exists, and the per-file
+size cap is configurable and visible (see §6f). P4 document-extraction quality
+remains deferred (see §7). Content search is off by default; with
 `SEEKFS_CONTENT_SEARCH=1`, `content:` queries work through the service once the
 service-owned build has attached an FRN-keyed `.gsx`.
 
@@ -296,6 +299,48 @@ indexing/progress, the default allowlist, journal-reset self-heal, re-attach
 after a not-ready volume becomes ready, lock release across extraction,
 mid-build journal-change abort, and shutdown cancellation. PB2 (delta folding
 into the persisted base) stays in PF-5/§7.
+
+## 6f. PF-4 — encoding breadth + size policy (WP4/WP6, done)
+
+Both changes alter normalized text, so the `.gsx` format version is now **3**; a
+v2 sidecar fails decode (magic+version gate) and is never attached, and the
+PF-3 path rebuilds it.
+
+- **Encoding (PB6).** A BOM (UTF-8/16LE/16BE) and valid UTF-8 are decoded
+  exactly as before. The extractor passes its real truncation signal (a
+  plain-text file whose size exceeds the raw cap) into the decoder, and only
+  then -- and only when the buffer is otherwise a UTF-8 prefix whose sole
+  invalid rune is a multibyte tail cut mid-rune -- is it decoded as UTF-8 with
+  the incomplete tail repaired to `U+FFFD`, never treated as legacy. The signal
+  is the actual `size > maxRaw` cut, not a guess from the byte shape, so a
+  genuine Latin-1/CP1252 file ending in `caf\xe9` (no cut) is decoded, not
+  repaired. Any other invalid buffer is decoded **hybridly**: every valid UTF-8
+  span is kept byte-exact and only the invalid spans are decoded as a legacy
+  single-byte encoding. That keeps a mostly-UTF-8 file with one stray invalid
+  byte searchable (its `café` stays `café`) while still recovering the stray
+  span, instead of re-decoding the whole file as CP1252 and mojibaking it. One
+  consequence: an over-cap UTF-8 file that also contains an earlier stray byte
+  lacks the tail-only shape, so it takes the hybrid path and its cut tail is
+  legacy-decoded rather than repaired; index and search still agree because the
+  stored text is produced under this same auto policy. Each invalid span
+  decodes as Windows-1252, except a span whose CP1252
+  decode yields `U+FFFD` -- one of CP1252's five undefined bytes
+  (0x81/0x8D/0x8F/0x90/0x9D), which Go's `charmap` maps to `U+FFFD` -- which is
+  decoded as Latin-1 (ISO-8859-1) instead, so no source byte is dropped.
+  `-encoding <WHATWG label>` on offline `content-index` and
+  `SEEKFS_CONTENT_ENCODING` for the service build + USN delta override it via the
+  existing `parseContentEncoding` (a BOM still wins; `none` keeps raw bytes).
+  The NUL-based binary sniff is unchanged, so binary files are still rejected.
+- **Size policy (PB7).** Caps are configurable (`-max-raw`, `-max-text`;
+  `contentBuildOptions.MaxRaw/MaxText`), defaulting to the historical 32 MiB /
+  16 MiB with hard ceilings (512 MiB / 256 MiB) that clamp any larger request. A
+  plain-text file over the raw cap is indexed as a bounded prefix (memory bounded
+  by the cap) and marked `Truncated`; a container (zip/OOXML, PDF) that cannot be
+  prefixed is `Skipped` with a reason. Neither is silent: the build tallies them
+  into a new CXPL policy section in the `.gsx`, and content health surfaces
+  `max_raw`, `max_text`, `skipped`, `truncated`. The service build and USN delta
+  always use the 32 MiB / 16 MiB defaults; `-max-raw`/`-max-text` are
+  offline-CLI flags (the service caps are not env-exposed yet).
 
 ## 7. Carried debt / known gaps
 

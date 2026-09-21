@@ -26,26 +26,34 @@ func (contentTextExtractor) Sniff(head []byte) bool {
 }
 
 func (contentTextExtractor) Extract(ctx context.Context, r io.ReaderAt, size int64) (contentExtractResult, error) {
-	if size > contentExtractMaxRawBytes {
-		return contentExtractResult{Skipped: true, Reason: "raw size over cap", Class: contentClassText}, nil
-	}
-	raw, err := contentReadBounded(r, size, contentExtractMaxRawBytes)
+	s := contentExtractSettingsFromContext(ctx)
+	// Index a bounded prefix of an over-cap text file instead of skipping it:
+	// truncation is marked and counted, so the cap is visible, not a silent
+	// drop. Memory stays bounded by maxRaw. Container formats (zip/PDF) cannot
+	// be prefixed and skip instead.
+	raw, err := contentReadBounded(r, size, int(s.maxRaw))
 	if err != nil {
 		return contentExtractResult{}, err
 	}
+	truncated := size > s.maxRaw
 	// A BOM-marked UTF-16 file is text even though its raw bytes contain NULs;
 	// decode first, and only a BOM-less NUL makes a file binary.
 	if !contentHasBOM(raw) && contentLooksBinary(raw) {
 		return contentExtractResult{Skipped: true, Reason: "binary", Class: contentClassText}, nil
 	}
-	text := contentDecodeForIndex(raw, contentEncodingMode{auto: true})
+	text := contentDecodeForIndex(raw, s.encoding, truncated)
 	if !contentHasBOM(raw) && contentLooksBinary([]byte(text)) {
 		return contentExtractResult{Skipped: true, Reason: "binary", Class: contentClassText}, nil
 	}
-	if len(text) > contentExtractMaxTextBytes {
-		text = truncateUTF8(text, contentExtractMaxTextBytes)
+	if int64(len(text)) > s.maxText {
+		text = truncateUTF8(text, int(s.maxText))
+		truncated = true
 	}
-	return contentExtractResult{Text: []byte(text), Class: contentClassText}, nil
+	res := contentExtractResult{Text: []byte(text), Class: contentClassText, Truncated: truncated}
+	if truncated {
+		res.Reason = "indexed bounded prefix up to policy cap"
+	}
+	return res, nil
 }
 
 // truncateUTF8 cuts s to at most n bytes without splitting a rune.

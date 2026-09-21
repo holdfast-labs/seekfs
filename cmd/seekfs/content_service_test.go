@@ -35,6 +35,24 @@ func contentTestState() *contentVolumeState {
 	return s
 }
 
+// PB7: the attached base's extraction policy and skip/truncation counts are
+// surfaced in health, so a size cap is visible rather than a silent drop.
+func TestContentHealthSurfacesBuildPolicy(t *testing.T) {
+	t.Setenv("SEEKFS_CONTENT_SEARCH", "1")
+	idx := newContentIndex()
+	idx.Policy = contentBuildPolicy{MaxRaw: 8, MaxText: 4, Skipped: 2, Truncated: 1}
+	r, err := openContentReader(idx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st := newContentVolumeState("C:")
+	st.setReady(idx, r, buildContentResolver(nil, nil, nil))
+	h := st.healthSnapshot(0)
+	if h.MaxRaw != 8 || h.MaxText != 4 || h.Skipped != 2 || h.Truncated != 1 {
+		t.Fatalf("health policy not surfaced: %+v", h)
+	}
+}
+
 func TestContentCoordinatorDirtyPromote(t *testing.T) {
 	s := contentTestState()
 	c := newContentCoordinator(s)

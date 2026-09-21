@@ -19,11 +19,14 @@ import (
 
 // contentIndexMagic identifies a `.gsx` file. The trailing digits are the
 // format version encoded in the magic as well as the header, matching the v9
-// habit. The 02 bump added the content USN checkpoint (WP0); a 001 sidecar is
-// rejected on load so it can never be attached as ready.
-var contentIndexMagic = [8]byte{'G', 'O', 'S', 'C', 'X', '0', '0', '2'}
+// habit. The 02 bump added the content USN checkpoint (WP0); the 03 bump is
+// PF-4's encoding breadth + size policy, which changes normalized text and the
+// policy section. A sidecar whose version does not match is rejected on load,
+// so it can never be attached stale: the service sees no usable base and its
+// PF-3 build path rebuilds it.
+var contentIndexMagic = [8]byte{'G', 'O', 'S', 'C', 'X', '0', '0', '3'}
 
-const contentIndexVersion = 2
+const contentIndexVersion = 3
 
 // contentOrigin records what the doc keys are, so a `.gsx` can never be
 // attached to a key space it does not join.
@@ -45,7 +48,42 @@ const (
 	contentSectionRank     uint32 = 'C'<<24 | 'X'<<16 | 'R'<<8 | 'N'
 	contentSectionDelta    uint32 = 'C'<<24 | 'X'<<16 | 'D'<<8 | 'X'
 	contentSectionPaths    uint32 = 'C'<<24 | 'X'<<16 | 'P'<<8 | 'T'
+	contentSectionPolicy   uint32 = 'C'<<24 | 'X'<<16 | 'P'<<8 | 'L'
 )
+
+// contentBuildPolicy is the extraction policy a `.gsx` was built with and the
+// build's skip/truncation counts, stored in the CXPL section. It makes the
+// size/encoding policy visible to the service's content health instead of a
+// silent drop.
+type contentBuildPolicy struct {
+	MaxRaw    int64
+	MaxText   int64
+	Skipped   int64
+	Truncated int64
+}
+
+const contentPolicySize = 32
+
+func (p contentBuildPolicy) encode() []byte {
+	b := make([]byte, contentPolicySize)
+	binary.LittleEndian.PutUint64(b[0:], uint64(p.MaxRaw))
+	binary.LittleEndian.PutUint64(b[8:], uint64(p.MaxText))
+	binary.LittleEndian.PutUint64(b[16:], uint64(p.Skipped))
+	binary.LittleEndian.PutUint64(b[24:], uint64(p.Truncated))
+	return b
+}
+
+func decodeContentPolicy(data []byte) (contentBuildPolicy, bool) {
+	if len(data) < contentPolicySize {
+		return contentBuildPolicy{}, false
+	}
+	return contentBuildPolicy{
+		MaxRaw:    int64(binary.LittleEndian.Uint64(data[0:])),
+		MaxText:   int64(binary.LittleEndian.Uint64(data[8:])),
+		Skipped:   int64(binary.LittleEndian.Uint64(data[16:])),
+		Truncated: int64(binary.LittleEndian.Uint64(data[24:])),
+	}, true
+}
 
 // contentHashLen is the width of the content hash stored per document.
 const contentHashLen = 16
@@ -87,6 +125,8 @@ type contentIndex struct {
 	BuiltAt       time.Time
 	Docs          []contentDoc
 	Sections      map[uint32][]byte
+	// Policy is the build's extraction policy + skip/truncation counts (CXPL).
+	Policy contentBuildPolicy
 }
 
 func newContentIndex() *contentIndex {
@@ -161,6 +201,9 @@ func contentDecodeDocTable(data []byte) ([]contentDoc, error) {
 // section table. Offsets are relative to the start of the file.
 func contentIndexEncode(idx *contentIndex) []byte {
 	idx.Sections[contentSectionDocTable] = contentDocTableBytes(idx.Docs)
+	if idx.Policy != (contentBuildPolicy{}) {
+		idx.Sections[contentSectionPolicy] = idx.Policy.encode()
+	}
 
 	var body bytes.Buffer
 	headerSize := contentHeaderSize()
@@ -275,6 +318,11 @@ func contentIndexDecode(data []byte) (*contentIndex, error) {
 			return nil, fmt.Errorf("content section %08x out of range", tag)
 		}
 		idx.Sections[tag] = data[off : off+length]
+	}
+	if sec, ok := idx.Sections[contentSectionPolicy]; ok {
+		if p, ok := decodeContentPolicy(sec); ok {
+			idx.Policy = p
+		}
 	}
 	table, ok := idx.Sections[contentSectionDocTable]
 	if !ok {

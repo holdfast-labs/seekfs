@@ -22,11 +22,22 @@ func cmdContentIndex(args []string) error {
 	out := fs.String("out", "", "output .gsx path")
 	under := fs.String("under", "", "only index files under this path")
 	exts := fs.String("ext", "", "comma-separated extension allowlist, e.g. .go,.md,.txt")
+	encoding := fs.String("encoding", "auto", "text encoding override: auto, none, or a WHATWG label (latin1, windows-1252, utf-16le, sjis, ...)")
+	maxRaw := fs.Int64("max-raw", 0, "max raw source bytes per file (0 = default 32 MiB, clamped to the hard ceiling)")
+	maxText := fs.Int64("max-text", 0, "max extracted text bytes per file (0 = default 16 MiB, clamped to the hard ceiling)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	opts := defaultContentBuildOptions()
 	opts.Under = *under
+	opts.MaxRaw = *maxRaw
+	opts.MaxText = *maxText
+	if *encoding != "" {
+		if _, err := parseContentEncoding(*encoding); err != nil {
+			return fmt.Errorf("content-index: %w", err)
+		}
+		opts.Encoding = *encoding
+	}
 	if strings.TrimSpace(*exts) != "" {
 		opts.Exts = make(map[string]struct{})
 		for _, e := range strings.Split(*exts, ",") {
@@ -82,6 +93,9 @@ func cmdContentIndex(args []string) error {
 		return err
 	}
 	fmt.Fprintf(os.Stdout, "indexed %d documents into %s\n", len(idx.Docs), outPath)
+	if p := idx.Policy; p != (contentBuildPolicy{}) {
+		fmt.Fprintf(os.Stdout, "policy: max_raw=%d max_text=%d skipped=%d truncated=%d\n", p.MaxRaw, p.MaxText, p.Skipped, p.Truncated)
+	}
 	return nil
 }
 

@@ -4,6 +4,8 @@ import (
 	"strings"
 	"testing"
 	"unicode/utf16"
+
+	"golang.org/x/text/encoding/charmap"
 )
 
 func contentUTF16LEWithBOM(s string) []byte {
@@ -114,7 +116,7 @@ func TestContentEncodingIndexAndSearchAgree(t *testing.T) {
 		[]byte("plain ascii\n"),
 	}
 	for _, raw := range cases {
-		indexed := contentDecodeForIndex(raw, contentEncodingMode{auto: true})
+		indexed := contentDecodeForIndex(raw, contentEncodingMode{auto: true}, false)
 		searched := contentDecode(raw, contentEncodingMode{auto: true})
 		if indexed != searched {
 			t.Fatalf("index and search disagree on %q: %q vs %q", raw, indexed, searched)
@@ -175,6 +177,179 @@ func TestContentEncodingMaximalSubsequence(t *testing.T) {
 func TestContentBorrowsWholeInputRejectsInvalidUTF8(t *testing.T) {
 	if contentBorrowsWholeInput([]byte("caf\xe9"), contentEncodingMode{auto: true}) {
 		t.Fatal("invalid UTF-8 is repaired, so the bytes cannot be borrowed whole")
+	}
+}
+
+// PB6: auto's default policy keeps valid UTF-8 exact, and decodes non-UTF-8
+// bytes as Windows-1252 (accented terms survive) instead of repairing to U+FFFD.
+func TestContentEncodingAutoKeepsValidUTF8(t *testing.T) {
+	s := "café naïve — plain"
+	if got := contentDecode([]byte(s), contentAutoEncoding); got != s {
+		t.Fatalf("valid UTF-8 changed: %q -> %q", s, got)
+	}
+}
+
+func TestContentEncodingAutoFallsBackToCP1252(t *testing.T) {
+	// 0xE9 -> é, 0x92 -> right single quote in Windows-1252.
+	got := contentDecode([]byte{'c', 'a', 'f', 0xe9, ' ', 0x92}, contentAutoEncoding)
+	if !strings.Contains(got, "café") || !strings.ContainsRune(got, '\u2019') {
+		t.Fatalf("bytes not decoded as CP1252: %q", got)
+	}
+	if strings.ContainsRune(got, contentReplacementChar) {
+		t.Fatalf("auto must not repair a CP1252 byte to U+FFFD: %q", got)
+	}
+}
+
+// Windows-1252 leaves five byte values undefined; the fallback re-decodes the
+// buffer as Latin-1 so no source byte is dropped. Go's charmap maps those five
+// to U+FFFD, which is what triggers the Latin-1 fallback; assert both halves so
+// a charmap change cannot silently make this pass through the CP1252 path.
+func TestContentEncodingLegacyUndefinedByteFallsBackToLatin1(t *testing.T) {
+	cp1252, err := charmap.Windows1252.NewDecoder().Bytes([]byte{0x81})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.ContainsRune(string(cp1252), contentReplacementChar) {
+		t.Fatalf("precondition: CP1252 0x81 mapped to %q; want U+FFFD to trigger fallback", cp1252)
+	}
+	got := contentDecode([]byte{'a', 0x81, 'b'}, contentAutoEncoding)
+	if strings.ContainsRune(got, contentReplacementChar) {
+		t.Fatalf("undefined CP1252 byte left a replacement: %q", got)
+	}
+	if !strings.Contains(got, "a") || !strings.Contains(got, "b") || !strings.ContainsRune(got, '\u0081') {
+		t.Fatalf("Latin-1 fallback lost bytes: %q", got)
+	}
+}
+
+// PF-4 regression: a mostly-UTF-8 file with one stray invalid byte must keep its
+// valid UTF-8 spans byte-exact (so "café" stays findable) while still recovering
+// the stray span as legacy text.
+func TestContentEncodingLegacyHybridKeepsValidUTF8(t *testing.T) {
+	raw := []byte("caf\xc3\xa9 \x92") // valid "café", then a stray CP1252 0x92
+	got := contentDecode(raw, contentAutoEncoding)
+	if !strings.Contains(got, "café") {
+		t.Fatalf("valid UTF-8 span was not preserved: %q", got)
+	}
+	if strings.Contains(got, "cafÃ©") {
+		t.Fatalf("valid UTF-8 was mojibaked: %q", got)
+	}
+	if !strings.ContainsRune(got, '\u2019') {
+		t.Fatalf("stray legacy byte not recovered as CP1252: %q", got)
+	}
+	if strings.ContainsRune(got, contentReplacementChar) {
+		t.Fatalf("hybrid decode should not repair the stray byte: %q", got)
+	}
+}
+
+// PF-4 regression: an over-cap UTF-8 prefix cut mid-rune (the real truncation
+// flag set by the extractor) must decode as UTF-8 with the incomplete tail
+// repaired, not as CP1252, so accented terms stay findable.
+func TestContentEncodingLegacyTruncatedTailDecodesAsUTF8(t *testing.T) {
+	raw := []byte("caf\xc3\xa9 \xc3") // "café " then the lead byte of a cut é
+	got := contentDecodeForIndex(raw, contentAutoEncoding, true)
+	if !strings.HasPrefix(got, "café ") {
+		t.Fatalf("valid UTF-8 prefix not preserved: %q", got)
+	}
+	if strings.Contains(got, "cafÃ©") {
+		t.Fatalf("truncated UTF-8 was mojibaked as legacy: %q", got)
+	}
+	if !strings.HasSuffix(got, string(contentReplacementChar)) {
+		t.Fatalf("incomplete tail was not repaired: %q", got)
+	}
+}
+
+// PF-4 regression: without the real truncation signal, a genuine legacy buffer
+// ending in a byte that merely looks like a cut UTF-8 sequence must take the
+// hybrid path and stay decodable. 0xE9 alone (no trailing newline) and the
+// 2-byte tail 0xE9 0x92 both have the shape the old byte heuristic mistook for
+// a cut rune, so each is repaired to U+FFFD and café becomes unsearchable.
+func TestContentEncodingLegacyLeadByteTailIsNotTruncation(t *testing.T) {
+	for _, raw := range [][]byte{
+		[]byte("caf\xe9"),     // 0xE9 would be a cut 3-byte lead
+		[]byte("caf\xe9\x92"), // a 2-byte tail that also looks like a cut sequence
+	} {
+		got := contentDecodeForIndex(raw, contentAutoEncoding, false)
+		if !strings.Contains(got, "café") {
+			t.Fatalf("genuine legacy tail not decoded as CP1252: %q -> %q", raw, got)
+		}
+		if strings.ContainsRune(got, contentReplacementChar) {
+			t.Fatalf("genuine legacy tail repaired to U+FFFD: %q -> %q", raw, got)
+		}
+	}
+}
+
+// The real truncation signal gates the repair: an over-cap buffer whose first
+// invalid byte is an earlier stray (not the EOF tail) takes the hybrid path, so
+// the stray is recovered as legacy and the UTF-8 prefix is untouched.
+func TestContentEncodingTruncatedWithEarlierStrayTakesHybrid(t *testing.T) {
+	raw := []byte("caf\xc3\xa9 \x92\xc3") // valid "café", stray 0x92, cut é lead
+	got := contentDecodeForIndex(raw, contentAutoEncoding, true)
+	if !strings.HasPrefix(got, "café ") {
+		t.Fatalf("valid UTF-8 prefix not preserved: %q", got)
+	}
+	if !strings.ContainsRune(got, '\u2019') {
+		t.Fatalf("earlier stray not recovered as CP1252: %q", got)
+	}
+}
+
+// A genuinely legacy buffer (never valid UTF-8) still decodes and stays
+// findable; the hybrid path must not break the pure CP1252 case.
+func TestContentEncodingLegacyCP1252StillDecodes(t *testing.T) {
+	got := contentDecode([]byte("caf\xe9 na\xefve"), contentAutoEncoding)
+	if !strings.Contains(got, "café") || !strings.Contains(got, "naïve") {
+		t.Fatalf("CP1252 bytes not decoded: %q", got)
+	}
+	if strings.ContainsRune(got, contentReplacementChar) {
+		t.Fatalf("CP1252 decode left a replacement: %q", got)
+	}
+}
+
+// Normalization must reuse the extractor's auto (legacy-aware) mode; for
+// already-decoded text that is exactly lowercasing, but it must not re-repair a
+// valid accented rune. This pins index and delta to the same normalization.
+func TestContentNormalizeTextMatchesExtractorDecode(t *testing.T) {
+	for _, raw := range [][]byte{
+		[]byte("Caf\xe9 Needle"),
+		[]byte("Valid Caf\xc3\xa9\n"),
+		[]byte{0x81, 'X', 0x92},
+	} {
+		extracted := contentDecodeForIndex(raw, contentAutoEncoding, false)
+		want := []byte(strings.ToLower(extracted))
+		if got := contentNormalizeText([]byte(extracted)); string(got) != string(want) {
+			t.Fatalf("normalize(decode(%q)) = %q; want %q", raw, got, want)
+		}
+	}
+}
+
+func TestContentEncodingLegacyIndexAndSearchAgree(t *testing.T) {
+	for _, raw := range [][]byte{
+		[]byte("caf\xe9 needle"),
+		[]byte{0x81, 0x92, 'x'},
+		[]byte("plain ascii\n"),
+		[]byte("valid café utf8\n"),
+	} {
+		if a, b := contentDecodeForIndex(raw, contentAutoEncoding, false), contentDecode(raw, contentAutoEncoding); a != b {
+			t.Fatalf("index/search disagree on %q: %q vs %q", raw, a, b)
+		}
+	}
+}
+
+// The explicit -encoding override beats the auto fallback (a BOM would still
+// win, per the existing BOM tests). WHATWG maps "latin1" to windows-1252, so a
+// genuinely distinct label is used here.
+func TestContentEncodingExplicitOverrideWins(t *testing.T) {
+	raw := []byte{0xa1} // CP1252 '¡' (U+00A1) vs ISO-8859-2 'Ą' (U+0104)
+	iso2, err := parseContentEncoding("iso-8859-2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	auto := contentDecode(raw, contentAutoEncoding)
+	explicit := contentDecode(raw, iso2)
+	if auto == explicit {
+		t.Fatalf("explicit iso-8859-2 must differ from auto/cp1252: %q", auto)
+	}
+	if explicit != "Ą" {
+		t.Fatalf("explicit iso-8859-2 decoded 0xa1 to %q; want Ą", explicit)
 	}
 }
 

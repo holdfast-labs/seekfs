@@ -91,6 +91,14 @@ type contentHealth struct {
 	BuildDone  int    `json:"build_done,omitempty"`
 	BuildTotal int    `json:"build_total,omitempty"`
 	BuildError string `json:"build_error,omitempty"`
+	// MaxRaw/MaxText are the attached base's extraction policy caps and
+	// Skipped/Truncated count what the policy excluded or cut at build time
+	// (PB7). They come from the `.gsx` CXPL section so a size cap is visible,
+	// never a silent drop.
+	MaxRaw    int64 `json:"max_raw,omitempty"`
+	MaxText   int64 `json:"max_text,omitempty"`
+	Skipped   int   `json:"skipped,omitempty"`
+	Truncated int   `json:"truncated,omitempty"`
 }
 
 // contentDeltaDoc is an extracted document for a file changed since the base,
@@ -277,6 +285,12 @@ func (s *contentVolumeState) setReady(idx *contentIndex, reader *contentReader, 
 	// catch-up truncation belonged to the replaced base.
 	s.health.Incomplete = false
 	s.health.Docs = len(idx.Docs)
+	if idx.Policy != (contentBuildPolicy{}) {
+		s.health.MaxRaw = idx.Policy.MaxRaw
+		s.health.MaxText = idx.Policy.MaxText
+		s.health.Skipped = int(idx.Policy.Skipped)
+		s.health.Truncated = int(idx.Policy.Truncated)
+	}
 	s.health.LastRebuild = time.Now().UTC().Format(time.RFC3339)
 }
 
@@ -675,7 +689,8 @@ func contentExtractDeltaDoc(frn uint64, path string, prior [contentHashLen]byte,
 	if e == nil {
 		return contentDeltaDoc{}, false, nil
 	}
-	res, err := e.Extract(context.Background(), f, size)
+	ctx := contentWithExtractSettings(context.Background(), contentServiceExtractSettings())
+	res, err := e.Extract(ctx, f, size)
 	if err != nil || res.Skipped || len(res.Text) == 0 {
 		return contentDeltaDoc{}, false, err
 	}

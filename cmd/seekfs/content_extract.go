@@ -28,13 +28,79 @@ const (
 )
 
 // Bounds. Extraction reads at most maxRaw; the extracted text is capped at
-// maxText. A file larger than maxRaw is skipped entirely (the coordinator logs
-// it); this is the disk/CPU guard that keeps a content index bounded.
+// maxText. Both are policy values (contentBuildOptions / -max-raw / -max-text)
+// whose defaults are the historical 32 MiB / 16 MiB and whose hard ceilings stop
+// a policy from unbounded allocation. A plain-text file larger than maxRaw is
+// indexed up to the cap (a bounded prefix) and marked Truncated; a container
+// format that cannot be prefixed (zip/OOXML, PDF) is skipped with a Reason. No
+// over-cap file is ever dropped silently.
 const (
-	contentExtractMaxRawBytes  = 32 << 20 // 32 MiB of source bytes
-	contentExtractMaxTextBytes = 16 << 20 // 16 MiB of extracted text
-	contentExtractBinarySniff  = 8 << 10  // first 8 KiB NUL check, as ripgrep
+	contentExtractMaxRawBytes  = 32 << 20 // default: 32 MiB of source bytes
+	contentExtractMaxTextBytes = 16 << 20 // default: 16 MiB of extracted text
+	// Hard safety ceilings: a policy may raise the defaults but never past
+	// these, so extraction memory stays bounded regardless of configuration.
+	contentExtractHardMaxRawBytes  = 512 << 20 // 512 MiB of source bytes
+	contentExtractHardMaxTextBytes = 256 << 20 // 256 MiB of extracted text
+	contentExtractBinarySniff      = 8 << 10   // first 8 KiB NUL check, as ripgrep
 )
+
+// contentExtractSettings is the per-build extraction policy carried on the
+// context: the encoding override and the raw/text caps. Extractors read it with
+// contentExtractSettingsFromContext, so no global state is shared between a
+// service build and the offline CLI.
+type contentExtractSettings struct {
+	encoding contentEncodingMode
+	maxRaw   int64
+	maxText  int64
+}
+
+type contentExtractSettingsKey struct{}
+
+func contentDefaultExtractSettings() contentExtractSettings {
+	return contentExtractSettings{
+		encoding: contentAutoEncoding,
+		maxRaw:   contentExtractMaxRawBytes,
+		maxText:  contentExtractMaxTextBytes,
+	}
+}
+
+// contentNormalizeExtractCaps resolves a policy's raw/text caps: zero means the
+// default, and anything above the hard ceiling is clamped to it.
+func contentNormalizeExtractCaps(maxRaw, maxText int64) (int64, int64) {
+	if maxRaw <= 0 {
+		maxRaw = contentExtractMaxRawBytes
+	}
+	if maxText <= 0 {
+		maxText = contentExtractMaxTextBytes
+	}
+	if maxRaw > contentExtractHardMaxRawBytes {
+		maxRaw = contentExtractHardMaxRawBytes
+	}
+	if maxText > contentExtractHardMaxTextBytes {
+		maxText = contentExtractHardMaxTextBytes
+	}
+	return maxRaw, maxText
+}
+
+// contentWithExtractSettings stamps an extraction policy onto ctx. The zero
+// encoding resolves to the default auto policy; caps are normalized and clamped.
+func contentWithExtractSettings(ctx context.Context, s contentExtractSettings) context.Context {
+	if s.encoding == (contentEncodingMode{}) {
+		s.encoding = contentAutoEncoding
+	}
+	s.maxRaw, s.maxText = contentNormalizeExtractCaps(s.maxRaw, s.maxText)
+	return context.WithValue(ctx, contentExtractSettingsKey{}, s)
+}
+
+// contentExtractSettingsFromContext returns the ctx's policy or the defaults.
+func contentExtractSettingsFromContext(ctx context.Context) contentExtractSettings {
+	if ctx != nil {
+		if s, ok := ctx.Value(contentExtractSettingsKey{}).(contentExtractSettings); ok {
+			return s
+		}
+	}
+	return contentDefaultExtractSettings()
+}
 
 // contentExtractResult is what an extractor returns.
 type contentExtractResult struct {
@@ -44,7 +110,11 @@ type contentExtractResult struct {
 	// extract (encrypted, scanned image, oversized, ...). The coordinator marks
 	// such docs Evaluated=true, Matched=false.
 	Skipped bool
-	Reason  string
+	// Truncated is true when the extractor indexed a bounded prefix of the file
+	// (raw over the policy cap, or text cut at the text cap) rather than the
+	// whole document. It is surfaced in health/policy counts, never silent.
+	Truncated bool
+	Reason    string
 }
 
 // contentExtractor turns file bytes into text. Implementations live in their own
@@ -57,8 +127,9 @@ type contentExtractor interface {
 	// Sniff reports whether this extractor claims a file whose first bytes are
 	// head. Used only for extensionless files.
 	Sniff(head []byte) bool
-	// Extract returns the searchable text. It must not read more than
-	// contentExtractMaxRawBytes from r.
+	// Extract returns the searchable text, reading at most the ctx policy's
+	// maxRaw bytes from r (contentExtractSettingsFromContext) and returning at
+	// most its maxText bytes.
 	Extract(ctx context.Context, r io.ReaderAt, size int64) (contentExtractResult, error)
 }
 

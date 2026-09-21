@@ -19,18 +19,46 @@ import (
 )
 
 // contentBuildOptions bounds and scopes a build. MaxFiles caps files scanned;
-// MaxRaw caps the raw size of any one file; Under limits to a path prefix; Exts
-// is an optional lowercase extension allowlist (with dots). An empty Exts means
-// "any extractable text/code file".
+// MaxRaw/MaxText cap the raw source and extracted text a file contributes (0 =
+// default 32/16 MiB, always clamped to the hard safety ceiling); Encoding is a
+// WHATWG label ("auto", "none", "latin1", ...); Under limits to a path prefix;
+// Exts is an optional lowercase extension allowlist (with dots). An empty Exts
+// means "any extractable text/code file".
 type contentBuildOptions struct {
 	MaxFiles int
 	MaxRaw   int64
+	MaxText  int64
+	Encoding string
 	Under    string
 	Exts     map[string]struct{}
 }
 
 func defaultContentBuildOptions() contentBuildOptions {
-	return contentBuildOptions{MaxFiles: 2_000_000, MaxRaw: contentExtractMaxRawBytes}
+	return contentBuildOptions{
+		MaxFiles: 2_000_000,
+		MaxRaw:   contentExtractMaxRawBytes,
+		MaxText:  contentExtractMaxTextBytes,
+		Encoding: "auto",
+	}
+}
+
+// extractSettings resolves the options into the per-build extraction policy
+// (encoding + normalized, clamped caps) that extractors read from the context.
+func (o contentBuildOptions) extractSettings() contentExtractSettings {
+	s := contentDefaultExtractSettings()
+	if o.Encoding != "" {
+		if m, err := parseContentEncoding(o.Encoding); err == nil {
+			s.encoding = m
+		}
+	}
+	if o.MaxRaw > 0 {
+		s.maxRaw = o.MaxRaw
+	}
+	if o.MaxText > 0 {
+		s.maxText = o.MaxText
+	}
+	s.maxRaw, s.maxText = contentNormalizeExtractCaps(s.maxRaw, s.maxText)
+	return s
 }
 
 // allows reports whether a path is in scope for a build.
@@ -70,8 +98,11 @@ type contentBuildDoc struct {
 
 // buildContentIndexFromDir builds an in-memory `.gsx` for root.
 func buildContentIndexFromDir(ctx context.Context, root string, opts contentBuildOptions) (*contentIndex, error) {
+	settings := opts.extractSettings()
+	ctx = contentWithExtractSettings(ctx, settings)
 	docs := make([]contentBuildDoc, 0, 4096)
 	var scanned int
+	var skipped, truncated int64
 	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
 			return nil
@@ -109,17 +140,28 @@ func buildContentIndexFromDir(ctx context.Context, root string, opts contentBuil
 			return nil
 		}
 		size := info.Size()
-		if opts.MaxRaw > 0 && size > opts.MaxRaw {
-			return nil
-		}
 		head, _ := contentReadBounded(f, size, 512)
 		e := contentExtractorForPath(path, head)
 		if e == nil {
 			return nil
 		}
+		// The extractor applies the raw/text policy: an over-cap container is
+		// Skipped with a reason, an over-cap text file contributes a bounded,
+		// Truncated prefix. Both are tallied into the policy section.
 		res, eerr := e.Extract(ctx, f, size)
-		if eerr != nil || res.Skipped || len(res.Text) == 0 {
+		if eerr != nil {
+			skipped++
 			return nil
+		}
+		if res.Skipped {
+			skipped++
+			return nil
+		}
+		if len(res.Text) == 0 {
+			return nil
+		}
+		if res.Truncated {
+			truncated++
 		}
 		rel, rerr := filepath.Rel(root, path)
 		if rerr != nil {
@@ -136,7 +178,12 @@ func buildContentIndexFromDir(ctx context.Context, root string, opts contentBuil
 		return nil, err
 	}
 	defer os.RemoveAll(tmpDir)
-	return assembleContentIndex(docs, tmpDir)
+	idx, err := assembleContentIndex(docs, tmpDir)
+	if err != nil {
+		return nil, err
+	}
+	idx.Policy = contentBuildPolicy{MaxRaw: settings.maxRaw, MaxText: settings.maxText, Skipped: skipped, Truncated: truncated}
+	return idx, nil
 }
 
 // contentBuildArenaBytes bounds the external builder's raw-posting buffer; when
@@ -265,8 +312,11 @@ func buildContentIndexForIndex(ctx context.Context, idx *Index, opts contentBuil
 	if idx == nil {
 		return nil, errors.New("nil record index")
 	}
+	settings := opts.extractSettings()
+	ctx = contentWithExtractSettings(ctx, settings)
 	cache := make(map[int]string, 1024)
 	docs := make([]contentBuildDoc, 0, 4096)
+	var skipped, truncated int64
 	count := idx.compactRecordCount()
 	for id := 0; id < count; id++ {
 		if err := ctx.Err(); err != nil {
@@ -276,15 +326,20 @@ func buildContentIndexForIndex(ctx context.Context, idx *Index, opts contentBuil
 		if rec.Deleted || rec.Mode&uint32(os.ModeDir) != 0 || rec.FRN == 0 {
 			continue
 		}
-		if opts.MaxRaw > 0 && rec.Size > opts.MaxRaw {
-			continue
-		}
 		path := idx.reconstructCompactPathCached(id, cache)
 		if path == "" || !opts.allows(path) {
 			continue
 		}
-		if doc, ok := contentBuildDocSafe(ctx, contentBuildItem{frn: rec.FRN, path: path}); ok {
+		doc, res, ok := contentBuildDocSafe(ctx, contentBuildItem{frn: rec.FRN, path: path})
+		if ok {
 			docs = append(docs, doc)
+			if res.Truncated {
+				truncated++
+			}
+			continue
+		}
+		if res.Skipped {
+			skipped++
 		}
 	}
 	tmpDir, err := os.MkdirTemp("", "seekfs-content-*")
@@ -297,6 +352,7 @@ func buildContentIndexForIndex(ctx context.Context, idx *Index, opts contentBuil
 		return nil, err
 	}
 	cidx.Origin = contentOriginUSN
+	cidx.Policy = contentBuildPolicy{MaxRaw: settings.maxRaw, MaxText: settings.maxText, Skipped: skipped, Truncated: truncated}
 	// Stamp the content USN checkpoint from the record index metadata: the
 	// base is complete as of the .gsi checkpoint, so restart catch-up resumes
 	// from here rather than re-reading the whole journal (WP0/PB3).
@@ -308,12 +364,18 @@ func buildContentIndexForIndex(ctx context.Context, idx *Index, opts contentBuil
 }
 
 // contentNormalizeText is the one normalization every builder and the delta
-// extractor must share: lowercase, then lossy repair. Hashing the normalized
-// text makes base and delta ContentHash comparable, so a touch-only write is
-// recognized as unchanged.
+// extractor must share: lowercase, then a defensive re-decode under the auto
+// (legacy-aware) policy. The input is already-decoded text, so the re-decode is
+// normally the identity. It deliberately uses contentAutoEncoding here -- not
+// the extractor's own mode -- which is not the same decode as the extractor's
+// under -encoding <label> or none, but is benign: those modes already produce
+// valid UTF-8, which auto returns unchanged. Using auto (rather than the bare
+// lossy-repair zero mode) keeps base and delta from decoding a stray byte
+// differently. Hashing the normalized text makes base and delta ContentHash
+// comparable, so a touch-only write is recognized as unchanged.
 func contentNormalizeText(decoded []byte) []byte {
 	lower := []byte(strings.ToLower(string(decoded)))
-	return []byte(contentDecodeForIndex(lower, contentEncodingMode{auto: true}))
+	return []byte(contentDecodeForIndex(lower, contentAutoEncoding, false))
 }
 
 // contentPathKey is the stable 64-bit identity of a walk-relative path: FNV-1a

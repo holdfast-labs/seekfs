@@ -20,11 +20,7 @@ import (
 	"strings"
 )
 
-const (
-	contentOOXMLMaxEntries           = 4096
-	contentOOXMLMaxEntryUncompressed = contentExtractMaxTextBytes
-	contentOOXMLMaxTotalUncompressed = contentExtractMaxTextBytes * 4
-)
+const contentOOXMLMaxEntries = 4096
 
 type contentOOXMLExtractor struct{}
 
@@ -102,10 +98,14 @@ func contentOOXMLSelect(zr *zip.Reader) []*zip.File {
 }
 
 func (contentOOXMLExtractor) Extract(ctx context.Context, r io.ReaderAt, size int64) (contentExtractResult, error) {
-	if size > contentExtractMaxRawBytes {
+	s := contentExtractSettingsFromContext(ctx)
+	// A zip's central directory lives at the end, so a bounded prefix is not a
+	// valid archive: an over-cap container is skipped with a visible reason
+	// rather than prefix-indexed.
+	if size > s.maxRaw {
 		return contentExtractResult{Skipped: true, Reason: "raw size over cap", Class: contentClassOOXML}, nil
 	}
-	raw, err := contentReadBounded(r, size, contentExtractMaxRawBytes)
+	raw, err := contentReadBounded(r, size, int(s.maxRaw))
 	if err != nil {
 		return contentExtractResult{}, err
 	}
@@ -117,18 +117,22 @@ func (contentOOXMLExtractor) Extract(ctx context.Context, r io.ReaderAt, size in
 	selected := contentOOXMLSelect(zr)
 	var out bytes.Buffer
 	var total int64
+	maxTotal := s.maxText * 4
+	truncated := len(selected) > contentOOXMLMaxEntries
 	for i, f := range selected {
 		if i >= contentOOXMLMaxEntries {
+			truncated = true
 			break
 		}
 		if err := ctx.Err(); err != nil {
 			return contentExtractResult{}, err
 		}
-		remaining := int64(contentOOXMLMaxTotalUncompressed) - total
+		remaining := maxTotal - total
 		if remaining <= 0 {
+			truncated = true
 			break
 		}
-		limit := int64(contentOOXMLMaxEntryUncompressed)
+		limit := s.maxText
 		if remaining < limit {
 			limit = remaining
 		}
@@ -145,16 +149,21 @@ func (contentOOXMLExtractor) Extract(ctx context.Context, r io.ReaderAt, size in
 			out.WriteByte('\n')
 		}
 		// A full read means an input cap was hit: stop with what we have.
-		if cr.n >= limit || int64(out.Len()) >= contentExtractMaxTextBytes {
+		if cr.n >= limit || int64(out.Len()) >= s.maxText {
+			truncated = true
 			break
 		}
 	}
 
 	if out.Len() == 0 {
-		return contentExtractResult{Class: contentClassOOXML}, nil
+		return contentExtractResult{Class: contentClassOOXML, Truncated: truncated}, nil
 	}
-	text := truncateUTF8(out.String(), contentExtractMaxTextBytes)
-	return contentExtractResult{Text: []byte(text), Class: contentClassOOXML}, nil
+	text := truncateUTF8(out.String(), int(s.maxText))
+	res := contentExtractResult{Text: []byte(text), Class: contentClassOOXML, Truncated: truncated}
+	if truncated {
+		res.Reason = "indexed bounded prefix up to policy cap"
+	}
+	return res, nil
 }
 
 type contentOOXMLCountReader struct {

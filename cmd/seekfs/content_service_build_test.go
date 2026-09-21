@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/binary"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -229,6 +230,62 @@ func TestContentServiceBuildSelfHealsAfterJournalReset(t *testing.T) {
 	}
 	if hits, err := contentServiceSearch(t, vol, "content:needle", false); err != nil || len(hits) != 1 {
 		t.Fatalf("self-healed content not searchable: %v %v", hits, err)
+	}
+}
+
+// PF-4 bumps the content format version (normalized text + policy changed). An
+// existing sidecar written by an older version must be rejected and rebuilt by
+// the service, never attached stale.
+func TestContentOldVersionSidecarRebuiltNotAttached(t *testing.T) {
+	t.Setenv("SEEKFS_CONTENT_SEARCH", "1")
+	stubContentCatchUpSync(t)
+	stubContentBuildSync(t)
+
+	dir := t.TempDir()
+	note := filepath.Join(dir, "note.txt")
+	if err := os.WriteFile(note, []byte("upgrade needle"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	const journal = uint64(0x515)
+	const cp = int64(64)
+	stubContentCatchUpJournal(t, usnJournalDataV0{UsnJournalID: journal, FirstUsn: 1, LowestValidUsn: 1, NextUsn: cp})
+	vol, gsx := contentBuildTestVolume(t, dir, journal, uint64(cp), []CompactRecord{
+		{FRN: 10, ParentFRN: 10, Parent: -1, Name: "note.txt", Size: 14},
+	})
+
+	// Write a well-formed sidecar, then downgrade its magic+version to the
+	// previous format (a pre-PF-4 v2 file).
+	old, err := assembleContentIndex([]contentBuildDoc{{path: note, frn: 10, text: []byte("upgrade needle")}}, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	old.Origin = contentOriginUSN
+	old.JournalID = journal
+	old.CheckpointUSN = uint64(cp)
+	data := contentIndexEncode(old)
+	binary.LittleEndian.PutUint32(data[8:], contentIndexVersion-1)
+	data[7] = byte('0' + (contentIndexVersion - 1))
+	if err := os.WriteFile(gsx, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := contentLoadFile(gsx); err == nil {
+		t.Fatal("an old-version sidecar must be rejected on load, not attached")
+	}
+
+	s := contentTestService(t)
+	s.ensureContentBuild(vol)
+	if got := vol.content.stateOf(); got != contentStateReady {
+		t.Fatalf("state after version-invalidated rebuild = %q; want ready", got)
+	}
+	rebuilt, err := contentLoadFile(gsx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rebuilt.Version != contentIndexVersion {
+		t.Fatalf("rebuilt version = %d; want %d", rebuilt.Version, contentIndexVersion)
+	}
+	if hits, err := contentServiceSearch(t, vol, "content:needle", false); err != nil || len(hits) != 1 {
+		t.Fatalf("rebuilt content not searchable: %v %v", hits, err)
 	}
 }
 

@@ -16,6 +16,7 @@ import (
 	"unicode/utf8"
 
 	"golang.org/x/text/encoding"
+	"golang.org/x/text/encoding/charmap"
 	"golang.org/x/text/encoding/htmlindex"
 )
 
@@ -23,6 +24,11 @@ import (
 type contentEncodingMode struct {
 	// auto sniffs a UTF-8/UTF-16 BOM, otherwise treats the bytes as UTF-8.
 	auto bool
+	// legacy makes auto's non-BOM fallback decode invalid UTF-8 as a legacy
+	// single-byte encoding (Windows-1252, then Latin-1) rather than repairing
+	// it to U+FFFD. The label parser's "auto" sets this; the zero mode keeps
+	// the lossy-repair behavior the decoder primitives and their tests expect.
+	legacy bool
 	// none disables sniffing entirely: raw bytes are kept as-is (invalid bytes
 	// are still repaired by the lossy pass, matching the index).
 	none bool
@@ -31,6 +37,11 @@ type contentEncodingMode struct {
 	// label is the user-facing name, for diagnostics.
 	label string
 }
+
+// contentAutoEncoding is the default policy: BOM sniff, exact UTF-8, and a
+// legacy single-byte fallback for non-UTF-8 bytes (PB6). This is what an absent
+// -encoding override means for every extractor.
+var contentAutoEncoding = contentEncodingMode{auto: true, legacy: true, label: "auto"}
 
 const contentReplacementChar = '\uFFFD'
 
@@ -43,7 +54,7 @@ func parseContentEncoding(label string) (contentEncodingMode, error) {
 	label = strings.TrimSpace(label)
 	switch strings.ToLower(label) {
 	case "", "auto":
-		return contentEncodingMode{auto: true, label: "auto"}, nil
+		return contentAutoEncoding, nil
 	case "none":
 		return contentEncodingMode{none: true, label: "none"}, nil
 	}
@@ -100,6 +111,9 @@ func contentDecodeWithFixups(b []byte, mode contentEncodingMode) (string, conten
 	if mode.explicit != nil && mode.explicit != encoding.Nop {
 		return contentTranscode(mode.explicit, b), contentLossyFixups{}
 	}
+	if mode.legacy {
+		return contentDecodeLegacy(b, false), contentLossyFixups{}
+	}
 	return contentRepairUTF8(b, true)
 }
 
@@ -110,8 +124,11 @@ func contentDecode(b []byte, mode contentEncodingMode) string {
 }
 
 // contentDecodeForIndex repairs bytes the same way a search will, so the index
-// holds exactly the bytes a later search matches against.
-func contentDecodeForIndex(b []byte, mode contentEncodingMode) string {
+// holds exactly the bytes a later search matches against. truncated is the
+// extractor's real signal that b was cut at the raw-size cap; only then may an
+// incomplete UTF-8 tail be treated as a truncation artifact rather than as
+// genuinely invalid legacy bytes.
+func contentDecodeForIndex(b []byte, mode contentEncodingMode, truncated bool) string {
 	if mode.none {
 		return contentRepairString(b, false)
 	}
@@ -124,6 +141,9 @@ func contentDecodeForIndex(b []byte, mode contentEncodingMode) string {
 	}
 	if mode.explicit != nil && mode.explicit != encoding.Nop {
 		return contentTranscode(mode.explicit, b)
+	}
+	if mode.legacy {
+		return contentDecodeLegacy(b, truncated)
 	}
 	return contentRepairString(b, false)
 }
@@ -152,6 +172,110 @@ func contentTranscode(enc encoding.Encoding, b []byte) string {
 		return contentRepairString(b, false)
 	}
 	return string(out)
+}
+
+// contentDecodeLegacy decodes the default auto policy's non-UTF-8 bytes as a
+// legacy single-byte encoding, without giving up the UTF-8 around them.
+//
+// truncated is the caller's real signal that b was cut at the raw-size cap (the
+// extractor's size > maxRaw), never inferred from the byte shape. Only when it
+// is set -- and b is otherwise a UTF-8 prefix whose one invalid rune is an
+// incomplete EOF tail -- is the whole buffer decoded as UTF-8 with that tail
+// repaired, because the apparent invalidity is an artifact of the cut. Every
+// other invalid buffer is decoded hybridly: every valid UTF-8 span is kept
+// byte-exact and only the invalid spans are legacy-decoded. That keeps a genuine
+// Latin-1/CP1252 file ending in "caf\xe9" searchable as "café" (no cut, so no
+// repair) and a mostly-UTF-8 file with one stray byte searchable (its "café"
+// stays "café") while recovering the stray span, instead of re-decoding the
+// entire buffer as CP1252 and mojibaking it.
+//
+// Each invalid span decodes as Windows-1252 (the WHATWG/browser fallback),
+// except a span whose CP1252 decode yields U+FFFD -- one of CP1252's five
+// undefined bytes, 0x81/0x8D/0x8F/0x90/0x9D, which Go's charmap maps to
+// U+FFFD. Such a span is decoded as Latin-1 (ISO-8859-1) instead, which maps
+// every byte, so no source byte is silently dropped.
+func contentDecodeLegacy(b []byte, truncated bool) string {
+	if utf8.Valid(b) {
+		return string(b)
+	}
+	if truncated && contentIsUTF8TruncatedAtEOF(b) {
+		return contentRepairString(b, false)
+	}
+	var sb strings.Builder
+	sb.Grow(len(b))
+	rest := b
+	for len(rest) > 0 {
+		r, size := utf8.DecodeRune(rest)
+		if r == utf8.RuneError && size == 1 {
+			n := contentInvalidSeqLen(rest)
+			if n < 1 {
+				n = 1
+			}
+			if n > len(rest) {
+				n = len(rest)
+			}
+			sb.WriteString(contentDecodeLegacySpan(rest[:n]))
+			rest = rest[n:]
+			continue
+		}
+		sb.Write(rest[:size])
+		rest = rest[size:]
+	}
+	return sb.String()
+}
+
+// contentDecodeLegacySpan decodes one maximal invalid UTF-8 span with the
+// legacy fallback: Windows-1252, or Latin-1 when CP1252 leaves U+FFFD.
+func contentDecodeLegacySpan(span []byte) string {
+	if s := contentTranscode(charmap.Windows1252, span); !strings.ContainsRune(s, contentReplacementChar) {
+		return s
+	}
+	return contentTranscode(charmap.ISO8859_1, span)
+}
+
+// contentIsUTF8TruncatedAtEOF reports whether the only rune-level problem in b
+// is a single multibyte sequence cut short at EOF. It is consulted only when the
+// caller's real truncation flag is already set; the flag alone is not enough,
+// because an over-cap buffer may also carry an earlier genuinely invalid byte,
+// and then the hybrid path must recover that byte instead of repairing it away.
+func contentIsUTF8TruncatedAtEOF(b []byte) bool {
+	for i := 0; i < len(b); {
+		r, size := utf8.DecodeRune(b[i:])
+		if r == utf8.RuneError && size == 1 {
+			return contentTruncatedTailAtEOF(b[i:])
+		}
+		i += size
+	}
+	return false
+}
+
+// contentTruncatedTailAtEOF reports whether b is a valid UTF-8 lead byte with
+// only continuation bytes after it, too few to complete the sequence (so it
+// was cut at EOF rather than being genuinely malformed).
+func contentTruncatedTailAtEOF(b []byte) bool {
+	if len(b) == 0 {
+		return false
+	}
+	var need int
+	switch lead := b[0]; {
+	case lead >= 0xC2 && lead <= 0xDF:
+		need = 2
+	case lead >= 0xE0 && lead <= 0xEF:
+		need = 3
+	case lead >= 0xF0 && lead <= 0xF4:
+		need = 4
+	default:
+		return false
+	}
+	if len(b) >= need {
+		return false
+	}
+	for i := 1; i < len(b); i++ {
+		if b[i]&0xC0 != 0x80 {
+			return false
+		}
+	}
+	return true
 }
 
 // contentLossyFixups maps an offset in the repaired text back to the source.

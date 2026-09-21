@@ -54,6 +54,7 @@ import (
 	"fmt"
 	"os"
 	"sort"
+	"strings"
 	"time"
 )
 
@@ -137,7 +138,36 @@ var contentBuildIndexingHook = func(*contentVolumeState) {}
 func defaultServiceContentBuildOptions() contentBuildOptions {
 	opts := defaultContentBuildOptions()
 	opts.Exts = contentServiceExtensions()
+	// A service-wide encoding override so the background build and the USN
+	// delta extractor decode the same way. Absent/unset means the default auto
+	// policy (BOM + UTF-8 exact + Windows-1252/Latin-1 fallback).
+	opts.Encoding = contentServiceEncodingLabel()
 	return opts
+}
+
+// contentServiceEncodingLabel returns the service's SEEKFS_CONTENT_ENCODING
+// value, or "auto". A blank/invalid label resolves to auto. It is read at build
+// and delta time so both paths agree without shared mutable state.
+func contentServiceEncodingLabel() string {
+	label := strings.TrimSpace(os.Getenv("SEEKFS_CONTENT_ENCODING"))
+	if label == "" {
+		return "auto"
+	}
+	if _, err := parseContentEncoding(label); err != nil {
+		return "auto"
+	}
+	return label
+}
+
+// contentServiceExtractSettings is the default extraction policy for service
+// paths that are not a build (the USN delta extractor): default caps + the
+// service encoding override.
+func contentServiceExtractSettings() contentExtractSettings {
+	s := contentDefaultExtractSettings()
+	if m, err := parseContentEncoding(contentServiceEncodingLabel()); err == nil {
+		s.encoding = m
+	}
+	return s
 }
 
 // contentServiceExtensions returns the union of the curated text/code/config
@@ -291,9 +321,9 @@ func (s *goSearchService) snapshotContentBuildItems(vol *serviceVolumeIndex, opt
 			if rec.Deleted || rec.FRN == 0 || rec.Mode&uint32(os.ModeDir) != 0 {
 				continue
 			}
-			if opts.MaxRaw > 0 && rec.Size > opts.MaxRaw {
-				continue
-			}
+			// No size pre-filter: the extractor applies the raw/text policy
+			// (bounded prefix for text, visible Skip for containers), so an
+			// over-cap file is never silently excluded here.
 			path := idx.reconstructCompactPathCached(id, cache)
 			if path == "" || !opts.allows(path) {
 				continue
@@ -316,36 +346,34 @@ func (s *goSearchService) snapshotContentBuildItems(vol *serviceVolumeIndex, opt
 // contentBuildDocSafe extracts one file into a build doc. It recovers from an
 // extractor panic so one pathological document cannot kill the service, and
 // returns ok=false for missing/oversized/binary/skipped files.
-func contentBuildDocSafe(ctx context.Context, item contentBuildItem) (doc contentBuildDoc, ok bool) {
+func contentBuildDocSafe(ctx context.Context, item contentBuildItem) (doc contentBuildDoc, res contentExtractResult, ok bool) {
 	defer func() {
 		if recover() != nil {
 			doc = contentBuildDoc{}
+			res = contentExtractResult{}
 			ok = false
 		}
 	}()
 	f, err := contentOpenNoRecall(item.path)
 	if err != nil {
-		return contentBuildDoc{}, false
+		return contentBuildDoc{}, contentExtractResult{}, false
 	}
 	defer f.Close()
 	info, err := f.Stat()
 	if err != nil || info.IsDir() {
-		return contentBuildDoc{}, false
+		return contentBuildDoc{}, contentExtractResult{}, false
 	}
 	size := info.Size()
-	if size > contentExtractMaxRawBytes {
-		return contentBuildDoc{}, false
-	}
 	head, _ := contentReadBounded(f, size, 512)
 	e := contentExtractorForPath(item.path, head)
 	if e == nil {
-		return contentBuildDoc{}, false
+		return contentBuildDoc{}, contentExtractResult{}, false
 	}
-	res, err := e.Extract(ctx, f, size)
+	res, err = e.Extract(ctx, f, size)
 	if err != nil || res.Skipped || len(res.Text) == 0 {
-		return contentBuildDoc{}, false
+		return contentBuildDoc{}, res, false
 	}
-	return contentBuildDoc{path: item.path, frn: item.frn, text: res.Text, modUnix: info.ModTime().Unix()}, true
+	return contentBuildDoc{path: item.path, frn: item.frn, text: res.Text, modUnix: info.ModTime().Unix()}, res, true
 }
 
 // contentBuildCurrent reports whether a build may still publish: the per-volume
@@ -426,7 +454,8 @@ func (s *goSearchService) runContentBuild(vol *serviceVolumeIndex) {
 	vol.content.markIndexing(len(items))
 	contentBuildIndexingHook(vol.content)
 
-	ctx, cancel := context.WithCancel(context.Background())
+	settings := opts.extractSettings()
+	ctx, cancel := context.WithCancel(contentWithExtractSettings(context.Background(), settings))
 	defer cancel()
 	go func() {
 		select {
@@ -449,6 +478,7 @@ func (s *goSearchService) runContentBuild(vol *serviceVolumeIndex) {
 	// source extracts one doc at a time into the streaming assembler, so the raw
 	// corpus is never accumulated (see the memory budget in the file comment).
 	done := 0
+	var skipped, truncated int64
 	abortReason := ""
 	abortRetry := false
 	source := func() (contentBuildDoc, bool, error) {
@@ -466,7 +496,13 @@ func (s *goSearchService) runContentBuild(vol *serviceVolumeIndex) {
 			}
 			item := items[done]
 			done++
-			doc, ok := contentBuildDocSafe(ctx, item)
+			doc, res, ok := contentBuildDocSafe(ctx, item)
+			if ok && res.Truncated {
+				truncated++
+			}
+			if !ok && res.Skipped {
+				skipped++
+			}
 			if done%contentBuildBatchSize == 0 {
 				if !s.contentBuildCurrent(vol, gen, journalID) {
 					abortReason, abortRetry = "journal generation changed during build", true
@@ -509,6 +545,7 @@ func (s *goSearchService) runContentBuild(vol *serviceVolumeIndex) {
 	cidx.Origin = contentOriginUSN
 	cidx.JournalID = journalID
 	cidx.CheckpointUSN = uint64(checkpoint)
+	cidx.Policy = contentBuildPolicy{MaxRaw: settings.maxRaw, MaxText: settings.maxText, Skipped: skipped, Truncated: truncated}
 
 	// Re-check before publishing: the volume could have been rebuilt (or the
 	// service stopped) during the minutes-long extraction.
