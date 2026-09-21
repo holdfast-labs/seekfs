@@ -422,13 +422,17 @@ func (vol *serviceVolumeIndex) boundedScanCandidatesFiltered(pq parsedQuery, fil
 	// from a prefix, so it keeps the full candidate set. contentFullCandidates
 	// selects the historical full-candidate arm for differential testing, which
 	// must scan before re-ranking. A pending overlay hidden set also disables
-	// the bias early stop: scanCandidateMatches sees the base record only, so a
-	// hidden base match would fill the root page and the caller's verify loop
-	// would drop it, under-filling the result with no way to recover. The guard
-	// applies to the biased case only (non-biased early stop is unchanged).
+	// the early stop for every query shape: scanCandidateMatches sees the base
+	// record only, so a hidden base match would fill the page and the caller's
+	// verify loop would drop it, under-filling the result with no way to
+	// recover. The guard is the caller's captured hidden set (threaded through
+	// pq), so the scan and the verify loop drop exactly the same records; it is
+	// a cheap length check and is evaluated last, so the common no-overlay path
+	// pays nothing.
 	biased := pq.RootBias != "" || pq.CWDBias != ""
 	canStopAtLimit := !pq.CountOnly && limit > 0 &&
-		(!biased || (!pq.contentFullCandidates && pq.SortColumn != "relevance" && vol.snapshotHiddenBaseIDs().empty()))
+		(!biased || (!pq.contentFullCandidates && pq.SortColumn != "relevance")) &&
+		pq.hidden.empty()
 	if canStopAtLimit {
 		biasRoot := ""
 		if biased {

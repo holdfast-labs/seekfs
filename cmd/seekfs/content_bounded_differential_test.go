@@ -552,6 +552,89 @@ func TestContentBoundedBiasedFilenameMultiVolumeDifferential(t *testing.T) {
 	}
 }
 
+// Item 9 (non-biased): the bounded-scan early stop has no overlay-hidden guard
+// unless the query is biased, and scanCandidateMatches only sees the base
+// Deleted flag, never the pending hidden set. Matching base records hidden by a
+// pending delete therefore fill the page, the caller's verify loop drops every
+// one of them, and the scan has already returned with limit candidates -- the
+// result under-fills and cannot recover the non-hidden matches it never
+// scanned. The first page's worth of matches in scan order are hidden, with
+// non-hidden matches after them; the default arm must fill to the limit and
+// equal the contentFullCandidates (non-early-stop) arm byte-for-byte, for both
+// a content regex (no posting superset, so the bounded scan is the source) and
+// a filename shape. Runs searchCompactWithCacheHidden directly so the global
+// filename planners (which are already hidden-aware) cannot mask the per-volume
+// scan this fixes.
+func TestContentBoundedNonBiasedHiddenDifferential(t *testing.T) {
+	t.Setenv("SEEKFS_CONTENT_SEARCH", "1")
+	const total = 200
+	const hiddenTotal = 60
+	const limit = 20
+	mk := func(volume string, baseFRN uint64) []contentVolRecord {
+		recs := make([]contentVolRecord, 0, total)
+		for i := 0; i < total; i++ {
+			name := fmt.Sprintf("hit-%06d.txt", i)
+			recs = append(recs, contentVolRecord{
+				frn:       baseFRN + uint64(i) + 2,
+				parent:    -1,
+				parentFRN: 1,
+				name:      name,
+				size:      int64(i) + 1,
+				modUnix:   int64(1_600_000_000 + i),
+				path:      volume + `\alpha\` + name,
+				content:   "the archive worker syncs the download cache",
+			})
+		}
+		return recs
+	}
+	vol := newContentRecordVolume(t, "C:", mk("C:", 1_000_000))
+	changes := make([]usnChange, 0, hiddenTotal)
+	for i := 0; i < hiddenTotal; i++ {
+		changes = append(changes, usnChange{FRN: 1_000_000 + uint64(i) + 2, USN: int64(i) + 7, Reason: usnReasonFileDelete})
+	}
+	vol.applyUSNChanges(changes)
+	hidden := vol.snapshotHiddenBaseIDs()
+	if hidden.empty() {
+		t.Fatal("pending deletes did not hide base records")
+	}
+	shapes := []struct {
+		name       string
+		query      string
+		contentVol *serviceVolumeIndex
+	}{
+		// Explicit sort keeps the verify limit small (the default-order path
+		// widens to the 4096-entry content window, which the hidden prefix would
+		// never fill).
+		{"content", "content:/archive/ sort:size", vol},
+		{"filename", "type:file sort:size", nil},
+	}
+	for _, shape := range shapes {
+		t.Run(shape.name, func(t *testing.T) {
+			run := func(fullCandidates bool) ([]Entry, *searchTrace, error) {
+				trace := &searchTrace{}
+				opts := queryOptions{Query: shape.query, Limit: limit, Trace: trace, contentFullCandidates: fullCandidates}
+				matches, err := searchCompactWithCacheHidden(vol.index, opts, false, make(map[int]string), vol.nameTermCandidates, hidden, shape.contentVol)
+				return matches, trace, err
+			}
+			fullMatches, fullTrace, err := run(true)
+			if err != nil {
+				t.Fatalf("non-early-stop arm: %v", err)
+			}
+			gotMatches, gotTrace, err := run(false)
+			if err != nil {
+				t.Fatalf("default arm: %v", err)
+			}
+			if len(fullMatches) != limit {
+				t.Fatalf("non-early-stop arm under-filled: got %d; want %d", len(fullMatches), limit)
+			}
+			if len(gotMatches) != limit {
+				t.Fatalf("default arm under-filled: got %d; want %d", len(gotMatches), limit)
+			}
+			assertBoundedDifferentialEqual(t, shape.name, fullTrace, gotTrace, fullMatches, gotMatches)
+		})
+	}
+}
+
 // Item 9: when the bias root holds matches, a biased broad query stops the scan
 // as soon as the biased page is full, instead of scanning to the candidate
 // budget. The candidate count in the trace is the scan's output size. Uses the

@@ -226,6 +226,7 @@ func searchCompactWithCacheHidden(idx *Index, opts queryOptions, countOnly bool,
 	pq.Limit = limit
 	pq.CountOnly = countOnly
 	pq.contentCandidateMeta = &contentCandidateMeta{}
+	pq.hidden = hidden
 	var contentMatcher *contentLeafMatcher
 	if contentVol != nil && queryHasAnyContentLeaf(pq) {
 		contentMatcher = newContentLeafMatcher(pq)
@@ -683,7 +684,7 @@ func (vol *serviceVolumeIndex) nameTermCandidates(pq parsedQuery) ([]int, bool) 
 			// substitute: it walks the same rank/result order and verifies
 			// inline, stopping at the window.
 			bounded := !pq.contentFullCandidates && !pq.CountOnly && pq.Limit > 0 &&
-				pq.SortColumn != "relevance" && vol.snapshotHiddenBaseIDs().empty()
+				pq.SortColumn != "relevance" && pq.hidden.empty()
 			candidateCap := 0
 			if bounded {
 				// Probe broadness against the completeness window, not the

@@ -536,6 +536,11 @@ type parsedQuery struct {
 	// contentCandidateMeta carries a candidate source's self-report back to
 	// searchCompact for the current search call (never shared across queries).
 	contentCandidateMeta *contentCandidateMeta
+	// hidden is the overlay hidden-base-ID set captured once for this search
+	// call and threaded into the bounded candidate scan, so the scan's
+	// early-stop guard drops exactly the records the caller's verify loop drops
+	// instead of re-reading the volume snapshot and racing a republish.
+	hidden hiddenBaseIDs
 }
 
 // contentCandidateMeta is the per-search-call channel a candidate source uses to
