@@ -356,6 +356,78 @@ func TestContentPDFObjectStream(t *testing.T) {
 	contentPDFAssertContains(t, got, "objstmneedle")
 }
 
+// Text drawn through a Form XObject (`/Fm0 Do`) must be extracted: many
+// LaTeX/print PDFs put the whole page in a form with the page carrying only
+// /XObject (no /Font). Found by production testing (a 32-page paper extracted
+// zero text). Nested forms are followed too.
+func TestContentPDFFormXObject(t *testing.T) {
+	form := contentPDFStreamBytes([]byte("BT /F1 12 Tf (formxobjneedle) Tj ET"),
+		"/Type /XObject /Subtype /Form /BBox [0 0 612 792] /Resources << /Font << /F1 6 0 R >> >>")
+	objs := [][]byte{
+		[]byte("<< /Type /Catalog /Pages 2 0 R >>"),
+		[]byte("<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+		[]byte("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /XObject << /Fm0 4 0 R >> >> /Contents 5 0 R >>"),
+		form,
+		contentPDFStreamBytes([]byte("q /Fm0 Do Q"), ""),
+		[]byte("<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"),
+	}
+	contentPDFAssertContains(t, contentPDFTestExtract(t, contentPDFAssemble(objs, 1)), "formxobjneedle")
+}
+
+func TestContentPDFNestedFormXObject(t *testing.T) {
+	inner := contentPDFStreamBytes([]byte("BT /F1 12 Tf (nestedformneedle) Tj ET"),
+		"/Type /XObject /Subtype /Form /BBox [0 0 10 10] /Resources << /Font << /F1 7 0 R >> >>")
+	outer := contentPDFStreamBytes([]byte("/FmInner Do"),
+		"/Type /XObject /Subtype /Form /BBox [0 0 10 10] /Resources << /XObject << /FmInner 6 0 R >> >>")
+	objs := [][]byte{
+		[]byte("<< /Type /Catalog /Pages 2 0 R >>"),
+		[]byte("<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+		[]byte("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /XObject << /FmOuter 4 0 R >> >> /Contents 5 0 R >>"),
+		outer,
+		contentPDFStreamBytes([]byte("/FmOuter Do"), ""),
+		inner,
+		[]byte("<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"),
+	}
+	contentPDFAssertContains(t, contentPDFTestExtract(t, contentPDFAssemble(objs, 1)), "nestedformneedle")
+}
+
+// A form that draws itself must terminate at the depth bound, not recurse
+// forever or allocate unboundedly.
+func TestContentPDFFormCycleTerminates(t *testing.T) {
+	self := contentPDFStreamBytes([]byte("/FmSelf Do"),
+		"/Type /XObject /Subtype /Form /BBox [0 0 10 10] /Resources << /XObject << /FmSelf 4 0 R >> >>")
+	objs := [][]byte{
+		[]byte("<< /Type /Catalog /Pages 2 0 R >>"),
+		[]byte("<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+		[]byte("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /XObject << /FmSelf 4 0 R >> >> /Contents 5 0 R >>"),
+		self,
+		contentPDFStreamBytes([]byte("/FmSelf Do"), ""),
+	}
+	done := make(chan contentExtractResult, 1)
+	go func() { done <- contentPDFTestExtract(t, contentPDFAssemble(objs, 1)) }()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("self-referential form did not terminate")
+	}
+}
+
+// A ligature mapped to its Unicode presentation form (U+FB01/U+FB02) is
+// expanded to ASCII letters, so a word set with an fi/fl glyph stays searchable
+// as plain text.
+func TestContentPDFLigatureExpanded(t *testing.T) {
+	cmap := "/CIDInit /ProcSet findresource begin\n12 dict begin\nbegincmap\n1 beginbfchar\n<90> <FB02>\nendbfchar\nendcmap\nend\n"
+	objs := [][]byte{
+		[]byte("<< /Type /Catalog /Pages 2 0 R >>"),
+		[]byte("<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+		[]byte("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>"),
+		[]byte("<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /ToUnicode 6 0 R >>"),
+		contentPDFStreamBytes([]byte("BT /F1 12 Tf (work) Tj <90> Tj (ows) Tj ET"), ""),
+		contentPDFStreamBytes([]byte(cmap), ""),
+	}
+	contentPDFAssertContains(t, contentPDFTestExtract(t, contentPDFAssemble(objs, 1)), "workflows")
+}
+
 func TestContentPDFToUnicodeMapping(t *testing.T) {
 	cmap := "/CIDInit /ProcSet findresource begin\n12 dict begin\nbegincmap\n1 beginbfchar\n<90> <00E9>\nendbfchar\nendcmap\nend\n"
 	objs := [][]byte{

@@ -24,6 +24,8 @@ const (
 	contentPDFMaxCMapOps    = 1 << 16
 	contentPDFMaxCMapEntry  = 1 << 16
 	contentPDFMaxContentOps = 1 << 22
+	contentPDFMaxFormDepth  = 8
+	contentPDFMaxXObjects   = 256
 )
 
 type contentPDFFont struct {
@@ -103,6 +105,7 @@ func (w *contentPDFTextWriter) appendBytes(b []byte) {
 // its text.
 func (d *contentPDFDoc) extractPageText(pg contentPDFPage, w *contentPDFTextWriter) error {
 	fonts := d.pageFonts(pg.resources)
+	xobjs := d.pageXObjects(pg.resources)
 	for _, cv := range pg.contents {
 		if w.done() {
 			return nil
@@ -118,12 +121,35 @@ func (d *contentPDFDoc) extractPageText(pg contentPDFPage, w *contentPDFTextWrit
 		if err != nil || len(data) == 0 {
 			continue
 		}
-		d.contentStreamText(data, fonts, w)
+		d.contentStreamText(data, fonts, xobjs, w, 0)
 	}
 	return nil
 }
 
-func (d *contentPDFDoc) contentStreamText(data []byte, fonts map[string]*contentPDFFont, w *contentPDFTextWriter) {
+// pageXObjects resolves a resources dict's /XObject map to its stream values by
+// name. Form XObjects draw text through `Do`; image XObjects are ignored (no OCR).
+func (d *contentPDFDoc) pageXObjects(resources contentPDFValue) map[string]contentPDFValue {
+	out := map[string]contentPDFValue{}
+	resources = d.resolve(resources)
+	if resources.kind != contentPDFDict {
+		return out
+	}
+	xv := d.resolve(resources.dict["XObject"])
+	if xv.kind != contentPDFDict {
+		return out
+	}
+	for name, ref := range xv.dict {
+		if len(out) >= contentPDFMaxXObjects {
+			break
+		}
+		if ov := d.resolve(ref); ov.kind == contentPDFStream {
+			out[name] = ov
+		}
+	}
+	return out
+}
+
+func (d *contentPDFDoc) contentStreamText(data []byte, fonts map[string]*contentPDFFont, xobjs map[string]contentPDFValue, w *contentPDFTextWriter, depth int) {
 	l := &contentPDFLexer{buf: data, budget: contentPDFMaxValues}
 	var stack []contentPDFValue
 	var font *contentPDFFont
@@ -194,6 +220,21 @@ func (d *contentPDFDoc) contentStreamText(data []byte, fonts map[string]*content
 			if len(stack) >= 1 {
 				d.contentPDFShowArray(stack[len(stack)-1], font, w)
 			}
+		case "Do":
+			// A Form XObject draws text through its own resources; recurse,
+			// bounded by depth and the writer's text cap. Image XObjects are
+			// skipped (no OCR).
+			if depth < contentPDFMaxFormDepth && len(stack) >= 1 {
+				if n, ok := contentPDFNameOf(stack[len(stack)-1]); ok {
+					if ov, ok := xobjs[n]; ok {
+						if frame, _, derr := contentPDFDecodeStream(d.ctx, d, ov.dict, ov.raw, d.maxRaw); derr == nil && len(frame) > 0 {
+							subFonts := d.pageFonts(ov.dict["Resources"])
+							subXobjs := d.pageXObjects(ov.dict["Resources"])
+							d.contentStreamText(frame, subFonts, subXobjs, w, depth+1)
+						}
+					}
+				}
+			}
 		}
 		stack = stack[:0]
 	}
@@ -253,7 +294,7 @@ func contentPDFDecodeString(f *contentPDFFont, b []byte) string {
 		for i := 0; i+1 < len(b); i += 2 {
 			code := uint32(b[i])<<8 | uint32(b[i+1])
 			if r, ok := f.toUni[code]; ok && r != 0 {
-				sb.WriteRune(r)
+				contentPDFAppendRune(&sb, r)
 			}
 		}
 		return sb.String()
@@ -261,15 +302,39 @@ func contentPDFDecodeString(f *contentPDFFont, b []byte) string {
 	for _, c := range b {
 		if r, ok := f.toUni[uint32(c)]; ok {
 			if r != 0 {
-				sb.WriteRune(r)
+				contentPDFAppendRune(&sb, r)
 			}
 			continue
 		}
 		if r := f.simple[c]; r != 0 {
-			sb.WriteRune(r)
+			contentPDFAppendRune(&sb, r)
 		}
 	}
 	return sb.String()
+}
+
+// contentPDFAppendRune expands a Unicode ligature presentation form to its
+// ASCII letters, so a ToUnicode/Differences that maps a ligature to U+FB00–
+// FB06 (very common) keeps the word searchable as plain text. (A producer that
+// maps the ligature to a single base letter, e.g. `fl` → `f`, is lossy in the
+// PDF itself and cannot be recovered here.)
+func contentPDFAppendRune(sb *strings.Builder, r rune) {
+	switch r {
+	case 0xFB00:
+		sb.WriteString("ff")
+	case 0xFB01:
+		sb.WriteString("fi")
+	case 0xFB02:
+		sb.WriteString("fl")
+	case 0xFB03:
+		sb.WriteString("ffi")
+	case 0xFB04:
+		sb.WriteString("ffl")
+	case 0xFB05, 0xFB06:
+		sb.WriteString("st")
+	default:
+		sb.WriteRune(r)
+	}
 }
 
 // ----- fonts -----
@@ -556,4 +621,5 @@ var contentPDFGlyphNames = map[string]rune{
 	"ellipsis": '\u2026', "trademark": '\u2122', "dagger": '\u2020', "daggerdbl": '\u2021',
 	"perthousand": '\u2030', "guilsinglleft": '\u2039', "guilsinglright": '\u203A',
 	"fi": '\uFB01', "fl": '\uFB02', "minus": '\u2212', "fraction": '\u2044',
+	"ff": '\uFB00', "ffi": '\uFB03', "ffl": '\uFB04',
 }
