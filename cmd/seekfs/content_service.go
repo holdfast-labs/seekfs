@@ -698,6 +698,16 @@ func (s *contentVolumeState) markSidecarCapped(size, cap int64) {
 // rather than the resident delta growing without bound. The deferred change is
 // not lost: the base checkpoint is not advanced, so it is replayed once the cap
 // is raised and the volume rebuilt.
+//
+// No rebuild is scheduled here (P6-2, documented limitation). A rebuild re-
+// extracts the same live corpus at the same cap, so it can only publish if the
+// content has since shrunk below the cap or the cap was raised — otherwise it
+// fails over cap again. And a rebuild's markIndexing drops the still-usable base
+// and delta, so a failed attempt would take the volume from degraded-but-usable
+// to unusable. The pure over-cap case (without this hard bound) already
+// self-heals through the 15-minute capped fold retry once base+delta fit. The
+// operator action is to lower the indexed content or raise contentGSXMaxBytes,
+// then restart; health surfaces sidecar_bytes/sidecar_cap and this reason.
 func (s *contentVolumeState) markDeltaCapped() {
 	if s == nil {
 		return
@@ -705,6 +715,7 @@ func (s *contentVolumeState) markDeltaCapped() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.health.Incomplete = true
+	s.health.BuildError = "content delta hit its hard bound while the sidecar is over the size cap; lower the indexed content or raise contentGSXMaxBytes, then restart"
 	if s.state != contentStateStale && s.state != contentStateIndexing {
 		s.state = contentStateDegraded
 		s.health.State = contentStateDegraded
@@ -889,6 +900,19 @@ func (s *contentVolumeState) markCatchUpComplete() {
 	s.catchUpPending = false
 }
 
+// catchUpPendingNow reports whether restart catch-up for the attached base has
+// not yet finished. It is used to verify that a successful self-heal clears the
+// gate (a capped/failed catch-up clears it only when a rebuild attaches and its
+// catch-up completes).
+func (s *contentVolumeState) catchUpPendingNow() bool {
+	if s == nil {
+		return false
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.catchUpPending
+}
+
 // catchUpIncomplete reports whether a fold must wait: catch-up is still in
 // progress, or it was capped/failed and may have skipped records.
 func (s *contentVolumeState) catchUpIncomplete() bool {
@@ -936,6 +960,11 @@ type contentCoordinator struct {
 	observedUSN uint64
 	// foldRetryAfter paces fold retries after a failure; the delta is kept.
 	foldRetryAfter time.Time
+	// done is closed by stopDrain to retire this coordinator's drain loop when
+	// its volume is replaced or removed, without touching s.stop. It is created
+	// with the coordinator and closed at most once.
+	done     chan struct{}
+	doneOnce sync.Once
 }
 
 func newContentCoordinator(state *contentVolumeState) *contentCoordinator {
@@ -943,7 +972,26 @@ func newContentCoordinator(state *contentVolumeState) *contentCoordinator {
 		state: state,
 		dirty: make(map[uint64]struct{}),
 		queue: make(map[uint64]struct{}),
+		done:  make(chan struct{}),
 	}
+}
+
+// stopDrain retires the coordinator's drain loop by closing its per-volume done
+// channel and clearing drainEnabled. It is TERMINAL for this coordinator: done
+// stays closed, so a re-attach of the same coordinator would not re-arm (a new
+// loop would return immediately on <-done). Re-attaching must build a fresh
+// coordinator. It is idempotent and independent of s.stop: shutdown still stops
+// every loop, while a volume swap stops only the drain it replaces.
+func (c *contentCoordinator) stopDrain() {
+	if c == nil {
+		return
+	}
+	c.doneOnce.Do(func() {
+		close(c.done)
+		c.mu.Lock()
+		c.drainEnabled = false
+		c.mu.Unlock()
+	})
 }
 
 // enableDrain arms USN consumption. Until a drain loop is attached, the

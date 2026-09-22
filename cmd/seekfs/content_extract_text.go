@@ -19,11 +19,12 @@ func (contentTextExtractor) Class() uint16   { return contentClassText }
 // extension is not claimed by a richer extractor and which is not binary.
 func (contentTextExtractor) Extensions() []string { return nil }
 
-// Sniff accepts any file whose head is not binary, or that carries a BOM (a
-// UTF-16 file's bytes contain NULs but it is text). The coordinator also applies
-// an extension allowlist before calling, so this is the last-resort claimer.
+// Sniff accepts any file whose head is not binary, or that is text whose bytes
+// legitimately contain NULs (a BOM, or a BOM-less UTF-16 NUL pattern). The
+// coordinator also applies an extension allowlist before calling, so this is the
+// last-resort claimer.
 func (contentTextExtractor) Sniff(head []byte) bool {
-	return contentHasBOM(head) || !contentLooksBinary(head)
+	return contentDetectsTextEncoding(head) || !contentLooksBinary(head)
 }
 
 func (contentTextExtractor) Extract(ctx context.Context, r io.ReaderAt, size int64) (contentExtractResult, error) {
@@ -37,13 +38,14 @@ func (contentTextExtractor) Extract(ctx context.Context, r io.ReaderAt, size int
 		return contentExtractResult{}, err
 	}
 	truncated := size > s.maxRaw
-	// A BOM-marked UTF-16 file is text even though its raw bytes contain NULs;
-	// decode first, and only a BOM-less NUL makes a file binary.
-	if !contentHasBOM(raw) && contentLooksBinary(raw) {
+	// A UTF-16 file (BOM-marked, or BOM-less by NUL pattern) is text even though
+	// its raw bytes contain NULs; decode first, and only a NUL that no text
+	// encoding explains makes a file binary.
+	if !contentDetectsTextEncoding(raw) && contentLooksBinary(raw) {
 		return contentExtractResult{Skipped: true, Reason: "binary", Class: contentClassText}, nil
 	}
 	text := contentDecodeForIndex(raw, s.encoding, truncated)
-	if !contentHasBOM(raw) && contentLooksBinary([]byte(text)) {
+	if !contentDetectsTextEncoding(raw) && contentLooksBinary([]byte(text)) {
 		return contentExtractResult{Skipped: true, Reason: "binary", Class: contentClassText}, nil
 	}
 	if int64(len(text)) > s.maxText {

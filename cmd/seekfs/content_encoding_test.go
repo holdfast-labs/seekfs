@@ -24,6 +24,18 @@ func contentUTF16BEWithBOM(s string) []byte {
 	return v
 }
 
+func contentUTF16WithoutBOM(s, enc string) []byte {
+	var v []byte
+	for _, u := range utf16.Encode([]rune(s)) {
+		if enc == "utf-16be" {
+			v = append(v, byte(u>>8), byte(u))
+		} else {
+			v = append(v, byte(u), byte(u>>8))
+		}
+	}
+	return v
+}
+
 func TestContentEncodingParsesSpecialLabels(t *testing.T) {
 	for _, label := range []string{"auto", ""} {
 		m, err := parseContentEncoding(label)
@@ -59,6 +71,51 @@ func TestContentEncodingAutoDecodesUTF16BOM(t *testing.T) {
 		if got := contentDecode(tc.bytes, contentEncodingMode{auto: true}); got != "hello needle\n" {
 			t.Fatalf("%s: got %q", tc.name, got)
 		}
+	}
+}
+
+// P6-5: a BOM-less UTF-16 file is recognized by its NUL-byte pattern (one NUL
+// per ASCII character on a consistent parity) and decoded, instead of being
+// rejected as binary. The sniff must also drive search (borrow) consistently.
+func TestContentEncodingAutoDecodesBOMlessUTF16(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		enc  string
+	}{
+		{"le", "utf-16le"},
+		{"be", "utf-16be"},
+	} {
+		raw := contentUTF16WithoutBOM("hello needle\n", tc.enc)
+		if got := contentSniffUTF16BOMless(raw); got != tc.enc {
+			t.Fatalf("%s: sniff = %q; want %q", tc.name, got, tc.enc)
+		}
+		if got := contentDecode(raw, contentAutoEncoding); got != "hello needle\n" {
+			t.Fatalf("%s: decode = %q", tc.name, got)
+		}
+		if contentBorrowsWholeInput(raw, contentAutoEncoding) {
+			t.Fatalf("%s: BOM-less UTF-16 must not be borrowed whole", tc.name)
+		}
+	}
+}
+
+// P6-5 guard: one-sided NUL bytes alone must not classify a binary file as text,
+// and a small binary must still be rejected.
+func TestContentSniffBOMlessUTF16RejectsBinary(t *testing.T) {
+	// Big-endian control characters: the byte pattern looks like UTF-16BE, but
+	// the decoded runes are non-printable, so the textual guard rejects it.
+	bin := []byte{0x00, 0x01, 0x00, 0x02, 0x00, 0x03, 0x00, 0x04}
+	if enc := contentSniffUTF16BOMless(bin); enc != "" {
+		t.Fatalf("binary NUL pattern classified as %q", enc)
+	}
+	// A single stray NUL in otherwise short ASCII is not UTF-16.
+	if enc := contentSniffUTF16BOMless([]byte("abc\x00def")); enc != "" {
+		t.Fatalf("stray-NUL ASCII classified as %q", enc)
+	}
+	// A short ASCII file with a couple of stray NULs (2 odd NULs, 50% on one
+	// parity) clears the two-NUL bar but is under the minimum sample length, so
+	// it must still be treated as binary.
+	if enc := contentSniffUTF16BOMless([]byte("abc\x00def\x00")); enc != "" {
+		t.Fatalf("short stray-NUL ASCII classified as %q", enc)
 	}
 }
 

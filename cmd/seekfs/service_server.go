@@ -571,6 +571,14 @@ func replaceServiceVolumeContents(dst, src *serviceVolumeIndex) {
 	if dst == nil || src == nil {
 		return
 	}
+	// The destination's content coordinator is preserved below (content is
+	// generation-independent), so its drain keeps running across a base swap. A
+	// replacement object that carries a different coordinator must not leave a
+	// drain of its own behind: retire it (P6-4). This is a no-op today because
+	// the replacement is always a fresh, undrained volume.
+	if src.contentCoord != nil && src.contentCoord != dst.contentCoord {
+		src.stopContentDrain()
+	}
 	prevJournalID := dst.journalID
 	dst.dbPath = src.dbPath
 	dst.index = src.index

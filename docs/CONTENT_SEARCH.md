@@ -387,9 +387,22 @@ distinct new document is deferred and the volume is marked incomplete/degraded,
 rather than the delta growing without bound. Existing entries are still updated,
 so no acknowledged content is dropped, and a deferred change is not lost — the
 persisted base checkpoint is not advanced, so it is replayed once recovery
-happens. Recovery is to raise the cap (or reduce the indexed content) and
-rebuild, which re-extracts the deferred USN range and clears the cap and the
-incomplete flag.
+happens.
+
+**Recovery (P6-2, accepted limitation).** A plain over-cap fold (the delta is
+over the cap but has not hit the hard bound) self-heals: `health.Incomplete` is
+still clear, so the 15-minute capped retry re-encodes base+delta and publishes
+as soon as the content fits again (files deleted or shrunk). Once the delta hits
+the hard bound, `markDeltaCapped` sets `health.Incomplete`, which gates every
+fold, so only a fresh attach (rebuild or restart) can clear it. No rebuild is
+scheduled automatically: `runContentBuild` calls `markIndexing`, which drops the
+still-usable base+delta, and a rebuild at the same cap fails over cap again
+whenever the live corpus still exceeds `contentGSXMaxBytes` — so an automatic
+attempt would take the volume from degraded-but-usable to unusable without
+guaranteed benefit. The operator action is to lower the indexed content or raise
+the cap, then restart; the condition and the action are surfaced in
+`loaded --json` via `sidecar_bytes`/`sidecar_cap` and a `build_error` naming the
+operator action.
 
 ## 6h. PB8 — bounded content candidates + residual list (done)
 
@@ -444,21 +457,43 @@ Residual / known limitations (all explicit deferrals):
   deferred to the engine R1/R5 work.
 - **Completeness residual.** A window-capped superset whose true matches fall in
   `[userLimit, window)` reports `incomplete` conservatively (the safe direction).
-- **M2.** A `context`-ignoring extractor can wedge the serial drain/build; the
-  per-document timeout only bounds an extractor that observes it, and the
-  offline walk builder (`buildContentIndexFromDir`) applies no per-doc timeout.
-- **M10.** A service that loses the `.gsx.lock` race at startup never
-  re-acquires it (best-effort, logged; `acquireContentVolumeLock`).
-- **Over-cap fold.** A 15-minute capped backoff (`contentFoldCappedBackoff`); a
-  volume whose live content exceeds `contentGSXMaxBytes` needs a rebuild/restart,
-  and `markDeltaCapped` does not schedule one.
-- **Capped/aborted catch-up** leaves `catchUpPending` set until
-  `ensureContentBuild`/restart.
-- **No per-volume drain cancellation** (loops end at `s.stop`).
-- **Binary-sniff edges.** BOM-less UTF-16 is rejected; a NUL-free binary file is
-  indexed as text.
-- **`contentResolvePath`** has no end-to-end test (only the FRN-column fallback
-  is unit-tested).
+- **M2.** `contentExtractSafely` runs extraction in a goroutine and returns on
+  `ectx.Done()`, so a context-ignoring extractor cannot wedge the serial drain,
+  the service build, or the offline walk builder. The residual is the abandoned
+  goroutine and its close-race with the caller's deferred `f.Close()`: safe for
+  `*os.File` (concurrency-safe `ReadAt`/`Close`) but not for a non-close-safe
+  library `ReaderAt`; P4's out-of-process path would replace both with a hard
+  kill (see the `ponytail:` comment on `contentExtractSafely`).
+- **M10 (fixed, P6-1).** A service that loses the `.gsx.lock` race at startup
+  re-attempts acquisition on the drain cadence (`retryContentVolumeLock`), so it
+  takes ownership once the CLI build releases it. The failure is logged once and
+  the retry is a single non-blocking `LockFileEx`.
+- **Over-cap fold (accepted limitation, P6-2).** A volume whose live content
+  exceeds `contentGSXMaxBytes` is kept correct and usable (previous base +
+  delta), with a 15-minute capped backoff that recovers a transient over-cap.
+  Once the delta hard bound sets `health.Incomplete`, folds are gated and no
+  rebuild is scheduled: `runContentBuild`'s `markIndexing` would drop the usable
+  base, and a rebuild at the same cap fails again while the corpus is too large.
+  The operator must lower the indexed content or raise the cap, then restart;
+  `markDeltaCapped` now records that action in `build_error`.
+- **Capped/aborted catch-up (verified, P6-3).** A successful self-heal rebuild
+  re-attaches and re-runs catch-up to the live checkpoint, which clears
+  `catchUpPending` and `health.Incomplete` (asserted in
+  `TestContentCatchUpCapSelfHealsRebuild`). It stays set only when the bounded
+  rebuild budget is exhausted, leaving the volume gated until a restart.
+- **Per-volume drain cancellation (fixed, P6-4).** The coordinator owns a `done`
+  channel; `contentDrainLoop` selects on it and on `s.stop`, and
+  `stopContentDrain` retires one volume's loop without affecting shutdown.
+- **Binary-sniff edges (P6-5).** BOM-less UTF-16 is now recognized by a NUL-byte
+  parity heuristic (one-sided, ≥40% NULs, textual guard, minimum sample length)
+  and decoded. A NUL-free binary file is still indexed as text — a general binary
+  classifier is an accepted limitation, not a heuristic rabbit hole. Because the
+  text extractor's `Version()` is intentionally not bumped, a BOM-less UTF-16
+  file previously skipped as binary is not re-indexed by the sniff change alone:
+  it becomes findable only after a rebuild or a USN change to the file.
+- **`contentResolvePath` (fixed, P6-6).** Covered end-to-end by
+  `TestContentResolvePathParentChain` against a compact index with a real parent
+  chain, including the low-memory FRN-column fallback and an overlay rename.
 - **PDF extraction** remains a best-effort spike (no xref/object streams, Flate
   only).
 - **Dead code.** `contentPostingIndex.lookup`/`forEach` and
@@ -474,9 +509,6 @@ Residual / known limitations (all explicit deferrals):
   directly and have been removed; `contentLossyFixups` remains for the decoder.
 - The service reads the whole `.gsx` into heap (`contentLoadFile`); mmap-ing it
   is deferred to the ARCHITECTURE_REVIEW R1/R5 engine work.
-- `contentResolvePath` has no end-to-end test (needs a compact index with a
-  parent chain); only its `contentLookupFRNColumn` fallback is tested.
-- No per-volume drain cancellation (loops end at `s.stop`).
 - PDF extraction is a best-effort spike (no xref/object streams, Flate only,
   simple fonts only); quality is a P4 decision.
 
@@ -500,8 +532,9 @@ Each item below is intentionally out of scope for P5; the rationale is one line.
   (walk-keyed sidecar refused, USN-keyed attached) and the persisted FRN
   resolver are covered end-to-end in `content_service_integration_test.go`, and
   the attach + restart catch-up path in `content_restart_test.go`.
-- **`contentResolvePath` end-to-end test**: needs a compact index with a real
-  parent chain; only its `contentLookupFRNColumn` fallback is unit-tested today.
+- **`contentResolvePath` end-to-end test**: DONE (P6-6) —
+  `TestContentResolvePathParentChain` covers a compact index with a real parent
+  chain plus the FRN-column fallback and an overlay rename.
 - **Journal-reset content rebuild scheduling**: DONE in PF-3 (§6e) — a reset
   marks the index `stale` and the rebuild chain schedules and re-attaches a
   service-owned content build, so content self-heals.

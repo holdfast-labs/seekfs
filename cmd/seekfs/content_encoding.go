@@ -12,6 +12,7 @@ package main
 import (
 	"fmt"
 	"strings"
+	"unicode"
 	"unicode/utf16"
 	"unicode/utf8"
 
@@ -79,6 +80,84 @@ func sniffContentBOM(b []byte) (enc string, n int) {
 	return "", 0
 }
 
+// contentBOMlessUTF16MinSample is the smallest sample the BOM-less UTF-16 sniff
+// trusts. Below it the one-sided-NUL test is too easily satisfied by a short
+// text file carrying a stray NUL, so the bytes fall through to the binary check.
+const contentBOMlessUTF16MinSample = 16
+
+// contentSniffUTF16BOMless recognizes BOM-less UTF-16 text from a NUL-byte
+// pattern, so a UTF-16 file written without a BOM is decoded instead of being
+// rejected as binary. ASCII-heavy UTF-16 stores one NUL per ASCII character on a
+// single byte parity (odd offsets for LE, even for BE), so the sniff requires
+// that one parity is mostly NUL, the other is almost never NUL, and the decoded
+// sample is overwhelmingly printable. Returns "utf-16le", "utf-16be", or "". The
+// textual guard keeps a binary file that merely happens to have one-sided NUL
+// bytes from being misread as text, and the minimum sample length keeps a short
+// text file with a stray NUL from clearing the two-NUL bar.
+func contentSniffUTF16BOMless(b []byte) string {
+	sample := b
+	if len(sample) > contentExtractBinarySniff {
+		sample = sample[:contentExtractBinarySniff]
+	}
+	if len(sample) < contentBOMlessUTF16MinSample {
+		return ""
+	}
+	even, odd, nulEven, nulOdd := 0, 0, 0, 0
+	for i := 0; i < len(sample); i++ {
+		if i%2 == 0 {
+			even++
+			if sample[i] == 0 {
+				nulEven++
+			}
+		} else {
+			odd++
+			if sample[i] == 0 {
+				nulOdd++
+			}
+		}
+	}
+	// Require at least two dominant-parity NULs and a strong one-sided majority
+	// (>=40%; ASCII-heavy UTF-16 is ~50%). A lone stray NUL must not trip it.
+	le := nulOdd >= 2 && nulOdd*100 >= odd*40 && nulEven*100 <= even*5
+	be := nulEven >= 2 && nulEven*100 >= even*40 && nulOdd*100 <= odd*5
+	var enc string
+	switch {
+	case le && !be:
+		enc = "utf-16le"
+	case be && !le:
+		enc = "utf-16be"
+	default:
+		return ""
+	}
+	body := sample
+	if len(body)%2 != 0 {
+		body = body[:len(body)-1]
+	}
+	if !contentLooksTextualUTF16(contentTranscodeUTF16(enc, body)) {
+		return ""
+	}
+	return enc
+}
+
+// contentLooksTextualUTF16 reports whether a decoded UTF-16 sample is text: no
+// NUL rune and at least 85% printable/space runes.
+func contentLooksTextualUTF16(s string) bool {
+	if s == "" {
+		return false
+	}
+	total, printable := 0, 0
+	for _, r := range s {
+		total++
+		if r == 0 {
+			return false
+		}
+		if unicode.IsPrint(r) || unicode.IsSpace(r) {
+			printable++
+		}
+	}
+	return printable*100 >= total*85
+}
+
 // contentBorrowsWholeInput reports whether decoding would hand back the entire
 // input untouched (no BOM trim, no transcode, no lossy repair). This is the
 // precondition for searching bytes straight out of a memory map: invalid UTF-8
@@ -88,6 +167,9 @@ func contentBorrowsWholeInput(b []byte, mode contentEncodingMode) bool {
 		return false
 	}
 	if mode.explicit != nil && mode.explicit != encoding.Nop {
+		return false
+	}
+	if contentSniffUTF16BOMless(b) != "" {
 		return false
 	}
 	return utf8.Valid(b)
@@ -110,6 +192,11 @@ func contentDecodeWithFixups(b []byte, mode contentEncodingMode) (string, conten
 	}
 	if mode.explicit != nil && mode.explicit != encoding.Nop {
 		return contentTranscode(mode.explicit, b), contentLossyFixups{}
+	}
+	if mode.auto {
+		if enc := contentSniffUTF16BOMless(b); enc != "" {
+			return contentTranscodeUTF16(enc, b), contentLossyFixups{}
+		}
 	}
 	if mode.legacy {
 		return contentDecodeLegacy(b, false), contentLossyFixups{}
@@ -141,6 +228,11 @@ func contentDecodeForIndex(b []byte, mode contentEncodingMode, truncated bool) s
 	}
 	if mode.explicit != nil && mode.explicit != encoding.Nop {
 		return contentTranscode(mode.explicit, b)
+	}
+	if mode.auto {
+		if enc := contentSniffUTF16BOMless(b); enc != "" {
+			return contentTranscodeUTF16(enc, b)
+		}
 	}
 	if mode.legacy {
 		return contentDecodeLegacy(b, truncated)

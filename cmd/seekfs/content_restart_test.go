@@ -776,6 +776,14 @@ func TestContentCatchUpCapSelfHealsRebuild(t *testing.T) {
 	if vol.content.healthIncomplete() {
 		t.Fatal("a completed rebuild must clear the incomplete flag")
 	}
+	// PF-5b/P6-3: the rebuild's attach re-ran catch-up to the live checkpoint,
+	// which must clear catchUpPending too, or the fold stays gated forever.
+	if vol.content.catchUpPendingNow() {
+		t.Fatal("a completed rebuild's catch-up must clear catchUpPending")
+	}
+	if vol.content.catchUpIncomplete() {
+		t.Fatal("a completed rebuild must leave no catch-up gate")
+	}
 	rebuilt, err := contentLoadFile(contentIndexPathForDB(vol.dbPath))
 	if err != nil {
 		t.Fatalf("load rebuilt sidecar: %v", err)

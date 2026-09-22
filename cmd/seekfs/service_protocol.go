@@ -424,6 +424,10 @@ type goSearchService struct {
 	// distinct sidecar paths; released at process exit.
 	contentLocksMu sync.Mutex
 	contentLocks   map[string]*contentVolumeLock
+	// contentLockWarned marks sidecar paths whose lock acquisition failed and
+	// has not yet succeeded, so the bounded retry (drain tick) logs once instead
+	// of flooding while another process holds the lock.
+	contentLockWarned map[string]bool
 }
 
 // signalServiceStop closes the stop channel exactly once.  It is safe to call

@@ -161,10 +161,11 @@ func (s *goSearchService) attachContentForVolume(vol *serviceVolumeIndex) {
 // acquireContentVolumeLock records this service as the owner of vol's content
 // sidecar (M10) by taking the `.gsx.lock` advisory lock, held for the process
 // lifetime. It is idempotent and best-effort: a lock already held for the path
-// is reused, and a path owned by another process is logged and skipped so the
-// service still attaches (the atomic sidecar write keeps the file intact, and
-// the CLI refuses when it finds the service's lock). A nil receiver or volume is
-// a no-op.
+// is reused, and a path owned by another process is logged (once) and skipped so
+// the service still attaches (the atomic sidecar write keeps the file intact,
+// and the CLI refuses when it finds the service's lock). A later attempt is made
+// from the drain tick so the service eventually owns the lock after a
+// startup-race loss (M10 residual). A nil receiver or volume is a no-op.
 func (s *goSearchService) acquireContentVolumeLock(vol *serviceVolumeIndex) {
 	if s == nil || vol == nil {
 		return
@@ -180,13 +181,42 @@ func (s *goSearchService) acquireContentVolumeLock(vol *serviceVolumeIndex) {
 	}
 	lk, err := acquireContentVolumeLock(gsx)
 	if err != nil {
-		serviceLog("content sidecar lock volume=%s path=%s not acquired: %v", vol.volume, gsx, err)
+		if !s.contentLockWarned[gsx] {
+			serviceLog("content sidecar lock volume=%s path=%s not acquired: %v", vol.volume, gsx, err)
+			if s.contentLockWarned == nil {
+				s.contentLockWarned = make(map[string]bool)
+			}
+			s.contentLockWarned[gsx] = true
+		}
 		return
 	}
+	delete(s.contentLockWarned, gsx)
 	if s.contentLocks == nil {
 		s.contentLocks = make(map[string]*contentVolumeLock)
 	}
 	s.contentLocks[gsx] = lk
+}
+
+// retryContentVolumeLock makes one bounded re-acquisition attempt for vol's
+// sidecar lock if it is not yet held. The drain tick calls it, so a service that
+// lost the startup `.gsx.lock` race to a CLI build takes ownership once that
+// build releases it, instead of never re-acquiring (M10 residual). The attempt
+// is a single non-blocking LockFileEx and is a map lookup once the lock is held.
+func (s *goSearchService) retryContentVolumeLock(vol *serviceVolumeIndex) {
+	if s == nil || vol == nil {
+		return
+	}
+	gsx := contentIndexPathForDB(vol.dbPath)
+	if gsx == "" {
+		return
+	}
+	s.contentLocksMu.Lock()
+	_, held := s.contentLocks[gsx]
+	s.contentLocksMu.Unlock()
+	if held {
+		return
+	}
+	s.acquireContentVolumeLock(vol)
 }
 
 // contentCatchUpMaxChanges and contentCatchUpMaxBytes bound restart catch-up so
@@ -423,16 +453,30 @@ func (vol *serviceVolumeIndex) contentFRNSizeLocked(frn uint64) (int64, bool) {
 const contentDrainInterval = 2 * time.Second
 
 func (s *goSearchService) contentDrainLoop(vol *serviceVolumeIndex) {
+	if vol == nil || vol.contentCoord == nil {
+		return
+	}
+	// Capture the per-volume done channel once: a volume swap that installs a
+	// different coordinator must not let this loop observe a new channel and
+	// outlive its volume (M10/P6-4). The loop ends at either s.stop (shutdown)
+	// or this volume's done (replaced/removed).
+	done := vol.contentCoord.done
 	ticker := time.NewTicker(contentDrainInterval)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-s.stop:
 			return
+		case <-done:
+			return
 		case <-ticker.C:
 			if vol.contentCoord == nil {
 				return
 			}
+			// M10 residual: keep trying to own the sidecar lock on the drain
+			// cadence, so a service that lost the startup race acquires it once
+			// the CLI build releases it.
+			s.retryContentVolumeLock(vol)
 			vol.contentCoord.promoteAll()
 			// A private path cache: the drain must not touch vol.pathCache,
 			// which the search path trims under searchMu (a different lock).
@@ -533,6 +577,17 @@ func invalidateContentAfterBaseReset(vol *serviceVolumeIndex, reason string) {
 		return
 	}
 	vol.content.markStale(reason)
+}
+
+// stopContentDrain retires vol's content drain loop, if any. It is the
+// per-volume cancel: a volume that is replaced by a different one (or removed)
+// stops its own loop without disturbing s.stop, while a plain in-place base swap
+// keeps the coordinator (and therefore its drain). Idempotent and nil-safe.
+func (vol *serviceVolumeIndex) stopContentDrain() {
+	if vol == nil || vol.contentCoord == nil {
+		return
+	}
+	vol.contentCoord.stopDrain()
 }
 
 // rebindContentAfterBaseSwap rebuilds a volume's content->record resolver

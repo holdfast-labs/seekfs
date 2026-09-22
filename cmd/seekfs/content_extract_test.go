@@ -92,6 +92,19 @@ func TestContentTextExtractorDecodesUTF16(t *testing.T) {
 	}
 }
 
+// P6-5: a BOM-less UTF-16 file is decoded by the text extractor instead of
+// being skipped as binary.
+func TestContentTextExtractorDecodesBOMlessUTF16(t *testing.T) {
+	raw := contentUTF16WithoutBOM("needle needle\n", "utf-16le")
+	got, err := contentTextExtractor{}.Extract(context.Background(), bytes.NewReader(raw), int64(len(raw)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Skipped || string(got.Text) != "needle needle\n" {
+		t.Fatalf("got %+v; want decoded text", got)
+	}
+}
+
 // PB7: an over-cap text file is indexed as a bounded prefix (never a silent
 // drop), marked Truncated, and the policy cap is respected so memory stays
 // bounded by maxRaw/maxText.

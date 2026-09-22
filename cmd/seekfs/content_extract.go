@@ -260,8 +260,18 @@ func contentHasBOM(b []byte) bool {
 	return n > 0
 }
 
+// contentDetectsTextEncoding reports whether b is text whose bytes legitimately
+// contain NULs: a UTF-8/UTF-16 BOM, or a BOM-less UTF-16 NUL pattern. It is the
+// gate the binary NUL sniff consults so a BOM-less UTF-16 file is decoded rather
+// than rejected as binary.
+func contentDetectsTextEncoding(b []byte) bool {
+	return contentHasBOM(b) || contentSniffUTF16BOMless(b) != ""
+}
+
 // contentLooksBinary reports whether head indicates a binary file: a NUL byte in
-// the first contentExtractBinarySniff bytes, matching ripgrep.
+// the first contentExtractBinarySniff bytes, matching ripgrep. A NUL-free binary
+// file (no NUL in the sniff window) is still indexed as text: a general binary
+// classifier is a rabbit hole, so this is an accepted limitation.
 func contentLooksBinary(head []byte) bool {
 	limit := len(head)
 	if limit > contentExtractBinarySniff {
