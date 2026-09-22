@@ -187,7 +187,10 @@ func (contentRTFExtractor) Extract(ctx context.Context, r io.ReaderAt, size int6
 	if out.Len() == 0 {
 		return contentExtractResult{Class: contentClassRTF, Truncated: truncated}, nil
 	}
-	text := truncateUTF8(out.String(), int(s.maxText))
+	// The byte-level scanner can split a multibyte rune (a control symbol consumes
+	// only the lead byte, then the continuation bytes are emitted as literals), so
+	// repair the buffer to valid UTF-8 before returning it.
+	text := truncateUTF8(contentRepairString(out.Bytes(), false), int(s.maxText))
 	res := contentExtractResult{Text: []byte(text), Class: contentClassRTF, Truncated: truncated}
 	if truncated {
 		res.Reason = "indexed bounded prefix up to policy cap"

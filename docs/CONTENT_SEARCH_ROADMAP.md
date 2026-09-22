@@ -1,8 +1,9 @@
 # Content Search — Roadmap to Filename-Search Parity
 
 Status: the parity packages (PB1–PB9, M1–M10) are complete; the remaining
-optional item is PB8 items 4–7 (global-lane integration, WP7), and **WP11 —
-additional file types — is the next body of work**. Companion to
+optional item is PB8 items 4–7 (global-lane integration, WP7). **WP11 —
+additional file types — has landed all planned extractors except legacy OLE**
+(HTML, EML, mbox, RTF, MSG, PDF), with one fuzz target per parser. Companion to
 `docs/CONTENT_SEARCH.md` (which documents P0–P5, the accepted feature as it
 stands today); the full format detail is in the gitignored
 `docs/CONTENT_SEARCH_FORMATS_PLAN.md`.
@@ -295,7 +296,11 @@ test strategy, open questions — lives in the gitignored
   (no `<script>`, base64 noise, `\fonttbl`, control words), `Skipped`+`Reason`
   for encrypted/scanned/malformed, `Truncated` over cap, `len(Text) ≤ maxText`;
   one `FuzzContent<Format>Extractor` per parser (no panic, bounded, ctx honored);
-  offline differential goldens outside CI.
+  offline differential goldens outside CI. **Status:** landed — synthetic
+  fixtures per format, an allowlist assertion per format, and the six fuzz
+  targets (HTML/EML/mbox/RTF/MSG/PDF) are in `content_extract_fuzz_test.go`;
+  campaigns found and fixed an RTF UTF-8 rune-split and a PDF `/Length`-absent
+  `endstream` rescan that could burn seconds on a ≤1 MiB input.
 - **Risks:** every new parser is a hostile-input surface (decompression bombs,
   malformed CFB/xref loops); format-affecting changes must go through P1/WP0.
 - **Decisions already made (do not relitigate):** PDF **text-layer only, no
@@ -323,7 +328,7 @@ test strategy, open questions — lives in the gitignored
 | WP8 | Resource hardening (with M9) | M (4–7 d) |
 | WP9 | Semantics | M–L (5–12 d) |
 | WP10 | `.gsx` eviction/size cap/dedup (M7) | M (3–6 d) |
-| WP11 | Additional file types (HTML→EML→mbox→RTF→MSG→PDF; legacy OLE deferred) | M–XL (25–50 d; per-format) |
+| WP11 | Additional file types (HTML→EML→mbox→RTF→MSG→PDF; legacy OLE deferred) | **done** except legacy OLE |
 
 Corrected program total: **~60–110 engineer-days**, with the content-checkpoint /
 format-versioning work (WP0) on the critical path. WP11 is a separate,
@@ -349,11 +354,11 @@ deferred.
 8. **WP8** — hardening (M1, M2, M5, M9, M10).
 9. **WP10** — `.gsx` eviction/size cap/dedup (M7).
 10. **WP5** — legacy OLE (defer unless required).
-11. **WP11 — additional file types** — the next body of work after parity:
-    pre-requisites P1/P2 first (blocking), then HTML → EML → mbox → RTF → MSG,
-    with PDF on a separate track; legacy OLE stays deferred. Independent of the
-    parity packages once the extractor interface/versioning is frozen; may run
-    alongside WP7's global-lane tail. Full detail in
+11. **WP11 — additional file types** — **done** except legacy OLE: HTML → EML →
+    mbox → RTF → MSG → PDF, each reviewed and committed, with the P1/P2/P3
+    pre-requisites (per-doc extractor refresh, offline panic isolation,
+    coordinator deadline) already landed and the six fuzz targets in place.
+    Legacy OLE stays deferred (WP5). Full detail in
     `docs/CONTENT_SEARCH_FORMATS_PLAN.md`.
 
 The originally proposed three items map to **WP2 (PDF)**, **WP3 (email)**, and

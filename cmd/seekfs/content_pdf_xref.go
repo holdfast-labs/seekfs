@@ -13,6 +13,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"sort"
 	"strconv"
 )
 
@@ -32,17 +33,19 @@ type contentPDFCompRef struct {
 }
 
 type contentPDFDoc struct {
-	ctx         context.Context
-	buf         []byte
-	maxRaw      int64
-	maxText     int64
-	offsets     map[int]int64
-	compressed  map[int]contentPDFCompRef
-	trailer     map[string]contentPDFValue
-	cache       map[int]contentPDFValue
-	objStmCache map[int]map[int]contentPDFValue
-	objCount    int
-	encrypted   bool
+	ctx           context.Context
+	buf           []byte
+	maxRaw        int64
+	maxText       int64
+	offsets       map[int]int64
+	compressed    map[int]contentPDFCompRef
+	trailer       map[string]contentPDFValue
+	cache         map[int]contentPDFValue
+	objStmCache   map[int]map[int]contentPDFValue
+	objCount      int
+	encrypted     bool
+	endstreams    []int
+	endstreamsSet bool
 }
 
 type contentPDFObject struct {
@@ -410,16 +413,39 @@ func (d *contentPDFDoc) readStreamBytes(l *contentPDFLexer, dict map[string]cont
 		l.pos = end
 		return d.buf[start:end], true
 	}
-	k := bytes.Index(d.buf[start:], []byte("endstream"))
+	k := d.endstreamAt(start)
 	if k < 0 {
 		return nil, false
 	}
-	data := d.buf[start : start+k]
+	data := d.buf[start:k]
 	for len(data) > 0 && (data[len(data)-1] == '\n' || data[len(data)-1] == '\r') {
 		data = data[:len(data)-1]
 	}
-	l.pos = start + k
+	l.pos = k
 	return data, true
+}
+
+// endstreamAt returns the absolute offset of the first `endstream` keyword at or
+// after start, or -1. Occurrences are indexed once (O(n)) so many streams whose
+// /Length is absent do not each rescan the whole buffer.
+func (d *contentPDFDoc) endstreamAt(start int) int {
+	const kw = "endstream"
+	if !d.endstreamsSet {
+		d.endstreamsSet = true
+		for off := 0; ; {
+			i := bytes.Index(d.buf[off:], []byte(kw))
+			if i < 0 {
+				break
+			}
+			d.endstreams = append(d.endstreams, off+i)
+			off += i + len(kw)
+		}
+	}
+	i := sort.SearchInts(d.endstreams, start)
+	if i < len(d.endstreams) {
+		return d.endstreams[i]
+	}
+	return -1
 }
 
 // object resolves an indirect object by number, through the xref offset map or

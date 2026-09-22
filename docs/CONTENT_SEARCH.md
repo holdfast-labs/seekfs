@@ -526,10 +526,16 @@ Residual / known limitations (all explicit deferrals):
   Flate/LZW/ASCII85/ASCIIHex/RunLength, ToUnicode/Differences); text-layer only,
   no OCR, encrypted → `Skipped`.
 - **PDF `readStreamBytes` without `/Length`.** When a stream's `/Length` is
-  absent or untrusted, the payload is delimited by scanning for `endstream`, so a
-  document that omits `/Length` on many objects costs O(objects × maxRaw) rather
-  than O(maxRaw); it is bounded only by the per-document deadline (the residual
-  abandoned-goroutine case noted in M2).
+  absent or untrusted, the payload is delimited by the `endstream` keyword.
+  Occurrences are indexed once per document (O(maxRaw)) and looked up by binary
+  search, so omitting `/Length` on many objects no longer costs
+  O(objects × maxRaw). Fuzzing previously drove multi-second extractions on
+  ~1 MiB inputs; the index removed that stall.
+- **RTF output is repaired to valid UTF-8.** The byte-level RTF scanner can split
+  a multibyte rune (a control symbol consumes only the lead byte, then the
+  continuation bytes are emitted as literals), so the emitted buffer is run
+  through the shared UTF-8 repair before truncation. Found by
+  `FuzzContentRTFExtractor`; the crashing input is committed as a seed.
 - **PDF `/Encrypt` detection can be evaded by a later `/Prev` section that fails
   to parse.** The loader merges trailer keys first-wins as it walks `/Prev`; if a
   newer section parses without `/Encrypt` and an older section (which held it)
