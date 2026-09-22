@@ -542,16 +542,18 @@ Residual / known limitations (all explicit deferrals):
   then fails to parse, the walk stops and the document is treated as unencrypted.
   The reason degrades to "no extractable text" rather than "encrypted" — not a
   content leak, because the objects stay encrypted and decode to nothing.
-- **Delta hard ceiling applies only while the sidecar is capped (M1).** The
-  resident delta is bounded between folds by the fold trigger, and past the
-  trigger by the hard ceiling — but the ceiling is enforced only while the
-  sidecar is over its size cap, because that is the one case where a fold
-  provably cannot advance the persisted checkpoint, so deferring a change cannot
-  lose it. A persistent non-cap fold failure (e.g. a full disk) can therefore
-  grow the delta until the failure clears. A correct fix needs per-FRN USN
-  tracking plus a checkpoint clamp so deferred changes replay after a restart
-  (the PB2/WP1c checkpoint semantics); until then health reports `delta_bytes`
-  and `fold_error` so the growth and the failing fold are visible.
+- **A delta parked at its hard ceiling freezes the persisted checkpoint (M1).**
+  Distinct changes beyond the hard ceiling (docs/bytes) are parked by FRN and
+  replayed once the delta drains, so the resident delta is bounded in every
+  case. While any are parked a fold keeps the persisted checkpoint at the base's
+  value, so a restart replays those USNs instead of skipping them — the parked
+  changes are delayed and surfaced incomplete (`deferred_docs`, `incomplete`),
+  never lost. The trade-off: a restart during a stall redundantly re-extracts the
+  USNs since the base checkpoint, and the parked set is held in memory (one FRN
+  per changed file, ~50 B each — bounded by the number of distinct files changed
+  during the stall, not by time; a delete burst is tombstoned in the delta
+  directly and is not parked). Folds still publish the admitted delta, so a
+  recovered fold drains the park set batch by batch.
 - **Moved-class invalidation.** Extractor invalidation keys on the stored
   `(ContentType class, ExtractorVersion)`. A base built while an extension was
   text-indexed (class Text, e.g. `.html` before the HTML extractor) is neither

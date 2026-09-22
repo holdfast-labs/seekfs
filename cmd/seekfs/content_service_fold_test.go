@@ -471,6 +471,132 @@ func TestContentFoldFailureKeepsDelta(t *testing.T) {
 	}
 }
 
+func (f *contentFoldFixture) drainTick(t *testing.T) {
+	t.Helper()
+	f.vol.contentCoord.processQueue(func(frn uint64) (string, bool) {
+		p, ok := f.paths[frn]
+		return p, ok
+	})
+	f.s.runContentFold(f.vol)
+}
+
+// M1: the hard ceiling bounds the delta even when the fold fails for a non-cap
+// reason, and the parked changes are replayed (not lost) once the fold recovers.
+func TestContentFoldNonCapFailureBoundsAndReplays(t *testing.T) {
+	const n = 8
+	files := make([]contentFixtureFile, 0, n)
+	for i := 0; i < n; i++ {
+		files = append(files, contentFixtureFile{frn: uint64(100 + i), name: fmt.Sprintf("f%02d.txt", i), text: "baseonly"})
+	}
+	f := newContentFoldFixture(t, files)
+
+	restoreDocs := contentDeltaFoldMaxDocs
+	contentDeltaFoldMaxDocs = 1 << 30
+	t.Cleanup(func() { contentDeltaFoldMaxDocs = restoreDocs })
+	restoreHard := contentDeltaHardMaxDocs
+	contentDeltaHardMaxDocs = 3
+	t.Cleanup(func() { contentDeltaHardMaxDocs = restoreHard })
+	restoreSave := contentFoldSave
+	contentFoldSave = func(string, *contentIndex) error { return errors.New("injected save failure") }
+	t.Cleanup(func() { contentFoldSave = restoreSave })
+
+	for i := 0; i < n; i++ {
+		f.churn(t, uint64(100+i), int64(200+i), fmt.Sprintf("needle%d", i))
+	}
+	if got := f.vol.content.deltaView().len(); got > contentDeltaHardMaxDocs {
+		t.Fatalf("delta grew to %d entries; hard bound is %d", got, contentDeltaHardMaxDocs)
+	}
+	h := f.vol.content.healthSnapshot(0)
+	if h.Deferred == 0 || !h.Incomplete {
+		t.Fatalf("deferred changes not surfaced: %+v", h)
+	}
+
+	// Recover the fold; the parked changes replay and become searchable while the
+	// delta stays bounded.
+	contentFoldSave = restoreSave
+	drained := false
+	for tick := 0; tick < 128; tick++ {
+		f.drainTick(t)
+		if got := f.vol.content.deltaView().len(); got > contentDeltaHardMaxDocs {
+			t.Fatalf("delta exceeded the hard bound during replay: %d", got)
+		}
+		if f.vol.contentCoord.deferredCount() == 0 && f.vol.content.deltaView().len() == 0 {
+			drained = true
+			break
+		}
+	}
+	if !drained {
+		t.Fatalf("parked changes never replayed (deferred=%d delta=%d)",
+			f.vol.contentCoord.deferredCount(), f.vol.content.deltaView().len())
+	}
+	for i := 0; i < n; i++ {
+		if hits, _ := contentServiceSearch(t, f.vol, fmt.Sprintf("content:needle%d", i), false); len(hits) != 1 {
+			t.Fatalf("deferred change needle%d not replayed: %v", i, hits)
+		}
+	}
+	if h := f.vol.content.healthSnapshot(0); h.Incomplete || h.Deferred != 0 {
+		t.Fatalf("health still incomplete after replay: %+v", h)
+	}
+}
+
+// M1: while changes are parked at the hard ceiling the fold must not advance the
+// persisted checkpoint past them, so a restart replays their USNs. Once they
+// drain the next fold advances it again.
+func TestContentFoldFreezesCheckpointWhileDeferred(t *testing.T) {
+	f := newContentFoldFixture(t, []contentFixtureFile{
+		{10, "alpha.txt", "alpha base"},
+		{20, "beta.txt", "beta base"},
+		{30, "gamma.txt", "gamma base"},
+	})
+
+	restoreDocs := contentDeltaFoldMaxDocs
+	contentDeltaFoldMaxDocs = 1 << 30
+	t.Cleanup(func() { contentDeltaFoldMaxDocs = restoreDocs })
+	restoreHard := contentDeltaHardMaxDocs
+	contentDeltaHardMaxDocs = 1
+	t.Cleanup(func() { contentDeltaHardMaxDocs = restoreHard })
+
+	for i, frn := range []uint64{10, 20, 30} {
+		f.churn(t, frn, int64(200+i), fmt.Sprintf("needle%d", i))
+	}
+	if f.vol.contentCoord.deferredCount() == 0 {
+		t.Fatal("test did not reach the hard ceiling; nothing deferred")
+	}
+
+	// A fold while changes are parked publishes the admitted delta but must leave
+	// the checkpoint at the base so a restart replays the parked USNs.
+	f.s.runContentFold(f.vol)
+	reloaded, err := contentLoadFile(contentIndexPathForDB(f.dbPath))
+	releaseContentIndexOnCleanup(t, reloaded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reloaded.CheckpointUSN != 100 {
+		t.Fatalf("fold advanced the checkpoint to %d while changes were deferred; want 100", reloaded.CheckpointUSN)
+	}
+
+	// Drain the parked changes; once none remain a fold may advance the
+	// checkpoint past them (they are now in the base).
+	for tick := 0; tick < 128; tick++ {
+		f.drainTick(t)
+		if f.vol.contentCoord.deferredCount() == 0 && f.vol.content.deltaView().len() == 0 {
+			break
+		}
+	}
+	if f.vol.contentCoord.deferredCount() != 0 {
+		t.Fatalf("parked changes never drained: %d", f.vol.contentCoord.deferredCount())
+	}
+	f.drainTick(t)
+	reloaded2, err := contentLoadFile(contentIndexPathForDB(f.dbPath))
+	releaseContentIndexOnCleanup(t, reloaded2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reloaded2.CheckpointUSN <= 100 {
+		t.Fatalf("checkpoint not advanced after the parked changes drained: %d", reloaded2.CheckpointUSN)
+	}
+}
+
 // PF-5a blocker (two streams): a fold must not persist observedUSN while restart
 // catch-up is still pending. observedUSN is a max over the live replay and
 // catch-up streams, so it can run ahead of the delta's coverage; persisting it

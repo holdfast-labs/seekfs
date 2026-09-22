@@ -215,19 +215,18 @@ Streaming postings (M6) and optional mmap of `.gsx` are the easy tails.
 - **Validation:** churn memory stays bounded; a slow file cannot stall the drain;
   CLI build against a live service is rejected or serialized; a stat-shaped
   divergence sets the flag.
-- **Status:** M2, M5, M10 and M9 are **done** (M10 Windows-only; M9's local
-  flag plus the remote projection of a coarse `content` health block). M1 is
-  done for the normal and over-cap paths — the fold trigger bounds the delta
-  between folds, and the hard ceiling refuses new distinct docs while the
-  sidecar is capped. **Residual (documented):** the hard ceiling is only
-  enforced while the sidecar is capped, because that is the one case where a
-  fold provably cannot advance the persisted checkpoint, so deferring cannot
-  lose a change. A *persistent* non-cap fold failure (e.g. a full disk) can
-  still grow the delta; a correct fix needs per-FRN USN tracking plus a
-  checkpoint clamp so deferred changes replay after a restart, which touches
-  the PB2/WP1c checkpoint semantics and is its own package. To make the growth
-  visible meanwhile, health now reports the resident `delta_bytes` and a
-  `fold_error` (cleared on the next successful fold).
+- **Status: done.** M2, M5, M10 (Windows-only) and M9 (local flag plus the
+  remote projection of a coarse `content` health block) are complete. M1: the
+  resident delta is bounded in every case — the fold trigger bounds it between
+  folds, and distinct changes past the hard ceiling are parked by FRN and
+  replayed once the delta drains, so a stalled or failed fold cannot grow it
+  without bound. While any change is parked a fold keeps the persisted
+  checkpoint below them, so a restart replays their USNs rather than skipping
+  them (the change is delayed and surfaced `incomplete`/`deferred_docs`, never
+  lost). Health also reports the resident `delta_bytes` and a `fold_error`. A
+  fold now runs from `ready` or `degraded` (a degraded-but-usable base folds to
+  recover), and `catchUpFailed` separates the catch-up fold gate from the
+  delta-incomplete signal (they previously shared `health.Incomplete`).
 
 ### WP9 — Semantics (M3, M4) — decide, then scope
 - **Method:** honor `case:true` for content (store a case-preserving text section
@@ -338,7 +337,7 @@ test strategy, open questions — lives in the gitignored
 | WP5 | Legacy OLE Office (candidate to defer) | L (8–15 d) |
 | WP6 | Size policy | S–M (1–3 d) |
 | WP7 | Global-lane + count integration, multi-volume federation | L–XL (15–30 d) |
-| WP8 | Resource hardening (with M9) | **done** except the M1 non-cap fold-failure residual |
+| WP8 | Resource hardening (with M9) | **done** |
 | WP9 | Semantics | M–L (5–12 d) |
 | WP10 | `.gsx` eviction/size cap/dedup (M7) | M (3–6 d) |
 | WP11 | Additional file types (HTML→EML→mbox→RTF→MSG→PDF; legacy OLE deferred) | **done** except legacy OLE |
@@ -364,8 +363,7 @@ deferred.
    surface); otherwise after WP1e.
 7. **WP2 (PDF) and WP3 (email + markup)** — independent and parallelizable once
    the extractor interface/versioning is frozen.
-8. **WP8** — hardening (M1, M2, M5, M9, M10) — **done** except the M1
-   non-cap fold-failure residual (see §WP8).
+8. **WP8** — hardening (M1, M2, M5, M9, M10) — **done**.
 9. **WP10** — `.gsx` eviction/size cap/dedup (M7).
 10. **WP5** — legacy OLE (defer unless required).
 11. **WP11 — additional file types** — **done** except legacy OLE: HTML → EML →

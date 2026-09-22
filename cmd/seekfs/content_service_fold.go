@@ -88,9 +88,14 @@ func (s *goSearchService) runContentFold(vol *serviceVolumeIndex) {
 	if vol == nil || vol.content == nil || vol.contentCoord == nil {
 		return
 	}
-	// Only a ready, attached base can be folded; a build/rebuild owns the other
-	// states and writes the same sidecar.
-	if vol.content.stateOf() != contentStateReady {
+	// A fold needs a usable attached base. ready and degraded both have one —
+	// degraded means the base is usable but incomplete, over cap, or mid
+	// extractor refresh, and a fold is exactly how it recovers (this is also what
+	// lets a delta parked at its hard ceiling replay once the fold can publish).
+	// indexing/stale own the sidecar via a build/rebuild and must not be folded.
+	switch vol.content.stateOf() {
+	case contentStateReady, contentStateDegraded:
+	default:
 		return
 	}
 	// Serialize with the service-owned build: both publish the `.gsx`.
@@ -101,10 +106,11 @@ func (s *goSearchService) runContentFold(vol *serviceVolumeIndex) {
 		vol.contentBuildBusy.Store(false)
 		// A journal reset (or base rebuild) may have called scheduleContentBuild
 		// while this fold held the build slot, so its CAS failed and the rebuild
-		// was dropped. Now that the slot is free, reschedule if the volume is no
-		// longer ready, so a reset volume is not left stale until the next
-		// unrelated trigger.
-		if vol.content.stateOf() != contentStateReady {
+		// was dropped. Reschedule only for a state that actually needs a rebuild
+		// (stale/unavailable): a degraded volume is usable and a fold is its
+		// recovery, so re-attaching it here would clear the degradation signal
+		// prematurely (and a rebuild would drop the usable base).
+		if st := vol.content.stateOf(); st == contentStateStale || st == contentStateUnavailable {
 			s.scheduleContentBuild(vol)
 		}
 	}()
@@ -139,6 +145,13 @@ func (s *goSearchService) runContentFold(vol *serviceVolumeIndex) {
 	}
 	checkpoint := observedUSN
 	if checkpoint < base.CheckpointUSN {
+		checkpoint = base.CheckpointUSN
+	}
+	// Changes parked at the delta's hard ceiling are not in this fold's
+	// snapshot; keep the persisted checkpoint below them so a restart replays
+	// their USNs instead of skipping them. The in-process replay re-admits them
+	// as the delta drains, so this is a redundant-but-safe re-extract on restart.
+	if vol.contentCoord.hasDeferred() {
 		checkpoint = base.CheckpointUSN
 	}
 	cidx.Origin = contentOriginUSN

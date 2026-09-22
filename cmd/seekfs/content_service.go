@@ -75,7 +75,11 @@ type contentHealth struct {
 	// DeltaBytes is the resident delta's normalized-text size. It grows while a
 	// fold cannot publish, so a delta that is accumulating (M1) is observable
 	// instead of only surfacing as memory pressure.
-	DeltaBytes       int64  `json:"delta_bytes,omitempty"`
+	DeltaBytes int64 `json:"delta_bytes,omitempty"`
+	// Deferred counts distinct changes parked at the delta's hard ceiling
+	// (memory-bounded, replayed once the delta drains). Non-zero means the
+	// volume is serving content that is missing those changes until replay.
+	Deferred         int    `json:"deferred_docs,omitempty"`
 	ExtractorVersion int    `json:"extractor_version,omitempty"`
 	QueueDepth       int    `json:"queue_depth,omitempty"`
 	LastRebuild      string `json:"last_rebuild,omitempty"`
@@ -344,6 +348,13 @@ type contentVolumeState struct {
 	// catch-up never clears it, so the volume stays gated and degraded until a
 	// rebuild.
 	catchUpPending bool
+	// catchUpFailed is the fold gate for a capped/aborted restart catch-up whose
+	// skipped records may lie below observedUSN. It is distinct from
+	// health.Incomplete, which is also raised by a delta parked at its hard
+	// ceiling (markDeltaCapped): that deferral is safe to fold because the
+	// checkpoint is held below the parked changes, so it must not gate folds.
+	// setReady clears it for a freshly attached base.
+	catchUpFailed bool
 	// sidecarCapped is set when the encoded `.gsx` exceeds contentGSXMaxBytes
 	// (WP10/M7). The attached base and the delta are left in place, so content
 	// stays correct and usable; the flag only keeps the volume surfaced as
@@ -404,6 +415,7 @@ func mergeContentHealth(dst *contentHealth, src contentHealth) {
 	}
 	dst.Docs += src.Docs
 	dst.DeltaBytes += src.DeltaBytes
+	dst.Deferred += src.Deferred
 	dst.QueueDepth += src.QueueDepth
 	dst.Evictions += src.Evictions
 	dst.ExtractionErrors += src.ExtractionErrors
@@ -607,6 +619,7 @@ func (s *contentVolumeState) setReady(idx *contentIndex, reader *contentReader, 
 	// A freshly attached base is complete as of its checkpoint; any earlier
 	// catch-up truncation belonged to the replaced base.
 	s.health.Incomplete = false
+	s.catchUpFailed = false
 	s.health.Docs = len(idx.Docs)
 	s.health.SidecarBytes = idx.EncodedSize
 	s.health.SidecarCap = contentGSXMaxBytes
@@ -668,6 +681,7 @@ func (s *contentVolumeState) markStale(reason string) {
 	s.resolver = nil
 	s.delta = newContentDelta()
 	s.catchUpPending = false
+	s.catchUpFailed = false
 	s.refreshActive = false
 	s.refreshPending = 0
 	s.health.ExtractorRefresh = false
@@ -690,6 +704,7 @@ func (s *contentVolumeState) markIndexing(total int) {
 	s.reader = nil
 	s.resolver = nil
 	s.catchUpPending = false
+	s.catchUpFailed = false
 	s.refreshActive = false
 	s.refreshPending = 0
 	s.health.ExtractorRefresh = false
@@ -758,22 +773,21 @@ func (s *contentVolumeState) markSidecarCapped(size, cap int64) {
 	}
 }
 
-// markDeltaCapped flags that the delta reached its hard ceiling while the
-// sidecar is over cap, so a new distinct document was not admitted. The volume
-// is surfaced incomplete/degraded (base+delta are still served by search)
-// rather than the resident delta growing without bound. The deferred change is
-// not lost: the base checkpoint is not advanced, so it is replayed once the cap
-// is raised and the volume rebuilt.
+// markDeltaCapped flags that the delta reached its hard ceiling, so a new
+// distinct document was not admitted. It fires whether the ceiling is reached
+// because the sidecar is over the size cap (no fold can publish) or because a
+// fold is failing for another reason; either way the resident delta must not
+// grow without bound. The volume is surfaced incomplete/degraded (base+delta are
+// still served by search) rather than the delta growing.
 //
-// No rebuild is scheduled here (P6-2, documented limitation). A rebuild re-
-// extracts the same live corpus at the same cap, so it can only publish if the
-// content has since shrunk below the cap or the cap was raised — otherwise it
-// fails over cap again. And a rebuild's markIndexing drops the still-usable base
-// and delta, so a failed attempt would take the volume from degraded-but-usable
-// to unusable. The pure over-cap case (without this hard bound) already
-// self-heals through the 15-minute capped fold retry once base+delta fit. The
-// operator action is to lower the indexed content or raise contentGSXMaxBytes,
-// then restart; health surfaces sidecar_bytes/sidecar_cap and this reason.
+// A deferred change is not lost: it is replayed by FRN once the delta drains
+// (contentCoordinator.replayDeferred), and while any remain the fold keeps the
+// persisted checkpoint below them (runContentFold), so a restart replays their
+// USNs too. No rebuild is scheduled here (P6-2, documented limitation): a
+// rebuild re-extracts the same live corpus and a failed attempt would drop the
+// still-usable base. The operator action for the over-cap case is to lower the
+// indexed content or raise contentGSXMaxBytes, then restart; health surfaces
+// sidecar_bytes/sidecar_cap, delta_bytes, deferred_docs and this reason.
 func (s *contentVolumeState) markDeltaCapped() {
 	if s == nil {
 		return
@@ -781,7 +795,7 @@ func (s *contentVolumeState) markDeltaCapped() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.health.Incomplete = true
-	s.health.BuildError = "content delta hit its hard bound while the sidecar is over the size cap; lower the indexed content or raise contentGSXMaxBytes, then restart"
+	s.health.BuildError = "content delta reached its hard bound; changes are deferred and replay once the delta drains (if the sidecar is over the size cap, lower the indexed content or raise contentGSXMaxBytes, then restart)"
 	if s.state != contentStateStale && s.state != contentStateIndexing {
 		s.state = contentStateDegraded
 		s.health.State = contentStateDegraded
@@ -873,6 +887,13 @@ func (s *contentVolumeState) setDeltaBytes(n int64) {
 	s.mu.Unlock()
 }
 
+// setDeferred records how many changes are parked at the delta's hard ceiling.
+func (s *contentVolumeState) setDeferred(n int) {
+	s.mu.Lock()
+	s.health.Deferred = n
+	s.mu.Unlock()
+}
+
 // setFoldError records why the last delta fold failed (empty clears it). A
 // successful fold, or a base publish, clears it.
 func (s *contentVolumeState) setFoldError(msg string) {
@@ -943,6 +964,7 @@ func (s *contentVolumeState) markCatchUpIncomplete() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.health.Incomplete = true
+	s.catchUpFailed = true
 	if s.state != contentStateStale {
 		s.state = contentStateDegraded
 		s.health.State = contentStateDegraded
@@ -984,6 +1006,7 @@ func (s *contentVolumeState) markCatchUpComplete() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.catchUpPending = false
+	s.catchUpFailed = false
 }
 
 // catchUpPendingNow reports whether restart catch-up for the attached base has
@@ -1032,14 +1055,17 @@ func (s *contentVolumeState) refreshPendingNow() bool {
 }
 
 // catchUpIncomplete reports whether a fold must wait: catch-up is still in
-// progress, or it was capped/failed and may have skipped records.
+// progress, or it was capped/failed and may have skipped records. A delta
+// parked at its hard ceiling (health.Incomplete via markDeltaCapped) is not
+// this case — its checkpoint is held below the parked changes — so it does not
+// gate folds.
 func (s *contentVolumeState) catchUpIncomplete() bool {
 	if s == nil {
 		return false
 	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.catchUpPending || s.health.Incomplete
+	return s.catchUpPending || s.catchUpFailed
 }
 
 // hasContentForFRN reports whether a live content doc already exists for the
@@ -1066,10 +1092,14 @@ func (s *contentVolumeState) hasContentForFRN(frn uint64) bool {
 // are promoted for extraction on Close or a quiet window; read-only closes never
 // produce work.
 type contentCoordinator struct {
-	mu           sync.Mutex
-	state        *contentVolumeState
-	dirty        map[uint64]struct{}
-	queue        map[uint64]struct{}
+	mu    sync.Mutex
+	state *contentVolumeState
+	dirty map[uint64]struct{}
+	queue map[uint64]struct{}
+	// deferred parks distinct changes that could not be admitted because the
+	// delta is at its hard ceiling. Keyed by FRN; replayed once the delta
+	// drains. Bounded in memory (an FRN per change, not its text).
+	deferred     map[uint64]struct{}
 	drainEnabled bool
 	// observedUSN is the highest change USN handed to observeChanges. It is a
 	// contiguous persistence bound only when no observed-but-unextracted work
@@ -1087,10 +1117,11 @@ type contentCoordinator struct {
 
 func newContentCoordinator(state *contentVolumeState) *contentCoordinator {
 	return &contentCoordinator{
-		state: state,
-		dirty: make(map[uint64]struct{}),
-		queue: make(map[uint64]struct{}),
-		done:  make(chan struct{}),
+		state:    state,
+		dirty:    make(map[uint64]struct{}),
+		queue:    make(map[uint64]struct{}),
+		deferred: make(map[uint64]struct{}),
+		done:     make(chan struct{}),
 	}
 }
 
@@ -1245,6 +1276,50 @@ func (c *contentCoordinator) takeQueued() []uint64 {
 	return out
 }
 
+// deferChange parks a distinct change that could not be admitted because the
+// delta is at its hard ceiling. It is replayed by FRN once the delta drains, so
+// it is delayed, never lost; while any remain, a fold keeps the persisted
+// checkpoint below them (runContentFold), so a restart replays them too.
+func (c *contentCoordinator) deferChange(frn uint64) {
+	c.mu.Lock()
+	if c.deferred == nil {
+		c.deferred = make(map[uint64]struct{})
+	}
+	c.deferred[frn] = struct{}{}
+	c.mu.Unlock()
+}
+
+// replayDeferred moves every parked change back onto the extraction queue for
+// another attempt. The caller invokes it only when the delta has room, so the
+// replayed changes are admitted rather than immediately re-deferred.
+func (c *contentCoordinator) replayDeferred() {
+	c.mu.Lock()
+	if len(c.deferred) == 0 {
+		c.mu.Unlock()
+		return
+	}
+	for frn := range c.deferred {
+		c.queue[frn] = struct{}{}
+	}
+	c.deferred = make(map[uint64]struct{})
+	c.mu.Unlock()
+}
+
+// deferredCount returns the number of changes parked at the hard ceiling.
+func (c *contentCoordinator) deferredCount() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.deferred)
+}
+
+// hasDeferred reports whether any change is parked at the hard ceiling; a fold
+// must then stop advancing the persisted checkpoint past those changes.
+func (c *contentCoordinator) hasDeferred() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.deferred) > 0
+}
+
 func (c *contentCoordinator) drainEnabledNow() bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -1396,19 +1471,41 @@ func sha256Of(text []byte) [contentHashLen]byte {
 // processQueue resolves and extracts every queued FRN, upserting the delta and
 // deleting docs for files that no longer resolve. It returns the number of
 // documents added or changed. resolvePath maps an FRN to its current path.
+//
+// The resident delta is bounded by contentDeltaHardMaxDocs/Bytes in every case,
+// not only while the sidecar is capped: a distinct document that arrives at the
+// ceiling is deferred by FRN rather than admitted, so a stalled or failed fold
+// cannot grow the delta without bound. Deferred changes are replayed once the
+// delta drains, and while any remain the fold stops advancing the persisted
+// checkpoint past them (runContentFold), so a restart replays their USNs too — a
+// deferred change is delayed and surfaced incomplete, never lost.
 func (c *contentCoordinator) processQueue(resolvePath func(frn uint64) (string, bool)) int {
 	if c == nil {
 		return 0
 	}
+	delta := c.state.deltaView()
+	// Re-admit previously deferred changes once there is room; otherwise they
+	// stay parked (no extraction churn) until a fold drains the delta.
+	if !delta.atHardBound(contentDeltaHardMaxDocs, contentDeltaHardMaxBytes) {
+		c.replayDeferred()
+	}
 	frns := c.takeQueued()
 	changed := 0
 	for _, frn := range frns {
-		path, ok := resolvePath(frn)
-		if !ok {
-			c.state.deltaView().delete(frn)
+		// At the hard ceiling a distinct change cannot be admitted without
+		// unbounded memory: defer it and surface the volume incomplete. Updating
+		// an existing slot is always allowed, so acknowledged content is never
+		// dropped. Checking before extraction also spares the I/O.
+		if !delta.contains(frn) && delta.atHardBound(contentDeltaHardMaxDocs, contentDeltaHardMaxBytes) {
+			c.deferChange(frn)
 			continue
 		}
-		prior, havePrior := c.state.deltaView().priorHash(frn)
+		path, ok := resolvePath(frn)
+		if !ok {
+			delta.delete(frn)
+			continue
+		}
+		prior, havePrior := delta.priorHash(frn)
 		doc, didChange, err := contentExtractDeltaDoc(frn, path, prior, havePrior)
 		if err != nil {
 			c.state.noteExtractionError()
@@ -1421,26 +1518,19 @@ func (c *contentCoordinator) processQueue(resolvePath func(frn uint64) (string, 
 			// A prior delta entry (havePrior) is left alone: an unchanged write
 			// must not delete acknowledged content.
 			if !havePrior && c.state.hasContentForFRN(frn) {
-				c.state.deltaView().delete(frn)
+				delta.delete(frn)
 			}
-			continue
-		}
-		// While the sidecar is capped no fold can publish, so the delta cannot
-		// drain. Admit a distinct document only up to the hard ceiling: past it
-		// the new document is deferred (replayed after a cap raise + rebuild)
-		// and the volume is surfaced incomplete, rather than growing without
-		// bound. Updating an existing slot is always allowed, so acknowledged
-		// content is never dropped.
-		delta := c.state.deltaView()
-		if c.state.sidecarCappedNow() && !delta.contains(frn) &&
-			delta.atHardBound(contentDeltaHardMaxDocs, contentDeltaHardMaxBytes) {
-			c.state.markDeltaCapped()
 			continue
 		}
 		delta.upsert(doc)
 		changed++
 	}
-	c.state.setDeltaBytes(c.state.deltaView().liveBytes())
+	c.state.setDeltaBytes(delta.liveBytes())
+	deferred := c.deferredCount()
+	c.state.setDeferred(deferred)
+	if deferred > 0 {
+		c.state.markDeltaCapped()
+	}
 	c.state.markDrained()
 	return changed
 }
