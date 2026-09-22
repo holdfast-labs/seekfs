@@ -204,7 +204,7 @@ Streaming postings (M6) and optional mmap of `.gsx` are the easy tails.
   unusable content volume still returns that volume's filename matches; count ==
   search for non-stat shapes; the degraded flag reaches remote callers.
 - **Risks:** overlaps WP1d (build) and the engine R1/R5 work (mmap).
-- **Status / design (phase 0 landed).** The join is easier than first feared:
+- **Status / design (phases 0–3 landed).** The join is easier than first feared:
   `serviceVolumeIndex.contentCandidatesBounded` already maps each matching
   content docID to a **local record ID** via the resolver, so the per-volume
   content candidate set is *already in the global `globalRecordID.local` space* —
@@ -212,18 +212,28 @@ Streaming postings (M6) and optional mmap of `.gsx` are the easy tails.
   **filename-driven + content-verified**: drive the existing global filename
   iterator (ext/under/dir/name) and verify the content leaves inline, which
   avoids materializing the content candidate superset for a common content term.
-  **Phase 0 (landed):** an optional `*contentLeafMatcher` is threaded through the
-  global verification primitives (`collectGlobalVerifiedTopN`,
-  `countGlobalVerifiedIterator`, `rankedEntriesFromGlobalIDs`,
-  `countVerifiedGlobalIDs`), calling `compactCandidateEntryIfMatchIn`; every
-  existing caller passes `nil`, so filename behavior is byte-identical.
-  **Next phases:** (1) a unified filename-iterator builder — the compound lane
-  must cover **both** the ext-only source (`globalExtPostingFilters`) and the
-  component source (`globalComponentQueryIterator`), not just components; (2) the
-  lane + count-lane wiring, the content-usable/degraded partition at lane level
-  (M8), overlay/hidden handling, and ordering parity; (3) multi-volume routing
-  and the biased-early-stop budget. Each phase is reviewed and differential-
-  tested against the per-volume content path.
+  In `cmd/seekfs/content_global_lane.go`, off by default behind
+  `SEEKFS_CONTENT_GLOBAL_LANE`:
+  - **Phase 0** (`a7e11a0`): an optional `*contentLeafMatcher` is threaded through
+    the global verification primitives (`collectGlobalVerifiedTopN`,
+    `countGlobalVerifiedIterator`, `rankedEntriesFromGlobalIDs`,
+    `countVerifiedGlobalIDs`), calling `compactCandidateEntryIfMatchIn`; every
+    existing caller passes `nil`, so filename behavior is byte-identical.
+  - **Phase 1** (`9d1b348`): the compound search lane — a unified filename
+    iterator over **both** the ext-only source and the component source, with
+    inline content verification. Declines anything it cannot answer exactly.
+  - **Phase 2** (`dd9e824`): the count twin, so count == len(search) for the
+    in-scope shapes; declines the same shapes plus the truncated-catch-up
+    (`healthIncomplete`) case, where the content path marks the search incomplete
+    and refuses the count.
+  - **Phase 3**: multi-volume — the lane drives only the content-usable volumes
+    (M8) and surfaces unusable ones degraded (`partial`), matching the content
+    path; declines the biased-order (`RootBias`/`CWDBias`) shapes.
+  Each phase is reviewed and differential-tested against the per-volume content
+  path (single and multi volume).
+  **Remaining:** (4) handle overlays/hidden and `under:`/`exists:` lane-natively
+  instead of declining; (5) the biased-early-stop budget; (6) flip the default
+  (drop `SEEKFS_CONTENT_GLOBAL_LANE`) once coverage is complete.
 
 ### WP8 — Resource hardening (M1, M2, M5, M9, M10)
 - **Method:** bounded delta + eviction between folds (M1), per-document

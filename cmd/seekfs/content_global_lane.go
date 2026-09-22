@@ -1,8 +1,8 @@
 package main
 
-// WP7 phase 1: the compound content lane. A query that ANDs a positive content
-// leaf with a selective filename selector (ext:/under:/dir:/name:) is answered
-// by driving the filename candidate iterator and verifying each candidate's
+// WP7: the compound content lane. A query that ANDs a positive content leaf
+// with a selective filename selector (ext:/under:/dir:/name:) is answered by
+// driving the filename candidate iterator and verifying each candidate's
 // content inline, instead of materializing the content candidate superset. The
 // two sides are both requirements, so the lane returns exactly the set the
 // per-volume content path does; it is a cost optimization, not a semantic
@@ -13,12 +13,13 @@ package main
 // the filename side and filters by content. A bare `ext:` selector is the
 // ext-only source, anything else with a root is the component source.
 //
-// Scope (phase 1): single volume, no overlay/hidden records, a content-usable
-// volume, and a filename root (ext-only or component). Anything else declines
-// (handled=false) and the existing content path answers. Off by default behind
-// SEEKFS_CONTENT_GLOBAL_LANE so it is validated against the content path before
-// becoming the default route. Multi-volume routing, count parity, and the
-// overlay/hidden cases are the next phase.
+// Multi-volume (M8): only content-usable volumes are driven; an unusable volume
+// is skipped and the query surfaced degraded, so a volume without usable content
+// never blocks the answer. If no volume is usable the lane declines and the
+// content path refuses. Off by default behind SEEKFS_CONTENT_GLOBAL_LANE so it
+// is validated against the content path before becoming the default route.
+// Overlays/hidden, relevance order, under:/exists:, biased order, and boolean
+// content groups still decline to the content path.
 
 import "os"
 
@@ -42,6 +43,48 @@ func contentLeavesUnderBooleanGroups(pq parsedQuery) bool {
 		}
 	}
 	return false
+}
+
+// contentLaneScope returns the content-usable volumes the lane may drive and the
+// skipped (unusable) volume labels, or ok=false when the lane does not apply and
+// the per-volume content path must answer. needOrder is true for a search (which
+// orders results) and false for a count.
+func contentLaneScope(snapshot globalQuerySnapshot, pq parsedQuery, needOrder bool) (usable []*serviceVolumeIndex, skipped []string, ok bool) {
+	if !snapshot.overlaysOK || globalSnapshotsHaveHidden(snapshot.overlays) || globalSnapshotsHaveOverlayRecords(snapshot.overlays) {
+		// A content lane must not under-fill on shadowed records; the content
+		// path owns those cases until the lane handles them.
+		return nil, nil, false
+	}
+	// `under:`/`exists:` can stat on search but not on count (M9); the lane's
+	// shared verifier does not reproduce that split. A content leaf under an
+	// OR/NOT group is not a superset under stripContentLeaves. Biased order
+	// (RootBias/CWDBias) is not reproduced by the lane's rank order.
+	if pq.Under != "" || pq.Exists || contentLeavesUnderBooleanGroups(pq) {
+		return nil, nil, false
+	}
+	if pq.RootBias != "" || pq.CWDBias != "" {
+		return nil, nil, false
+	}
+	if needOrder && pq.SortColumn == "relevance" {
+		return nil, nil, false
+	}
+	if stripContentLeaves(pq).isEmpty() {
+		return nil, nil, false
+	}
+	usable, skipped = contentUsableVolumes(snapshot.volumes, pq)
+	if len(usable) == 0 {
+		return nil, nil, false
+	}
+	for _, vol := range usable {
+		// A truncated catch-up leaves the volume usable but incomplete: the
+		// content path marks the trace incomplete and refuses a count, which the
+		// lane does not reproduce, so decline and let the content path own the
+		// signal.
+		if vol == nil || vol.index == nil || vol.content == nil || !vol.content.usableForQuery() || vol.content.healthIncomplete() {
+			return nil, nil, false
+		}
+	}
+	return usable, skipped, true
 }
 
 // globalContentFilenameIterator builds the filename-side candidate iterator for
@@ -87,130 +130,78 @@ func globalContentFilenameIterator(volumes []*serviceVolumeIndex, filenamePQ par
 
 // searchServiceVolumesGlobalContentComponentsSnapshot answers a compound
 // content + filename query from the filename iterator with inline content
-// verification. It declines for anything outside the phase-1 scope, leaving the
+// verification. It declines for anything outside the lane's scope, leaving the
 // per-volume content path to answer.
 func searchServiceVolumesGlobalContentComponentsSnapshot(snapshot globalQuerySnapshot, opts queryOptions, countOnly bool, pq parsedQuery) ([]Entry, bool, error) {
 	if countOnly || !contentGlobalLaneEnabled() {
 		return nil, false, nil
 	}
-	volumes := snapshot.volumes
-	if len(volumes) != 1 {
+	usable, skipped, ok := contentLaneScope(snapshot, pq, true)
+	if !ok {
 		return nil, false, nil
 	}
-	if !snapshot.overlaysOK || globalSnapshotsHaveHidden(snapshot.overlays) || globalSnapshotsHaveOverlayRecords(snapshot.overlays) {
-		// A content lane must not under-fill on shadowed records; the content
-		// path owns those cases until the lane handles them.
-		return nil, false, nil
+	for _, vol := range usable {
+		if err := checkQueryCapabilities(pq, vol.index); err != nil {
+			return nil, true, err
+		}
 	}
-	vol := volumes[0]
-	if vol == nil || vol.index == nil || vol.content == nil || !vol.content.usableForQuery() {
-		return nil, false, nil
-	}
-	// A truncated catch-up leaves the volume usable but incomplete: the content
-	// path marks the trace incomplete (and refuses a count). The lane does not
-	// reproduce that, so it declines and lets the content path own the signal.
-	if vol.content.healthIncomplete() {
-		return nil, false, nil
-	}
-	// `under:`/`exists:` can stat on search but not on count (M9). The lane is
-	// shared by both paths and its verifier does not reproduce that split, so it
-	// declines those shapes to keep count == search.
-	if pq.Under != "" || pq.Exists {
-		return nil, false, nil
-	}
-	filenamePQ := stripContentLeaves(pq)
-	if filenamePQ.isEmpty() {
-		return nil, false, nil
-	}
-	// The lane drives from the filename projection, which is a complete superset
-	// of the result set only when every positive content leaf is a top-level
-	// conjunct. Inside an OR/NOT group, stripContentLeaves drops a content-only
-	// alternative, so the filename iterator would miss every record that matched
-	// only that alternative — decline those shapes to the content path.
-	if contentLeavesUnderBooleanGroups(pq) {
-		return nil, false, nil
-	}
-	// The lane verifies and orders by the filename rank; it does not
-	// relevance-rank, so a relevance sort must stay on the content path.
-	if pq.SortColumn == "relevance" {
-		return nil, false, nil
-	}
-	if err := checkQueryCapabilities(pq, vol.index); err != nil {
-		return nil, true, err
-	}
-	it, ok := globalContentFilenameIterator(volumes, filenamePQ, opts.Trace)
+	it, ok := globalContentFilenameIterator(usable, stripContentLeaves(pq), opts.Trace)
 	if !ok {
 		return nil, false, nil
 	}
 	// Verify the original predicate (filename + content) inline; the matcher is
 	// built once and compactCandidateEntryIfMatchIn consumes base and delta
-	// content through the volume's reader/resolver.
+	// content through the volume's reader/resolver. No overlays/hidden here (the
+	// scope declined them), so no snapshots are needed.
 	matcher := newContentLeafMatcher(pq)
 	limit := normalizedLimit(opts.Limit, false)
-	base, verified, err := collectGlobalVerifiedTopN(it, volumes, snapshot.overlays, pq, limit, matcher)
+	base, verified, err := collectGlobalVerifiedTopN(it, usable, nil, pq, limit, matcher)
 	if err != nil {
 		return nil, true, err
 	}
+	markContentQueryDegraded(opts.Trace, skipped)
 	if opts.Trace != nil {
 		opts.Trace.ComponentRecordsVerified += verified
 		opts.Trace.setPlannerMode("global-content-components")
 		opts.Trace.setSource("global:content-components", len(base))
-		opts.Trace.setComplete(true)
+		opts.Trace.setComplete(opts.Trace == nil || !opts.Trace.ContentPartial)
 	}
-	results := globalRankedEntriesToEntries(mergeGlobalOverlayEntries(volumes, snapshot.overlays, base, pq, limit))
+	results := globalRankedEntriesToEntries(mergeGlobalOverlayEntries(usable, nil, base, pq, limit))
 	return results, true, nil
 }
 
 // countServiceVolumesGlobalContentComponentsSnapshot is the count twin of the
 // compound content lane: it drives the same filename iterator and tallies the
 // inline content verification, so count == len(search) for the in-scope shapes.
-// It declines whenever the search lane would (plus, since ordering is moot for a
-// count, only the relevance decline is dropped). A count never uses a capped
-// content superset, so it is exact and never refuses on incompleteness.
+// A count never uses a capped content superset, so it is exact.
 func countServiceVolumesGlobalContentComponentsSnapshot(snapshot globalQuerySnapshot, opts queryOptions, pq parsedQuery) (int, bool, error) {
 	if !contentGlobalLaneEnabled() {
 		return 0, false, nil
 	}
-	volumes := snapshot.volumes
-	if len(volumes) != 1 {
+	usable, skipped, ok := contentLaneScope(snapshot, pq, false)
+	if !ok {
 		return 0, false, nil
 	}
-	if !snapshot.overlaysOK || globalSnapshotsHaveHidden(snapshot.overlays) || globalSnapshotsHaveOverlayRecords(snapshot.overlays) {
-		return 0, false, nil
+	for _, vol := range usable {
+		if err := checkQueryCapabilities(pq, vol.index); err != nil {
+			return 0, true, err
+		}
 	}
-	vol := volumes[0]
-	if vol == nil || vol.index == nil || vol.content == nil || !vol.content.usableForQuery() {
-		return 0, false, nil
-	}
-	// A truncated catch-up means the count is not exact; the content path
-	// refuses it (errContentIncomplete). Decline so that refusal still happens.
-	if vol.content.healthIncomplete() {
-		return 0, false, nil
-	}
-	if pq.Under != "" || pq.Exists {
-		return 0, false, nil
-	}
-	filenamePQ := stripContentLeaves(pq)
-	if filenamePQ.isEmpty() || contentLeavesUnderBooleanGroups(pq) {
-		return 0, false, nil
-	}
-	if err := checkQueryCapabilities(pq, vol.index); err != nil {
-		return 0, true, err
-	}
-	it, ok := globalContentFilenameIterator(volumes, filenamePQ, opts.Trace)
+	it, ok := globalContentFilenameIterator(usable, stripContentLeaves(pq), opts.Trace)
 	if !ok {
 		return 0, false, nil
 	}
 	matcher := newContentLeafMatcher(pq)
-	count, verified, err := countGlobalVerifiedIterator(it, volumes, snapshot.overlays, pq, matcher)
+	count, verified, err := countGlobalVerifiedIterator(it, usable, nil, pq, matcher)
 	if err != nil {
 		return 0, true, err
 	}
+	markContentQueryDegraded(opts.Trace, skipped)
 	if opts.Trace != nil {
 		opts.Trace.ComponentRecordsVerified += verified
 		opts.Trace.setPlannerMode("global-content-components")
 		opts.Trace.setSource("global:content-components-count", count)
-		opts.Trace.setComplete(true)
+		opts.Trace.setComplete(opts.Trace == nil || !opts.Trace.ContentPartial)
 	}
 	return count, true, nil
 }
