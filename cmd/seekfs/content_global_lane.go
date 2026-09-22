@@ -106,6 +106,18 @@ func searchServiceVolumesGlobalContentComponentsSnapshot(snapshot globalQuerySna
 	if vol == nil || vol.index == nil || vol.content == nil || !vol.content.usableForQuery() {
 		return nil, false, nil
 	}
+	// A truncated catch-up leaves the volume usable but incomplete: the content
+	// path marks the trace incomplete (and refuses a count). The lane does not
+	// reproduce that, so it declines and lets the content path own the signal.
+	if vol.content.healthIncomplete() {
+		return nil, false, nil
+	}
+	// `under:`/`exists:` can stat on search but not on count (M9). The lane is
+	// shared by both paths and its verifier does not reproduce that split, so it
+	// declines those shapes to keep count == search.
+	if pq.Under != "" || pq.Exists {
+		return nil, false, nil
+	}
 	filenamePQ := stripContentLeaves(pq)
 	if filenamePQ.isEmpty() {
 		return nil, false, nil
@@ -147,4 +159,58 @@ func searchServiceVolumesGlobalContentComponentsSnapshot(snapshot globalQuerySna
 	}
 	results := globalRankedEntriesToEntries(mergeGlobalOverlayEntries(volumes, snapshot.overlays, base, pq, limit))
 	return results, true, nil
+}
+
+// countServiceVolumesGlobalContentComponentsSnapshot is the count twin of the
+// compound content lane: it drives the same filename iterator and tallies the
+// inline content verification, so count == len(search) for the in-scope shapes.
+// It declines whenever the search lane would (plus, since ordering is moot for a
+// count, only the relevance decline is dropped). A count never uses a capped
+// content superset, so it is exact and never refuses on incompleteness.
+func countServiceVolumesGlobalContentComponentsSnapshot(snapshot globalQuerySnapshot, opts queryOptions, pq parsedQuery) (int, bool, error) {
+	if !contentGlobalLaneEnabled() {
+		return 0, false, nil
+	}
+	volumes := snapshot.volumes
+	if len(volumes) != 1 {
+		return 0, false, nil
+	}
+	if !snapshot.overlaysOK || globalSnapshotsHaveHidden(snapshot.overlays) || globalSnapshotsHaveOverlayRecords(snapshot.overlays) {
+		return 0, false, nil
+	}
+	vol := volumes[0]
+	if vol == nil || vol.index == nil || vol.content == nil || !vol.content.usableForQuery() {
+		return 0, false, nil
+	}
+	// A truncated catch-up means the count is not exact; the content path
+	// refuses it (errContentIncomplete). Decline so that refusal still happens.
+	if vol.content.healthIncomplete() {
+		return 0, false, nil
+	}
+	if pq.Under != "" || pq.Exists {
+		return 0, false, nil
+	}
+	filenamePQ := stripContentLeaves(pq)
+	if filenamePQ.isEmpty() || contentLeavesUnderBooleanGroups(pq) {
+		return 0, false, nil
+	}
+	if err := checkQueryCapabilities(pq, vol.index); err != nil {
+		return 0, true, err
+	}
+	it, ok := globalContentFilenameIterator(volumes, filenamePQ, opts.Trace)
+	if !ok {
+		return 0, false, nil
+	}
+	matcher := newContentLeafMatcher(pq)
+	count, verified, err := countGlobalVerifiedIterator(it, volumes, snapshot.overlays, pq, matcher)
+	if err != nil {
+		return 0, true, err
+	}
+	if opts.Trace != nil {
+		opts.Trace.ComponentRecordsVerified += verified
+		opts.Trace.setPlannerMode("global-content-components")
+		opts.Trace.setSource("global:content-components-count", count)
+		opts.Trace.setComplete(true)
+	}
+	return count, true, nil
 }

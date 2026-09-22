@@ -40,6 +40,12 @@ func countServiceVolumes(volumes []*serviceVolumeIndex, opts queryOptions) (int,
 	volumes = prioritizeServiceVolumesForPathTerms(volumes, opts)
 	opts.Trace.setEligibleVolumes(volumes)
 	if queryHasAnyContentLeaf(pq) {
+		if contentGlobalLaneEnabled() && queryHasPositiveContentLeaf(pq) {
+			snapshot := newGlobalQuerySnapshot(volumes, opts.Trace)
+			if n, handled, err := countServiceVolumesGlobalContentComponentsSnapshot(snapshot, opts, pq); handled {
+				return n, true, err
+			}
+		}
 		// Content counts run the exact same per-volume candidate + inline
 		// verification path as content searches so count == len(search results)
 		// for every shape that does not require a stat. Unusable volumes degrade

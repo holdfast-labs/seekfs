@@ -117,3 +117,85 @@ func TestContentGlobalLaneDeclinesWithoutFilenameRoot(t *testing.T) {
 		t.Fatal("lane engaged a content query with no filename selector")
 	}
 }
+
+func contentGlobalLaneCount(vol *serviceVolumeIndex, query string, enabled bool) (int, *searchTrace) {
+	if enabled {
+		os.Setenv("SEEKFS_CONTENT_GLOBAL_LANE", "1")
+	} else {
+		os.Unsetenv("SEEKFS_CONTENT_GLOBAL_LANE")
+	}
+	trace := &searchTrace{}
+	n, ok, err := countServiceVolumes([]*serviceVolumeIndex{vol}, queryOptions{Query: query, Trace: trace})
+	if err != nil || !ok {
+		return -1, trace
+	}
+	return n, trace
+}
+
+func TestContentGlobalLaneCountMatchesContentPath(t *testing.T) {
+	t.Setenv("SEEKFS_CONTENT_SEARCH", "1")
+	vol := newContentRecordVolume(t, "C:", contentGlobalLaneRecords("C:"))
+	for _, q := range []string{
+		"content:needle ext:.go",
+		"content:pelican ext:.txt",
+		"content:needle ext:.go size:>1",
+	} {
+		t.Run("engaged/"+q, func(t *testing.T) {
+			want, _ := contentGlobalLaneCount(vol, q, false)
+			got, trace := contentGlobalLaneCount(vol, q, true)
+			if trace.PlannerMode != "global-content-components" {
+				t.Fatalf("%q: count lane did not engage (planner=%q)", q, trace.PlannerMode)
+			}
+			if got != want {
+				t.Fatalf("%q: count lane=%d content=%d", q, got, want)
+			}
+			matches, _ := contentGlobalLaneSearch(vol, q, 100, true)
+			if got != len(matches) {
+				t.Fatalf("%q: count %d != len(search) %d", q, got, len(matches))
+			}
+		})
+	}
+	for _, q := range []string{"content:needle", "content:needle|dir:alpha"} {
+		t.Run("declined/"+q, func(t *testing.T) {
+			want, _ := contentGlobalLaneCount(vol, q, false)
+			got, trace := contentGlobalLaneCount(vol, q, true)
+			if trace.PlannerMode == "global-content-components" {
+				t.Fatalf("%q: count lane engaged a declined shape", q)
+			}
+			if got != want {
+				t.Fatalf("%q: count diverged lane=%d content=%d", q, got, want)
+			}
+		})
+	}
+}
+
+// A truncated catch-up leaves the volume usable but incomplete; the lane must
+// decline so the content path still marks the search incomplete and refuses the
+// count (errContentIncomplete).
+func TestContentGlobalLaneDeclinesWhenContentIncomplete(t *testing.T) {
+	t.Setenv("SEEKFS_CONTENT_SEARCH", "1")
+	vol := newContentRecordVolume(t, "C:", contentGlobalLaneRecords("C:"))
+	vol.content.markCatchUpIncomplete()
+	const q = "content:needle ext:.go"
+
+	want, _ := contentGlobalLaneSearch(vol, q, 100, false)
+	got, searchTrace := contentGlobalLaneSearch(vol, q, 100, true)
+	if searchTrace.PlannerMode == "global-content-components" {
+		t.Fatal("search lane engaged an incomplete content volume")
+	}
+	if len(got) != len(want) {
+		t.Fatalf("%q: search diverged lane=%d content=%d", q, len(got), len(want))
+	}
+
+	wantCount, _ := contentGlobalLaneCount(vol, q, false)
+	gotCount, countTrace := contentGlobalLaneCount(vol, q, true)
+	if countTrace.PlannerMode == "global-content-components" {
+		t.Fatal("count lane engaged an incomplete content volume")
+	}
+	if gotCount != wantCount {
+		t.Fatalf("%q: count diverged lane=%d content=%d", q, gotCount, wantCount)
+	}
+	if wantCount != -1 {
+		t.Fatalf("%q: incomplete content count was answered (%d); want refused (-1)", q, wantCount)
+	}
+}
