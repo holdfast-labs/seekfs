@@ -45,7 +45,12 @@ func TestRemoteResponseAllowlist(t *testing.T) {
 		Complete:        boolPtr(false),
 		Health:          "ok",
 		HealthMessage:   "volume C: stale: journal replay failed",
-		DBs:             []dbInfo{{Path: "C:\\ProgramData\\seekfs\\indexes\\seekfs_c.gsi", Entries: 100, Volume: "C:", State: "ready", JournalID: 123, Checkpoint: 456, Memory: &residentMemoryInfo{Records: 100}, LastPersistError: "boom", Source: "usn", BuiltAt: "2026-01-01T00:00:00Z", FRNRecords: 100}},
+		Content: &contentHealth{
+			State: "degraded", Partial: true, Incomplete: true, CountDivergent: true,
+			DegradedVolumes: []string{"F:"}, BuildError: "secret build error",
+			FoldError: "secret fold error", DeltaBytes: 4096,
+		},
+		DBs: []dbInfo{{Path: "C:\\ProgramData\\seekfs\\indexes\\seekfs_c.gsi", Entries: 100, Volume: "C:", State: "ready", JournalID: 123, Checkpoint: 456, Memory: &residentMemoryInfo{Records: 100}, LastPersistError: "boom", Source: "usn", BuiltAt: "2026-01-01T00:00:00Z", FRNRecords: 100}},
 	}
 
 	out := remoteResponseFromService(resp, false)
@@ -60,7 +65,7 @@ func TestRemoteResponseAllowlist(t *testing.T) {
 	if err := json.Unmarshal(b, &raw); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
-	for _, forbidden := range []string{"pid", "executable", "executable_hash", "pipe_name", "process_mode", "runtime", "journal_id", "checkpoint", "component_bounds", "blocks_decoded", "memory", "planner_mode", "candidates", "decline", "fallback"} {
+	for _, forbidden := range []string{"pid", "executable", "executable_hash", "pipe_name", "process_mode", "runtime", "journal_id", "checkpoint", "component_bounds", "blocks_decoded", "memory", "planner_mode", "candidates", "decline", "fallback", "build_error", "fold_error", "delta_bytes"} {
 		if _, ok := raw[forbidden]; ok {
 			t.Errorf("remote response leaks forbidden field %q", forbidden)
 		}
@@ -103,6 +108,15 @@ func TestRemoteResponseAllowlist(t *testing.T) {
 	// Health message is coarse-capped to avoid leaking the stale reason/path.
 	if out.HealthMessage == "volume C: stale: journal replay failed" {
 		t.Errorf("health message leaked internal detail: %q", out.HealthMessage)
+	}
+	// Content health is projected coarsely: the trust flags and volume labels
+	// reach a remote caller, but the error text and sizes do not.
+	if out.Content == nil {
+		t.Fatal("content health not projected to remote callers")
+	}
+	if out.Content.State != "degraded" || !out.Content.Partial || !out.Content.Incomplete ||
+		!out.Content.CountDivergent || len(out.Content.DegradedVolumes) != 1 || out.Content.DegradedVolumes[0] != "F:" {
+		t.Errorf("content health flags lost: %+v", out.Content)
 	}
 }
 

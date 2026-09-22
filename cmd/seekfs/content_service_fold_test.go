@@ -418,6 +418,10 @@ func TestContentFoldBoundsDeltaBytes(t *testing.T) {
 	if got := f.vol.content.deltaView().liveBytes(); got == 0 {
 		t.Fatal("delta live bytes not tracked")
 	}
+	// Health surfaces the resident delta size, so growth is observable (M1).
+	if h := f.vol.content.healthSnapshot(0); h.DeltaBytes == 0 || h.DeltaBytes != f.vol.content.deltaView().liveBytes() {
+		t.Fatalf("health delta bytes = %d; want %d", h.DeltaBytes, f.vol.content.deltaView().liveBytes())
+	}
 	f.s.maybeFoldContentDelta(f.vol)
 	if got := f.vol.content.deltaView().liveBytes(); got >= contentDeltaFoldMaxBytes {
 		t.Fatalf("delta live bytes %d not bounded below %d", got, contentDeltaFoldMaxBytes)
@@ -448,6 +452,9 @@ func TestContentFoldFailureKeepsDelta(t *testing.T) {
 	if hits, _ := contentServiceSearch(t, f.vol, "content:needlegamma", false); len(hits) != 1 {
 		t.Fatalf("edit lost after a failed fold: %v", hits)
 	}
+	if h := f.vol.content.healthSnapshot(0); h.FoldError == "" {
+		t.Fatalf("failed fold not surfaced in health: %+v", h)
+	}
 	reloaded, err := contentLoadFile(contentIndexPathForDB(f.dbPath))
 	releaseContentIndexOnCleanup(t, reloaded)
 	if err != nil {
@@ -455,6 +462,12 @@ func TestContentFoldFailureKeepsDelta(t *testing.T) {
 	}
 	if reloaded.CheckpointUSN != 100 {
 		t.Fatalf("failed fold wrote the sidecar: checkpoint=%d; want 100", reloaded.CheckpointUSN)
+	}
+	// A later successful fold publishes and clears the fold-error signal.
+	contentFoldSave = restore
+	f.s.runContentFold(f.vol)
+	if h := f.vol.content.healthSnapshot(0); h.FoldError != "" {
+		t.Fatalf("successful fold did not clear the fold error: %+v", h)
 	}
 }
 

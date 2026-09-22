@@ -542,6 +542,16 @@ Residual / known limitations (all explicit deferrals):
   then fails to parse, the walk stops and the document is treated as unencrypted.
   The reason degrades to "no extractable text" rather than "encrypted" — not a
   content leak, because the objects stay encrypted and decode to nothing.
+- **Delta hard ceiling applies only while the sidecar is capped (M1).** The
+  resident delta is bounded between folds by the fold trigger, and past the
+  trigger by the hard ceiling — but the ceiling is enforced only while the
+  sidecar is over its size cap, because that is the one case where a fold
+  provably cannot advance the persisted checkpoint, so deferring a change cannot
+  lose it. A persistent non-cap fold failure (e.g. a full disk) can therefore
+  grow the delta until the failure clears. A correct fix needs per-FRN USN
+  tracking plus a checkpoint clamp so deferred changes replay after a restart
+  (the PB2/WP1c checkpoint semantics); until then health reports `delta_bytes`
+  and `fold_error` so the growth and the failing fold are visible.
 - **Moved-class invalidation.** Extractor invalidation keys on the stored
   `(ContentType class, ExtractorVersion)`. A base built while an extension was
   text-indexed (class Text, e.g. `.html` before the HTML extractor) is neither

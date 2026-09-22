@@ -70,9 +70,12 @@ func contentEligibleForExtraction(mode, attrs uint32) bool {
 // contentHealth is the content telemetry surfaced through the service response
 // and `loaded --json`.
 type contentHealth struct {
-	State            string `json:"state,omitempty"`
-	Docs             int    `json:"docs,omitempty"`
-	Bytes            int    `json:"bytes,omitempty"`
+	State string `json:"state,omitempty"`
+	Docs  int    `json:"docs,omitempty"`
+	// DeltaBytes is the resident delta's normalized-text size. It grows while a
+	// fold cannot publish, so a delta that is accumulating (M1) is observable
+	// instead of only surfacing as memory pressure.
+	DeltaBytes       int64  `json:"delta_bytes,omitempty"`
 	ExtractorVersion int    `json:"extractor_version,omitempty"`
 	QueueDepth       int    `json:"queue_depth,omitempty"`
 	LastRebuild      string `json:"last_rebuild,omitempty"`
@@ -97,6 +100,10 @@ type contentHealth struct {
 	BuildDone  int    `json:"build_done,omitempty"`
 	BuildTotal int    `json:"build_total,omitempty"`
 	BuildError string `json:"build_error,omitempty"`
+	// FoldError records why the last delta fold failed. The delta is retained
+	// and search stays correct, but a fold that keeps failing accumulates the
+	// delta; surfacing the reason makes that visible instead of silent.
+	FoldError string `json:"fold_error,omitempty"`
 	// MaxRaw/MaxText are the attached base's extraction policy caps and
 	// Skipped/Truncated count what the policy excluded or cut at build time
 	// (PB7). They come from the `.gsx` CXPL section so a size cap is visible,
@@ -396,7 +403,7 @@ func mergeContentHealth(dst *contentHealth, src contentHealth) {
 		dst.State = src.State
 	}
 	dst.Docs += src.Docs
-	dst.Bytes += src.Bytes
+	dst.DeltaBytes += src.DeltaBytes
 	dst.QueueDepth += src.QueueDepth
 	dst.Evictions += src.Evictions
 	dst.ExtractionErrors += src.ExtractionErrors
@@ -424,6 +431,13 @@ func mergeContentHealth(dst *contentHealth, src contentHealth) {
 			dst.BuildError = src.BuildError
 		} else {
 			dst.BuildError += "; " + src.BuildError
+		}
+	}
+	if src.FoldError != "" && !strings.Contains(dst.FoldError, src.FoldError) {
+		if dst.FoldError == "" {
+			dst.FoldError = src.FoldError
+		} else {
+			dst.FoldError += "; " + src.FoldError
 		}
 	}
 	dst.MaxRaw = minContentCap(dst.MaxRaw, src.MaxRaw)
@@ -506,15 +520,15 @@ func aggregateContentHealth(healths []contentHealth) contentHealth {
 //
 //   - State is the most severe state: ready/off < unavailable < indexing <
 //     degraded < stale (contentStateSeverity).
-//   - Docs, Bytes, QueueDepth, Evictions, ExtractionErrors, Skipped, Truncated,
-//     SidecarBytes and SidecarCap are summed; BuildDone/BuildTotal sum only
-//     while indexing.
+//   - Docs, DeltaBytes, QueueDepth, Evictions, ExtractionErrors, Skipped,
+//     Truncated, SidecarBytes and SidecarCap are summed; BuildDone/BuildTotal
+//     sum only while indexing.
 //   - Partial, Incomplete and CountDivergent are OR-ed.
 //   - ExtractorRefresh is OR-ed and StaleExtractorDocs summed, so a targeted
 //     extractor-version refresh in progress on any volume is visible.
 //   - DegradedVolumes is the deduped stable union.
 //   - ExtractorVersion takes the highest.
-//   - BuildError joins the distinct non-empty reasons with "; ".
+//   - BuildError and FoldError each join the distinct non-empty reasons with "; ".
 //   - MaxRaw/MaxText keep the smallest non-zero cap (the effective cap).
 //   - LastRebuild takes the oldest, so "stale since" stays visible; LastDrain
 //     takes the newest.
@@ -608,6 +622,7 @@ func (s *contentVolumeState) setReady(idx *contentIndex, reader *contentReader, 
 	// A base that attached is not over cap and has no build fault.
 	s.sidecarCapped = false
 	s.health.BuildError = ""
+	s.health.FoldError = ""
 	if idx.Policy != (contentBuildPolicy{}) {
 		s.health.MaxRaw = idx.Policy.MaxRaw
 		s.health.MaxText = idx.Policy.MaxText
@@ -849,6 +864,21 @@ func (s *contentVolumeState) deltaView() *contentDelta {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.delta
+}
+
+// setDeltaBytes records the resident delta size for health (M1).
+func (s *contentVolumeState) setDeltaBytes(n int64) {
+	s.mu.Lock()
+	s.health.DeltaBytes = n
+	s.mu.Unlock()
+}
+
+// setFoldError records why the last delta fold failed (empty clears it). A
+// successful fold, or a base publish, clears it.
+func (s *contentVolumeState) setFoldError(msg string) {
+	s.mu.Lock()
+	s.health.FoldError = msg
+	s.mu.Unlock()
 }
 
 func (s *contentVolumeState) healthSnapshot(queueDepth int) contentHealth {
@@ -1291,12 +1321,14 @@ func (c *contentCoordinator) foldSucceeded() {
 	c.mu.Lock()
 	c.foldRetryAfter = time.Time{}
 	c.mu.Unlock()
+	c.state.setFoldError("")
 }
 
 func (c *contentCoordinator) foldFailed(backoff time.Duration) {
 	c.mu.Lock()
 	c.foldRetryAfter = time.Now().Add(backoff)
 	c.mu.Unlock()
+	c.state.setFoldError("content fold failed; the delta is retained and the fold will retry")
 }
 
 // contentExtractDocTimeout bounds one document's extraction so a single
@@ -1408,6 +1440,7 @@ func (c *contentCoordinator) processQueue(resolvePath func(frn uint64) (string, 
 		delta.upsert(doc)
 		changed++
 	}
+	c.state.setDeltaBytes(c.state.deltaView().liveBytes())
 	c.state.markDrained()
 	return changed
 }
