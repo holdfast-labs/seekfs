@@ -124,8 +124,9 @@ type contentExtractor interface {
 	Version() uint16
 	// Class declares the contentClass* this extractor produces. It is stamped
 	// into each doc's ContentType; a class's registered version is what
-	// invalidation compares against, so a Version() bump forces the volume to
-	// be rebuilt rather than serving text from the old extractor.
+	// invalidation compares against, so a Version() bump re-extracts the docs
+	// that extractor produced (targeted per-doc refresh) rather than serving
+	// text from the old extractor.
 	Class() uint16
 	// Extensions lists lowercase extensions including the dot, e.g. ".docx".
 	Extensions() []string

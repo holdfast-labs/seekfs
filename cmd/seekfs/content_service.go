@@ -110,6 +110,13 @@ type contentHealth struct {
 	// `loaded --json` instead of only failing silently.
 	SidecarBytes int64 `json:"sidecar_bytes,omitempty"`
 	SidecarCap   int64 `json:"sidecar_cap,omitempty"`
+	// ExtractorRefresh/StaleExtractorDocs report a targeted per-doc extractor
+	// version refresh (WP11): the attached base still holds StaleExtractorDocs
+	// docs produced by an older extractor Version(), so the volume is usable
+	// (the old text is a valid, older extraction) but surfaced degraded until a
+	// fold publishes a base re-extracted at the current versions.
+	ExtractorRefresh   bool `json:"extractor_refresh,omitempty"`
+	StaleExtractorDocs int  `json:"stale_extractor_docs,omitempty"`
 }
 
 // contentDeltaDoc is an extracted document for a file changed since the base,
@@ -335,6 +342,14 @@ type contentVolumeState struct {
 	// stays correct and usable; the flag only keeps the volume surfaced as
 	// degraded across drain ticks until a base that fits is published.
 	sidecarCapped bool
+	// refreshActive is true while a targeted extractor-version refresh is in
+	// flight for this volume (set by attach, cleared once a fold publishes a
+	// base with no stale docs or a rebuild/stale transition drops the base).
+	// refreshPending is the number of docs in the attached base still stamped
+	// with an older extractor Version(); the count (and the degraded signal)
+	// clears when a fold republishes the base at the current versions.
+	refreshActive  bool
+	refreshPending int
 }
 
 func newContentVolumeState(volume string) *contentVolumeState {
@@ -397,6 +412,8 @@ func mergeContentHealth(dst *contentHealth, src contentHealth) {
 	dst.Partial = dst.Partial || src.Partial
 	dst.Incomplete = dst.Incomplete || src.Incomplete
 	dst.CountDivergent = dst.CountDivergent || src.CountDivergent
+	dst.ExtractorRefresh = dst.ExtractorRefresh || src.ExtractorRefresh
+	dst.StaleExtractorDocs += src.StaleExtractorDocs
 	for _, v := range src.DegradedVolumes {
 		if !containsVolumeName(dst.DegradedVolumes, v) {
 			dst.DegradedVolumes = append(dst.DegradedVolumes, v)
@@ -493,6 +510,8 @@ func aggregateContentHealth(healths []contentHealth) contentHealth {
 //     SidecarBytes and SidecarCap are summed; BuildDone/BuildTotal sum only
 //     while indexing.
 //   - Partial, Incomplete and CountDivergent are OR-ed.
+//   - ExtractorRefresh is OR-ed and StaleExtractorDocs summed, so a targeted
+//     extractor-version refresh in progress on any volume is visible.
 //   - DegradedVolumes is the deduped stable union.
 //   - ExtractorVersion takes the highest.
 //   - BuildError joins the distinct non-empty reasons with "; ".
@@ -589,6 +608,19 @@ func (s *contentVolumeState) setReady(idx *contentIndex, reader *contentReader, 
 		s.health.Skipped = int(idx.Policy.Skipped)
 		s.health.Truncated = int(idx.Policy.Truncated)
 	}
+	// A targeted extractor-version refresh (WP11) keeps the volume usable: its
+	// text is a valid, if older, extraction. The refresh signal is only raised
+	// by markExtractorRefresh (attach), and recomputed here as folds publish
+	// refreshed bases, so an arbitrary base handed to setReady is not degraded.
+	if s.refreshActive {
+		s.refreshPending = contentStaleExtractorDocCount(idx)
+		s.refreshActive = s.refreshPending > 0
+		s.health.ExtractorRefresh = s.refreshPending > 0
+		s.health.StaleExtractorDocs = s.refreshPending
+		if s.refreshPending > 0 {
+			s.health.State = contentStateDegraded
+		}
+	}
 	s.health.LastRebuild = time.Now().UTC().Format(time.RFC3339)
 }
 
@@ -614,6 +646,10 @@ func (s *contentVolumeState) markStale(reason string) {
 	s.resolver = nil
 	s.delta = newContentDelta()
 	s.catchUpPending = false
+	s.refreshActive = false
+	s.refreshPending = 0
+	s.health.ExtractorRefresh = false
+	s.health.StaleExtractorDocs = 0
 }
 
 // markIndexing is the service-owned background build's visible state. A
@@ -632,6 +668,10 @@ func (s *contentVolumeState) markIndexing(total int) {
 	s.reader = nil
 	s.resolver = nil
 	s.catchUpPending = false
+	s.refreshActive = false
+	s.refreshPending = 0
+	s.health.ExtractorRefresh = false
+	s.health.StaleExtractorDocs = 0
 }
 
 // setBuildProgress publishes extraction progress for an in-flight build so
@@ -666,6 +706,10 @@ func (s *contentVolumeState) markBuildFailed(reason string) {
 	s.health.State = contentStateDegraded
 	s.health.Incomplete = true
 	s.health.BuildError = reason
+	s.refreshActive = false
+	s.refreshPending = 0
+	s.health.ExtractorRefresh = false
+	s.health.StaleExtractorDocs = 0
 }
 
 // markSidecarCapped surfaces an index whose encoded size exceeds
@@ -822,6 +866,11 @@ func (s *contentVolumeState) markDrained() {
 	// ready with no usable index attached.
 	if s.state != contentStateStale && s.state != contentStateIndexing {
 		switch {
+		case s.refreshPending > 0:
+			// A targeted extractor-version refresh is still unfolding: the old
+			// (but valid) text is served, and health stays degraded until a fold
+			// publishes the refreshed base.
+			s.health.State = contentStateDegraded
 		case s.health.Incomplete:
 			s.state = contentStateDegraded
 			s.health.State = contentStateDegraded
@@ -911,6 +960,38 @@ func (s *contentVolumeState) catchUpPendingNow() bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.catchUpPending
+}
+
+// markExtractorRefresh records that attach has enqueued n stale base docs for a
+// targeted re-extraction at the current extractor versions. The volume stays
+// usable and its state ready, but health is surfaced degraded until a fold
+// publishes a base with no stale docs (setReady recomputes it).
+func (s *contentVolumeState) markExtractorRefresh(n int) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.refreshActive = n > 0
+	s.refreshPending = n
+	s.health.ExtractorRefresh = n > 0
+	s.health.StaleExtractorDocs = n
+	if n > 0 && s.state == contentStateReady {
+		s.health.State = contentStateDegraded
+	}
+}
+
+// refreshPendingNow reports whether the attached base still holds docs produced
+// by an older extractor Version() that a targeted refresh has not yet folded
+// back. The drain uses it to force a fold once the refresh extraction is done,
+// even when the delta is below its normal size trigger.
+func (s *contentVolumeState) refreshPendingNow() bool {
+	if s == nil {
+		return false
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.refreshPending > 0
 }
 
 // catchUpIncomplete reports whether a fold must wait: catch-up is still in
@@ -1084,6 +1165,24 @@ func (c *contentCoordinator) promoteAll() {
 	}
 }
 
+// enqueueFRNs queues FRNs for extraction without a USN change. It is the
+// targeted extractor-version refresh path: attach enqueues a base's stale FRNs
+// so the drain re-extracts them with the current extractor. A duplicate (also
+// observed through the USN stream) collapses in the set.
+func (c *contentCoordinator) enqueueFRNs(frns []uint64) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, frn := range frns {
+		if frn == 0 {
+			continue
+		}
+		c.queue[frn] = struct{}{}
+	}
+}
+
 // invalidate is the D4 recovery path: drop all pending content work and mark the
 // volume stale so a full rebuild is scheduled.
 func (c *contentCoordinator) invalidate(reason string) {
@@ -1158,8 +1257,11 @@ func (c *contentCoordinator) commitFold(snapshot []contentDeltaDoc) {
 }
 
 // foldDue reports whether the live delta has grown past either bound and is not
-// in a retry backoff.
-func (c *contentCoordinator) foldDue(maxDocs int, maxBytes int64) bool {
+// in a retry backoff. A pending targeted extractor refresh also forces a fold
+// once the drain has emptied the queue: the refreshed docs must be persisted so
+// the refreshed base replaces the stale one and the degraded signal clears, even
+// when a small stale set never reaches the delta size trigger.
+func (c *contentCoordinator) foldDue(maxDocs int, maxBytes int64, refreshPending bool) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if !c.drainEnabled {
@@ -1167,6 +1269,9 @@ func (c *contentCoordinator) foldDue(maxDocs int, maxBytes int64) bool {
 	}
 	if !c.foldRetryAfter.IsZero() && time.Now().Before(c.foldRetryAfter) {
 		return false
+	}
+	if refreshPending && len(c.dirty) == 0 && len(c.queue) == 0 {
+		return true
 	}
 	delta := c.state.deltaView()
 	// Count every entry, not just live ones: a burst of deletes of base-indexed
@@ -1271,6 +1376,14 @@ func (c *contentCoordinator) processQueue(resolvePath func(frn uint64) (string, 
 			continue
 		}
 		if !didChange {
+			// A base doc that re-extracts to nothing — the file is now binary or
+			// skipped, or no longer maps to an extractor — must not keep serving
+			// its old-version text. Tombstone it so the fold drops the base doc.
+			// A prior delta entry (havePrior) is left alone: an unchanged write
+			// must not delete acknowledged content.
+			if !havePrior && c.state.hasContentForFRN(frn) {
+				c.state.deltaView().delete(frn)
+			}
 			continue
 		}
 		// While the sidecar is capped no fold can publish, so the delta cannot

@@ -203,7 +203,7 @@ var contentDefaultTextExtensions = []string{
 	".sh", ".bash", ".zsh", ".fish", ".ps1", ".psm1", ".bat", ".cmd",
 	// Data / config / markup.
 	".sql", ".graphql", ".gql", ".proto", ".css", ".scss", ".sass", ".less",
-	".html", ".htm", ".xhtml", ".xml", ".xsl", ".xslt", ".xsd", ".svg",
+	".xml", ".xsl", ".xslt", ".xsd", ".svg",
 	".json", ".jsonc", ".jsonl", ".ndjson", ".yaml", ".yml", ".toml",
 	".ini", ".cfg", ".conf", ".config", ".properties", ".env", ".editorconfig",
 	".csv", ".tsv", ".tex", ".bib", ".diff", ".patch",

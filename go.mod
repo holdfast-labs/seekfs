@@ -5,6 +5,7 @@ go 1.26.3
 require (
 	github.com/akavel/rsrc v0.10.2
 	github.com/wailsapp/wails/v2 v2.16.0
+	golang.org/x/net v0.56.0
 	golang.org/x/sys v0.48.0
 	golang.org/x/text v0.42.0
 )
@@ -35,5 +36,4 @@ require (
 	github.com/wailsapp/go-webview2 v1.0.22 // indirect
 	github.com/wailsapp/mimetype v1.4.1 // indirect
 	golang.org/x/crypto v0.53.0 // indirect
-	golang.org/x/net v0.56.0 // indirect
 )

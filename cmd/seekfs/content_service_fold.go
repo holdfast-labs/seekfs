@@ -75,7 +75,7 @@ func (s *goSearchService) maybeFoldContentDelta(vol *serviceVolumeIndex) {
 	if vol == nil || vol.contentCoord == nil {
 		return
 	}
-	if !vol.contentCoord.foldDue(contentDeltaFoldMaxDocs, contentDeltaFoldMaxBytes) {
+	if !vol.contentCoord.foldDue(contentDeltaFoldMaxDocs, contentDeltaFoldMaxBytes, vol.content.refreshPendingNow()) {
 		return
 	}
 	s.runContentFold(vol)

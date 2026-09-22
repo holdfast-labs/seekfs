@@ -371,12 +371,12 @@ func contentIndexDecode(data []byte) (*contentIndex, error) {
 }
 
 // contentIndexExtractorMismatch reports whether a decoded index contains a doc
-// whose extractor identity no longer matches the registry, so the volume must
-// be rebuilt rather than served. A doc with ContentType==0 is an older `.gsx`
-// written before these fields were populated. A class whose registered version
-// differs means that extractor's Version() was bumped, so re-extract. Per-doc
-// incremental re-extraction is a future optimization; a mismatch rebuilds the
-// whole volume (safe, simple), never serving stale extracted text.
+// whose extractor identity no longer matches the registry. A doc with
+// ContentType==0 is an older `.gsx` written before these fields were populated.
+// A class whose registered version differs means that extractor's Version() was
+// bumped. A mismatch is resolved by contentPlanStaleExtractorRefresh: a
+// registered-class version bump re-extracts just the stale docs in place, while
+// an unregistered class or an over-large stale set falls back to a full rebuild.
 func contentIndexExtractorMismatch(idx *contentIndex) (string, bool) {
 	if idx == nil {
 		return "nil content index", true
@@ -395,6 +395,118 @@ func contentIndexExtractorMismatch(idx *contentIndex) (string, bool) {
 		}
 	}
 	return "", false
+}
+
+// contentRefreshMaxDocs bounds a targeted extractor-version refresh: a stale
+// set larger than this falls back to a full rebuild, which is the right tool
+// for a wholesale invalidation and bounds the coordinator queue the refresh
+// admits. A var so tests can lower it.
+var contentRefreshMaxDocs = 32768
+
+// contentStaleExtractorPlan is the outcome of partitioning a mismatched content
+// index. A non-rebuild plan carries the FRNs to re-extract in place; a rebuild
+// plan carries the reason the full-rebuild path must run instead.
+type contentStaleExtractorPlan struct {
+	refreshFRNs []uint64
+	rebuild     bool
+	reason      string
+}
+
+// contentPlanStaleExtractorRefresh partitions an index whose extractor identity
+// no longer matches the registry into docs that can be re-extracted in place:
+//
+//   - a registered class whose Version() changed: the FRN is re-extracted by the
+//     drain with the current extractor, which re-stamps the delta doc's class
+//     and version; the fold then carries it into the base;
+//   - an old class==0 doc whose file still resolves and whose extension a
+//     registered extractor (or the service text allowlist) claims: same refresh;
+//   - an old class==0 doc whose file no longer resolves is still enqueued so the
+//     drain tombstones it through the normal delete path.
+//
+// A class==0 doc whose extension is no longer extractable, a doc whose class has
+// no registered extractor, or a stale set over contentRefreshMaxDocs cannot be
+// refreshed and forces rebuild=true. resolvePath may be nil only when the index
+// has no class==0 docs.
+func contentPlanStaleExtractorRefresh(idx *contentIndex, resolvePath func(uint64) (string, bool)) contentStaleExtractorPlan {
+	if idx == nil {
+		return contentStaleExtractorPlan{rebuild: true, reason: "nil content index"}
+	}
+	var plan contentStaleExtractorPlan
+	for i := range idx.Docs {
+		if len(plan.refreshFRNs) > contentRefreshMaxDocs {
+			return contentStaleExtractorPlan{rebuild: true, reason: fmt.Sprintf("more than %d stale content docs", contentRefreshMaxDocs)}
+		}
+		d := &idx.Docs[i]
+		if d.ContentType == 0 {
+			path, resolved := "", false
+			if resolvePath != nil {
+				path, resolved = resolvePath(d.FRN)
+			}
+			if !resolved || contentPathExtractableByRegistry(path) {
+				plan.refreshFRNs = append(plan.refreshFRNs, d.FRN)
+				continue
+			}
+			return contentStaleExtractorPlan{rebuild: true, reason: fmt.Sprintf("content doc FRN %d has no content type and its extension is not extractable", d.FRN)}
+		}
+		want, ok := contentExtractorVersionForClass(d.ContentType)
+		if !ok {
+			return contentStaleExtractorPlan{rebuild: true, reason: fmt.Sprintf("content doc class %d has no registered extractor", d.ContentType)}
+		}
+		if d.ExtractorVersion != want {
+			plan.refreshFRNs = append(plan.refreshFRNs, d.FRN)
+		}
+	}
+	if len(plan.refreshFRNs) > contentRefreshMaxDocs {
+		return contentStaleExtractorPlan{rebuild: true, reason: fmt.Sprintf("%d stale content docs exceed the targeted-refresh cap (%d)", len(plan.refreshFRNs), contentRefreshMaxDocs)}
+	}
+	return plan
+}
+
+// contentPathExtractableByRegistry reports whether a path's extension is claimed
+// by a registered extractor or is in the service's curated text allowlist. It is
+// the extension gate for refreshing an old class==0 doc: a doc whose extension
+// nothing would extract now cannot be re-extracted, so the volume rebuilds.
+func contentPathExtractableByRegistry(path string) bool {
+	ext := contentPathExtension(path)
+	if ext == "" {
+		return false
+	}
+	for _, e := range contentExtractors {
+		for _, want := range e.Extensions() {
+			if want == ext {
+				return true
+			}
+		}
+	}
+	for _, want := range contentDefaultTextExtensions {
+		if want == ext {
+			return true
+		}
+	}
+	return false
+}
+
+// contentStaleExtractorDocCount counts the docs in an attached base whose
+// (class, version) no longer matches the registry. It drives the health refresh
+// signal: it stays non-zero (degraded) while stale text is served and returns to
+// zero once a fold publishes a base re-extracted at the current versions.
+func contentStaleExtractorDocCount(idx *contentIndex) int {
+	if idx == nil {
+		return 0
+	}
+	n := 0
+	for i := range idx.Docs {
+		d := &idx.Docs[i]
+		if d.ContentType == 0 {
+			n++
+			continue
+		}
+		want, ok := contentExtractorVersionForClass(d.ContentType)
+		if !ok || d.ExtractorVersion != want {
+			n++
+		}
+	}
+	return n
 }
 
 // contentLookupFRN binary-searches the FRN-sorted doc table.

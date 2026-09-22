@@ -77,13 +77,33 @@ func (s *goSearchService) attachContentForVolume(vol *serviceVolumeIndex) {
 		serviceLog("content index for volume %s is not FRN-keyed (origin=%d); leaving unavailable", vol.volume, idx.Origin)
 		return
 	}
-	// P1: a base whose docs were produced by an older/other extractor version
-	// (or written before the class was populated) would serve stale text. Treat
-	// it as stale so PF-3 schedules a rebuild instead of attaching it.
+	// P1/WP11: a base whose docs were produced by an older/other extractor
+	// version (or written before the class was populated) would serve stale
+	// text. A registered-class version bump is refreshed in place: the stale
+	// FRNs are enqueued for the drain to re-extract with the current extractor
+	// (re-stamping class/version in the delta, then the base via the fold). The
+	// old text is still served — a valid, if older, extraction — with a degraded
+	// refresh signal until the fold publishes the refreshed base. An
+	// unregistered class, an unrefreshable old doc, or an over-large stale set
+	// falls back to the full rebuild. See contentPlanStaleExtractorRefresh.
+	var refreshFRNs []uint64
 	if reason, mismatch := contentIndexExtractorMismatch(idx); mismatch {
-		serviceLog("content index for volume %s %s; leaving stale", vol.volume, reason)
-		vol.content.markStale(reason)
-		return
+		if vol.contentCoord == nil {
+			serviceLog("content index for volume %s %s; leaving stale (no coordinator)", vol.volume, reason)
+			vol.content.markStale(reason)
+			return
+		}
+		pathCache := make(map[int]string, 64)
+		plan := contentPlanStaleExtractorRefresh(idx, func(frn uint64) (string, bool) {
+			return s.contentResolvePath(vol, frn, pathCache)
+		})
+		if plan.rebuild {
+			serviceLog("content index for volume %s %s; leaving stale", vol.volume, plan.reason)
+			vol.content.markStale(plan.reason)
+			return
+		}
+		refreshFRNs = plan.refreshFRNs
+		serviceLog("content index for volume %s %s; refreshing %d doc(s) in place", vol.volume, reason, len(refreshFRNs))
 	}
 	// A USN-origin base with no journal generation or no checkpoint watermark
 	// cannot be joined or caught up: a zero watermark would attach `ready` and
@@ -145,6 +165,13 @@ func (s *goSearchService) attachContentForVolume(vol *serviceVolumeIndex) {
 		// rebuild must not spawn a second loop. enableDrain stays idempotent.
 		startDrain := !vol.contentCoord.drainEnabledNow()
 		vol.contentCoord.enableDrain()
+		// A targeted extractor refresh enqueues the stale base FRNs before the
+		// drain loop starts, so the first tick re-extracts them. The queue is a
+		// set, so a duplicate from the USN stream collapses.
+		if len(refreshFRNs) > 0 {
+			vol.content.markExtractorRefresh(len(refreshFRNs))
+			vol.contentCoord.enqueueFRNs(refreshFRNs)
+		}
 		if startDrain {
 			go s.contentDrainLoop(vol)
 		}
