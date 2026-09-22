@@ -546,6 +546,15 @@ Residual / known limitations (all explicit deferrals):
   from the `maxText` policy, so a document with a single text run over 1 MiB is
   truncated at 1 MiB even when `maxText` would allow more. It is flagged via
   `Truncated` (and the bounded-prefix reason), not silent.
+- **RTF: group-scoped properties are single scalars, not saved/restored per
+  group.** `\ucN` and `\ansicpgN` are held in one variable for the whole scan,
+  so a nested override leaks to the rest of the document instead of reverting
+  when its group closes (most documents set them once at the top level).
+- **RTF: `\field` is skipped whole.** The visible `{\fldrslt …}` text of a
+  field or hyperlink is dropped along with its `\fldinst`; a follow-up could
+  index `\fldrslt` only.
+- **RTF: DBCS codepages.** `\ansicpg932/936/949/950` (CJK) are not mapped and
+  fall back to CP1252, yielding mojibake; v1 covers single-byte pages only.
 
 ### Explicitly deferred (P5)
 

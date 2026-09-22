@@ -181,15 +181,37 @@ func (contentHTMLExtractor) Extract(ctx context.Context, r io.ReaderAt, size int
 	// declared <meta> charset is honored when the shared policy has no stronger
 	// signal (BOM / explicit override / BOM-less UTF-16).
 	decoded := contentDecodeForIndex(raw, contentHTMLDecodeMode(raw, s.encoding), truncated)
+	text, textTruncated, err := contentHTMLText(ctx, decoded, s.maxText)
+	if err != nil {
+		return contentExtractResult{}, err
+	}
+	truncated = truncated || textTruncated
+	if len(text) == 0 {
+		return contentExtractResult{Class: contentClassHTML, Truncated: truncated}, nil
+	}
+	res := contentExtractResult{Text: []byte(text), Class: contentClassHTML, Truncated: truncated}
+	if truncated {
+		res.Reason = "indexed bounded prefix up to policy cap"
+	}
+	return res, nil
+}
+
+// contentHTMLText walks already-decoded HTML and returns its searchable text,
+// capped at maxText bytes. truncated reports a bounded prefix: the text cap was
+// hit, or the tokenizer failed on a pathological token (SetMaxBuf). ctx is
+// checked between tokens so an extraction deadline can stop a huge document.
+// It is shared by the HTML extractor and the email extractor's text/html parts.
+func contentHTMLText(ctx context.Context, decoded string, maxText int64) (string, bool, error) {
 	z := html.NewTokenizer(strings.NewReader(decoded))
 	z.SetMaxBuf(contentHTMLMaxToken)
 
 	var out bytes.Buffer
+	truncated := false
 	inRaw := ""
 walk:
 	for {
 		if err := ctx.Err(); err != nil {
-			return contentExtractResult{}, err
+			return "", false, err
 		}
 		switch z.Next() {
 		case html.ErrorToken:
@@ -225,21 +247,16 @@ walk:
 				contentHTMLSeparate(&out)
 			}
 		}
-		if int64(out.Len()) >= s.maxText {
+		if int64(out.Len()) >= maxText {
 			truncated = true
 			break walk
 		}
 	}
 
 	if out.Len() == 0 {
-		return contentExtractResult{Class: contentClassHTML, Truncated: truncated}, nil
+		return "", truncated, nil
 	}
-	text := truncateUTF8(out.String(), int(s.maxText))
-	res := contentExtractResult{Text: []byte(text), Class: contentClassHTML, Truncated: truncated}
-	if truncated {
-		res.Reason = "indexed bounded prefix up to policy cap"
-	}
-	return res, nil
+	return truncateUTF8(out.String(), int(maxText)), truncated, nil
 }
 
 // contentHTMLTagName returns the lowercased name of the current tag token.
