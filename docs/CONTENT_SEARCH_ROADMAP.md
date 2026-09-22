@@ -383,6 +383,7 @@ test strategy, open questions — lives in the gitignored
 | WP9 | Semantics | M–L (5–12 d) |
 | WP10 | `.gsx` eviction/size cap/dedup (M7) | M (3–6 d) |
 | WP11 | Additional file types (HTML→EML→mbox→RTF→MSG→PDF; legacy OLE deferred) | **done** except legacy OLE |
+| WP12 | PDF recall hardening + skip accounting (production-corpus findings) | M (3–6 d) |
 
 Corrected program total: **~60–110 engineer-days**, with the content-checkpoint /
 format-versioning work (WP0) on the critical path. WP11 is a separate,
@@ -414,6 +415,15 @@ deferred.
     coordinator deadline) already landed and the six fuzz targets in place.
     Legacy OLE stays deferred (WP5). Full detail in
     `docs/CONTENT_SEARCH_FORMATS_PLAN.md`.
+
+12. **WP12 (new, from production testing)** — the offline walk path matched
+    `rg -F -i` exactly on text corpora and 13/13 on in-cap OOXML, but real PDFs
+    exposed recall gaps: a valid in-cap xref-stream/ObjStm PDF is silently
+    `skipped`; simple-font ligatures drop their tail (`workflows`→`workfows`);
+    Type0/Identity-H without `/ToUnicode` drops whole pages with no per-result
+    signal; and skip accounting omits binary/empty files. See
+    `docs/CONTENT_SEARCH.md` §7 "Production-corpus findings". Two defects from
+    the same pass are already fixed (root walk error; HTML large-token loss).
 
 The originally proposed three items map to **WP2 (PDF)**, **WP3 (email)**, and
 **WP1e (journal-reset rebuild)**; the roadmap places WP0/WP1 ahead of them

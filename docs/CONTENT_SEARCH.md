@@ -577,11 +577,13 @@ Residual / known limitations (all explicit deferrals):
   refreshed base publishes and the branch cannot spin; a future partial/dropped
   refresh would re-force a fold every drain tick (still paced by the fold-retry
   backoff), which is why it is worth a note.
-- **`contentHTMLMaxToken` caps one text node at 1 MiB regardless of `maxText`.**
-  The HTML tokenizer's per-token buffer cap is a separate bounded-memory ceiling
-  from the `maxText` policy, so a document with a single text run over 1 MiB is
-  truncated at 1 MiB even when `maxText` would allow more. It is flagged via
-  `Truncated` (and the bounded-prefix reason), not silent.
+- **HTML per-token cap is the text budget, clamped to [1 MiB, 16 MiB].** The
+  tokenizer's per-token buffer is `maxText` clamped to `contentHTMLMaxToken`
+  (floor) and `contentHTMLMaxTokenCeiling` (16 MiB), so a large-but-in-cap token
+  no longer trips `ErrBufferExceeded` and discards every token after it (the
+  1 MiB fixed cap silently dropped the tail of e.g.
+  `cmd/trace/static/trace_viewer_full.html`). A token larger than the (bounded)
+  cap still stops extraction as a `Truncated` bounded prefix, not silently.
 - **RTF: group-scoped properties are single scalars, not saved/restored per
   group.** `\ucN` and `\ansicpgN` are held in one variable for the whole scan,
   so a nested override leaks to the rest of the document instead of reverting
@@ -591,6 +593,44 @@ Residual / known limitations (all explicit deferrals):
   index `\fldrslt` only.
 - **RTF: DBCS codepages.** `\ansicpg932/936/949/950` (CJK) are not mapped and
   fall back to CP1252, yielding mojibake; v1 covers single-byte pages only.
+
+### Production-corpus findings (offline walk path, real corpora)
+
+Black-box batteries over the Go stdlib tree (~8k docs), the repo, and real
+PDF/DOCX/PPTX/XLSX corpora. Independent oracles: `rg -F -i` (text) and
+PyMuPDF/pypdf + OOXML unzip (documents). Two defects found here are already
+fixed (root walk error; HTML large-token loss); the rest are open:
+
+- **A valid, in-cap PDF is silently skipped (recall 0).** A 19.45 MiB, 32-page,
+  unencrypted PDF (`/Type /XRef` xref stream + 5 `/ObjStm`, all fonts with
+  `/ToUnicode`) is reported `skipped` with no text; `-max-raw` 64/512 MiB does
+  not help, so it is not the cap. Another PDF with 330 ObjStm streams indexes
+  fine, so it is file-specific — likely compressed-object resolution in the
+  xref-stream path. The CLI surfaces no per-file skip reason. Open.
+- **Simple-font ligatures drop their tail, making words unsearchable.** A LaTeX
+  PDF (`CMR10`, no `/Encoding`, no `/ToUnicode`) indexes `workflows` as
+  `workfows` and `MLflow` as `MLfow`, so the real words miss. Matches the
+  "ligature maps to its first rune" limit above; expanding the standard ligature
+  code points (`ff/fi/fl/ffi/ffl` → ASCII letters) in the simple-font table
+  would fix the common case. Open.
+- **Type0/Identity-H without `/ToUnicode` drops whole pages with no signal.**
+  The page text is recoverable (PyMuPDF gets it) but seekfs declines it while
+  still reporting the document as indexed; a query cannot tell pages were
+  dropped. Open (needs a per-result incomplete signal or a CID fallback).
+- **Skip accounting is incomplete.** `Skipped` counts only claimed-but-declined
+  containers (PDF/OOXML); a NUL-containing/binary text file and a 0-byte file
+  are dropped by the sniffer before any tally, and over-`maxRaw` **text** is
+  counted `Truncated`, not `Skipped`. No file is mis-reported, but
+  `indexed + skipped + truncated` need not equal the file count. Open
+  (accounting).
+- **`.gsx` has no integrity checksum.** Payload/text byte flips are undetected
+  (structural damage is caught); fuzzing found no panic. Accepted.
+- Confirmed clean: encrypted/image-only PDFs → `skipped` with no false hits;
+  OOXML oracle parity 13/13 under the 32 MiB cap; snippets valid UTF-8; BOM-less
+  UTF-16 recovered under `-encoding auto`; `-n` caps; broad queries bounded
+  (~3 s for ~5.8k hits over ~8k docs); corrupt/truncated `.gsx` and a missing
+  term fail cleanly with no panic; a byte-exact extractor-faithful oracle matched
+  29/29 on an adversarial corpus.
 
 ### Explicitly deferred (P5)
 
