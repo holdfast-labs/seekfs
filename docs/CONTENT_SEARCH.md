@@ -509,6 +509,15 @@ Residual / known limitations (all explicit deferrals):
   directly and have been removed; `contentLossyFixups` remains for the decoder.
 - The service reads the whole `.gsx` into heap (`contentLoadFile`); mmap-ing it
   is deferred to the ARCHITECTURE_REVIEW R1/R5 engine work.
+- **A file extracted while still being written.** The drain promotes a dirty file
+  on a close/USN-quiet window (≤2 s tick), so a file written in place without a
+  close can be indexed from a partial state. The next USN change (or the close)
+  re-extracts it; there is no in-progress-write guard.
+- **Intra-volume rename keeps its stored path until re-extraction.** An
+  intra-volume rename preserves the FRN, so the base/delta doc keeps the old
+  `Path` (the delta is not re-extracted for a rename). Content search resolves
+  paths through the record index/resolver, so matching is unaffected — this is a
+  stale stored-path/ordering field, not a match gap.
 - PDF extraction is a best-effort spike (no xref/object streams, Flate only,
   simple fonts only); quality is a P4 decision.
 
