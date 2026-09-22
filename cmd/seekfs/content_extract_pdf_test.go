@@ -457,6 +457,32 @@ func TestContentPDFDifferencesLetterNames(t *testing.T) {
 	contentPDFAssertContains(t, contentPDFTestExtract(t, contentPDFAssemble(objs, 1)), "WATER")
 }
 
+// A font that places each glyph with its own Td must not come out letter-spaced:
+// the move equals the glyph advance (from /Widths), so no space is emitted. A
+// move wider than the advance plus slack is a real word gap.
+func TestContentPDFPerGlyphPlacementNotSpaced(t *testing.T) {
+	page := []byte("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>")
+	font := []byte("<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /FirstChar 65 /Widths [600 600 600 600 600] >>")
+	objs := func(body string) [][]byte {
+		return [][]byte{
+			[]byte("<< /Type /Catalog /Pages 2 0 R >>"),
+			[]byte("<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+			page, font,
+			contentPDFStreamBytes([]byte(body), ""),
+		}
+	}
+	// Advance is 600/1000*10 = 6 per glyph, so a 6-unit Td is intra-word.
+	got := contentPDFTestExtract(t, contentPDFAssemble(objs("BT /F1 10 Tf 1 0 0 1 0 0 Tm <41> Tj 6 0 Td <42> Tj 6 0 Td <43> Tj ET"), 1))
+	if text := string(got.Text); !strings.Contains(text, "ABC") {
+		t.Fatalf("per-glyph word not extracted: %q", text)
+	}
+	// A 12-unit Td (advance 6 + 6) is a word gap.
+	got = contentPDFTestExtract(t, contentPDFAssemble(objs("BT /F1 10 Tf 1 0 0 1 0 0 Tm <41> Tj 6 0 Td <42> Tj 12 0 Td <43> Tj ET"), 1))
+	if text := string(got.Text); !strings.Contains(text, "AB C") {
+		t.Fatalf("word gap not detected: %q", text)
+	}
+}
+
 func TestContentPDFToUnicodeMapping(t *testing.T) {
 	cmap := "/CIDInit /ProcSet findresource begin\n12 dict begin\nbegincmap\n1 beginbfchar\n<90> <00E9>\nendbfchar\nendcmap\nend\n"
 	objs := [][]byte{

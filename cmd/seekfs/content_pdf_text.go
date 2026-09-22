@@ -21,6 +21,7 @@ import (
 
 const (
 	contentPDFWordGap       = 120.0
+	contentPDFSpaceSlack    = 0.22
 	contentPDFMaxCMapOps    = 1 << 16
 	contentPDFMaxCMapEntry  = 1 << 16
 	contentPDFMaxContentOps = 1 << 22
@@ -32,6 +33,14 @@ type contentPDFFont struct {
 	simple [256]rune
 	cid    bool
 	toUni  map[uint32]string
+
+	// Glyph widths in 1/1000 text-space units, used to tell an intra-word
+	// per-glyph move from a real word gap. Simple fonts use /Widths (+
+	// /MissingWidth); CID fonts use /DescendantFonts/W (+ /DW).
+	widths  [256]int32
+	missing int32
+	cidW    map[uint32]int32
+	cidDW   int32
 }
 
 // contentPDFTextWriter accumulates decoded text under maxText. Separators are
@@ -154,6 +163,7 @@ func (d *contentPDFDoc) contentStreamText(data []byte, fonts map[string]*content
 	var stack []contentPDFValue
 	var font *contentPDFFont
 	var x, y, lastX, lastY float64
+	var advance, fontSize float64
 	havePos := false
 	ops := 0
 	for {
@@ -183,42 +193,49 @@ func (d *contentPDFDoc) contentStreamText(data []byte, fonts map[string]*content
 				if n, ok := contentPDFNameOf(stack[len(stack)-2]); ok {
 					font = fonts[n]
 				}
+				fontSize = contentPDFNumOf(stack[len(stack)-1])
 			}
 		case "BT":
 			x, y, havePos = 0, 0, false
+			advance = 0
 		case "Td", "TD":
 			if len(stack) >= 2 {
 				tx, ty := contentPDFNumOf(stack[len(stack)-2]), contentPDFNumOf(stack[len(stack)-1])
 				x += tx
 				y += ty
-				contentPDFMove(w, havePos, lastX, lastY, x, y)
+				contentPDFMove(w, havePos, lastX, lastY, x, y, advance, fontSize)
 				lastX, lastY, havePos = x, y, true
+				advance = 0
 			}
 		case "Tm":
 			if len(stack) >= 6 {
 				x, y = contentPDFNumOf(stack[len(stack)-2]), contentPDFNumOf(stack[len(stack)-1])
-				contentPDFMove(w, havePos, lastX, lastY, x, y)
+				contentPDFMove(w, havePos, lastX, lastY, x, y, advance, fontSize)
 				lastX, lastY, havePos = x, y, true
+				advance = 0
 			}
 		case "T*":
 			w.newline()
+			advance = 0
 		case "Tj":
 			if len(stack) >= 1 {
-				d.contentPDFShow(stack[len(stack)-1], font, w)
+				advance += d.contentPDFShow(stack[len(stack)-1], font, w, fontSize)
 			}
 		case "'":
 			w.newline()
+			advance = 0
 			if len(stack) >= 1 {
-				d.contentPDFShow(stack[len(stack)-1], font, w)
+				advance += d.contentPDFShow(stack[len(stack)-1], font, w, fontSize)
 			}
 		case `"`:
 			w.newline()
+			advance = 0
 			if len(stack) >= 1 {
-				d.contentPDFShow(stack[len(stack)-1], font, w)
+				advance += d.contentPDFShow(stack[len(stack)-1], font, w, fontSize)
 			}
 		case "TJ":
 			if len(stack) >= 1 {
-				d.contentPDFShowArray(stack[len(stack)-1], font, w)
+				advance += d.contentPDFShowArray(stack[len(stack)-1], font, w, fontSize)
 			}
 		case "Do":
 			// A Form XObject draws text through its own resources; recurse,
@@ -240,38 +257,51 @@ func (d *contentPDFDoc) contentStreamText(data []byte, fonts map[string]*content
 	}
 }
 
-func contentPDFMove(w *contentPDFTextWriter, havePos bool, lastX, lastY, x, y float64) {
+func contentPDFMove(w *contentPDFTextWriter, havePos bool, lastX, lastY, x, y, expectedAdvance, fontSize float64) {
 	if !havePos {
 		return
 	}
 	if y != lastY {
 		w.newline()
-	} else if x != lastX {
+		return
+	}
+	// A move wider than the glyphs already written plus a slack is a word gap; a
+	// per-glyph placement move (delta ≈ the glyph advance) is not. With no usable
+	// widths (expectedAdvance 0) this falls back to a space on any advance.
+	if x-lastX > expectedAdvance+contentPDFSpaceSlack*fontSize {
 		w.space()
 	}
 }
 
-func (d *contentPDFDoc) contentPDFShow(v contentPDFValue, font *contentPDFFont, w *contentPDFTextWriter) {
+func (d *contentPDFDoc) contentPDFShow(v contentPDFValue, font *contentPDFFont, w *contentPDFTextWriter, fontSize float64) float64 {
 	if v.kind != contentPDFString {
-		return
+		return 0
 	}
 	w.writeString(contentPDFDecodeString(font, v.str))
+	return contentPDFStringAdvance(font, v.str, fontSize)
 }
 
-func (d *contentPDFDoc) contentPDFShowArray(v contentPDFValue, font *contentPDFFont, w *contentPDFTextWriter) {
+func (d *contentPDFDoc) contentPDFShowArray(v contentPDFValue, font *contentPDFFont, w *contentPDFTextWriter, fontSize float64) float64 {
 	if v.kind != contentPDFArray {
-		return
+		return 0
 	}
+	var adv float64
 	for _, e := range v.arr {
 		switch e.kind {
 		case contentPDFString:
 			w.writeString(contentPDFDecodeString(font, e.str))
+			adv += contentPDFStringAdvance(font, e.str, fontSize)
 		case contentPDFInt, contentPDFReal:
-			if contentPDFNumOf(e) <= -contentPDFWordGap {
+			n := contentPDFNumOf(e)
+			if n <= -contentPDFWordGap {
 				w.space()
+			}
+			if shift := -n / 1000 * fontSize; shift > 0 {
+				adv += shift
 			}
 		}
 	}
+	return adv
 }
 
 // contentPDFDecodeString maps a shown byte string through the active font. A
@@ -391,11 +421,112 @@ func (d *contentPDFDoc) buildFont(v contentPDFValue) *contentPDFFont {
 	}
 	if f.cid {
 		// A Type0/CID font with no /ToUnicode map is dropped: the codes are CIDs,
-		// not Latin-1, so emitting them as text would only add noise.
+		// not Latin-1, so emitting them as text would only add noise. Widths are
+		// still parsed for the CID fonts that do map.
+		f.cidW, f.cidDW = d.contentPDFCIDWidths(v.dict)
 		return f
 	}
 	f.simple = contentPDFSimpleEncodingTable(d, v.dict)
+	f.missing = int32(contentPDFDictInt(v.dict, "MissingWidth", 0))
+	if fd := d.resolve(v.dict["FontDescriptor"]); fd.kind == contentPDFDict {
+		f.missing = int32(contentPDFDictInt(fd.dict, "MissingWidth", int64(f.missing)))
+	}
+	first := contentPDFDictInt(v.dict, "FirstChar", 0)
+	if wv := d.resolve(v.dict["Widths"]); wv.kind == contentPDFArray {
+		for i, e := range wv.arr {
+			c := first + int64(i)
+			if c < 0 || c > 255 {
+				continue
+			}
+			f.widths[c] = int32(contentPDFNumOf(e))
+		}
+	}
 	return f
+}
+
+// contentPDFCIDWidths parses a Type0 font's descendant /W array and /DW default
+// into a code->width map (1/1000 text-space units). The /W forms are
+// `c [w1 w2 ...]` and `cFirst cLast w`.
+func (d *contentPDFDoc) contentPDFCIDWidths(font map[string]contentPDFValue) (map[uint32]int32, int32) {
+	out := map[uint32]int32{}
+	dw := int32(1000)
+	df := d.resolve(font["DescendantFonts"])
+	if df.kind != contentPDFArray || len(df.arr) == 0 {
+		return out, dw
+	}
+	dfont := d.resolve(df.arr[0])
+	if dfont.kind != contentPDFDict {
+		return out, dw
+	}
+	dw = int32(contentPDFDictInt(dfont.dict, "DW", 1000))
+	wv := d.resolve(dfont.dict["W"])
+	if wv.kind != contentPDFArray {
+		return out, dw
+	}
+	arr := wv.arr
+	for i := 0; i+1 < len(arr) && len(out) < contentPDFMaxCMapEntry; {
+		c, ok := contentPDFIntOf(arr[i])
+		if !ok {
+			break
+		}
+		i++
+		if arr[i].kind == contentPDFArray {
+			for k, e := range arr[i].arr {
+				out[uint32(c)+uint32(k)] = int32(contentPDFNumOf(e))
+			}
+			i++
+			continue
+		}
+		last, ok := contentPDFIntOf(arr[i])
+		if !ok || i+1 >= len(arr) {
+			break
+		}
+		i++
+		w := int32(contentPDFNumOf(arr[i]))
+		i++
+		for code := c; code <= last && code-c < contentPDFMaxCMapEntry; code++ {
+			out[uint32(code)] = w
+		}
+	}
+	return out, dw
+}
+
+// contentPDFGlyphWidth returns one glyph's advance in 1/1000 text-space units.
+func (f *contentPDFFont) contentPDFGlyphWidth(code uint32) float64 {
+	if f == nil {
+		return 0
+	}
+	if f.cid {
+		if w, ok := f.cidW[code]; ok {
+			return float64(w)
+		}
+		return float64(f.cidDW)
+	}
+	if code < 256 && f.widths[code] != 0 {
+		return float64(f.widths[code])
+	}
+	return float64(f.missing)
+}
+
+// contentPDFStringAdvance is the horizontal advance a shown byte string makes at
+// the given font size, used to distinguish a per-glyph placement move from a
+// word gap. Zero when the font carries no usable widths (caller falls back to
+// the conservative space-on-move behavior).
+func contentPDFStringAdvance(f *contentPDFFont, b []byte, fontSize float64) float64 {
+	if f == nil || fontSize == 0 {
+		return 0
+	}
+	var w float64
+	if f.cid {
+		for i := 0; i+1 < len(b); i += 2 {
+			w += f.contentPDFGlyphWidth(uint32(b[i])<<8 | uint32(b[i+1]))
+		}
+	} else {
+		for _, c := range b {
+			w += f.contentPDFGlyphWidth(uint32(c))
+		}
+	}
+	return w / 1000 * fontSize
 }
 
 // contentPDFSimpleEncodingTable resolves a simple font's base encoding and
