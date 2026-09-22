@@ -23,11 +23,17 @@ import (
 	"golang.org/x/text/encoding"
 )
 
-// contentHTMLMaxToken caps one token's buffered bytes. Without it a single
-// unterminated <script>, comment, or giant text run would buffer the whole
-// document; the tokenizer then reports ErrBufferExceeded and extraction stops
-// with what was already emitted. Well under maxRaw (default 32 MiB).
+// contentHTMLMaxToken is the floor for one token's buffered bytes. The
+// effective cap is the document's text budget (clamped to
+// contentHTMLMaxTokenCeiling), so a single large-but-in-cap token — a big inline
+// <script>, a long paragraph — no longer trips ErrBufferExceeded and discards
+// every token after it. A token larger than the (bounded) cap still stops
+// extraction as a bounded prefix. Well under maxRaw (default 32 MiB).
 const contentHTMLMaxToken = 1 << 20
+
+// contentHTMLMaxTokenCeiling bounds the tokenizer buffer independent of maxText,
+// so a large text budget cannot make the tokenizer buffer unbounded.
+const contentHTMLMaxTokenCeiling = contentExtractMaxTextBytes
 
 // contentHTMLCharsetPeek bounds the head inspected for a <meta> charset. The
 // WHATWG prescan reads at most the first 1024 bytes; no more is decoded.
@@ -203,7 +209,17 @@ func (contentHTMLExtractor) Extract(ctx context.Context, r io.ReaderAt, size int
 // It is shared by the HTML extractor and the email extractor's text/html parts.
 func contentHTMLText(ctx context.Context, decoded string, maxText int64) (string, bool, error) {
 	z := html.NewTokenizer(strings.NewReader(decoded))
-	z.SetMaxBuf(contentHTMLMaxToken)
+	// Bound one token by the text budget so a large-but-in-cap token does not
+	// discard the rest of the document; never below the floor or above the
+	// ceiling, so the buffer stays bounded whatever maxText is.
+	tokenCap := int(maxText)
+	if tokenCap < contentHTMLMaxToken {
+		tokenCap = contentHTMLMaxToken
+	}
+	if tokenCap > contentHTMLMaxTokenCeiling {
+		tokenCap = contentHTMLMaxTokenCeiling
+	}
+	z.SetMaxBuf(tokenCap)
 
 	var out bytes.Buffer
 	truncated := false

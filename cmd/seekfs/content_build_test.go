@@ -49,6 +49,15 @@ func TestContentBuildExcludesIndexFiles(t *testing.T) {
 	}
 }
 
+// A root that cannot be read (a typo'd or inaccessible path) must fail rather
+// than silently publish an empty index.
+func TestContentBuildMissingRootErrors(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "does-not-exist")
+	if _, err := buildContentIndexFromDir(context.Background(), root, defaultContentBuildOptions()); err == nil {
+		t.Fatal("missing root must return an error, not an empty index")
+	}
+}
+
 func TestContentBuildRespectsExtAndUnder(t *testing.T) {
 	dir := t.TempDir()
 	sub := filepath.Join(dir, "sub")

@@ -21,6 +21,38 @@ func contentHTMLExtract(t *testing.T, raw []byte) contentExtractResult {
 	return got
 }
 
+func contentHTMLExtractCaps(t *testing.T, raw []byte, maxRaw, maxText int64) contentExtractResult {
+	t.Helper()
+	ctx := contentWithExtractSettings(context.Background(), contentExtractSettings{maxRaw: maxRaw, maxText: maxText})
+	got, err := contentHTMLExtractor{}.Extract(ctx, bytes.NewReader(raw), int64(len(raw)))
+	if err != nil {
+		t.Fatalf("Extract error: %v", err)
+	}
+	return got
+}
+
+// A large (but within-budget) token must not discard the rest of the document.
+// Regression: a >1 MiB inline script or text run silently dropped every term
+// after it.
+func TestContentHTMLTextAfterLargeTokenPreserved(t *testing.T) {
+	filler := strings.Repeat("y", contentHTMLMaxToken+64*1024)
+	cases := map[string]string{
+		"text-run": "<html><body>alpha FIRSTWORD " + filler + " LASTWORD omega</body></html>",
+		"script":   "<html><body>alpha FIRSTWORD <script>" + filler + "</script> LASTWORD omega</body></html>",
+	}
+	for name, raw := range cases {
+		t.Run(name, func(t *testing.T) {
+			got := contentHTMLExtract(t, []byte(raw))
+			text := string(got.Text)
+			for _, want := range []string{"FIRSTWORD", "LASTWORD"} {
+				if !strings.Contains(text, want) {
+					t.Fatalf("lost %q after large token (Truncated=%v, %d bytes)", want, got.Truncated, len(text))
+				}
+			}
+		})
+	}
+}
+
 // Body and <title> text are searchable; script/style/comments/doctype are not,
 // and emitted text carries no tags.
 func TestContentHTMLExtractsBodyAndTitle(t *testing.T) {
@@ -77,20 +109,23 @@ func TestContentHTMLMalformedDoesNotPanic(t *testing.T) {
 // A pathological unterminated script (or comment) trips SetMaxBuf: no crash,
 // bounded output, and text before it is still indexed.
 func TestContentHTMLUnterminatedScriptIsBounded(t *testing.T) {
-	huge := "<html><body><p>before needle</p><script>" + strings.Repeat("a", contentHTMLMaxToken*2)
-	got := contentHTMLExtract(t, []byte(huge))
+	// Cap the text budget so the pathological token exceeds the tokenizer
+	// buffer; extraction must then be a bounded prefix, not a wedge.
+	const cap = contentHTMLMaxToken
+	huge := "<html><body><p>before needle</p><script>" + strings.Repeat("a", cap*2)
+	got := contentHTMLExtractCaps(t, []byte(huge), int64(len(huge))+1, cap)
 	if !got.Truncated {
 		t.Fatalf("unterminated script must mark Truncated: %+v", got)
 	}
 	if !strings.Contains(string(got.Text), "before needle") {
 		t.Fatalf("text %q lost pre-script content", got.Text)
 	}
-	if len(got.Text) > contentHTMLMaxToken {
+	if len(got.Text) > cap {
 		t.Fatalf("output not bounded: %d bytes", len(got.Text))
 	}
 
-	comment := "<html><body><p>before needle</p><!--" + strings.Repeat("a", contentHTMLMaxToken*2)
-	got = contentHTMLExtract(t, []byte(comment))
+	comment := "<html><body><p>before needle</p><!--" + strings.Repeat("a", cap*2)
+	got = contentHTMLExtractCaps(t, []byte(comment), int64(len(comment))+1, cap)
 	if !got.Truncated || !strings.Contains(string(got.Text), "before needle") {
 		t.Fatalf("unterminated comment not bounded: %+v", got)
 	}

@@ -110,6 +110,12 @@ func buildContentIndexFromDir(ctx context.Context, root string, opts contentBuil
 	var skipped, truncated int64
 	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
+			// A failure on the root itself (a typo'd or inaccessible path) is
+			// fatal — otherwise an empty index is silently published. Failures
+			// below the root stay best-effort.
+			if d == nil || path == root {
+				return err
+			}
 			return nil
 		}
 		if err := ctx.Err(); err != nil {
