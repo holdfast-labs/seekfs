@@ -502,8 +502,10 @@ Residual / known limitations (all explicit deferrals):
   chain, including the low-memory FRN-column fallback and an overlay rename.
 - **PDF extraction** is a bounded text-layer parser (classic + xref-stream +
   ObjStm, Flate(+predictors)/LZW/ASCII85/ASCIIHex/RunLength, `/ToUnicode` +
-  `/Differences`). Limits: no OCR; encrypted → `Skipped`; Type0/CID without a
-  `/ToUnicode` CMap is dropped; a multi-rune ligature maps to its first rune.
+  `/Differences`, and text drawn through `/Form` XObjects via `Do`). Limits: no
+  OCR; encrypted → `Skipped`; Type0/CID without a `/ToUnicode` CMap is dropped;
+  a producer ToUnicode that maps a ligature to a single base letter is lossy in
+  the PDF itself.
 - **Dead code.** `contentPostingIndex.lookup`/`forEach` and
   `contentLossyFixups.toSourceOffset`/`isEmpty` are test-only (annotated).
 
@@ -598,39 +600,57 @@ Residual / known limitations (all explicit deferrals):
 
 Black-box batteries over the Go stdlib tree (~8k docs), the repo, and real
 PDF/DOCX/PPTX/XLSX corpora. Independent oracles: `rg -F -i` (text) and
-PyMuPDF/pypdf + OOXML unzip (documents). Two defects found here are already
-fixed (root walk error; HTML large-token loss); the rest are open:
+PyMuPDF/pypdf + OOXML unzip (documents). A PDF recall battery vs PyMuPDF over 45
+real in-cap PDFs measured mean recall **0.933 → 0.980** and perfect files
+**31/45 → 38/45** after the WP12 fixes below.
 
-- **A valid, in-cap PDF is silently skipped (recall 0).** A 19.45 MiB, 32-page,
-  unencrypted PDF (`/Type /XRef` xref stream + 5 `/ObjStm`, all fonts with
-  `/ToUnicode`) is reported `skipped` with no text; `-max-raw` 64/512 MiB does
-  not help, so it is not the cap. Another PDF with 330 ObjStm streams indexes
-  fine, so it is file-specific — likely compressed-object resolution in the
-  xref-stream path. The CLI surfaces no per-file skip reason. Open.
-- **Simple-font ligatures drop their tail, making words unsearchable.** A LaTeX
-  PDF (`CMR10`, no `/Encoding`, no `/ToUnicode`) indexes `workflows` as
-  `workfows` and `MLflow` as `MLfow`, so the real words miss. Matches the
-  "ligature maps to its first rune" limit above; expanding the standard ligature
-  code points (`ff/fi/fl/ffi/ffl` → ASCII letters) in the simple-font table
-  would fix the common case. Open.
-- **Type0/Identity-H without `/ToUnicode` drops whole pages with no signal.**
-  The page text is recoverable (PyMuPDF gets it) but seekfs declines it while
-  still reporting the document as indexed; a query cannot tell pages were
-  dropped. Open (needs a per-result incomplete signal or a CID fallback).
+**Fixed:**
+
+- **Form-XObject-only pages extracted no text.** Many LaTeX/print PDFs put the
+  whole page in a `/Form` XObject drawn by `Do` with the page carrying only
+  `/XObject` (no `/Font`); a real 32-page paper was silently skipped. `Do` now
+  recurses with the XObject's resources, bounded by `contentPDFMaxFormDepth` and
+  a shared per-page `contentPDFMaxXObjectInvocations` budget (depth alone does
+  not bound fan-out).
+- **Ligature loss.** `ff/fi/fl/ffi/ffl` mapped to Unicode presentation forms
+  (U+FB00–FB06) are expanded to ASCII; a `/ToUnicode` destination with several
+  runes (producers spelling `fi` as `00660069`) now keeps the whole sequence
+  rather than the first rune; `/Differences` names that are plain Latin letters
+  (A–Z/a–z) now map. `workflows`/`configurations`/`Efficient` are searchable.
+- **Per-glyph placement letter-spaced words.** Producers that place each glyph
+  with its own `Td`/`Tm` used to come out `A B C`; spacing is now width-aware
+  (`/Widths` //W` vs the accumulated `advance`), so an intra-word move does not
+  insert a space while a real word gap still does.
+- **Large-token HTML loss** and the **swallowed root walk error** (earlier
+  fixes; see §7).
+- **RTF non-BMP `\u`** surrogate pairs are reassembled instead of becoming two
+  U+FFFD.
+- **Truncation accounting** counts a bounded extraction that produced no text
+  (e.g. a depth-cap hit) instead of dropping it.
+
+**Open:**
+
+- **Type0/Identity-H without `/ToUnicode`** (e.g. `ProximaNova-Regular`) drops
+  the page's text with no per-result signal; recovering it needs the embedded
+  font program's cmap/charset (PyMuPDF reads that; seekfs does not). 3 real
+  files; the fitz oracle text for them is itself unreliable.
+- **Rotated per-glyph runs that restart with `Tm` mid-word** can still insert a
+  gap (1 real file, `EXPRESS` in a rotated appearance stream).
 - **Skip accounting is incomplete.** `Skipped` counts only claimed-but-declined
   containers (PDF/OOXML); a NUL-containing/binary text file and a 0-byte file
   are dropped by the sniffer before any tally, and over-`maxRaw` **text** is
   counted `Truncated`, not `Skipped`. No file is mis-reported, but
-  `indexed + skipped + truncated` need not equal the file count. Open
-  (accounting).
+  `indexed + skipped + truncated` need not equal the file count.
 - **`.gsx` has no integrity checksum.** Payload/text byte flips are undetected
   (structural damage is caught); fuzzing found no panic. Accepted.
 - Confirmed clean: encrypted/image-only PDFs → `skipped` with no false hits;
-  OOXML oracle parity 13/13 under the 32 MiB cap; snippets valid UTF-8; BOM-less
-  UTF-16 recovered under `-encoding auto`; `-n` caps; broad queries bounded
-  (~3 s for ~5.8k hits over ~8k docs); corrupt/truncated `.gsx` and a missing
-  term fail cleanly with no panic; a byte-exact extractor-faithful oracle matched
-  29/29 on an adversarial corpus.
+  OOXML oracle parity 13/13 under the 32 MiB cap; RTF/EML/mbox/MSG end-to-end
+  synthetic parity (only `\fldrslt`, non-allowlisted headers and encoded blobs
+  excluded by design); snippets valid UTF-8; BOM-less UTF-16 recovered under
+  `-encoding auto`; `-n` caps; broad queries bounded (~3 s for ~5.8k hits over
+  ~8k docs); corrupt/truncated `.gsx` and a missing term fail cleanly with no
+  panic; a byte-exact extractor-faithful oracle matched 29/29 on an adversarial
+  corpus.
 
 ### Explicitly deferred (P5)
 

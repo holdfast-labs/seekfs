@@ -258,10 +258,14 @@ func (d *contentPDFDoc) contentStreamText(data []byte, fonts map[string]*content
 			// A Form XObject draws text through its own resources; recurse,
 			// bounded by depth, a shared invocation budget, and the writer's
 			// text cap. Image XObjects are skipped (no OCR).
-			if depth < contentPDFMaxFormDepth && *budget > 0 && len(stack) >= 1 {
+			if depth < contentPDFMaxFormDepth && len(stack) >= 1 {
 				if n, ok := contentPDFNameOf(stack[len(stack)-1]); ok {
 					if ov, ok := xobjs[n]; ok {
-						if frame, _, derr := contentPDFDecodeStream(d.ctx, d, ov.dict, ov.raw, d.maxRaw); derr == nil && len(frame) > 0 {
+						if *budget <= 0 {
+							// Budget exhausted: stop as a bounded prefix rather
+							// than silently dropping the rest of the page.
+							w.truncated = true
+						} else if frame, _, derr := contentPDFDecodeStream(d.ctx, d, ov.dict, ov.raw, d.maxRaw); derr == nil && len(frame) > 0 {
 							*budget--
 							subFonts := d.pageFonts(ov.dict["Resources"])
 							subXobjs := d.pageXObjects(ov.dict["Resources"])

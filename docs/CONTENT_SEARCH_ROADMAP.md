@@ -417,13 +417,16 @@ deferred.
     `docs/CONTENT_SEARCH_FORMATS_PLAN.md`.
 
 12. **WP12 (new, from production testing)** — the offline walk path matched
-    `rg -F -i` exactly on text corpora and 13/13 on in-cap OOXML, but real PDFs
-    exposed recall gaps: a valid in-cap xref-stream/ObjStm PDF is silently
-    `skipped`; simple-font ligatures drop their tail (`workflows`→`workfows`);
-    Type0/Identity-H without `/ToUnicode` drops whole pages with no per-result
-    signal; and skip accounting omits binary/empty files. See
-    `docs/CONTENT_SEARCH.md` §7 "Production-corpus findings". Two defects from
-    the same pass are already fixed (root walk error; HTML large-token loss).
+    `rg -F -i` exactly on text corpora and 13/13 on in-cap OOXML; a PDF recall
+    battery vs PyMuPDF over 45 real PDFs drove several fixes (**done**):
+    Form-XObject-only pages, ligature/multi-rune `/ToUnicode` and letter-name
+    `/Differences`, per-glyph placement spacing (now width-aware), the large-token
+    HTML loss, the swallowed root walk error, RTF surrogate pairs, and truncation
+    accounting. Mean PDF recall rose 0.933 → 0.980 (38/45 perfect).
+    **Remaining:** Type0/Identity-H with no `/ToUnicode` (needs the embedded font
+    program — 3 files, oracle text itself unreliable), rotated per-glyph runs that
+    restart with `Tm` mid-word (1 file), and the skip-accounting gap. See
+    `docs/CONTENT_SEARCH.md` §7 "Production-corpus findings".
 
 The originally proposed three items map to **WP2 (PDF)**, **WP3 (email)**, and
 **WP1e (journal-reset rebuild)**; the roadmap places WP0/WP1 ahead of them
