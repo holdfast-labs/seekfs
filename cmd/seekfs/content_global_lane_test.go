@@ -250,3 +250,58 @@ func TestContentGlobalLaneMultiVolumeSkipsUnusable(t *testing.T) {
 		t.Fatal("skipped volume not surfaced as partial")
 	}
 }
+
+// Broad-coverage differential over the existing 4,300-record corpus (two
+// volumes, many extensions/paths/names), across limits and sorts, to exercise
+// the lane beyond the tiny fixture before it could become the default route.
+func TestContentGlobalLaneLargeCorpusDifferential(t *testing.T) {
+	t.Setenv("SEEKFS_CONTENT_SEARCH", "1")
+	volC := newContentRecordVolume(t, "C:", contentBoundedDifferentialRecords("C:", 4_300, 1_000_000))
+	volF := newContentRecordVolume(t, "F:", contentBoundedDifferentialRecords("F:", 4_300, 2_000_000))
+	scopes := []struct {
+		name string
+		vols []*serviceVolumeIndex
+	}{
+		{"single", []*serviceVolumeIndex{volC}},
+		{"multi", []*serviceVolumeIndex{volC, volF}},
+	}
+	queries := []string{
+		"content:download ext:.go",
+		"content:download ext:.nrrd",
+		"content:pelican ext:.txt",
+		`content:"quick brown fox" ext:.md`,
+		"content:download ext:.go sort:size",
+		"content:download ext:.go sort:extension",
+		"content:download ext:.go sort:path",
+		"content:download ext:.go size:>100",
+	}
+	for _, scope := range scopes {
+		for _, q := range queries {
+			for _, limit := range []int{20, 5000} {
+				t.Run(fmt.Sprintf("%s/%s/limit=%d", scope.name, q, limit), func(t *testing.T) {
+					want, _ := contentGlobalLaneSearch(scope.vols, q, limit, false)
+					got, laneTrace := contentGlobalLaneSearch(scope.vols, q, limit, true)
+					if laneTrace.PlannerMode != "global-content-components" {
+						t.Fatalf("%q: lane did not engage (planner=%q)", q, laneTrace.PlannerMode)
+					}
+					if len(got) != len(want) {
+						t.Fatalf("%q: count diverged lane=%d content=%d", q, len(got), len(want))
+					}
+					for i := range want {
+						if got[i].Path != want[i].Path {
+							t.Fatalf("%q: element %d lane=%s content=%s", q, i, got[i].Path, want[i].Path)
+						}
+					}
+					wantCount, _ := contentGlobalLaneCount(scope.vols, q, false)
+					gotCount, countTrace := contentGlobalLaneCount(scope.vols, q, true)
+					if countTrace.PlannerMode != "global-content-components" {
+						t.Fatalf("%q: count lane did not engage", q)
+					}
+					if gotCount != wantCount {
+						t.Fatalf("%q: count lane=%d content=%d", q, gotCount, wantCount)
+					}
+				})
+			}
+		}
+	}
+}
