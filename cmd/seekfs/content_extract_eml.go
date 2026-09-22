@@ -82,21 +82,33 @@ func (contentEMLExtractor) Extract(ctx context.Context, r io.ReaderAt, size int6
 		return contentExtractResult{Skipped: true, Reason: "malformed message", Class: contentClassEmail}, nil
 	}
 
-	w := &contentEMLWalker{ctx: ctx, maxText: s.maxText}
-	w.appendHeaders(msg.Header)
-	if werr := w.processPart(textproto.MIMEHeader(msg.Header), msg.Body, 0); werr != nil {
+	text, wtrunc, werr := contentEMLMessageText(ctx, msg.Header, msg.Body, s.maxText)
+	if werr != nil {
 		return contentExtractResult{}, werr
 	}
-	truncated = truncated || w.truncated
-	if w.out.Len() == 0 {
+	truncated = truncated || wtrunc
+	if text == "" {
 		return contentExtractResult{Class: contentClassEmail, Truncated: truncated}, nil
 	}
-	text := truncateUTF8(w.out.String(), int(s.maxText))
+	text = truncateUTF8(text, int(s.maxText))
 	res = contentExtractResult{Text: []byte(text), Class: contentClassEmail, Truncated: truncated}
 	if truncated {
 		res.Reason = "indexed bounded prefix up to policy cap"
 	}
 	return res, nil
+}
+
+// contentEMLMessageText extracts one parsed message's searchable text: the
+// selected headers plus the decoded text/plain and text/html parts, skipping
+// attachments. It is the per-message core shared by the .eml/.emlx/.mht and
+// .mbox extractors. truncated reports that the walk stopped at maxText.
+func contentEMLMessageText(ctx context.Context, header mail.Header, body io.Reader, maxText int64) (text string, truncated bool, err error) {
+	w := &contentEMLWalker{ctx: ctx, maxText: maxText}
+	w.appendHeaders(header)
+	if err := w.processPart(textproto.MIMEHeader(header), body, 0); err != nil {
+		return "", w.truncated, err
+	}
+	return w.out.String(), w.truncated, nil
 }
 
 // contentEMLEMLXBody detects Apple's .emlx framing: a first line holding the

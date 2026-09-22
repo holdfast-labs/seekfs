@@ -26,6 +26,8 @@ const (
 	contentClassEmail  uint16 = 5
 	contentClassLegacy uint16 = 6
 	contentClassRTF    uint16 = 7
+	contentClassMbox   uint16 = 8
+	contentClassMSG    uint16 = 9
 )
 
 // Bounds. Extraction reads at most maxRaw; the extracted text is capped at

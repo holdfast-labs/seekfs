@@ -134,6 +134,23 @@ func TestContentIndexExtractorMismatch(t *testing.T) {
 	}
 }
 
+// Every registered extractor must declare a distinct class: invalidation
+// resolves a class to the first matching extractor, so two extractors sharing a
+// class would make a Version() bump on one re-extract the other's docs with the
+// other extractor's unchanged version, and the mismatch would never clear.
+func TestContentExtractorClassesAreDistinct(t *testing.T) {
+	seen := make(map[uint16]string, len(contentExtractors))
+	for _, e := range contentExtractors {
+		if prev, dup := seen[e.Class()]; dup {
+			t.Fatalf("class %d declared by both %q and %q", e.Class(), prev, e.Name())
+		}
+		seen[e.Class()] = e.Name()
+		if v, ok := contentExtractorVersionForClass(e.Class()); !ok || v != e.Version() {
+			t.Fatalf("class %d resolves to (%d,%v); want %q's version %d", e.Class(), v, ok, e.Name(), e.Version())
+		}
+	}
+}
+
 // A registered extractor's Version() bump must make a previously-built index
 // stale, and an unchanged version must not.
 func TestContentExtractorVersionBumpInvalidates(t *testing.T) {
