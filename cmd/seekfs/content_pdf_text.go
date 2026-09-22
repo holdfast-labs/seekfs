@@ -31,7 +31,7 @@ const (
 type contentPDFFont struct {
 	simple [256]rune
 	cid    bool
-	toUni  map[uint32]rune
+	toUni  map[uint32]string
 }
 
 // contentPDFTextWriter accumulates decoded text under maxText. Separators are
@@ -293,22 +293,32 @@ func contentPDFDecodeString(f *contentPDFFont, b []byte) string {
 	if f.cid {
 		for i := 0; i+1 < len(b); i += 2 {
 			code := uint32(b[i])<<8 | uint32(b[i+1])
-			if r, ok := f.toUni[code]; ok && r != 0 {
-				contentPDFAppendRune(&sb, r)
+			if s := f.toUni[code]; s != "" {
+				sb.WriteString(s)
 			}
 		}
 		return sb.String()
 	}
 	for _, c := range b {
-		if r, ok := f.toUni[uint32(c)]; ok {
-			if r != 0 {
-				contentPDFAppendRune(&sb, r)
-			}
+		if s, ok := f.toUni[uint32(c)]; ok {
+			sb.WriteString(s)
 			continue
 		}
 		if r := f.simple[c]; r != 0 {
 			contentPDFAppendRune(&sb, r)
 		}
+	}
+	return sb.String()
+}
+
+// contentPDFExpandRunes concatenates runes into a searchable string, expanding
+// Unicode ligature presentation forms to ASCII letters. A /ToUnicode destination
+// may be several runes (producers spell `ff`/`fi`/`fl`/`ffi`/`ffl` as their ASCII
+// letters); keeping them all is what makes the word searchable.
+func contentPDFExpandRunes(rs []rune) string {
+	var sb strings.Builder
+	for _, r := range rs {
+		contentPDFAppendRune(&sb, r)
 	}
 	return sb.String()
 }
@@ -457,8 +467,8 @@ func contentPDFCharmapTable(enc encoding.Encoding, fallback [256]rune) [256]rune
 
 // ----- ToUnicode CMaps -----
 
-func contentPDFParseCMap(data []byte) map[uint32]rune {
-	out := make(map[uint32]rune)
+func contentPDFParseCMap(data []byte) map[uint32]string {
+	out := make(map[uint32]string)
 	l := &contentPDFLexer{buf: data, budget: contentPDFMaxValues}
 	var operands []contentPDFValue
 	for {
@@ -492,7 +502,7 @@ func contentPDFParseCMap(data []byte) map[uint32]rune {
 	return out
 }
 
-func contentPDFCMapBFChar(out map[uint32]rune, ops []contentPDFValue) {
+func contentPDFCMapBFChar(out map[uint32]string, ops []contentPDFValue) {
 	for i := 0; i+1 < len(ops); i += 2 {
 		if len(out) >= contentPDFMaxCMapEntry {
 			return
@@ -502,12 +512,12 @@ func contentPDFCMapBFChar(out map[uint32]rune, ops []contentPDFValue) {
 			continue
 		}
 		if rs, ok := contentPDFUTF16Runes(ops[i+1]); ok && len(rs) > 0 {
-			out[src] = rs[0]
+			out[src] = contentPDFExpandRunes(rs)
 		}
 	}
 }
 
-func contentPDFCMapBFRange(out map[uint32]rune, ops []contentPDFValue) {
+func contentPDFCMapBFRange(out map[uint32]string, ops []contentPDFValue) {
 	for i := 0; i+2 < len(ops); i += 3 {
 		lo, ok1 := contentPDFHexCode(ops[i])
 		hi, ok2 := contentPDFHexCode(ops[i+1])
@@ -525,7 +535,7 @@ func contentPDFCMapBFRange(out map[uint32]rune, ops []contentPDFValue) {
 					break
 				}
 				if rs, ok := contentPDFUTF16Runes(e); ok && len(rs) > 0 {
-					out[code] = rs[0]
+					out[code] = contentPDFExpandRunes(rs)
 				}
 			}
 			continue
@@ -534,12 +544,26 @@ func contentPDFCMapBFRange(out map[uint32]rune, ops []contentPDFValue) {
 		if !ok || len(rs) == 0 {
 			continue
 		}
+		if len(rs) != 1 {
+			// A multi-rune destination cannot be incremented across the range;
+			// map every code to the same sequence rather than dropping it.
+			for code := lo; code <= hi; code++ {
+				if len(out) >= contentPDFMaxCMapEntry {
+					return
+				}
+				out[code] = contentPDFExpandRunes(rs)
+				if code == ^uint32(0) {
+					break
+				}
+			}
+			continue
+		}
 		base := rs[0]
 		for code := lo; code <= hi; code++ {
 			if len(out) >= contentPDFMaxCMapEntry {
 				return
 			}
-			out[code] = base + rune(code-lo)
+			out[code] = string(base + rune(code-lo))
 			if code == ^uint32(0) {
 				break
 			}
@@ -577,8 +601,18 @@ func contentPDFUTF16Runes(v contentPDFValue) ([]rune, bool) {
 // set covers the accented Latin letters and punctuation that show up in simple
 // fonts; an unknown name leaves the base-encoding entry untouched.
 func contentPDFGlyphRune(name string) (rune, bool) {
-	r, ok := contentPDFGlyphNames[name]
-	return r, ok
+	if r, ok := contentPDFGlyphNames[name]; ok {
+		return r, true
+	}
+	// Plain Latin letter names (A–Z, a–z) are common in /Differences but are not
+	// each listed above; the name is the letter.
+	if len(name) == 1 {
+		c := name[0]
+		if (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') {
+			return rune(c), true
+		}
+	}
+	return 0, false
 }
 
 var contentPDFGlyphNames = map[string]rune{

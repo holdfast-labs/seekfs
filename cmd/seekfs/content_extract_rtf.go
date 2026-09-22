@@ -19,6 +19,7 @@ import (
 	"context"
 	"io"
 	"strings"
+	"unicode/utf16"
 
 	"golang.org/x/text/encoding"
 	"golang.org/x/text/encoding/charmap"
@@ -65,6 +66,7 @@ func (contentRTFExtractor) Extract(ctx context.Context, r io.ReaderAt, size int6
 	cp := contentRTFDefaultCP
 	uc := 1
 	fallback := 0
+	pending := rune(0)
 	depth := 0
 	skipping := false
 	skipDepth := 0
@@ -134,8 +136,27 @@ func (contentRTFExtractor) Extract(ctx context.Context, r io.ReaderAt, size int6
 					if param < 0 {
 						r = rune(param + 0x10000)
 					}
-					if r > 0 && !skipping {
-						out.WriteRune(r)
+					if !skipping {
+						switch {
+						case r >= 0xD800 && r <= 0xDBFF:
+							// High surrogate: hold it for the low half, flushing
+							// any unpaired prior high surrogate.
+							if pending != 0 {
+								out.WriteRune(pending)
+							}
+							pending = r
+						case r >= 0xDC00 && r <= 0xDFFF && pending >= 0xD800 && pending <= 0xDBFF:
+							out.WriteRune(utf16.DecodeRune(pending, r))
+							pending = 0
+						default:
+							if pending != 0 {
+								out.WriteRune(pending)
+								pending = 0
+							}
+							if r > 0 {
+								out.WriteRune(r)
+							}
+						}
 						// Arm the fallback skip-count only for emitted text; the
 						// skipped region writes nothing, so it consumes nothing.
 						fallback = uc

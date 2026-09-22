@@ -428,6 +428,35 @@ func TestContentPDFLigatureExpanded(t *testing.T) {
 	contentPDFAssertContains(t, contentPDFTestExtract(t, contentPDFAssemble(objs, 1)), "workflows")
 }
 
+// A /ToUnicode destination may be several runes (a producer spelling the fi
+// ligature as the ASCII letters "fi"); all of them must be kept, not just the
+// first.
+func TestContentPDFToUnicodeMultiRune(t *testing.T) {
+	cmap := "/CIDInit /ProcSet findresource begin\n12 dict begin\nbegincmap\n1 beginbfchar\n<1C> <00660069>\nendbfchar\nendcmap\nend\n"
+	objs := [][]byte{
+		[]byte("<< /Type /Catalog /Pages 2 0 R >>"),
+		[]byte("<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+		[]byte("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>"),
+		[]byte("<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /ToUnicode 6 0 R >>"),
+		contentPDFStreamBytes([]byte("BT /F1 12 Tf (con) Tj <1C> Tj (gurations) Tj ET"), ""),
+		contentPDFStreamBytes([]byte(cmap), ""),
+	}
+	contentPDFAssertContains(t, contentPDFTestExtract(t, contentPDFAssemble(objs, 1)), "configurations")
+}
+
+// A /Differences array may name plain Latin letters; those names must map even
+// though the table does not list every letter.
+func TestContentPDFDifferencesLetterNames(t *testing.T) {
+	objs := [][]byte{
+		[]byte("<< /Type /Catalog /Pages 2 0 R >>"),
+		[]byte("<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+		[]byte("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>"),
+		[]byte("<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding << /Type /Encoding /Differences [65 /W /A /T /E /R] >> >>"),
+		contentPDFStreamBytes([]byte("BT /F1 12 Tf <4142434445> Tj ET"), ""),
+	}
+	contentPDFAssertContains(t, contentPDFTestExtract(t, contentPDFAssemble(objs, 1)), "WATER")
+}
+
 func TestContentPDFToUnicodeMapping(t *testing.T) {
 	cmap := "/CIDInit /ProcSet findresource begin\n12 dict begin\nbegincmap\n1 beginbfchar\n<90> <00E9>\nendbfchar\nendcmap\nend\n"
 	objs := [][]byte{
@@ -463,7 +492,7 @@ func TestContentPDFCMapEntryCapEnforced(t *testing.T) {
 	for i := 0; i < contentPDFMaxCMapEntry+over; i++ {
 		bfcharOps = append(bfcharOps, contentPDFCMapHexValue(uint32(i)), contentPDFCMapRuneValue('x'))
 	}
-	out := make(map[uint32]rune)
+	out := make(map[uint32]string)
 	contentPDFCMapBFChar(out, bfcharOps)
 	if len(out) > contentPDFMaxCMapEntry {
 		t.Fatalf("bfchar map = %d entries; cap %d", len(out), contentPDFMaxCMapEntry)
@@ -473,7 +502,7 @@ func TestContentPDFCMapEntryCapEnforced(t *testing.T) {
 	for i := range arr {
 		arr[i] = contentPDFCMapRuneValue('x')
 	}
-	out2 := make(map[uint32]rune)
+	out2 := make(map[uint32]string)
 	contentPDFCMapBFRange(out2, []contentPDFValue{
 		contentPDFCMapHexValue(0),
 		contentPDFCMapHexValue(0xFFFFFFFF),

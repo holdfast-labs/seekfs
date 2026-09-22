@@ -170,11 +170,13 @@ func buildContentIndexFromDir(ctx context.Context, root string, opts contentBuil
 			skipped++
 			return nil
 		}
-		if len(res.Text) == 0 {
-			return nil
-		}
+		// Count a bounded result even when it produced no text (e.g. a depth-cap
+		// hit), so the policy counters reflect every file the extractor handled.
 		if res.Truncated {
 			truncated++
+		}
+		if len(res.Text) == 0 {
+			return nil
 		}
 		rel, rerr := filepath.Rel(root, path)
 		if rerr != nil {
@@ -349,11 +351,11 @@ func buildContentIndexForIndex(ctx context.Context, idx *Index, opts contentBuil
 			continue
 		}
 		doc, res, ok := contentBuildDocSafe(ctx, contentBuildItem{frn: rec.FRN, path: path})
+		if res.Truncated {
+			truncated++
+		}
 		if ok {
 			docs = append(docs, doc)
-			if res.Truncated {
-				truncated++
-			}
 			continue
 		}
 		if res.Skipped {

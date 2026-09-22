@@ -80,6 +80,18 @@ func TestContentRTFUnicodeAndCodepage(t *testing.T) {
 // A \uN inside a skipped destination must not arm a fallback count: the
 // skipped region writes nothing, so the next characters of real text are not
 // consumed as phantom fallback (regression: body text came out as "eal").
+// A non-BMP \u escape arrives as a UTF-16 surrogate pair; the two halves must
+// reassemble to the astral rune, not two U+FFFD (Word emits emoji this way).
+func TestContentRTFUnicodeSurrogatePair(t *testing.T) {
+	text := string(contentRTFExtract(t, []byte(`{\rtf1\ansi\uc1\u-10179?\u-8704? EMOJIEND}`)).Text)
+	if !strings.Contains(text, "\U0001F600") {
+		t.Fatalf("surrogate pair not reassembled: %q", text)
+	}
+	if !strings.Contains(text, "EMOJIEND") {
+		t.Fatalf("text after surrogate pair lost: %q", text)
+	}
+}
+
 func TestContentRTFUnicodeInSkippedDestination(t *testing.T) {
 	for _, raw := range []string{
 		`{\rtf1\ansi{\info \u233}realneedle}`,
