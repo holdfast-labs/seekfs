@@ -192,7 +192,7 @@ func TestContentAttachExtractorIdentityRefresh(t *testing.T) {
 		}
 		s := contentTestService(t)
 		s.attachContentForVolume(vol)
-	releaseVolumeContentOnCleanup(t, vol)
+		releaseVolumeContentOnCleanup(t, vol)
 		return vol
 	}
 

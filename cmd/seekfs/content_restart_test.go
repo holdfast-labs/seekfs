@@ -213,7 +213,7 @@ func TestContentAttachCheckpointBranches(t *testing.T) {
 		s := &goSearchService{stop: make(chan struct{})}
 		t.Cleanup(func() { close(s.stop) })
 		s.attachContentForVolume(vol)
-	releaseVolumeContentOnCleanup(t, vol)
+		releaseVolumeContentOnCleanup(t, vol)
 		return s
 	}
 
@@ -391,7 +391,7 @@ func TestContentAttachRacesJournalReset(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		s.attachContentForVolume(vol)
-	releaseVolumeContentOnCleanup(t, vol)
+		releaseVolumeContentOnCleanup(t, vol)
 		close(done)
 	}()
 	replaceServiceVolumeContents(vol, newServiceVolumeIndex(dbPath, reset))
@@ -448,7 +448,7 @@ func TestContentCatchUpCapsDegrade(t *testing.T) {
 		s := &goSearchService{stop: make(chan struct{})}
 		defer close(s.stop)
 		s.attachContentForVolume(vol)
-	releaseVolumeContentOnCleanup(t, vol)
+		releaseVolumeContentOnCleanup(t, vol)
 		if !vol.content.healthIncomplete() {
 			t.Fatal("hitting the record cap must mark the volume incomplete")
 		}
@@ -469,7 +469,7 @@ func TestContentCatchUpCapsDegrade(t *testing.T) {
 		s := &goSearchService{stop: make(chan struct{})}
 		defer close(s.stop)
 		s.attachContentForVolume(vol)
-	releaseVolumeContentOnCleanup(t, vol)
+		releaseVolumeContentOnCleanup(t, vol)
 		if !vol.content.healthIncomplete() {
 			t.Fatal("hitting the byte cap must mark the volume incomplete")
 		}
