@@ -483,6 +483,31 @@ func TestContentPDFPerGlyphPlacementNotSpaced(t *testing.T) {
 	}
 }
 
+// A form that draws itself many times per execution must be bounded by the
+// shared invocation budget, not fan out exponentially with depth.
+func TestContentPDFFormFanoutBounded(t *testing.T) {
+	var body strings.Builder
+	for i := 0; i < 200; i++ {
+		body.WriteString("/FmSelf Do ")
+	}
+	self := contentPDFStreamBytes([]byte(body.String()),
+		"/Type /XObject /Subtype /Form /BBox [0 0 10 10] /Resources << /XObject << /FmSelf 4 0 R >> >>")
+	objs := [][]byte{
+		[]byte("<< /Type /Catalog /Pages 2 0 R >>"),
+		[]byte("<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+		[]byte("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /XObject << /FmSelf 4 0 R >> >> /Contents 5 0 R >>"),
+		self,
+		contentPDFStreamBytes([]byte("/FmSelf Do"), ""),
+	}
+	done := make(chan contentExtractResult, 1)
+	go func() { done <- contentPDFTestExtract(t, contentPDFAssemble(objs, 1)) }()
+	select {
+	case <-done:
+	case <-time.After(15 * time.Second):
+		t.Fatal("form fan-out did not terminate within the invocation budget")
+	}
+}
+
 func TestContentPDFToUnicodeMapping(t *testing.T) {
 	cmap := "/CIDInit /ProcSet findresource begin\n12 dict begin\nbegincmap\n1 beginbfchar\n<90> <00E9>\nendbfchar\nendcmap\nend\n"
 	objs := [][]byte{

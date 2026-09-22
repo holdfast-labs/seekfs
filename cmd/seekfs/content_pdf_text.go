@@ -2,9 +2,9 @@ package main
 
 // Content-stream text extraction: a bounded tokenizer that runs the page's
 // content, tracks text positioning, and maps the bytes of Tj/TJ/'/" operands to
-// Unicode through the active font. Word separation is heuristic (a positioning
-// move or a strong TJ adjustment emits a space or newline) because glyph widths
-// are not read.
+// Unicode through the active font. Word separation compares each positioning
+// move against the shown glyphs' advance (from /Widths //W), so a per-glyph
+// placement run is not letter-spaced while a real word gap still separates.
 //
 // Font decoding: /ToUnicode CMaps (bfchar/bfrange) win when present; simple
 // fonts otherwise fall back to WinAnsi/MacRoman/Standard encoding tables plus
@@ -12,6 +12,7 @@ package main
 // (documented non-goal), so no CJK CID text is fabricated.
 
 import (
+	"sort"
 	"strings"
 	"unicode/utf16"
 
@@ -21,12 +22,17 @@ import (
 
 const (
 	contentPDFWordGap       = 120.0
-	contentPDFSpaceSlack    = 0.22
+	contentPDFSpaceSlack    = 0.1
 	contentPDFMaxCMapOps    = 1 << 16
 	contentPDFMaxCMapEntry  = 1 << 16
 	contentPDFMaxContentOps = 1 << 22
 	contentPDFMaxFormDepth  = 8
 	contentPDFMaxXObjects   = 256
+	// contentPDFMaxXObjectInvocations bounds the TOTAL number of Form XObject
+	// executions per page. Depth alone does not bound fan-out: a form whose
+	// stream issues K `Do` ops that all resolve back to itself costs ~K^depth,
+	// so a shared budget (not a per-dict count) is the real bound.
+	contentPDFMaxXObjectInvocations = 1 << 16
 )
 
 type contentPDFFont struct {
@@ -115,6 +121,7 @@ func (w *contentPDFTextWriter) appendBytes(b []byte) {
 func (d *contentPDFDoc) extractPageText(pg contentPDFPage, w *contentPDFTextWriter) error {
 	fonts := d.pageFonts(pg.resources)
 	xobjs := d.pageXObjects(pg.resources)
+	budget := contentPDFMaxXObjectInvocations
 	for _, cv := range pg.contents {
 		if w.done() {
 			return nil
@@ -130,7 +137,7 @@ func (d *contentPDFDoc) extractPageText(pg contentPDFPage, w *contentPDFTextWrit
 		if err != nil || len(data) == 0 {
 			continue
 		}
-		d.contentStreamText(data, fonts, xobjs, w, 0)
+		d.contentStreamText(data, fonts, xobjs, w, 0, &budget)
 	}
 	return nil
 }
@@ -147,18 +154,23 @@ func (d *contentPDFDoc) pageXObjects(resources contentPDFValue) map[string]conte
 	if xv.kind != contentPDFDict {
 		return out
 	}
-	for name, ref := range xv.dict {
+	names := make([]string, 0, len(xv.dict))
+	for name := range xv.dict {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
 		if len(out) >= contentPDFMaxXObjects {
 			break
 		}
-		if ov := d.resolve(ref); ov.kind == contentPDFStream {
+		if ov := d.resolve(xv.dict[name]); ov.kind == contentPDFStream {
 			out[name] = ov
 		}
 	}
 	return out
 }
 
-func (d *contentPDFDoc) contentStreamText(data []byte, fonts map[string]*contentPDFFont, xobjs map[string]contentPDFValue, w *contentPDFTextWriter, depth int) {
+func (d *contentPDFDoc) contentStreamText(data []byte, fonts map[string]*contentPDFFont, xobjs map[string]contentPDFValue, w *contentPDFTextWriter, depth int, budget *int) {
 	l := &contentPDFLexer{buf: data, budget: contentPDFMaxValues}
 	var stack []contentPDFValue
 	var font *contentPDFFont
@@ -172,6 +184,11 @@ func (d *contentPDFDoc) contentStreamText(data []byte, fonts map[string]*content
 		}
 		ops++
 		if ops > contentPDFMaxContentOps {
+			return
+		}
+		// A context-ignoring Form tree cannot wedge the (serial) extraction: the
+		// per-call op bound plus this deadline check let the goroutine stop.
+		if ops&0x3FF == 0 && d.ctx.Err() != nil {
 			return
 		}
 		op, val, isOp, ok := l.nextContent()
@@ -239,15 +256,16 @@ func (d *contentPDFDoc) contentStreamText(data []byte, fonts map[string]*content
 			}
 		case "Do":
 			// A Form XObject draws text through its own resources; recurse,
-			// bounded by depth and the writer's text cap. Image XObjects are
-			// skipped (no OCR).
-			if depth < contentPDFMaxFormDepth && len(stack) >= 1 {
+			// bounded by depth, a shared invocation budget, and the writer's
+			// text cap. Image XObjects are skipped (no OCR).
+			if depth < contentPDFMaxFormDepth && *budget > 0 && len(stack) >= 1 {
 				if n, ok := contentPDFNameOf(stack[len(stack)-1]); ok {
 					if ov, ok := xobjs[n]; ok {
 						if frame, _, derr := contentPDFDecodeStream(d.ctx, d, ov.dict, ov.raw, d.maxRaw); derr == nil && len(frame) > 0 {
+							*budget--
 							subFonts := d.pageFonts(ov.dict["Resources"])
 							subXobjs := d.pageXObjects(ov.dict["Resources"])
-							d.contentStreamText(frame, subFonts, subXobjs, w, depth+1)
+							d.contentStreamText(frame, subFonts, subXobjs, w, depth+1, budget)
 						}
 					}
 				}
@@ -448,21 +466,23 @@ func (d *contentPDFDoc) buildFont(v contentPDFValue) *contentPDFFont {
 // into a code->width map (1/1000 text-space units). The /W forms are
 // `c [w1 w2 ...]` and `cFirst cLast w`.
 func (d *contentPDFDoc) contentPDFCIDWidths(font map[string]contentPDFValue) (map[uint32]int32, int32) {
-	out := map[uint32]int32{}
-	dw := int32(1000)
 	df := d.resolve(font["DescendantFonts"])
 	if df.kind != contentPDFArray || len(df.arr) == 0 {
-		return out, dw
+		return nil, 1000
 	}
 	dfont := d.resolve(df.arr[0])
 	if dfont.kind != contentPDFDict {
-		return out, dw
+		return nil, 1000
 	}
-	dw = int32(contentPDFDictInt(dfont.dict, "DW", 1000))
+	dw := int32(contentPDFDictInt(dfont.dict, "DW", 1000))
 	wv := d.resolve(dfont.dict["W"])
 	if wv.kind != contentPDFArray {
-		return out, dw
+		// No /W: the true advance is unknown. Return nil so the caller treats the
+		// width as 0 (conservative) rather than assuming a full em per glyph,
+		// which would overstate the advance and swallow real word gaps.
+		return nil, dw
 	}
+	out := map[uint32]int32{}
 	arr := wv.arr
 	for i := 0; i+1 < len(arr) && len(out) < contentPDFMaxCMapEntry; {
 		c, ok := contentPDFIntOf(arr[i])
@@ -472,6 +492,9 @@ func (d *contentPDFDoc) contentPDFCIDWidths(font map[string]contentPDFValue) (ma
 		i++
 		if arr[i].kind == contentPDFArray {
 			for k, e := range arr[i].arr {
+				if len(out) >= contentPDFMaxCMapEntry {
+					break
+				}
 				out[uint32(c)+uint32(k)] = int32(contentPDFNumOf(e))
 			}
 			i++
@@ -485,6 +508,9 @@ func (d *contentPDFDoc) contentPDFCIDWidths(font map[string]contentPDFValue) (ma
 		w := int32(contentPDFNumOf(arr[i]))
 		i++
 		for code := c; code <= last && code-c < contentPDFMaxCMapEntry; code++ {
+			if len(out) >= contentPDFMaxCMapEntry {
+				break
+			}
 			out[uint32(code)] = w
 		}
 	}
@@ -497,6 +523,9 @@ func (f *contentPDFFont) contentPDFGlyphWidth(code uint32) float64 {
 		return 0
 	}
 	if f.cid {
+		if f.cidW == nil {
+			return 0
+		}
 		if w, ok := f.cidW[code]; ok {
 			return float64(w)
 		}
@@ -678,11 +707,13 @@ func contentPDFCMapBFRange(out map[uint32]string, ops []contentPDFValue) {
 		if len(rs) != 1 {
 			// A multi-rune destination cannot be incremented across the range;
 			// map every code to the same sequence rather than dropping it.
+			// Expand once — the string is shared by every entry.
+			expanded := contentPDFExpandRunes(rs)
 			for code := lo; code <= hi; code++ {
 				if len(out) >= contentPDFMaxCMapEntry {
 					return
 				}
-				out[code] = contentPDFExpandRunes(rs)
+				out[code] = expanded
 				if code == ^uint32(0) {
 					break
 				}
