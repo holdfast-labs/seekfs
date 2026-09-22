@@ -496,8 +496,10 @@ Residual / known limitations (all explicit deferrals):
 - **`contentResolvePath` (fixed, P6-6).** Covered end-to-end by
   `TestContentResolvePathParentChain` against a compact index with a real parent
   chain, including the low-memory FRN-column fallback and an overlay rename.
-- **PDF extraction** remains a best-effort spike (no xref/object streams, Flate
-  only).
+- **PDF extraction** is a bounded text-layer parser (classic + xref-stream +
+  ObjStm, Flate(+predictors)/LZW/ASCII85/ASCIIHex/RunLength, `/ToUnicode` +
+  `/Differences`). Limits: no OCR; encrypted → `Skipped`; Type0/CID without a
+  `/ToUnicode` CMap is dropped; a multi-rune ligature maps to its first rune.
 - **Dead code.** `contentPostingIndex.lookup`/`forEach` and
   `contentLossyFixups.toSourceOffset`/`isEmpty` are test-only (annotated).
 
@@ -520,8 +522,20 @@ Residual / known limitations (all explicit deferrals):
   `Path` (the delta is not re-extracted for a rename). Content search resolves
   paths through the record index/resolver, so matching is unaffected — this is a
   stale stored-path/ordering field, not a match gap.
-- PDF extraction is a best-effort spike (no xref/object streams, Flate only,
-  simple fonts only); quality is a P4 decision.
+- PDF extraction is a bounded text-layer parser (xref tables + streams, ObjStm,
+  Flate/LZW/ASCII85/ASCIIHex/RunLength, ToUnicode/Differences); text-layer only,
+  no OCR, encrypted → `Skipped`.
+- **PDF `readStreamBytes` without `/Length`.** When a stream's `/Length` is
+  absent or untrusted, the payload is delimited by scanning for `endstream`, so a
+  document that omits `/Length` on many objects costs O(objects × maxRaw) rather
+  than O(maxRaw); it is bounded only by the per-document deadline (the residual
+  abandoned-goroutine case noted in M2).
+- **PDF `/Encrypt` detection can be evaded by a later `/Prev` section that fails
+  to parse.** The loader merges trailer keys first-wins as it walks `/Prev`; if a
+  newer section parses without `/Encrypt` and an older section (which held it)
+  then fails to parse, the walk stops and the document is treated as unencrypted.
+  The reason degrades to "no extractable text" rather than "encrypted" — not a
+  content leak, because the objects stay encrypted and decode to nothing.
 - **Moved-class invalidation.** Extractor invalidation keys on the stored
   `(ContentType class, ExtractorVersion)`. A base built while an extension was
   text-indexed (class Text, e.g. `.html` before the HTML extractor) is neither
@@ -560,8 +574,11 @@ Residual / known limitations (all explicit deferrals):
 
 Each item below is intentionally out of scope for P5; the rationale is one line.
 
-- **PDF extraction quality** (xref/object streams, CID/Type0 fonts): the
-  extractor is a best-effort spike; a real PDF engine is its own project.
+- **PDF extraction quality**: DONE in WP11 — a bounded text-layer parser
+  (xref tables/streams, ObjStm, Flate/LZW/ASCII85/ASCIIHex/RunLength,
+  ToUnicode/Differences). Remaining limits: no OCR, no decryption, Type0/CID
+  without ToUnicode dropped, ligature→first rune, and no object-scan fallback
+  when `startxref` is missing (malformed → `Skipped`).
 - **Posting-decode streaming in `contentCandidates`**: DONE in M6 — the posting
   codec's `postings`/`forEach` page the 1024-doc blocks and `content_read.go`'s
   `intersectDocIDStreams` merge-intersects lazy per-trigram streams, so a broad
