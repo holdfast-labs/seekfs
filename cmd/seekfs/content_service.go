@@ -532,9 +532,9 @@ func aggregateContentHealth(healths []contentHealth) contentHealth {
 //
 //   - State is the most severe state: ready/off < unavailable < indexing <
 //     degraded < stale (contentStateSeverity).
-//   - Docs, DeltaBytes, QueueDepth, Evictions, ExtractionErrors, Skipped,
-//     Truncated, SidecarBytes and SidecarCap are summed; BuildDone/BuildTotal
-//     sum only while indexing.
+//   - Docs, DeltaBytes, Deferred, QueueDepth, Evictions, ExtractionErrors,
+//     Skipped, Truncated, SidecarBytes and SidecarCap are summed;
+//     BuildDone/BuildTotal sum only while indexing.
 //   - Partial, Incomplete and CountDivergent are OR-ed.
 //   - ExtractorRefresh is OR-ed and StaleExtractorDocs summed, so a targeted
 //     extractor-version refresh in progress on any volume is visible.

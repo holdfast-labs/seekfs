@@ -1,12 +1,12 @@
 package main
 
 // WP7: the compound content lane. A query that ANDs a positive content leaf
-// with a selective filename selector (ext:/under:/dir:/name:) is answered by
-// driving the filename candidate iterator and verifying each candidate's
-// content inline, instead of materializing the content candidate superset. The
-// two sides are both requirements, so the lane returns exactly the set the
-// per-volume content path does; it is a cost optimization, not a semantic
-// change.
+// with a selective filename selector (ext: or a component root such as dir:) is
+// answered by driving the filename candidate iterator and verifying each
+// candidate's content inline, instead of materializing the content candidate
+// superset. The two sides are both requirements, so the lane returns exactly the
+// set the per-volume content path does; it is a cost optimization, not a
+// semantic change.
 //
 // contentCandidatesBounded already maps matching content docIDs to local record
 // IDs, so the content set is in globalRecordID space; the lane instead drives
@@ -18,13 +18,85 @@ package main
 // never blocks the answer. If no volume is usable the lane declines and the
 // content path refuses. Off by default behind SEEKFS_CONTENT_GLOBAL_LANE so it
 // is validated against the content path before becoming the default route.
-// Overlays/hidden, relevance order, under:/exists:, biased order, and boolean
-// content groups still decline to the content path.
+// Declines to the content path: overlays/hidden, relevance order, `under:`/
+// `exists:` (the M9 search-stats/count-does-not split), biased order, boolean
+// content groups, and any shape whose filename part is not a supported root.
 
-import "os"
+import (
+	"cmp"
+	"os"
+	"slices"
+)
 
 func contentGlobalLaneEnabled() bool {
 	return os.Getenv("SEEKFS_CONTENT_GLOBAL_LANE") == "1"
+}
+
+// collectContentLaneEntries verifies every candidate against the volume's
+// content and orders the result exactly like the per-volume content path
+// (content_verify.go:1042-1056): each volume's matches keep their rankForQuery
+// order with record-id ties (the stable sort preserves the iterator's local-id
+// order), and only when the merged set spans volumes is the shared
+// multi-volume comparator applied. collectGlobalVerifiedTopN cannot be reused
+// here because its heap compares by a different global rule than its final
+// sort, which drops or misorders tied basenames at a limit.
+func collectContentLaneEntries(it globalIDIterator, volumes []*serviceVolumeIndex, pq parsedQuery, matcher *contentLeafMatcher) ([]Entry, int, error) {
+	perVol := make([][]globalRankedEntry, len(volumes))
+	rankers := make([]func(int) int, len(volumes))
+	for i, vol := range volumes {
+		if vol != nil && vol.index != nil {
+			rankers[i] = candidateRanker(vol.index, vol.rankForQuery(pq))
+		}
+	}
+	pathCaches := make([]map[int]string, len(volumes))
+	verified := 0
+	for {
+		id, ok := it.Next()
+		if !ok {
+			break
+		}
+		if verified&1023 == 0 && queryCanceled(pq) {
+			return nil, verified, errQueryCanceled
+		}
+		if id.volume < 0 || id.volume >= len(volumes) {
+			continue
+		}
+		vol := volumes[id.volume]
+		if vol == nil || vol.index == nil || id.local < 0 || id.local >= vol.index.compactRecordCount() {
+			continue
+		}
+		if pathCaches[id.volume] == nil {
+			pathCaches[id.volume] = make(map[int]string)
+		}
+		volumePQ := pq
+		dropSatisfiedVolumeTerms(&volumePQ, vol.index.Volume)
+		entry, ok := compactCandidateEntryIfMatchIn(vol, vol.index, volumePQ, id.local, pathCaches[id.volume], true, false, matcher)
+		verified++
+		if !ok {
+			continue
+		}
+		rank := int(^uint(0) >> 1)
+		if rankers[id.volume] != nil {
+			rank = rankers[id.volume](id.local)
+		}
+		perVol[id.volume] = append(perVol[id.volume], globalRankedEntry{entry: entry, rank: rank, volume: id.volume, tie: entry.Path})
+	}
+	var ranked []globalRankedEntry
+	for _, bucket := range perVol {
+		if len(bucket) == 0 {
+			continue
+		}
+		slices.SortStableFunc(bucket, func(a, b globalRankedEntry) int { return cmp.Compare(a.rank, b.rank) })
+		ranked = append(ranked, bucket...)
+	}
+	if globalRankedEntriesSpanMultipleVolumes(ranked) {
+		sortGlobalRankedEntries(ranked, pq)
+	}
+	out := make([]Entry, len(ranked))
+	for i, r := range ranked {
+		out[i] = r.entry
+	}
+	return out, verified, nil
 }
 
 // contentLeavesUnderBooleanGroups reports whether any content leaf sits inside an
@@ -155,7 +227,7 @@ func searchServiceVolumesGlobalContentComponentsSnapshot(snapshot globalQuerySna
 	// scope declined them), so no snapshots are needed.
 	matcher := newContentLeafMatcher(pq)
 	limit := normalizedLimit(opts.Limit, false)
-	base, verified, err := collectGlobalVerifiedTopN(it, usable, nil, pq, limit, matcher)
+	base, verified, err := collectContentLaneEntries(it, usable, pq, matcher)
 	if err != nil {
 		return nil, true, err
 	}
@@ -166,8 +238,10 @@ func searchServiceVolumesGlobalContentComponentsSnapshot(snapshot globalQuerySna
 		opts.Trace.setSource("global:content-components", len(base))
 		opts.Trace.setComplete(opts.Trace == nil || !opts.Trace.ContentPartial)
 	}
-	results := globalRankedEntriesToEntries(mergeGlobalOverlayEntries(usable, nil, base, pq, limit))
-	return results, true, nil
+	if limit > 0 && len(base) > limit {
+		base = base[:limit]
+	}
+	return base, true, nil
 }
 
 // countServiceVolumesGlobalContentComponentsSnapshot is the count twin of the

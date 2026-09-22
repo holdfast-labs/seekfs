@@ -12,13 +12,17 @@ and the configurable per-file size cap (see §6f); PF-5c (WP10/M7) landed the
 `.gsx` size cap and the bounded fold (see §6g); PF-6a/PF-7b landed the
 case-preserving text store and the filename-only fallback for a content-unusable
 volume. PB8 landed bounded content-candidate materialization, the rank-ordered
-bounded scan fallback, and the biased/overlay early-stop fix (see §6h). HTML
-`<meta charset>` detection landed via `golang.org/x/net/html/charset`, and the
-HTML/refresh residuals it exposed are recorded in §7. The only
-parity work not taken is the optional PB8 items 4–7 (global-lane integration for
-compound content + selective-filename queries, §6h), plus the documented §7
-residuals. `.gsx` is format **v4**. P4 document-extraction quality remains
-deferred (see §7). Content search is off by default; with
+bounded scan fallback, and the biased/overlay early-stop fix (see §6h). WP11
+landed the HTML/EML/mbox/RTF/MSG/PDF extractors (with per-parser fuzz targets),
+and WP8 landed the M1 replay-bounded delta, M9 count/remote health, and the M1
+delta observability. The optional PB8 items 4–7 (global-lane integration) is now
+**partly landed**: a compound content + selective-filename lane
+(`cmd/seekfs/content_global_lane.go`) drives the filename iterator and verifies
+content inline, single and multi volume, but is **off by default** behind
+`SEEKFS_CONTENT_GLOBAL_LANE` and still declines overlays/hidden, `under:`/
+`exists:`, relevance, and biased order (see the WP7 section of the roadmap). The
+documented §7 residuals remain. `.gsx` is format **v4**. P4 document-extraction
+quality remains deferred (see §7). Content search is off by default; with
 `SEEKFS_CONTENT_SEARCH=1`, `content:` queries work through the service once the
 service-owned build has attached an FRN-keyed `.gsx`.
 

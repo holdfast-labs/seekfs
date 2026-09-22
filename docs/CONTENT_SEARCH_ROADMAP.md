@@ -195,8 +195,9 @@ integrate content into the global lane chain and count lanes, the
 parity, and ordering — the content id space is per-volume FRN/docID, not global,
 and that join is the hard part. Add **M8** explicitly: a volume without content
 must not block a query filename search can answer. This package also owns the
-A-row planner items — the remote degraded detail (the sanitizer omits `Content`,
-so remote callers see only `Complete=false`) and the biased-search budget
+A-row planner items — the remote degraded detail (landed in M9: the coarse
+`content` health block now reaches remote callers, replacing the old
+`Complete=false`-only signal) and the biased-search budget
 (`RootBias`/`CWDIBias` disables early-stop and scans to budget before the limit).
 Streaming postings (M6) and optional mmap of `.gsx` are the easy tails.
 - **Effort:** L–XL (15–30 d).
@@ -204,7 +205,7 @@ Streaming postings (M6) and optional mmap of `.gsx` are the easy tails.
   unusable content volume still returns that volume's filename matches; count ==
   search for non-stat shapes; the degraded flag reaches remote callers.
 - **Risks:** overlaps WP1d (build) and the engine R1/R5 work (mmap).
-- **Status / design (phases 0–3 landed).** The join is easier than first feared:
+- **Status / design (phases 0–4a landed).** The join is easier than first feared:
   `serviceVolumeIndex.contentCandidatesBounded` already maps each matching
   content docID to a **local record ID** via the resolver, so the per-volume
   content candidate set is *already in the global `globalRecordID.local` space* —
@@ -229,11 +230,18 @@ Streaming postings (M6) and optional mmap of `.gsx` are the easy tails.
   - **Phase 3**: multi-volume — the lane drives only the content-usable volumes
     (M8) and surfaces unusable ones degraded (`partial`), matching the content
     path; declines the biased-order (`RootBias`/`CWDBias`) shapes.
+  - **Phase 4a**: broad-corpus differential (4,300×2 records) and the ordering
+    fix it prompted — the lane orders results exactly like the content path
+    (per-volume rank with record-id ties, the shared comparator only when the
+    verified set spans volumes), so tied basenames are neither dropped nor
+    misordered at a limit.
   Each phase is reviewed and differential-tested against the per-volume content
   path (single and multi volume).
-  **Remaining:** (4) handle overlays/hidden and `under:`/`exists:` lane-natively
-  instead of declining; (5) the biased-early-stop budget; (6) flip the default
-  (drop `SEEKFS_CONTENT_GLOBAL_LANE`) once coverage is complete.
+  **Remaining:** (4b) handle overlays/hidden lane-natively instead of declining;
+  (4c) `under:`/`exists:` lane-natively plus differential coverage of the
+  remaining component roots (regex/attrib/parent); (5) the biased-early-stop
+  budget; (6) flip the default (drop `SEEKFS_CONTENT_GLOBAL_LANE`) once coverage
+  is complete.
 
 ### WP8 — Resource hardening (M1, M2, M5, M9, M10)
 - **Method:** bounded delta + eviction between folds (M1), per-document

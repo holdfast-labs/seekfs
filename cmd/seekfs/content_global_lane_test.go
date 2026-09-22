@@ -222,6 +222,53 @@ func TestContentGlobalLaneDeclinesWhenContentIncomplete(t *testing.T) {
 	}
 }
 
+// WP7 ordering blocker: tied basenames within a volume order by record id in
+// the single-volume case, while the shared comparator only applies when the
+// merged set spans volumes. The lane must match the content path for both — a
+// multi-volume scope whose matches all fall in one volume keeps record-id order,
+// so a path tie-break (the naive rank sort) would drop/misorder the top entry at
+// a limit.
+func TestContentGlobalLaneOrderingTiesMatchContentPath(t *testing.T) {
+	t.Setenv("SEEKFS_CONTENT_SEARCH", "1")
+	// dup.go appears in two directories; other.go is a third match.
+	volC := newContentRecordVolume(t, "C:", []contentVolRecord{
+		{frn: 1000, parent: -1, parentFRN: 1, name: "dup.go", path: `C:\zdir\dup.go`, content: "needle alpha"},
+		{frn: 1001, parent: -1, parentFRN: 1, name: "dup.go", path: `C:\adir\dup.go`, content: "needle beta"},
+		{frn: 1002, parent: -1, parentFRN: 1, name: "other.go", path: `C:\mdir\other.go`, content: "needle gamma"},
+	})
+	// F: is usable but contributes no content match, so the verified set is
+	// single-volume even though the lane scope is multi-volume.
+	volF := newContentRecordVolume(t, "F:", []contentVolRecord{
+		{frn: 2000, parent: -1, parentFRN: 1, name: "nomatch.go", path: `F:\x\nomatch.go`, content: "unrelated"},
+	})
+	scopes := []struct {
+		name string
+		vols []*serviceVolumeIndex
+	}{
+		{"single", []*serviceVolumeIndex{volC}},
+		{"multi-one-volume-matches", []*serviceVolumeIndex{volC, volF}},
+	}
+	for _, scope := range scopes {
+		for _, limit := range []int{1, 2, 3} {
+			t.Run(fmt.Sprintf("%s/limit=%d", scope.name, limit), func(t *testing.T) {
+				want, _ := contentGlobalLaneSearch(scope.vols, "content:needle ext:.go", limit, false)
+				got, laneTrace := contentGlobalLaneSearch(scope.vols, "content:needle ext:.go", limit, true)
+				if laneTrace.PlannerMode != "global-content-components" {
+					t.Fatalf("lane did not engage (planner=%q)", laneTrace.PlannerMode)
+				}
+				if len(got) != len(want) {
+					t.Fatalf("count diverged lane=%d content=%d", len(got), len(want))
+				}
+				for i := range want {
+					if got[i].Path != want[i].Path {
+						t.Fatalf("element %d lane=%s content=%s", i, got[i].Path, want[i].Path)
+					}
+				}
+			})
+		}
+	}
+}
+
 // M8: a volume without usable content must not block a content query. The lane
 // answers from the usable volume, matching the content path, and surfaces the
 // skipped volume as partial.
