@@ -240,8 +240,12 @@ Streaming postings (M6) and optional mmap of `.gsx` are the easy tails.
   **Remaining:** (4b) handle overlays/hidden lane-natively instead of declining;
   (4c) `under:`/`exists:` lane-natively plus differential coverage of the
   remaining component roots (regex/attrib/parent); (5) the biased-early-stop
-  budget; (6) flip the default (drop `SEEKFS_CONTENT_GLOBAL_LANE`) once coverage
-  is complete.
+  budget and the multi-volume lane (single-volume is provably parity, but the
+  content path's per-volume pre-truncation before the shared comparator is not
+  mirrorable, so multi-volume declines); (6) reconcile the lane's `Complete`/
+  `ContentIncomplete` signal with the content path's conservative window probe
+  (the lane's set is exact, so it reports complete where the content path marks
+  incomplete), then flip the default (drop `SEEKFS_CONTENT_GLOBAL_LANE`).
 
 ### WP8 — Resource hardening (M1, M2, M5, M9, M10)
 - **Method:** bounded delta + eviction between folds (M1), per-document

@@ -13,14 +13,25 @@ package main
 // the filename side and filters by content. A bare `ext:` selector is the
 // ext-only source, anything else with a root is the component source.
 //
-// Multi-volume (M8): only content-usable volumes are driven; an unusable volume
-// is skipped and the query surfaced degraded, so a volume without usable content
-// never blocks the answer. If no volume is usable the lane declines and the
-// content path refuses. Off by default behind SEEKFS_CONTENT_GLOBAL_LANE so it
+// Multi-volume (M8) is handled by the content path, not the lane: the content
+// path pre-truncates each volume at the user limit in rank order before applying
+// the shared comparator, a rule the lane cannot mirror exactly, so the lane is
+// single-volume (where per-volume truncation keeps the same top by the same
+// order, so the lane is provably parity). A volume without usable content still
+// never blocks the query — the content path skips it and reports partial.
+// Off by default behind SEEKFS_CONTENT_GLOBAL_LANE so it
 // is validated against the content path before becoming the default route.
 // Declines to the content path: overlays/hidden, relevance order, `under:`/
 // `exists:` (the M9 search-stats/count-does-not split), biased order, boolean
-// content groups, and any shape whose filename part is not a supported root.
+// content groups, multi-volume, and any shape whose filename part is not a
+// supported root.
+//
+// Known metadata difference: the lane verifies every filename candidate, so its
+// set is exact and it reports complete even where the content path's per-volume
+// window probe would conservatively set ContentIncomplete (a match set larger
+// than its completeness window). The result set/order/count still match; only
+// the completeness flag is more accurate. Reconcile this before the lane becomes
+// the default route.
 
 import (
 	"cmp"
@@ -144,7 +155,11 @@ func contentLaneScope(snapshot globalQuerySnapshot, pq parsedQuery, needOrder bo
 		return nil, nil, false
 	}
 	usable, skipped = contentUsableVolumes(snapshot.volumes, pq)
-	if len(usable) == 0 {
+	if len(usable) != 1 {
+		// Single volume only: the content path's per-volume pre-truncation
+		// (rank order) before the shared comparator cannot be mirrored exactly
+		// for multiple volumes, so multi-volume stays on the content path (M8
+		// there: an unusable volume is skipped and surfaced partial).
 		return nil, nil, false
 	}
 	for _, vol := range usable {

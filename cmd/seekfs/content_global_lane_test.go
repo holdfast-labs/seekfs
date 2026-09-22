@@ -73,18 +73,20 @@ func contentGlobalLaneCount(vols []*serviceVolumeIndex, query string, enabled bo
 }
 
 func contentGlobalLaneScopes(t *testing.T) []struct {
-	name string
-	vols []*serviceVolumeIndex
+	name     string
+	vols     []*serviceVolumeIndex
+	eligible bool
 } {
 	t.Helper()
 	volC := newContentRecordVolume(t, "C:", contentGlobalLaneRecords("C:"))
 	volF := newContentRecordVolume(t, "F:", contentGlobalLaneRecords("F:"))
 	return []struct {
-		name string
-		vols []*serviceVolumeIndex
+		name     string
+		vols     []*serviceVolumeIndex
+		eligible bool
 	}{
-		{"single", []*serviceVolumeIndex{volC}},
-		{"multi", []*serviceVolumeIndex{volC, volF}},
+		{"single", []*serviceVolumeIndex{volC}, true},
+		{"multi", []*serviceVolumeIndex{volC, volF}, false},
 	}
 }
 
@@ -116,16 +118,17 @@ func TestContentGlobalLaneMatchesContentPath(t *testing.T) {
 					t.Run(fmt.Sprintf("%s/engaged=%v/%s/limit=%d", scope.name, wantEngaged, q, limit), func(t *testing.T) {
 						want, _ := contentGlobalLaneSearch(scope.vols, q, limit, false)
 						got, laneTrace := contentGlobalLaneSearch(scope.vols, q, limit, true)
+						expectEngaged := wantEngaged && scope.eligible
 						didEngage := laneTrace.PlannerMode == "global-content-components"
-						if didEngage != wantEngaged {
-							t.Fatalf("%q: engaged=%v want %v (planner=%q)", q, didEngage, wantEngaged, laneTrace.PlannerMode)
+						if didEngage != expectEngaged {
+							t.Fatalf("%q: engaged=%v want %v (planner=%q)", q, didEngage, expectEngaged, laneTrace.PlannerMode)
 						}
 						if len(got) != len(want) {
 							t.Fatalf("%q: count diverged lane=%d content=%d", q, len(got), len(want))
 						}
 						for i := range want {
-							if got[i].Path != want[i].Path {
-								t.Fatalf("%q: element %d lane=%s content=%s", q, i, got[i].Path, want[i].Path)
+							if got[i].Path != want[i].Path || got[i].FRN != want[i].FRN {
+								t.Fatalf("%q: element %d lane=%s#%d content=%s#%d", q, i, got[i].Path, got[i].FRN, want[i].Path, want[i].FRN)
 							}
 						}
 					})
@@ -148,15 +151,18 @@ func TestContentGlobalLaneCountMatchesContentPath(t *testing.T) {
 			t.Run(scope.name+"/engaged/"+q, func(t *testing.T) {
 				want, _ := contentGlobalLaneCount(scope.vols, q, false)
 				got, trace := contentGlobalLaneCount(scope.vols, q, true)
-				if trace.PlannerMode != "global-content-components" {
-					t.Fatalf("%q: count lane did not engage (planner=%q)", q, trace.PlannerMode)
+				didEngage := trace.PlannerMode == "global-content-components"
+				if didEngage != scope.eligible {
+					t.Fatalf("%q: count lane engaged=%v want %v (planner=%q)", q, didEngage, scope.eligible, trace.PlannerMode)
 				}
 				if got != want {
 					t.Fatalf("%q: count lane=%d content=%d", q, got, want)
 				}
-				matches, _ := contentGlobalLaneSearch(scope.vols, q, 1000, true)
-				if got != len(matches) {
-					t.Fatalf("%q: count %d != len(search) %d", q, got, len(matches))
+				if scope.eligible {
+					matches, _ := contentGlobalLaneSearch(scope.vols, q, 1000, true)
+					if got != len(matches) {
+						t.Fatalf("%q: count %d != len(search) %d", q, got, len(matches))
+					}
 				}
 			})
 		}
@@ -230,49 +236,38 @@ func TestContentGlobalLaneDeclinesWhenContentIncomplete(t *testing.T) {
 // a limit.
 func TestContentGlobalLaneOrderingTiesMatchContentPath(t *testing.T) {
 	t.Setenv("SEEKFS_CONTENT_SEARCH", "1")
-	// dup.go appears in two directories; other.go is a third match.
+	// dup.go under two directories: distinct reconstructed paths but the same
+	// name (a rank tie under the default order), so a path tie-break would
+	// diverge from the content path's record-id tie-break.
 	volC := newContentRecordVolume(t, "C:", []contentVolRecord{
-		{frn: 1000, parent: -1, parentFRN: 1, name: "dup.go", path: `C:\zdir\dup.go`, content: "needle alpha"},
-		{frn: 1001, parent: -1, parentFRN: 1, name: "dup.go", path: `C:\adir\dup.go`, content: "needle beta"},
-		{frn: 1002, parent: -1, parentFRN: 1, name: "other.go", path: `C:\mdir\other.go`, content: "needle gamma"},
+		{frn: 900, parent: -1, parentFRN: 0, name: "zdir"},
+		{frn: 901, parent: -1, parentFRN: 0, name: "adir"},
+		{frn: 1000, parent: 0, parentFRN: 900, name: "dup.go", path: `C:\zdir\dup.go`, content: "needle alpha"},
+		{frn: 1001, parent: 1, parentFRN: 901, name: "dup.go", path: `C:\adir\dup.go`, content: "needle beta"},
+		{frn: 1002, parent: 0, parentFRN: 900, name: "other.go", path: `C:\zdir\other.go`, content: "needle gamma"},
 	})
-	// F: is usable but contributes no content match, so the verified set is
-	// single-volume even though the lane scope is multi-volume.
-	volF := newContentRecordVolume(t, "F:", []contentVolRecord{
-		{frn: 2000, parent: -1, parentFRN: 1, name: "nomatch.go", path: `F:\x\nomatch.go`, content: "unrelated"},
-	})
-	scopes := []struct {
-		name string
-		vols []*serviceVolumeIndex
-	}{
-		{"single", []*serviceVolumeIndex{volC}},
-		{"multi-one-volume-matches", []*serviceVolumeIndex{volC, volF}},
-	}
-	for _, scope := range scopes {
-		for _, limit := range []int{1, 2, 3} {
-			t.Run(fmt.Sprintf("%s/limit=%d", scope.name, limit), func(t *testing.T) {
-				want, _ := contentGlobalLaneSearch(scope.vols, "content:needle ext:.go", limit, false)
-				got, laneTrace := contentGlobalLaneSearch(scope.vols, "content:needle ext:.go", limit, true)
-				if laneTrace.PlannerMode != "global-content-components" {
-					t.Fatalf("lane did not engage (planner=%q)", laneTrace.PlannerMode)
+	for _, limit := range []int{1, 2, 3} {
+		t.Run(fmt.Sprintf("limit=%d", limit), func(t *testing.T) {
+			want, _ := contentGlobalLaneSearch([]*serviceVolumeIndex{volC}, "content:needle ext:.go", limit, false)
+			got, laneTrace := contentGlobalLaneSearch([]*serviceVolumeIndex{volC}, "content:needle ext:.go", limit, true)
+			if laneTrace.PlannerMode != "global-content-components" {
+				t.Fatalf("lane did not engage (planner=%q)", laneTrace.PlannerMode)
+			}
+			if len(got) != len(want) {
+				t.Fatalf("count diverged lane=%d content=%d", len(got), len(want))
+			}
+			for i := range want {
+				if got[i].Path != want[i].Path || got[i].FRN != want[i].FRN {
+					t.Fatalf("element %d lane=%s#%d content=%s#%d", i, got[i].Path, got[i].FRN, want[i].Path, want[i].FRN)
 				}
-				if len(got) != len(want) {
-					t.Fatalf("count diverged lane=%d content=%d", len(got), len(want))
-				}
-				for i := range want {
-					if got[i].Path != want[i].Path {
-						t.Fatalf("element %d lane=%s content=%s", i, got[i].Path, want[i].Path)
-					}
-				}
-			})
-		}
+			}
+		})
 	}
 }
 
-// M8: a volume without usable content must not block a content query. The lane
-// answers from the usable volume, matching the content path, and surfaces the
-// skipped volume as partial.
-func TestContentGlobalLaneMultiVolumeSkipsUnusable(t *testing.T) {
+// M8: a multi-volume query with exactly one content-usable volume engages the
+// lane on that volume and surfaces the unusable one partial, never blocked.
+func TestContentGlobalLaneSkipsUnusableVolume(t *testing.T) {
 	t.Setenv("SEEKFS_CONTENT_SEARCH", "1")
 	volC := newContentRecordVolume(t, "C:", contentGlobalLaneRecords("C:"))
 	volF := newContentRecordVolume(t, "F:", contentGlobalLaneRecords("F:"))
@@ -289,12 +284,12 @@ func TestContentGlobalLaneMultiVolumeSkipsUnusable(t *testing.T) {
 		t.Fatalf("count diverged lane=%d content=%d", len(got), len(want))
 	}
 	for i := range want {
-		if got[i].Path != want[i].Path {
-			t.Fatalf("element %d lane=%s content=%s", i, got[i].Path, want[i].Path)
+		if got[i].Path != want[i].Path || got[i].FRN != want[i].FRN {
+			t.Fatalf("element %d lane=%s#%d content=%s#%d", i, got[i].Path, got[i].FRN, want[i].Path, want[i].FRN)
 		}
 	}
 	if !laneTrace.ContentPartial {
-		t.Fatal("skipped volume not surfaced as partial")
+		t.Fatal("unusable volume not surfaced as partial")
 	}
 }
 
@@ -328,22 +323,20 @@ func TestContentGlobalLaneLargeCorpusDifferential(t *testing.T) {
 				t.Run(fmt.Sprintf("%s/%s/limit=%d", scope.name, q, limit), func(t *testing.T) {
 					want, _ := contentGlobalLaneSearch(scope.vols, q, limit, false)
 					got, laneTrace := contentGlobalLaneSearch(scope.vols, q, limit, true)
-					if laneTrace.PlannerMode != "global-content-components" {
-						t.Fatalf("%q: lane did not engage (planner=%q)", q, laneTrace.PlannerMode)
+					didEngage := laneTrace.PlannerMode == "global-content-components"
+					if didEngage != (scope.name == "single") {
+						t.Fatalf("%q: lane engaged=%v (planner=%q)", q, didEngage, laneTrace.PlannerMode)
 					}
 					if len(got) != len(want) {
 						t.Fatalf("%q: count diverged lane=%d content=%d", q, len(got), len(want))
 					}
 					for i := range want {
-						if got[i].Path != want[i].Path {
-							t.Fatalf("%q: element %d lane=%s content=%s", q, i, got[i].Path, want[i].Path)
+						if got[i].Path != want[i].Path || got[i].FRN != want[i].FRN {
+							t.Fatalf("%q: element %d lane=%s#%d content=%s#%d", q, i, got[i].Path, got[i].FRN, want[i].Path, want[i].FRN)
 						}
 					}
 					wantCount, _ := contentGlobalLaneCount(scope.vols, q, false)
-					gotCount, countTrace := contentGlobalLaneCount(scope.vols, q, true)
-					if countTrace.PlannerMode != "global-content-components" {
-						t.Fatalf("%q: count lane did not engage", q)
-					}
+					gotCount, _ := contentGlobalLaneCount(scope.vols, q, true)
 					if gotCount != wantCount {
 						t.Fatalf("%q: count lane=%d content=%d", q, gotCount, wantCount)
 					}
