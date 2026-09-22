@@ -12,7 +12,9 @@ and the configurable per-file size cap (see §6f); PF-5c (WP10/M7) landed the
 `.gsx` size cap and the bounded fold (see §6g); PF-6a/PF-7b landed the
 case-preserving text store and the filename-only fallback for a content-unusable
 volume. PB8 landed bounded content-candidate materialization, the rank-ordered
-bounded scan fallback, and the biased/overlay early-stop fix (see §6h). The only
+bounded scan fallback, and the biased/overlay early-stop fix (see §6h). HTML
+`<meta charset>` detection landed via `golang.org/x/net/html/charset`, and the
+HTML/refresh residuals it exposed are recorded in §7. The only
 parity work not taken is the optional PB8 items 4–7 (global-lane integration for
 compound content + selective-filename queries, §6h), plus the documented §7
 residuals. `.gsx` is format **v4**. P4 document-extraction quality remains
@@ -520,6 +522,30 @@ Residual / known limitations (all explicit deferrals):
   stale stored-path/ordering field, not a match gap.
 - PDF extraction is a best-effort spike (no xref/object streams, Flate only,
   simple fonts only); quality is a P4 decision.
+- **Moved-class invalidation.** Extractor invalidation keys on the stored
+  `(ContentType class, ExtractorVersion)`. A base built while an extension was
+  text-indexed (class Text, e.g. `.html` before the HTML extractor) is neither
+  refreshed nor rebuilt when that extension later gains a dedicated extractor:
+  the old class still has a registered extractor at the same version, so
+  `contentIndexExtractorMismatch` sees no mismatch and those docs keep serving
+  raw/markup text until a rebuild or a USN change to each file. Fresh installs
+  stamp the new class on the first build. This is the systemic case for any
+  format whose extension is in the text allowlist (EML/mbox/RTF/MSG are not).
+  Possible fix: compare the resolved path's *current* extractor class against the
+  stored class (not only version), or force a rebuild when the class mapping for
+  an extension changes.
+- **Forced fold has no "attempted" latch.** `foldDue` forces a fold whenever a
+  targeted extractor refresh is pending and the queue is drained, with no latch
+  recording that a forced fold was already attempted. The refresh is exhaustive
+  (every stale base FRN is enqueued), so `refreshPending` always clears when the
+  refreshed base publishes and the branch cannot spin; a future partial/dropped
+  refresh would re-force a fold every drain tick (still paced by the fold-retry
+  backoff), which is why it is worth a note.
+- **`contentHTMLMaxToken` caps one text node at 1 MiB regardless of `maxText`.**
+  The HTML tokenizer's per-token buffer cap is a separate bounded-memory ceiling
+  from the `maxText` policy, so a document with a single text run over 1 MiB is
+  truncated at 1 MiB even when `maxText` would allow more. It is flagged via
+  `Truncated` (and the bounded-prefix reason), not silent.
 
 ### Explicitly deferred (P5)
 

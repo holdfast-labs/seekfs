@@ -13,7 +13,9 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
+	"sync"
 	"time"
 )
 
@@ -151,6 +153,68 @@ type contentIndex struct {
 	// length and by encode from the produced bytes. Not persisted; surfaced in
 	// content health so sidecar growth is observable (WP10/M7).
 	EncodedSize int64
+	// release unmaps the file backing Sections when the index was loaded from a
+	// memory-mapped `.gsx` (contentLoadFileMapped); nil for a heap-decoded
+	// index. Only Sections (and the reader's text/posting views derived from
+	// them) alias the mapping; Docs and Policy are decoded copies. Release is
+	// once-only, and attachRelease also arms a finalizer, so an index whose
+	// owner merely drops it is still unmapped once no query references it. The
+	// GC only finalizes an unreachable index, which is what makes the unmap
+	// safe: a query holding the reader keeps the index reachable.
+	release     func()
+	releaseOnce sync.Once
+}
+
+// contentMappingReleaseHook, when non-nil, runs once each time a mapped `.gsx`
+// backing is unmapped. Tests use it to assert a replaced mapping is released.
+// It may be read from a finalizer goroutine, so access is mutex-guarded.
+var (
+	contentMappingHookMu      sync.Mutex
+	contentMappingReleaseHook func()
+)
+
+func setContentMappingReleaseHook(fn func()) {
+	contentMappingHookMu.Lock()
+	contentMappingReleaseHook = fn
+	contentMappingHookMu.Unlock()
+}
+
+func fireContentMappingReleaseHook() {
+	contentMappingHookMu.Lock()
+	fn := contentMappingReleaseHook
+	contentMappingHookMu.Unlock()
+	if fn != nil {
+		fn()
+	}
+}
+
+// attachRelease records how to unmap this index's backing file and arms a
+// finalizer so the mapping is released even when the owner only drops the
+// index. Only the mmap load path calls it; a heap index leaves release nil.
+func (idx *contentIndex) attachRelease(release func()) {
+	if idx == nil || release == nil {
+		return
+	}
+	idx.release = release
+	runtime.SetFinalizer(idx, (*contentIndex).Release)
+}
+
+// Release unmaps the index's backing file exactly once. It is a no-op on a
+// heap-decoded index. Explicit Release is only called by the service while it
+// holds indexMu for writing (no query can be reading the sections then); the
+// finalizer backstops every other drop, running only once the index is
+// unreachable from all goroutines, so an unmap can never race an in-flight
+// read.
+func (idx *contentIndex) Release() {
+	if idx == nil {
+		return
+	}
+	idx.releaseOnce.Do(func() {
+		if idx.release != nil {
+			idx.release()
+			idx.release = nil
+		}
+	})
 }
 
 func newContentIndex() *contentIndex {
@@ -300,8 +364,10 @@ func contentSectionOrder(sections map[uint32][]byte) []uint32 {
 	return tags
 }
 
-// contentDecode parses a `.gsx`. The doc table is decoded eagerly; other
-// sections are handed back as slices into a private copy.
+// contentDecode parses a `.gsx`. The doc table is decoded eagerly into heap
+// copies; other sections are handed back as slices into data. When data is a
+// mapping, those section slices alias the mapping and the index must be
+// Released before the mapping goes away (see attachRelease).
 func contentIndexDecode(data []byte) (*contentIndex, error) {
 	if len(data) < contentHeaderSize() {
 		return nil, errors.New("content index truncated")
@@ -553,11 +619,51 @@ func contentSaveFile(path string, idx *contentIndex) error {
 	return os.Rename(name, path)
 }
 
-// contentLoadFile reads and decodes a `.gsx`.
-func contentLoadFile(path string) (*contentIndex, error) {
+// contentMapFileFn is the mmap primitive contentLoadFileMapped uses. A var so
+// tests can force the heap fallback.
+var contentMapFileFn = contentMapFile
+
+// contentLoadFileMapped loads a `.gsx` by mapping it read-only and decoding the
+// blob sections zero-copy: Sections (and the reader's text/posting views) alias
+// the mapping until the index is Released. If mapping fails for any reason it
+// falls back to reading the file into the heap (release nil), so a load that
+// could have succeeded never fails for lack of a mapping.
+//
+// The index owns the mapping: attachRelease arms a finalizer and the returned
+// index's Release unmaps it exactly once.
+func contentLoadFileMapped(path string) (*contentIndex, error) {
+	data, release, err := contentMapFileFn(path)
+	if err != nil {
+		data, err = os.ReadFile(path)
+		if err != nil {
+			return nil, err
+		}
+		release = nil
+	}
+	idx, err := contentIndexDecode(data)
+	if err != nil {
+		if release != nil {
+			release()
+		}
+		return nil, err
+	}
+	idx.attachRelease(release)
+	return idx, nil
+}
+
+// contentLoadFileHeap is the pre-mmap path: read the whole `.gsx` into the heap
+// and decode it. Tests use it to compare a mapped load against the read path;
+// production goes through contentLoadFileMapped.
+func contentLoadFileHeap(path string) (*contentIndex, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
 	}
 	return contentIndexDecode(data)
+}
+
+// contentLoadFile reads and decodes a `.gsx`. It maps the file (zero-copy
+// sections) and falls back to a heap read, so its contract is unchanged.
+func contentLoadFile(path string) (*contentIndex, error) {
+	return contentLoadFileMapped(path)
 }

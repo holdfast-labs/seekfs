@@ -82,6 +82,7 @@ func TestContentOfflineSnippetOffsetMapsFoldedToRaw(t *testing.T) {
 		t.Fatal(err)
 	}
 	loaded, err := contentLoadFile(path)
+	releaseContentIndexOnCleanup(t, loaded)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -222,6 +223,7 @@ func TestContentIndexFileBuildRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	loaded, err := contentLoadFile(path)
+	releaseContentIndexOnCleanup(t, loaded)
 	if err != nil {
 		t.Fatal(err)
 	}

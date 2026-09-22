@@ -36,6 +36,7 @@ func TestContentIndexDBAllOptInBuildsSidecar(t *testing.T) {
 		t.Fatalf("content-index -all: %v", err)
 	}
 	built, err := contentLoadFile(contentIndexPathForDB(db))
+	releaseContentIndexOnCleanup(t, built)
 	if err != nil {
 		t.Fatalf("load built sidecar: %v", err)
 	}
@@ -113,6 +114,7 @@ func TestContentServiceOwnsVolumeLockAfterAttach(t *testing.T) {
 
 	s := contentTestService(t)
 	s.attachContentForVolume(vol)
+	releaseVolumeContentOnCleanup(t, vol)
 	if _, err := acquireContentVolumeLock(gsx); !errors.Is(err, errContentVolumeLocked) {
 		t.Fatalf("service did not hold the sidecar lock; acquire err = %v", err)
 	}

@@ -148,6 +148,9 @@ func cmdContent(args []string) error {
 	if err != nil {
 		return err
 	}
+	// A one-shot CLI query owns the mapping only for its own duration; release
+	// it on return. The hits are copied strings, so nothing outlives it.
+	defer idx.Release()
 	r, err := openContentReader(idx)
 	if err != nil {
 		return err

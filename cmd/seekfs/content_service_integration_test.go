@@ -102,6 +102,7 @@ func TestContentAttachRequiresFRNKeyedIndex(t *testing.T) {
 		t.Fatal(err)
 	}
 	s.attachContentForVolume(vol)
+	releaseVolumeContentOnCleanup(t, vol)
 	if got := vol.content.stateOf(); got != contentStateUnavailable {
 		t.Fatalf("walk-keyed sidecar attached as %q; want unavailable", got)
 	}
@@ -117,6 +118,7 @@ func TestContentAttachRequiresFRNKeyedIndex(t *testing.T) {
 		t.Fatal(err)
 	}
 	s.attachContentForVolume(vol)
+	releaseVolumeContentOnCleanup(t, vol)
 	if got := vol.content.stateOf(); got != contentStateReady {
 		t.Fatalf("FRN-keyed sidecar state = %q; want ready", got)
 	}
@@ -149,6 +151,7 @@ func TestContentResolverRebindsAfterBaseSwap(t *testing.T) {
 		t.Fatal(err)
 	}
 	s.attachContentForVolume(vol)
+	releaseVolumeContentOnCleanup(t, vol)
 	if vol.content.stateOf() != contentStateReady {
 		t.Fatalf("state = %q; want ready", vol.content.stateOf())
 	}

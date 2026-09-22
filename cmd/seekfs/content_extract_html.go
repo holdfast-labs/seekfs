@@ -15,9 +15,12 @@ import (
 	"context"
 	"errors"
 	"io"
+	"mime"
 	"strings"
 
 	"golang.org/x/net/html"
+	"golang.org/x/net/html/charset"
+	"golang.org/x/text/encoding"
 )
 
 // contentHTMLMaxToken caps one token's buffered bytes. Without it a single
@@ -25,6 +28,10 @@ import (
 // document; the tokenizer then reports ErrBufferExceeded and extraction stops
 // with what was already emitted. Well under maxRaw (default 32 MiB).
 const contentHTMLMaxToken = 1 << 20
+
+// contentHTMLCharsetPeek bounds the head inspected for a <meta> charset. The
+// WHATWG prescan reads at most the first 1024 bytes; no more is decoded.
+const contentHTMLCharsetPeek = 1024
 
 type contentHTMLExtractor struct{}
 
@@ -69,6 +76,99 @@ var contentHTMLBlockTags = map[string]bool{
 	"ul": true,
 }
 
+// contentHTMLDecodeMode resolves the encoding for an HTML document. The shared
+// policy has precedence: an explicit -encoding override, a BOM, or the shared
+// BOM-less UTF-16 sniff all win. Only when none of those applies does a
+// <meta charset> / <meta http-equiv> declaration take effect, applied through
+// the decoder's explicit path so the stored text stays index/search-consistent.
+// Nothing declared (or an unusable label) leaves the shared auto decoder's
+// repair/CP1252 behavior untouched.
+func contentHTMLDecodeMode(raw []byte, mode contentEncodingMode) contentEncodingMode {
+	if mode.none || mode.explicit != nil || contentHasBOM(raw) {
+		return mode
+	}
+	if mode.auto && contentSniffUTF16BOMless(raw) != "" {
+		return mode
+	}
+	enc, ok := contentHTMLMetaCharsetEncoding(raw)
+	if !ok {
+		return mode
+	}
+	return contentEncodingMode{explicit: enc, label: "html-meta"}
+}
+
+// contentHTMLMetaCharsetEncoding returns the encoding declared by a <meta> in
+// the bounded document head, if the declaration is present and resolves to a
+// usable non-UTF-8 WHATWG label. It mirrors the WHATWG prescan that
+// charset.DetermineEncoding runs, but only to tell a real declaration apart
+// from DetermineEncoding's no-declaration windows-1252 fallback, which must not
+// override the shared auto decoder's hybrid UTF-8/legacy recovery.
+func contentHTMLMetaCharsetEncoding(head []byte) (encoding.Encoding, bool) {
+	label, ok := contentHTMLMetaCharsetLabel(head)
+	if !ok {
+		return nil, false
+	}
+	enc, name := charset.Lookup(label)
+	// utf-8 needs no transcode (and would bypass the shared repair); utf-16
+	// labels are a contradiction in an ASCII-parsed meta and are left to the
+	// shared BOM/BOM-less handling.
+	if enc == nil || name == "" || name == "utf-8" || strings.HasPrefix(name, "utf-16") {
+		return nil, false
+	}
+	return enc, true
+}
+
+// contentHTMLMetaCharsetLabel scans the first contentHTMLCharsetPeek bytes for a
+// <meta> declaring a charset, in either the HTML5 (<meta charset=...>) or the
+// legacy (<meta http-equiv=Content-Type content="...; charset=...">) form.
+func contentHTMLMetaCharsetLabel(head []byte) (string, bool) {
+	if len(head) > contentHTMLCharsetPeek {
+		head = head[:contentHTMLCharsetPeek]
+	}
+	z := html.NewTokenizer(bytes.NewReader(head))
+	for {
+		switch z.Next() {
+		case html.ErrorToken:
+			return "", false
+		case html.StartTagToken, html.SelfClosingTagToken:
+			tag, hasAttr := z.TagName()
+			if !bytes.EqualFold(tag, []byte("meta")) {
+				continue
+			}
+			var cs, content string
+			hasPragma := false
+			for hasAttr {
+				var key, val []byte
+				key, val, hasAttr = z.TagAttr()
+				switch {
+				case bytes.EqualFold(key, []byte("charset")):
+					if cs == "" {
+						cs = string(val)
+					}
+				case bytes.EqualFold(key, []byte("http-equiv")):
+					if strings.EqualFold(string(val), "content-type") {
+						hasPragma = true
+					}
+				case bytes.EqualFold(key, []byte("content")):
+					if content == "" {
+						content = string(val)
+					}
+				}
+			}
+			if cs != "" {
+				return strings.TrimSpace(cs), true
+			}
+			if hasPragma && content != "" {
+				if _, params, err := mime.ParseMediaType(content); err == nil {
+					if label := strings.TrimSpace(params["charset"]); label != "" {
+						return label, true
+					}
+				}
+			}
+		}
+	}
+}
+
 func (contentHTMLExtractor) Extract(ctx context.Context, r io.ReaderAt, size int64) (contentExtractResult, error) {
 	s := contentExtractSettingsFromContext(ctx)
 	raw, err := contentReadBounded(r, size, int(s.maxRaw))
@@ -77,8 +177,10 @@ func (contentHTMLExtractor) Extract(ctx context.Context, r io.ReaderAt, size int
 	}
 	truncated := size > s.maxRaw
 	// Decode first: entities then see UTF-8, and a <meta charset>-less legacy
-	// document is repaired by the shared decoder rather than double-decoded.
-	decoded := contentDecodeForIndex(raw, s.encoding, truncated)
+	// document is repaired by the shared decoder rather than double-decoded. A
+	// declared <meta> charset is honored when the shared policy has no stronger
+	// signal (BOM / explicit override / BOM-less UTF-16).
+	decoded := contentDecodeForIndex(raw, contentHTMLDecodeMode(raw, s.encoding), truncated)
 	z := html.NewTokenizer(strings.NewReader(decoded))
 	z.SetMaxBuf(contentHTMLMaxToken)
 

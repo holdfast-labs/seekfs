@@ -201,6 +201,12 @@ func (s *goSearchService) publishFoldedContent(vol *serviceVolumeIndex, gen uint
 	if err != nil {
 		return false
 	}
+	attached := false
+	defer func() {
+		if !attached {
+			idx.Release()
+		}
+	}()
 	if idx.Origin != contentOriginUSN || idx.JournalID != journalID || idx.CheckpointUSN == 0 {
 		return false
 	}
@@ -208,8 +214,8 @@ func (s *goSearchService) publishFoldedContent(vol *serviceVolumeIndex, gen uint
 	if err != nil {
 		return false
 	}
-	s.indexMu.RLock()
-	defer s.indexMu.RUnlock()
+	s.indexMu.Lock()
+	defer s.indexMu.Unlock()
 	if vol.state != "ready" || vol.index == nil || vol.index.Source != "usn" {
 		return false
 	}
@@ -220,7 +226,23 @@ func (s *goSearchService) publishFoldedContent(vol *serviceVolumeIndex, gen uint
 	if !ok {
 		return false
 	}
-	vol.content.setReady(idx, reader, buildContentResolver(idx.Docs, frns, ids))
+	if old := vol.content.setReady(idx, reader, buildContentResolver(idx.Docs, frns, ids)); old != nil {
+		// Replace the previous base's mapping while holding indexMu for writing:
+		// no query can be reading it (queries hold indexMu.RLock throughout), so
+		// the unmap cannot race a read.
+		//
+		// The fold itself reads the base mapping WITHOUT indexMu (it captures the
+		// reader and streams docText/docPath lock-free for the whole assembly).
+		// That is safe because this Release is the only unmap that can occur while
+		// a fold runs, and it happens only here, AFTER the fold's base reads are
+		// complete. A concurrent markStale→setReady cannot reach setReady during a
+		// fold: the content state is ready (so attachContentForVolume early-returns)
+		// and a journal reset bumps vol.journalID, failing the check above. The
+		// finalizer is also a non-issue: the fold's local reader keeps reader.idx
+		// reachable for the whole assembly.
+		old.Release()
+	}
+	attached = true
 	return true
 }
 

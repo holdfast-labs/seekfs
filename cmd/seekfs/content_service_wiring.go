@@ -71,6 +71,16 @@ func (s *goSearchService) attachContentForVolume(vol *serviceVolumeIndex) {
 		serviceLog("content index unavailable for volume %s: %v", vol.volume, err)
 		return
 	}
+	// Until this base is attached it owns the only reference to a mapped
+	// sidecar; release it on any path that declines to attach so the mapping is
+	// not held by a dead index (the finalizer would eventually, but this is
+	// prompt).
+	attached := false
+	defer func() {
+		if !attached {
+			idx.Release()
+		}
+	}()
 	if idx.Origin != contentOriginUSN {
 		// A path-keyed (walk) sidecar does not join to record FRNs; attaching it
 		// would report `ready` while every document resolves to nothing.
@@ -120,15 +130,16 @@ func (s *goSearchService) attachContentForVolume(vol *serviceVolumeIndex) {
 		serviceLog("content index unreadable for volume %s: %v", vol.volume, err)
 		return
 	}
-	// Validate and publish under indexMu. Every base rebuild and content
-	// invalidation runs under indexMu.Lock (see replaceServiceVolumeContents),
-	// so holding it here rejects a base swapped or marked stale while this
-	// attach was in flight instead of overwriting a `stale`/rebuilding volume
-	// with an old `ready`.
-	s.indexMu.RLock()
+	// Validate and publish under indexMu for writing: every base rebuild and
+	// content invalidation runs under indexMu.Lock, and queries hold
+	// indexMu.RLock for their whole duration (serviceCommandSearch). Holding the
+	// write lock here both rejects a base swapped or marked stale while this
+	// attach was in flight and guarantees no query is reading the replaced base,
+	// so its mapping can be released immediately below without a use-after-unmap.
+	s.indexMu.Lock()
 	if vol.state != "ready" {
 		state := vol.state
-		s.indexMu.RUnlock()
+		s.indexMu.Unlock()
 		// A non-ready volume is owned by a rebuild (stale recovery). Do not
 		// publish content for it. Re-attaching after the rebuild finishes is
 		// PF-3 (service-owned build + rebuild scheduling); until then the
@@ -139,7 +150,7 @@ func (s *goSearchService) attachContentForVolume(vol *serviceVolumeIndex) {
 	frns, ids, ok := contentBaseFRNColumns(vol.index)
 	journalID := vol.journalID
 	if !ok {
-		s.indexMu.RUnlock()
+		s.indexMu.Unlock()
 		serviceLog("content index for volume %s has no FRN column; leaving unavailable", vol.volume)
 		return
 	}
@@ -148,14 +159,20 @@ func (s *goSearchService) attachContentForVolume(vol *serviceVolumeIndex) {
 	// than advertise ready with docs that resolve to nothing; PF-3 schedules
 	// the rebuild.
 	if idx.JournalID != journalID {
-		s.indexMu.RUnlock()
+		s.indexMu.Unlock()
 		reason := fmt.Sprintf("content base journal %d != volume journal %d", idx.JournalID, journalID)
 		serviceLog("content index journal mismatch for volume %s: %s", vol.volume, reason)
 		vol.content.markStale(reason)
 		return
 	}
-	vol.content.setReady(idx, reader, buildContentResolver(idx.Docs, frns, ids))
-	s.indexMu.RUnlock()
+	if old := vol.content.setReady(idx, reader, buildContentResolver(idx.Docs, frns, ids)); old != nil {
+		// The replaced base's Sections may alias a mapping; no query can be
+		// reading them under the write lock, so unmap now. Release is once-only,
+		// so a concurrent finalizer is harmless.
+		old.Release()
+	}
+	attached = true
+	s.indexMu.Unlock()
 	if vol.contentCoord != nil {
 		// Gate folds until catch-up finishes: observedUSN spans the live replay
 		// and catch-up streams, so a fold before this completes could persist a

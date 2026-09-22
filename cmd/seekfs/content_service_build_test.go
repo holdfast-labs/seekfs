@@ -57,7 +57,9 @@ func contentBuildTestVolume(t *testing.T, dir string, journal, checkpoint uint64
 	idx.Records = append([]CompactRecord(nil), records...)
 	contentIndexFRNs(idx)
 	dbPath := filepath.Join(t.TempDir(), "seekfs_c.gsi")
-	return newServiceVolumeIndex(dbPath, idx), contentIndexPathForDB(dbPath)
+	vol := newServiceVolumeIndex(dbPath, idx)
+	releaseVolumeContentOnCleanup(t, vol)
+	return vol, contentIndexPathForDB(dbPath)
 }
 
 // M7 (WP10): a service build whose encoded sidecar exceeds the cap must refuse
@@ -152,6 +154,7 @@ func TestContentServiceBuildsMissingBase(t *testing.T) {
 		t.Fatalf("sidecar was not persisted: %v", err)
 	}
 	built, err := contentLoadFile(gsx)
+	releaseContentIndexOnCleanup(t, built)
 	if err != nil {
 		t.Fatalf("load built sidecar: %v", err)
 	}
@@ -195,6 +198,7 @@ func TestContentServiceBuildDefaultScope(t *testing.T) {
 	s.ensureContentBuild(vol)
 
 	built, err := contentLoadFile(gsx)
+	releaseContentIndexOnCleanup(t, built)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -262,6 +266,7 @@ func TestContentServiceBuildSelfHealsAfterJournalReset(t *testing.T) {
 		t.Fatalf("state after self-heal = %q; want ready", got)
 	}
 	rebuilt, err := contentLoadFile(gsx)
+	releaseContentIndexOnCleanup(t, rebuilt)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -318,6 +323,7 @@ func TestContentOldVersionSidecarRebuiltNotAttached(t *testing.T) {
 		t.Fatalf("state after version-invalidated rebuild = %q; want ready", got)
 	}
 	rebuilt, err := contentLoadFile(gsx)
+	releaseContentIndexOnCleanup(t, rebuilt)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -486,6 +492,7 @@ func TestContentServiceBuildReschedulesAfterGenerationChange(t *testing.T) {
 		t.Fatalf("state after reschedule = %q; want ready", got)
 	}
 	rebuilt, err := contentLoadFile(gsx)
+	releaseContentIndexOnCleanup(t, rebuilt)
 	if err != nil {
 		t.Fatalf("load rescheduled sidecar: %v", err)
 	}
@@ -799,6 +806,7 @@ func TestContentServiceBuildPanicAndTimeoutIsolated(t *testing.T) {
 		t.Fatalf("state after build = %q; want ready", got)
 	}
 	built, err := contentLoadFile(gsx)
+	releaseContentIndexOnCleanup(t, built)
 	if err != nil {
 		t.Fatalf("load built sidecar: %v", err)
 	}

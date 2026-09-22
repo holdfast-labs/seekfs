@@ -576,9 +576,15 @@ func (s *goSearchService) searchContentHealth(trace *searchTrace) *contentHealth
 	return h
 }
 
-func (s *contentVolumeState) setReady(idx *contentIndex, reader *contentReader, resolver *contentResolver) {
+// setReady installs a freshly attached base and returns the index it replaced
+// (nil when none was attached), so the caller — which holds indexMu for writing
+// — can release the old base's mapping once no query can still read it. Content
+// is generation-independent, but the old base's Sections may alias a mapping, so
+// the replacement is the point that owns the unmap.
+func (s *contentVolumeState) setReady(idx *contentIndex, reader *contentReader, resolver *contentResolver) *contentIndex {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	old := s.idx
 	s.idx = idx
 	s.reader = reader
 	s.resolver = resolver
@@ -622,6 +628,7 @@ func (s *contentVolumeState) setReady(idx *contentIndex, reader *contentReader, 
 		}
 	}
 	s.health.LastRebuild = time.Now().UTC().Format(time.RFC3339)
+	return old
 }
 
 // rebuildResolver replaces the docID -> recordID map after a base swap. The

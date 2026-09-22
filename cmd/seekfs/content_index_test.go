@@ -115,6 +115,7 @@ func TestContentIndexFileRoundTrip(t *testing.T) {
 		t.Fatalf("contentSaveFile: %v", err)
 	}
 	got, err := contentLoadFile(path)
+	releaseContentIndexOnCleanup(t, got)
 	if err != nil {
 		t.Fatalf("contentLoadFile: %v", err)
 	}

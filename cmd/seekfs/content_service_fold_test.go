@@ -60,6 +60,7 @@ func newContentFoldFixture(t *testing.T, files []contentFixtureFile) *contentFol
 	s := &goSearchService{stop: make(chan struct{})}
 	t.Cleanup(func() { close(s.stop) })
 	s.attachContentForVolume(vol)
+	releaseVolumeContentOnCleanup(t, vol)
 	if got := vol.content.stateOf(); got != contentStateReady {
 		t.Fatalf("state after attach = %q; want ready", got)
 	}
@@ -98,6 +99,7 @@ func TestContentFoldOverCapKeepsBaseAndDelta(t *testing.T) {
 	f.s.runContentFold(f.vol)
 
 	reloaded, err := contentLoadFile(contentIndexPathForDB(f.dbPath))
+	releaseContentIndexOnCleanup(t, reloaded)
 	if err != nil {
 		t.Fatalf("reload sidecar: %v", err)
 	}
@@ -255,6 +257,7 @@ func TestContentFoldEvictsDeletedBaseDoc(t *testing.T) {
 	f.s.runContentFold(f.vol)
 
 	reloaded, err := contentLoadFile(contentIndexPathForDB(f.dbPath))
+	releaseContentIndexOnCleanup(t, reloaded)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -287,6 +290,7 @@ func TestContentFoldPersistsDeltaAndAdvancesCheckpoint(t *testing.T) {
 	f.s.runContentFold(f.vol)
 
 	reloaded, err := contentLoadFile(contentIndexPathForDB(f.dbPath))
+	releaseContentIndexOnCleanup(t, reloaded)
 	if err != nil {
 		t.Fatalf("reload folded sidecar: %v", err)
 	}
@@ -327,6 +331,7 @@ func TestContentFoldSurvivesRestart(t *testing.T) {
 	s2 := &goSearchService{stop: make(chan struct{})}
 	defer close(s2.stop)
 	s2.attachContentForVolume(vol2)
+	releaseVolumeContentOnCleanup(t, vol2)
 	if got := vol2.content.stateOf(); got != contentStateReady {
 		t.Fatalf("restart attach state = %q; want ready", got)
 	}
@@ -386,6 +391,7 @@ func TestContentFoldBoundsDeltaMemory(t *testing.T) {
 		t.Fatalf("delta live count %d not bounded below %d", got, contentDeltaFoldMaxDocs)
 	}
 	reloaded, err := contentLoadFile(contentIndexPathForDB(f.dbPath))
+	releaseContentIndexOnCleanup(t, reloaded)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -443,6 +449,7 @@ func TestContentFoldFailureKeepsDelta(t *testing.T) {
 		t.Fatalf("edit lost after a failed fold: %v", hits)
 	}
 	reloaded, err := contentLoadFile(contentIndexPathForDB(f.dbPath))
+	releaseContentIndexOnCleanup(t, reloaded)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -469,6 +476,7 @@ func TestContentFoldSkippedWhileCatchUpPending(t *testing.T) {
 	f.s.runContentFold(f.vol)
 
 	reloaded, err := contentLoadFile(contentIndexPathForDB(f.dbPath))
+	releaseContentIndexOnCleanup(t, reloaded)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -502,6 +510,7 @@ func TestContentFoldSkippedWhileCatchUpPending(t *testing.T) {
 	s2 := &goSearchService{stop: make(chan struct{})}
 	defer close(s2.stop)
 	s2.attachContentForVolume(vol2)
+	releaseVolumeContentOnCleanup(t, vol2)
 	vol2.contentCoord.processQueue(func(frn uint64) (string, bool) {
 		p, ok := f.paths[frn]
 		return p, ok
@@ -530,6 +539,7 @@ func TestContentFoldSkippedWhileWorkPending(t *testing.T) {
 	f.s.runContentFold(f.vol)
 
 	reloaded, err := contentLoadFile(contentIndexPathForDB(f.dbPath))
+	releaseContentIndexOnCleanup(t, reloaded)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -561,6 +571,7 @@ func TestContentFoldSkippedWhileCatchUpIncomplete(t *testing.T) {
 		t.Fatalf("state after gated fold = %q; want degraded", got)
 	}
 	reloaded, err := contentLoadFile(contentIndexPathForDB(f.dbPath))
+	releaseContentIndexOnCleanup(t, reloaded)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -594,6 +605,7 @@ func TestContentFoldRenameAfterSnapshotRetained(t *testing.T) {
 	f.s.runContentFold(f.vol)
 
 	reloaded, err := contentLoadFile(contentIndexPathForDB(f.dbPath))
+	releaseContentIndexOnCleanup(t, reloaded)
 	if err != nil {
 		t.Fatal(err)
 	}

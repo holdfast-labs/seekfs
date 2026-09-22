@@ -137,6 +137,7 @@ func TestContentRestartCatchUpAfterDrain(t *testing.T) {
 	s := &goSearchService{stop: make(chan struct{})}
 	defer close(s.stop)
 	s.attachContentForVolume(vol)
+	releaseVolumeContentOnCleanup(t, vol)
 	if got := vol.content.stateOf(); got != contentStateReady {
 		t.Fatalf("state after attach = %q; want ready", got)
 	}
@@ -212,6 +213,7 @@ func TestContentAttachCheckpointBranches(t *testing.T) {
 		s := &goSearchService{stop: make(chan struct{})}
 		t.Cleanup(func() { close(s.stop) })
 		s.attachContentForVolume(vol)
+	releaseVolumeContentOnCleanup(t, vol)
 		return s
 	}
 
@@ -331,6 +333,7 @@ func TestContentAttachSkipsNonReadyVolume(t *testing.T) {
 	s := &goSearchService{stop: make(chan struct{})}
 	defer close(s.stop)
 	s.attachContentForVolume(vol)
+	releaseVolumeContentOnCleanup(t, vol)
 	if got := vol.content.stateOf(); got == contentStateReady {
 		t.Fatalf("attach published %q over a rebuilding volume", got)
 	}
@@ -341,6 +344,7 @@ func TestContentAttachSkipsNonReadyVolume(t *testing.T) {
 	// After the rebuild finishes the volume is ready and attach publishes.
 	vol.state = "ready"
 	s.attachContentForVolume(vol)
+	releaseVolumeContentOnCleanup(t, vol)
 	if got := vol.content.stateOf(); got != contentStateReady {
 		t.Fatalf("state after ready re-attach = %q; want ready", got)
 	}
@@ -387,6 +391,7 @@ func TestContentAttachRacesJournalReset(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		s.attachContentForVolume(vol)
+	releaseVolumeContentOnCleanup(t, vol)
 		close(done)
 	}()
 	replaceServiceVolumeContents(vol, newServiceVolumeIndex(dbPath, reset))
@@ -443,6 +448,7 @@ func TestContentCatchUpCapsDegrade(t *testing.T) {
 		s := &goSearchService{stop: make(chan struct{})}
 		defer close(s.stop)
 		s.attachContentForVolume(vol)
+	releaseVolumeContentOnCleanup(t, vol)
 		if !vol.content.healthIncomplete() {
 			t.Fatal("hitting the record cap must mark the volume incomplete")
 		}
@@ -463,6 +469,7 @@ func TestContentCatchUpCapsDegrade(t *testing.T) {
 		s := &goSearchService{stop: make(chan struct{})}
 		defer close(s.stop)
 		s.attachContentForVolume(vol)
+	releaseVolumeContentOnCleanup(t, vol)
 		if !vol.content.healthIncomplete() {
 			t.Fatal("hitting the byte cap must mark the volume incomplete")
 		}
@@ -516,6 +523,7 @@ func TestContentCatchUpAllCreateByteCapDegrade(t *testing.T) {
 	s := &goSearchService{stop: make(chan struct{})}
 	defer close(s.stop)
 	s.attachContentForVolume(vol)
+	releaseVolumeContentOnCleanup(t, vol)
 
 	if !vol.content.healthIncomplete() {
 		t.Fatal("an all-create catch-up must trip the byte cap and mark the volume incomplete")
@@ -561,6 +569,7 @@ func TestContentCatchUpReadErrorDegraded(t *testing.T) {
 	s := &goSearchService{stop: make(chan struct{})}
 	defer close(s.stop)
 	s.attachContentForVolume(vol)
+	releaseVolumeContentOnCleanup(t, vol)
 	if !vol.content.healthIncomplete() {
 		t.Fatal("a catch-up read error must mark the volume incomplete")
 	}
@@ -642,6 +651,7 @@ func TestContentRestartCatchUpCreateAndRename(t *testing.T) {
 	s := &goSearchService{stop: make(chan struct{})}
 	defer close(s.stop)
 	s.attachContentForVolume(vol)
+	releaseVolumeContentOnCleanup(t, vol)
 
 	// The create and the move-in are queued; the intra-volume rename is not.
 	q := vol.contentCoord.takeQueued()
@@ -677,6 +687,7 @@ func TestContentAttachRejectsZeroCheckpoint(t *testing.T) {
 	s := &goSearchService{stop: make(chan struct{})}
 	defer close(s.stop)
 	s.attachContentForVolume(vol)
+	releaseVolumeContentOnCleanup(t, vol)
 	if got := vol.content.stateOf(); got != contentStateStale {
 		t.Fatalf("state = %q; want stale", got)
 	}
@@ -721,6 +732,7 @@ func TestContentAttachRejectsOldFormat(t *testing.T) {
 	s := &goSearchService{stop: make(chan struct{})}
 	defer close(s.stop)
 	s.attachContentForVolume(vol)
+	releaseVolumeContentOnCleanup(t, vol)
 	if got := vol.content.stateOf(); got == contentStateReady {
 		t.Fatal("old-format sidecar was attached ready")
 	}
@@ -769,6 +781,7 @@ func TestContentCatchUpCapSelfHealsRebuild(t *testing.T) {
 
 	s := contentTestService(t)
 	s.attachContentForVolume(vol)
+	releaseVolumeContentOnCleanup(t, vol)
 
 	if got := vol.content.stateOf(); got != contentStateReady {
 		t.Fatalf("state after capped catch-up self-heal = %q; want ready", got)
@@ -785,6 +798,7 @@ func TestContentCatchUpCapSelfHealsRebuild(t *testing.T) {
 		t.Fatal("a completed rebuild must leave no catch-up gate")
 	}
 	rebuilt, err := contentLoadFile(contentIndexPathForDB(vol.dbPath))
+	releaseContentIndexOnCleanup(t, rebuilt)
 	if err != nil {
 		t.Fatalf("load rebuilt sidecar: %v", err)
 	}

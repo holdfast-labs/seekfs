@@ -8,6 +8,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"golang.org/x/text/encoding/japanese"
 )
 
 func contentHTMLExtract(t *testing.T, raw []byte) contentExtractResult {
@@ -135,6 +137,110 @@ func TestContentHTMLExtractSafelyBounded(t *testing.T) {
 		}
 	case <-time.After(30 * time.Second):
 		t.Fatal("html extraction wedged")
+	}
+}
+
+// contentHTMLShiftJIS rounds-trips s through Shift-JIS, so a fixture's bytes
+// genuinely are a non-UTF-8 non-CP1252 legacy encoding.
+func contentHTMLShiftJIS(t *testing.T, s string) []byte {
+	t.Helper()
+	b, err := japanese.ShiftJIS.NewEncoder().Bytes([]byte(s))
+	if err != nil {
+		t.Fatalf("shift-jis encode: %v", err)
+	}
+	return b
+}
+
+// A <meta charset> declaring Shift-JIS is honored: the legacy bytes decode to
+// the intended text and a non-ASCII term is findable through a built index.
+func TestContentHTMLMetaCharsetShiftJIS(t *testing.T) {
+	term := "検索"
+	raw := append([]byte(`<!DOCTYPE html><html><head><meta charset="Shift_JIS"><title>`), contentHTMLShiftJIS(t, term+"タイトル")...)
+	raw = append(raw, []byte(`</title></head><body><p>`)...)
+	raw = append(raw, contentHTMLShiftJIS(t, "これは日本語の文書です")...)
+	raw = append(raw, []byte(`</p></body></html>`)...)
+
+	got := contentHTMLExtract(t, raw)
+	text := string(got.Text)
+	for _, want := range []string{term, "日本語", "文書"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("shift-jis meta charset not honored; text %q missing %q", text, want)
+		}
+	}
+
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "jp.html"), raw, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	idx, err := buildContentIndexFromDir(context.Background(), dir, defaultContentBuildOptions())
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, err := openContentReader(idx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hits := r.search(term, 0); len(hits) != 1 || hits[0].Path != "jp.html" {
+		t.Fatalf("non-ASCII term %q not findable: %v", term, contentPathsOf(hits))
+	}
+}
+
+// The legacy <meta http-equiv=Content-Type content="...; charset=..."> form is
+// honored the same way.
+func TestContentHTMLMetaHTTPEquivCharset(t *testing.T) {
+	raw := append([]byte(`<html><head><meta http-equiv="Content-Type" content="text/html; charset=Shift_JIS"></head><body><p>`), contentHTMLShiftJIS(t, "日本語テスト")...)
+	raw = append(raw, []byte(`</p></body></html>`)...)
+	text := string(contentHTMLExtract(t, raw).Text)
+	if !strings.Contains(text, "日本語") {
+		t.Fatalf("http-equiv charset not honored: %q", text)
+	}
+}
+
+// A UTF-8 BOM wins over a conflicting <meta charset>: the UTF-8 bytes stay
+// intact rather than being re-decoded as the declared legacy encoding.
+func TestContentHTMLBOMWinsOverMetaCharset(t *testing.T) {
+	raw := append([]byte{0xEF, 0xBB, 0xBF},
+		[]byte(`<html><head><meta charset="Shift_JIS"></head><body><p>`+"日本語テスト"+`</p></body></html>`)...)
+	text := string(contentHTMLExtract(t, raw).Text)
+	if !strings.Contains(text, "日本語") {
+		t.Fatalf("BOM did not win over meta charset: %q", text)
+	}
+	if strings.Contains(text, string(contentReplacementChar)) {
+		t.Fatalf("BOM-prefixed UTF-8 content was mangled: %q", text)
+	}
+}
+
+// A declared UTF-8 (and plain ASCII) document is unaffected: no transcode is
+// applied, so valid UTF-8 text survives byte-for-byte.
+func TestContentHTMLUTF8Unaffected(t *testing.T) {
+	raw := []byte(`<!DOCTYPE html><html><head><meta charset="utf-8"></head>` +
+		`<body><p>café 日本語 plain ascii</p></body></html>`)
+	text := string(contentHTMLExtract(t, raw).Text)
+	for _, want := range []string{"café", "日本語", "plain ascii"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("utf-8 document changed; text %q missing %q", text, want)
+		}
+	}
+}
+
+// With no declaration, and with an unusable declared label, the shared auto
+// decoder's legacy behavior is preserved (Latin-1/CP1252 bytes decode, not
+// mojibake). This is the "fall back to current behavior" guarantee.
+func TestContentHTMLUndeclaredLegacyUnchanged(t *testing.T) {
+	latin1 := []byte("<html><body><p>caf\xe9 r\xe9sum\xe9</p></body></html>")
+	for _, tc := range []struct {
+		name string
+		raw  []byte
+	}{
+		{"no-declaration", latin1},
+		{"unusable-label", append([]byte(`<html><head><meta charset="not-a-charset"></head><body><p>caf`+"\xe9"+` r`+"\xe9"+`sum`+"\xe9"), []byte(`</p></body></html>`)...)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			text := string(contentHTMLExtract(t, tc.raw).Text)
+			if !strings.Contains(text, "café") || !strings.Contains(text, "résumé") {
+				t.Fatalf("legacy fallback lost: %q", text)
+			}
+		})
 	}
 }
 

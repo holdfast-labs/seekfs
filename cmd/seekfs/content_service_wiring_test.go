@@ -151,6 +151,7 @@ func TestContentServiceReacquiresVolumeLockAfterContention(t *testing.T) {
 	}
 	s := contentTestService(t)
 	s.attachContentForVolume(vol)
+	releaseVolumeContentOnCleanup(t, vol)
 	s.retryContentVolumeLock(vol) // still contended; must not acquire
 	if _, err := acquireContentVolumeLock(gsx); !errors.Is(err, errContentVolumeLocked) {
 		t.Fatalf("service acquired while the CLI held the lock: %v", err)

@@ -192,6 +192,7 @@ func TestContentAttachExtractorIdentityRefresh(t *testing.T) {
 		}
 		s := contentTestService(t)
 		s.attachContentForVolume(vol)
+	releaseVolumeContentOnCleanup(t, vol)
 		return vol
 	}
 
@@ -300,6 +301,7 @@ func TestContentExtractorRefreshReextractsOnlyStaleClass(t *testing.T) {
 	s := &goSearchService{stop: make(chan struct{})}
 	t.Cleanup(func() { close(s.stop) })
 	s.attachContentForVolume(vol)
+	releaseVolumeContentOnCleanup(t, vol)
 
 	// The stale class is refreshed in place: ready and usable, degraded signal.
 	if got := vol.content.stateOf(); got != contentStateReady {
@@ -337,6 +339,7 @@ func TestContentExtractorRefreshReextractsOnlyStaleClass(t *testing.T) {
 	s.maybeFoldContentDelta(vol)
 
 	reloaded, err := contentLoadFile(contentIndexPathForDB(dbPath))
+	releaseContentIndexOnCleanup(t, reloaded)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -400,6 +403,7 @@ func TestContentExtractorRefreshOverThresholdRebuilds(t *testing.T) {
 
 	s := contentTestService(t)
 	s.attachContentForVolume(vol)
+	releaseVolumeContentOnCleanup(t, vol)
 	if got := vol.content.stateOf(); got != contentStateStale {
 		t.Fatalf("state = %q; want stale (over-cap refresh falls back to rebuild)", got)
 	}
@@ -434,6 +438,7 @@ func TestContentExtractorRefreshDeletedDocTombstoned(t *testing.T) {
 
 	s := contentTestService(t)
 	s.attachContentForVolume(vol)
+	releaseVolumeContentOnCleanup(t, vol)
 	if got := vol.content.stateOf(); got != contentStateReady {
 		t.Fatalf("state = %q; want ready refresh", got)
 	}
@@ -448,6 +453,7 @@ func TestContentExtractorRefreshDeletedDocTombstoned(t *testing.T) {
 	s.maybeFoldContentDelta(vol)
 
 	reloaded, err := contentLoadFile(gsx)
+	releaseContentIndexOnCleanup(t, reloaded)
 	if err != nil {
 		t.Fatal(err)
 	}
