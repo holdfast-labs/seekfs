@@ -41,7 +41,7 @@ func searchServiceVolumesGlobalExtOnlySnapshot(snapshot globalQuerySnapshot, opt
 			return nil, false, nil
 		}
 		ids = filterGlobalIDsHidden(ids, snapshots)
-		ranked, err := rankedEntriesFromGlobalIDs(volumes, ids, pq)
+		ranked, err := rankedEntriesFromGlobalIDs(volumes, ids, pq, nil)
 		if err != nil {
 			return nil, true, err
 		}
@@ -64,7 +64,7 @@ func searchServiceVolumesGlobalExtOnlySnapshot(snapshot globalQuerySnapshot, opt
 			return nil, false, nil
 		}
 		ids = filterGlobalIDsHidden(ids, snapshots)
-		ranked, err := rankedEntriesFromGlobalIDs(volumes, ids, pq)
+		ranked, err := rankedEntriesFromGlobalIDs(volumes, ids, pq, nil)
 		if err != nil {
 			return nil, true, err
 		}
@@ -145,7 +145,7 @@ func searchServiceVolumesGlobalExtOnlySnapshot(snapshot globalQuerySnapshot, opt
 			return rankOf(id.local)
 		})...)
 	}
-	ranked, err := rankedEntriesFromGlobalIDs(volumes, ids, pq)
+	ranked, err := rankedEntriesFromGlobalIDs(volumes, ids, pq, nil)
 	if err != nil {
 		return nil, true, err
 	}
@@ -203,7 +203,7 @@ func searchServiceVolumesGlobalComponentsOnlySnapshot(snapshot globalQuerySnapsh
 	if !countOnly && (len(pq.OrGroups) > 0 || len(pq.NotGroups) > 0) {
 		if ids, ok := globalSimplePathORTopIDs(volumes, pq, limit); ok && !globalSnapshotsHaveHidden(snapshots) && !globalSnapshotsHaveOverlayRecords(snapshots) {
 			topIt := newGlobalIDSliceIterator(ids)
-			base, verified, err := collectGlobalVerifiedTopN(&topIt, volumes, snapshots, pq, limit)
+			base, verified, err := collectGlobalVerifiedTopN(&topIt, volumes, snapshots, pq, limit, nil)
 			if err != nil {
 				return nil, true, err
 			}
@@ -222,7 +222,7 @@ func searchServiceVolumesGlobalComponentsOnlySnapshot(snapshot globalQuerySnapsh
 			}
 			return nil, false, nil
 		}
-		base, verified, err := collectGlobalVerifiedTopN(componentIt, volumes, snapshots, pq, limit)
+		base, verified, err := collectGlobalVerifiedTopN(componentIt, volumes, snapshots, pq, limit, nil)
 		if err != nil {
 			return nil, true, err
 		}
@@ -259,7 +259,7 @@ func searchServiceVolumesGlobalComponentsOnlySnapshot(snapshot globalQuerySnapsh
 			// keeps memory O(limit) and runs one verification pass, which is
 			// the difference between 28s and tens of ms for regex-literal
 			// queries.
-			base, verified, err := collectGlobalVerifiedTopN(componentIt, volumes, snapshots, pq, limit)
+			base, verified, err := collectGlobalVerifiedTopN(componentIt, volumes, snapshots, pq, limit, nil)
 			if err != nil {
 				return nil, true, err
 			}
@@ -285,7 +285,7 @@ func searchServiceVolumesGlobalComponentsOnlySnapshot(snapshot globalQuerySnapsh
 		}
 	}
 	ids = filterGlobalIDsByType(volumes, ids, pq.Type)
-	ranked, err := rankedEntriesFromGlobalIDs(volumes, ids, pq)
+	ranked, err := rankedEntriesFromGlobalIDs(volumes, ids, pq, nil)
 	if err != nil {
 		return nil, true, err
 	}
@@ -396,7 +396,7 @@ func searchServiceVolumesGlobalBoundedFallbackSnapshot(snapshot globalQuerySnaps
 		}
 	}
 	ids = filterGlobalIDsHidden(ids, snapshots)
-	ranked, err := rankedEntriesFromGlobalIDs(volumes, ids, pq)
+	ranked, err := rankedEntriesFromGlobalIDs(volumes, ids, pq, nil)
 	if err != nil {
 		return nil, true, err
 	}
@@ -794,7 +794,7 @@ func countServiceVolumesGlobalOnlySnapshot(snapshot globalQuerySnapshot, opts qu
 			// a huge []int that the verified iterator would only walk once.
 			if strings.ContainsAny(term, `\/*?[]:`) {
 				it := newGlobalRecordIterator(volumeIndex, vol.pathTermPosting(term))
-				count, verified, err := countGlobalVerifiedIterator(&it, volumes, snapshots, pq)
+				count, verified, err := countGlobalVerifiedIterator(&it, volumes, snapshots, pq, nil)
 				if err != nil {
 					return 0, true, err
 				}
@@ -834,7 +834,7 @@ func countServiceVolumesGlobalOnlySnapshot(snapshot globalQuerySnapshot, opts qu
 			}
 			return 0, false, nil
 		}
-		baseCount, verified, err := countGlobalVerifiedIterator(componentIt, volumes, snapshots, pq)
+		baseCount, verified, err := countGlobalVerifiedIterator(componentIt, volumes, snapshots, pq, nil)
 		if err != nil {
 			return 0, true, err
 		}

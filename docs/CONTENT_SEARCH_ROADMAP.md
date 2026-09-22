@@ -204,6 +204,26 @@ Streaming postings (M6) and optional mmap of `.gsx` are the easy tails.
   unusable content volume still returns that volume's filename matches; count ==
   search for non-stat shapes; the degraded flag reaches remote callers.
 - **Risks:** overlaps WP1d (build) and the engine R1/R5 work (mmap).
+- **Status / design (phase 0 landed).** The join is easier than first feared:
+  `serviceVolumeIndex.contentCandidatesBounded` already maps each matching
+  content docID to a **local record ID** via the resolver, so the per-volume
+  content candidate set is *already in the global `globalRecordID.local` space* —
+  no new FRN↔docID join is needed. The right optimization is therefore
+  **filename-driven + content-verified**: drive the existing global filename
+  iterator (ext/under/dir/name) and verify the content leaves inline, which
+  avoids materializing the content candidate superset for a common content term.
+  **Phase 0 (landed):** an optional `*contentLeafMatcher` is threaded through the
+  global verification primitives (`collectGlobalVerifiedTopN`,
+  `countGlobalVerifiedIterator`, `rankedEntriesFromGlobalIDs`,
+  `countVerifiedGlobalIDs`), calling `compactCandidateEntryIfMatchIn`; every
+  existing caller passes `nil`, so filename behavior is byte-identical.
+  **Next phases:** (1) a unified filename-iterator builder — the compound lane
+  must cover **both** the ext-only source (`globalExtPostingFilters`) and the
+  component source (`globalComponentQueryIterator`), not just components; (2) the
+  lane + count-lane wiring, the content-usable/degraded partition at lane level
+  (M8), overlay/hidden handling, and ordering parity; (3) multi-volume routing
+  and the biased-early-stop budget. Each phase is reviewed and differential-
+  tested against the per-volume content path.
 
 ### WP8 — Resource hardening (M1, M2, M5, M9, M10)
 - **Method:** bounded delta + eviction between folds (M1), per-document

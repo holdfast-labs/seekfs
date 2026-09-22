@@ -412,7 +412,7 @@ func globalAttrIDs(volumes []*serviceVolumeIndex, filters []uint32) ([]globalRec
 }
 
 func entriesFromGlobalIDs(volumes []*serviceVolumeIndex, ids []globalRecordID, pq parsedQuery) ([]Entry, error) {
-	ranked, err := rankedEntriesFromGlobalIDs(volumes, ids, pq)
+	ranked, err := rankedEntriesFromGlobalIDs(volumes, ids, pq, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -420,6 +420,10 @@ func entriesFromGlobalIDs(volumes []*serviceVolumeIndex, ids []globalRecordID, p
 }
 
 func countVerifiedGlobalIDs(volumes []*serviceVolumeIndex, ids []globalRecordID, pq parsedQuery) (int, error) {
+	return countVerifiedGlobalIDsContent(volumes, ids, pq, nil)
+}
+
+func countVerifiedGlobalIDsContent(volumes []*serviceVolumeIndex, ids []globalRecordID, pq parsedQuery, matcher *contentLeafMatcher) (int, error) {
 	pathCaches := make([]map[int]string, len(volumes))
 	count := 0
 	for _, id := range ids {
@@ -438,14 +442,14 @@ func countVerifiedGlobalIDs(volumes []*serviceVolumeIndex, ids []globalRecordID,
 		}
 		volumePQ := pq
 		dropSatisfiedVolumeTerms(&volumePQ, vol.index.Volume)
-		if _, ok := compactCandidateEntryIfMatch(vol.index, volumePQ, id.local, pathCaches[id.volume], true, false); ok {
+		if _, ok := compactCandidateEntryIfMatchIn(vol, vol.index, volumePQ, id.local, pathCaches[id.volume], true, false, matcher); ok {
 			count++
 		}
 	}
 	return count, nil
 }
 
-func rankedEntriesFromGlobalIDs(volumes []*serviceVolumeIndex, ids []globalRecordID, pq parsedQuery) ([]globalRankedEntry, error) {
+func rankedEntriesFromGlobalIDs(volumes []*serviceVolumeIndex, ids []globalRecordID, pq parsedQuery, matcher *contentLeafMatcher) ([]globalRankedEntry, error) {
 	pathCaches := make([]map[int]string, len(volumes))
 	rankers := make([]func(int) int, len(volumes))
 	for i, vol := range volumes {
@@ -470,7 +474,7 @@ func rankedEntriesFromGlobalIDs(volumes []*serviceVolumeIndex, ids []globalRecor
 		}
 		volumePQ := pq
 		dropSatisfiedVolumeTerms(&volumePQ, vol.index.Volume)
-		entry, ok := compactCandidateEntryIfMatch(vol.index, volumePQ, id.local, pathCaches[id.volume], true, compactCandidateCanSkipEntryMatches(volumePQ, true))
+		entry, ok := compactCandidateEntryIfMatchIn(vol, vol.index, volumePQ, id.local, pathCaches[id.volume], true, compactCandidateCanSkipEntryMatches(volumePQ, matcher == nil), matcher)
 		if ok {
 			rank := int(^uint(0) >> 1)
 			if rankers[id.volume] != nil {

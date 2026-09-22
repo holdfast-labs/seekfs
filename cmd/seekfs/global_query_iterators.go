@@ -467,7 +467,7 @@ func globalSimplePathORCount(volumes []*serviceVolumeIndex, pq parsedQuery) (int
 		}
 	}
 	merged := newGlobalMergeIterator(children...)
-	count, _, err := countGlobalVerifiedIterator(merged, volumes, nil, pq)
+	count, _, err := countGlobalVerifiedIterator(merged, volumes, nil, pq, nil)
 	return count, err == nil
 }
 

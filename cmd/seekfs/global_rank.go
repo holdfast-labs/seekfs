@@ -368,7 +368,7 @@ func compareGlobalVerifiedEntries(a, b globalRankedEntry, pq parsedQuery, global
 // the requested top-N entries. Boolean branches stay lazy: OR sources merge
 // their posting iterators and NOT advances the exclusion iterator with
 // SeekGE, while this verifier owns the only bounded result heap.
-func collectGlobalVerifiedTopN(it globalIDIterator, volumes []*serviceVolumeIndex, snapshots []*volumeSnapshot, pq parsedQuery, limit int) ([]globalRankedEntry, int, error) {
+func collectGlobalVerifiedTopN(it globalIDIterator, volumes []*serviceVolumeIndex, snapshots []*volumeSnapshot, pq parsedQuery, limit int, matcher *contentLeafMatcher) ([]globalRankedEntry, int, error) {
 	if it == nil || limit <= 0 {
 		return nil, 0, nil
 	}
@@ -403,7 +403,7 @@ func collectGlobalVerifiedTopN(it globalIDIterator, volumes []*serviceVolumeInde
 		}
 		volumePQ := pq
 		dropSatisfiedVolumeTerms(&volumePQ, vol.index.Volume)
-		entry, ok := compactCandidateEntryIfMatch(vol.index, volumePQ, id.local, pathCaches[id.volume], true, false)
+		entry, ok := compactCandidateEntryIfMatchIn(vol, vol.index, volumePQ, id.local, pathCaches[id.volume], true, false, matcher)
 		verified++
 		if !ok {
 			continue
@@ -427,7 +427,7 @@ func collectGlobalVerifiedTopN(it globalIDIterator, volumes []*serviceVolumeInde
 	return out, verified, nil
 }
 
-func countGlobalVerifiedIterator(it globalIDIterator, volumes []*serviceVolumeIndex, snapshots []*volumeSnapshot, pq parsedQuery) (int, int, error) {
+func countGlobalVerifiedIterator(it globalIDIterator, volumes []*serviceVolumeIndex, snapshots []*volumeSnapshot, pq parsedQuery, matcher *contentLeafMatcher) (int, int, error) {
 	if it == nil {
 		return 0, 0, nil
 	}
@@ -453,7 +453,7 @@ func countGlobalVerifiedIterator(it globalIDIterator, volumes []*serviceVolumeIn
 		}
 		volumePQ := pq
 		dropSatisfiedVolumeTerms(&volumePQ, vol.index.Volume)
-		_, ok = compactCandidateEntryIfMatch(vol.index, volumePQ, id.local, pathCaches[id.volume], true, false)
+		_, ok = compactCandidateEntryIfMatchIn(vol, vol.index, volumePQ, id.local, pathCaches[id.volume], true, false, matcher)
 		verified++
 		if ok {
 			count++

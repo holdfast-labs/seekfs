@@ -42,7 +42,7 @@ func searchServiceVolumesGlobalNameSnapshot(snapshot globalQuerySnapshot, opts q
 	if !ok {
 		return nil, false, nil
 	}
-	ranked, err := rankedEntriesFromGlobalIDs(snapshot.volumes, ids, pq)
+	ranked, err := rankedEntriesFromGlobalIDs(snapshot.volumes, ids, pq, nil)
 	if err != nil {
 		return nil, true, err
 	}
@@ -204,7 +204,7 @@ func globalNameTopRanked(snapshot globalQuerySnapshot, pq parsedQuery, trace *se
 			ids = append(ids, globalRecordID{volume: volumeIndex, local: local})
 		}
 	}
-	ranked, err := rankedEntriesFromGlobalIDs(snapshot.volumes, ids, pq)
+	ranked, err := rankedEntriesFromGlobalIDs(snapshot.volumes, ids, pq, nil)
 	if err != nil {
 		return nil, true, err
 	}
