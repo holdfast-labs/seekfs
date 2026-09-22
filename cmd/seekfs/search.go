@@ -383,6 +383,12 @@ func searchServiceVolumes(volumes []*serviceVolumeIndex, opts queryOptions, coun
 	}
 	volumes = prioritizeServiceVolumesForPathTerms(volumes, opts)
 	opts.Trace.setEligibleVolumes(volumes)
+	if contentGlobalLaneEnabled() && queryHasPositiveContentLeaf(pq) {
+		snapshot := newGlobalQuerySnapshot(volumes, opts.Trace)
+		if matches, handled, err := searchServiceVolumesGlobalContentComponentsSnapshot(snapshot, opts, countOnly, pq); handled {
+			return matches, err
+		}
+	}
 	if queryHasAnyContentLeaf(pq) {
 		// Content has its own candidate + post-filter path. It runs on every
 		// content-usable volume; an unusable volume degrades the result rather
