@@ -119,3 +119,35 @@ func TestContentServiceOwnsVolumeLockAfterAttach(t *testing.T) {
 		t.Fatalf("service did not hold the sidecar lock; acquire err = %v", err)
 	}
 }
+
+// A content base whose docs join none of the base's FRNs must not publish
+// ready: the candidate path drops unmapped docs and still returns ok, so a
+// zero-join base would answer every content query as an empty result while
+// advertising a usable index.
+func TestContentAttachZeroJoinRefused(t *testing.T) {
+	t.Setenv("SEEKFS_CONTENT_SEARCH", "1")
+	stubContentCatchUpSync(t)
+	stubContentCatchUpJournal(t, usnJournalDataV0{UsnJournalID: 5, FirstUsn: 1, LowestValidUsn: 1, NextUsn: 60})
+
+	dir := t.TempDir()
+	idx := &Index{Source: "usn", Volume: "C:", Compact: true, JournalID: 5, Checkpoint: 50}
+	idx.Records = []CompactRecord{{FRN: 10, ParentFRN: 1, Parent: -1, Name: "a.txt", Size: 10}}
+	contentIndexFRNs(idx)
+	vol := newServiceVolumeIndex(filepath.Join(dir, "seekfs_c.gsi"), idx)
+	usn := newContentIndex()
+	usn.Origin = contentOriginUSN
+	usn.JournalID = 5
+	usn.CheckpointUSN = 50
+	// FRN 999 has no base record: the resolver maps nothing.
+	usn.Docs = []contentDoc{{DocID: 0, FRN: 999, ContentType: contentClassText, ExtractorVersion: 1}}
+	if err := contentSaveFile(contentIndexPathForDB(vol.dbPath), usn); err != nil {
+		t.Fatal(err)
+	}
+
+	s := contentTestService(t)
+	s.attachContentForVolume(vol)
+	releaseVolumeContentOnCleanup(t, vol)
+	if vol.content.stateOf() == contentStateReady {
+		t.Fatalf("zero-join content base published ready (state=%v)", vol.content.stateOf())
+	}
+}

@@ -165,7 +165,20 @@ func (s *goSearchService) attachContentForVolume(vol *serviceVolumeIndex) {
 		vol.content.markStale(reason)
 		return
 	}
-	if old := vol.content.setReady(idx, reader, buildContentResolver(idx.Docs, frns, ids)); old != nil {
+	resolver := buildContentResolver(idx.Docs, frns, ids)
+	// A content index whose docs join none of the base's FRNs would serve every
+	// query as an empty result set while advertising `ready` (the candidate path
+	// drops unmapped docs and still returns ok). Refuse to publish it: a
+	// zero-join base is a fault (built against a different base/journal), not an
+	// empty corpus.
+	if len(idx.Docs) > 0 && resolver.liveDocCount() == 0 {
+		s.indexMu.Unlock()
+		reason := "content docs do not join the base FRN column"
+		serviceLog("content index for volume %s %s; leaving stale", vol.volume, reason)
+		vol.content.markStale(reason)
+		return
+	}
+	if old := vol.content.setReady(idx, reader, resolver); old != nil {
 		// The replaced base's Sections may alias a mapping; no query can be
 		// reading them under the write lock, so unmap now. Release is once-only,
 		// so a concurrent finalizer is harmless.
@@ -461,6 +474,18 @@ func (s *goSearchService) contentCatchUpBatchBytes(vol *serviceVolumeIndex, chan
 		size, known := vol.contentFRNSizeLocked(ch.FRN)
 		if !known {
 			size = contentCatchUpUnknownFileBytes
+		}
+		// Only files an extractor could actually index count toward the budget:
+		// a binary with no registered extractor would be skipped by extraction,
+		// so charging its full size would spuriously hit the catch-up cap and
+		// force a rebuild. An extensionless file is sniffable, so it still
+		// counts. Cap the per-file charge at the text cap (an extractable file
+		// contributes at most that much text).
+		if contentPathExtension(ch.Name) != "" && !contentPathExtractableByRegistry(ch.Name) {
+			continue
+		}
+		if size > contentExtractMaxTextBytes {
+			size = contentExtractMaxTextBytes
 		}
 		total += size
 	}
