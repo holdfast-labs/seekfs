@@ -467,8 +467,11 @@ Residual / known limitations (all explicit deferrals):
 - **OR-alternative candidate union.** `contentAltCandidateDocs` still
   materializes each alternative's doc set (`budget=0`); a k-way streamed union is
   an optimization tail.
-- **`.gsx` read into heap.** `contentLoadFile` reads the whole sidecar; mmap is
-  deferred to the engine R1/R5 work.
+- **`.gsx` mmap (done).** `contentLoadFile` maps the sidecar read-only
+  (`contentLoadFileMapped`) and decodes only the doc/path metadata; sections are
+  zero-copy views over the mapping, released on replace. A mapping failure falls
+  back to `contentLoadFileHeap`. The base `.gsi` still loads into heap unless
+  the service runs with `-lowmem`.
 - **Completeness residual.** A window-capped superset whose true matches fall in
   `[userLimit, window)` reports `incomplete` conservatively (the safe direction).
 - **M2.** `contentExtractSafely` runs extraction in a goroutine and returns on
@@ -525,8 +528,9 @@ Residual / known limitations (all explicit deferrals):
   stored text, so snippets keep original case. `contentSnippetWindowSource` and
   its `contentSnippetSource`/fixup mapping were dead once raw text was rendered
   directly and have been removed; `contentLossyFixups` remains for the decoder.
-- The service reads the whole `.gsx` into heap (`contentLoadFile`); mmap-ing it
-  is deferred to the ARCHITECTURE_REVIEW R1/R5 engine work.
+- The `.gsx` is mmapped (`contentLoadFileMapped`); only its doc/path metadata is
+  decoded into heap. The **base `.gsi`** is still read into heap unless the
+  service runs with `-lowmem`.
 - **A file extracted while still being written.** The drain promotes a dirty file
   on a close/USN-quiet window (≤2 s tick), so a file written in place without a
   close can be indexed from a partial state. The next USN change (or the close)
@@ -674,8 +678,9 @@ Each item below is intentionally out of scope for P5; the rationale is one line.
   codec's `postings`/`forEach` page the 1024-doc blocks and `content_read.go`'s
   `intersectDocIDStreams` merge-intersects lazy per-trigram streams, so a broad
   gram is never fully decoded (peak memory is O(budget + #trigrams)).
-- **mmap of `.gsx`**: the whole file is read into heap; mmap belongs with the
-  ARCHITECTURE_REVIEW R1/R5 engine work.
+- **mmap of `.gsx`**: DONE in `9c06ecc` — `contentLoadFileMapped` maps the
+  sidecar read-only with a heap fallback; see `content_mmap_test.go`.
+- **Base `.gsi` mmap**: still heap-loaded unless the service runs with `-lowmem`.
 - **Runtime-added-volume attach**: DONE in PF-3 (§6e) — `ensureContentBuild`
   runs after `index-usn` (`service_server.go:513`) and after
   `replaceLoadedVolume` (`service_server.go:548`), so a runtime-added or
