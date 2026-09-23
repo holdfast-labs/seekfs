@@ -877,3 +877,32 @@ func projectCLIJSON(t *testing.T, resp serviceResponse, query string, limit int)
 	}
 	return string(payload)
 }
+
+// A content query served through the real service request path must find
+// matches. service_server.go snapshots its volumes per request
+// (snapshotServiceVolumesForSearch); that view must carry the attached content
+// state, or every service content query returns empty while the volume reports
+// ready. The offline CLI and the other service tests attach a volume directly,
+// so only this path exposes the drop.
+func TestContentServiceSnapshotCarriesContentState(t *testing.T) {
+	vol := newContentQueryVolume(t, []contentFixtureFile{
+		{2, "a.txt", "alpha needle beta"},
+		{3, "b.md", "Needle in markdown"},
+		{4, "c.txt", "nothing here"},
+	})
+	view := snapshotServiceVolumeForSearch(vol)
+	if view == nil {
+		t.Fatal("nil snapshot view")
+	}
+	if view.content == nil {
+		t.Fatal("search snapshot dropped the content state")
+	}
+	matches, err := searchServiceVolumes([]*serviceVolumeIndex{view}, queryOptions{Query: "content:needle", Limit: 100}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := namesOf(matches)
+	if len(got) != 2 || got[0] != "a.txt" || got[1] != "b.md" {
+		t.Fatalf("snapshot content search = %v; want [a.txt b.md]", got)
+	}
+}

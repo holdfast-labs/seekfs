@@ -665,6 +665,7 @@ func snapshotServiceVolumeForSearch(vol *serviceVolumeIndex) *serviceVolumeIndex
 		checkpoint:        vol.checkpoint,
 		state:             vol.state,
 		staleReason:       vol.staleReason,
+		content:           vol.content,
 		frnToID:           vol.frnToID,
 		frns:              vol.frns,
 		frnRecordIDs:      vol.frnRecordIDs,

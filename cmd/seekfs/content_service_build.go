@@ -464,6 +464,15 @@ func (s *goSearchService) runContentBuild(vol *serviceVolumeIndex) {
 	if vol == nil || vol.content == nil {
 		return
 	}
+	// A valid sidecar may have become attachable since this build was scheduled
+	// (startup race: the build was queued while a base rebuild owned the volume,
+	// then the post-rebuild hook attached the existing sidecar). Re-attaching
+	// here avoids discarding a valid sidecar and blanking content queries for
+	// the minutes a needless rebuild would take.
+	s.attachContentForVolume(vol)
+	if vol.content.stateOf() == contentStateReady {
+		return
+	}
 	gen := vol.replayGen.Load()
 	opts := defaultServiceContentBuildOptions()
 
