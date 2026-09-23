@@ -147,7 +147,7 @@ func TestContentAttachZeroJoinRefused(t *testing.T) {
 	s := contentTestService(t)
 	s.attachContentForVolume(vol)
 	releaseVolumeContentOnCleanup(t, vol)
-	if vol.content.stateOf() == contentStateReady {
-		t.Fatalf("zero-join content base published ready (state=%v)", vol.content.stateOf())
+	if got := vol.content.stateOf(); got != contentStateStale {
+		t.Fatalf("zero-join content base state = %v; want %q", got, contentStateStale)
 	}
 }
