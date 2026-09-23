@@ -259,7 +259,7 @@ func (s *goSearchService) scheduleContentBuild(vol *serviceVolumeIndex) {
 	if !vol.contentBuildBusy.CompareAndSwap(false, true) {
 		return
 	}
-	contentBuildRun(func() { s.runContentBuild(vol) })
+	contentBuildRun(func() { s.runContentBuild(vol, true) })
 }
 
 // scheduleContentRebuild schedules a content rebuild for vol without first
@@ -286,7 +286,7 @@ func (s *goSearchService) scheduleContentRebuild(vol *serviceVolumeIndex) {
 	if !vol.contentBuildBusy.CompareAndSwap(false, true) {
 		return
 	}
-	contentBuildRun(func() { s.runContentBuild(vol) })
+	contentBuildRun(func() { s.runContentBuild(vol, false) })
 }
 
 // snapshotContentBuildItems copies the FRN/path/size/modtime metadata for every
@@ -423,7 +423,7 @@ func (s *goSearchService) contentBuildCurrent(vol *serviceVolumeIndex, gen uint6
 // attach to publish it. On abort/failure the volume is left visibly
 // unavailable/indexing/degraded, never ready with an unusable index, and a
 // generation change reschedules.
-func (s *goSearchService) runContentBuild(vol *serviceVolumeIndex) {
+func (s *goSearchService) runContentBuild(vol *serviceVolumeIndex, reuseSidecar bool) {
 	retry := false
 	contentBuildGate <- struct{}{}
 	gateReleased := false
@@ -468,10 +468,15 @@ func (s *goSearchService) runContentBuild(vol *serviceVolumeIndex) {
 	// (startup race: the build was queued while a base rebuild owned the volume,
 	// then the post-rebuild hook attached the existing sidecar). Re-attaching
 	// here avoids discarding a valid sidecar and blanking content queries for
-	// the minutes a needless rebuild would take.
-	s.attachContentForVolume(vol)
-	if vol.content.stateOf() == contentStateReady {
-		return
+	// the minutes a needless rebuild would take. Only scheduleContentBuild sets
+	// reuseSidecar: scheduleContentRebuild's whole point is to NOT re-attach the
+	// still-valid-but-incomplete sidecar it is replacing (re-attaching clears
+	// the incomplete flag via setReady and skips the rebuild).
+	if reuseSidecar {
+		s.attachContentForVolume(vol)
+		if vol.content.stateOf() == contentStateReady {
+			return
+		}
 	}
 	gen := vol.replayGen.Load()
 	opts := defaultServiceContentBuildOptions()

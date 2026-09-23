@@ -62,6 +62,53 @@ func contentBuildTestVolume(t *testing.T, dir string, journal, checkpoint uint64
 	return vol, contentIndexPathForDB(dbPath)
 }
 
+// scheduleContentBuild may reuse an existing valid sidecar; scheduleContentRebuild
+// exists to replace a still-valid-but-incomplete sidecar and must NOT re-attach
+// it. Re-attaching would setReady, which clears the incomplete flag and skips the
+// rebuild, silently publishing a base missing records. runContentBuild must
+// therefore only attempt the reuse attach when the caller allows it.
+func TestContentRebuildDoesNotReattachSidecar(t *testing.T) {
+	t.Setenv("SEEKFS_CONTENT_SEARCH", "1")
+	stubContentCatchUpSync(t)
+	stubContentBuildSync(t)
+
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "note.txt"), []byte("hello needle world"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	const journal = uint64(0xABC)
+	const cp = int64(120)
+	stubContentCatchUpJournal(t, usnJournalDataV0{UsnJournalID: journal, FirstUsn: 1, LowestValidUsn: 1, NextUsn: cp})
+
+	vol, _ := contentBuildTestVolume(t, dir, journal, uint64(cp), []CompactRecord{
+		{FRN: 10, ParentFRN: 10, Parent: -1, Name: "note.txt", Size: 18},
+	})
+	s := contentTestService(t)
+	s.ensureContentBuild(vol)
+	if got := vol.content.stateOf(); got != contentStateReady {
+		t.Fatalf("precondition: build state = %q; want ready", got)
+	}
+
+	// Make the build's snapshot unavailable (no watermark) so only an attach can
+	// publish ready: this isolates the reuse decision from a real rebuild.
+	vol.index.Checkpoint = 0
+	vol.baseCheckpoint = 0
+
+	// The reuse path (scheduleContentBuild) attaches the valid sidecar.
+	vol.content.markStale("test")
+	s.runContentBuild(vol, true)
+	if got := vol.content.stateOf(); got != contentStateReady {
+		t.Fatalf("reuse=true did not attach the valid sidecar; state = %q", got)
+	}
+
+	// The rebuild path (scheduleContentRebuild) must not re-attach it.
+	vol.content.markStale("test")
+	s.runContentBuild(vol, false)
+	if got := vol.content.stateOf(); got == contentStateReady {
+		t.Fatalf("reuse=false re-attached the replaced sidecar (state=%q); the rebuild must not re-publish it", got)
+	}
+}
+
 // M7 (WP10): a service build whose encoded sidecar exceeds the cap must refuse
 // to publish and surface the size in health, never write a truncated index.
 func TestContentServiceBuildOverCapRefuses(t *testing.T) {
