@@ -459,7 +459,14 @@ func (s *goSearchService) runContentBuild(vol *serviceVolumeIndex, reuseSidecar 
 			case <-time.After(contentBuildRetryBackoff):
 			}
 		}
-		s.scheduleContentBuild(vol)
+		// Route the retry by the same intent: a rebuild retry must not fall
+		// through to the reuse path, which would re-attach (and re-publish) the
+		// very sidecar the rebuild is replacing.
+		if reuseSidecar {
+			s.scheduleContentBuild(vol)
+		} else {
+			s.scheduleContentRebuild(vol)
+		}
 	}()
 	if vol == nil || vol.content == nil {
 		return

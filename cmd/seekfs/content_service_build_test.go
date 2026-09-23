@@ -109,6 +109,46 @@ func TestContentRebuildDoesNotReattachSidecar(t *testing.T) {
 	}
 }
 
+// A rebuild that aborts on a generation change retries. The retry must stay on
+// the rebuild path: if it fell through to scheduleContentBuild it would attach
+// the still-valid-but-incomplete sidecar, clearing health.Incomplete and
+// abandoning the rebuild (the failure scheduleContentRebuild exists to prevent).
+func TestContentRebuildRetryDoesNotReattachSidecar(t *testing.T) {
+	t.Setenv("SEEKFS_CONTENT_SEARCH", "1")
+	stubContentCatchUpSync(t)
+	stubContentBuildSync(t)
+
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "note.txt"), []byte("hello needle world"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	const journal = uint64(0xABC)
+	const cp = int64(120)
+	stubContentCatchUpJournal(t, usnJournalDataV0{UsnJournalID: journal, FirstUsn: 1, LowestValidUsn: 1, NextUsn: cp})
+
+	vol, _ := contentBuildTestVolume(t, dir, journal, uint64(cp), []CompactRecord{
+		{FRN: 10, ParentFRN: 10, Parent: -1, Name: "note.txt", Size: 18},
+	})
+	s := contentTestService(t)
+	s.ensureContentBuild(vol)
+	if got := vol.content.stateOf(); got != contentStateReady {
+		t.Fatalf("precondition: build state = %q; want ready", got)
+	}
+
+	// Force every rebuild attempt to abort on a generation change, so the retry
+	// loop runs; it exhausts contentBuildMaxAttempts and fails the build.
+	contentBuildSnapshotHook = func(_ *goSearchService, v *serviceVolumeIndex) {
+		v.replayGen.Add(1)
+	}
+
+	vol.content.markCatchUpIncomplete()
+	s.scheduleContentRebuild(vol)
+
+	if got := vol.content.stateOf(); got == contentStateReady {
+		t.Fatalf("rebuild retry re-attached the incomplete sidecar (state=%q)", got)
+	}
+}
+
 // M7 (WP10): a service build whose encoded sidecar exceeds the cap must refuse
 // to publish and surface the size in health, never write a truncated index.
 func TestContentServiceBuildOverCapRefuses(t *testing.T) {
