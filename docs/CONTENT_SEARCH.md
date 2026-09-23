@@ -83,6 +83,14 @@ unless `case:true` is set. The fold is the same on both sides because the
 builder folds documents and the query folds the leaf with the one shared
 `contentFoldText`.
 
+**Per-format scope.** Matching is against *extracted* text, not raw bytes. Plain
+text/code is indexed as text. HTML indexes the visible page text only — tags,
+entities, `<script>`/`<style>`/`<textarea>` and comments are excluded (verified:
+visible-text queries match `rg -F -i` exactly; syntax like `requestAnimationFrame`
+or `class="results-wrap"` does not, by design — use `rg` for raw-byte markup
+search). OOXML (docx/xlsx/pptx), PDF (text layer), RTF, email (EML/mbox/MSG) and
+OOXML shared strings are indexed as their extracted content.
+
 Service health: when the flag is on but no valid `.gsx` is attached, the service
 reports `content.state = "unavailable"` — never `"ready"` with an unusable
 index. Content queries are served once a volume is usable; when some (not all)
