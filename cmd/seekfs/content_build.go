@@ -107,7 +107,7 @@ func buildContentIndexFromDir(ctx context.Context, root string, opts contentBuil
 	ctx = contentWithExtractSettings(ctx, settings)
 	docs := make([]contentBuildDoc, 0, 4096)
 	var scanned int
-	var skipped, truncated int64
+	var skipped, truncated, declined int64
 	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
 			// A failure on the root itself (a typo'd or inaccessible path) is
@@ -154,6 +154,9 @@ func buildContentIndexFromDir(ctx context.Context, root string, opts contentBuil
 		head, _ := contentReadBounded(f, size, 512)
 		e := contentExtractorForPath(path, head)
 		if e == nil {
+			// No extractor: a binary/unsupported file, or an empty one the
+			// sniffer declined. Tallied so the counters reconcile.
+			declined++
 			return nil
 		}
 		// The extractor applies the raw/text policy: an over-cap container is
@@ -176,6 +179,7 @@ func buildContentIndexFromDir(ctx context.Context, root string, opts contentBuil
 			truncated++
 		}
 		if len(res.Text) == 0 {
+			declined++
 			return nil
 		}
 		rel, rerr := filepath.Rel(root, path)
@@ -198,6 +202,8 @@ func buildContentIndexFromDir(ctx context.Context, root string, opts contentBuil
 		return nil, err
 	}
 	idx.Policy = contentBuildPolicy{MaxRaw: settings.maxRaw, MaxText: settings.maxText, Skipped: skipped, Truncated: truncated}
+	idx.Scanned = int64(scanned)
+	idx.Declined = declined
 	return idx, nil
 }
 

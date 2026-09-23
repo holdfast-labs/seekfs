@@ -153,6 +153,13 @@ type contentIndex struct {
 	// length and by encode from the produced bytes. Not persisted; surfaced in
 	// content health so sidecar growth is observable (WP10/M7).
 	EncodedSize int64
+	// Scanned and Declined are the walk build's file accounting beyond Policy:
+	// how many eligible files were seen, and how many produced no text (a
+	// binary/unsupported file has no extractor; an empty or text-free file's
+	// extractor yields nothing). Not persisted; the offline CLI reports them so
+	// the counters reconcile against the file count.
+	Scanned  int64
+	Declined int64
 	// release unmaps the file backing Sections when the index was loaded from a
 	// memory-mapped `.gsx` (contentLoadFileMapped); nil for a heap-decoded
 	// index. Only Sections (and the reader's text/posting views derived from

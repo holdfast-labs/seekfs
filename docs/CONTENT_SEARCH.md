@@ -636,11 +636,12 @@ real in-cap PDFs measured mean recall **0.933 → 0.980** and perfect files
   files; the fitz oracle text for them is itself unreliable.
 - **Rotated per-glyph runs that restart with `Tm` mid-word** can still insert a
   gap (1 real file, `EXPRESS` in a rotated appearance stream).
-- **Skip accounting is incomplete.** `Skipped` counts only claimed-but-declined
-  containers (PDF/OOXML); a NUL-containing/binary text file and a 0-byte file
-  are dropped by the sniffer before any tally, and over-`maxRaw` **text** is
-  counted `Truncated`, not `Skipped`. No file is mis-reported, but
-  `indexed + skipped + truncated` need not equal the file count.
+- **Skip accounting (offline CLI now reconciles).** `Skipped` counts only
+  claimed-but-declined containers (PDF/OOXML). The offline build now also reports
+  `scan: eligible=<n> declined=<n>` (files with no extractor — binary/unsupported
+  — or whose extractor produced no text, e.g. empty), so `indexed == eligible -
+  declined - skipped`. Not persisted to the `.gsx` (the policy section is a fixed
+  size), so the service health view does not carry it yet.
 - **`.gsx` has no integrity checksum.** Payload/text byte flips are undetected
   (structural damage is caught); fuzzing found no panic. Accepted.
 - Confirmed clean: encrypted/image-only PDFs → `skipped` with no false hits;

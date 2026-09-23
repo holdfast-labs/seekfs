@@ -111,6 +111,11 @@ func cmdContentIndex(args []string) error {
 	if p := idx.Policy; p != (contentBuildPolicy{}) {
 		fmt.Fprintf(os.Stdout, "policy: max_raw=%d max_text=%d skipped=%d truncated=%d\n", p.MaxRaw, p.MaxText, p.Skipped, p.Truncated)
 	}
+	if idx.Scanned > 0 || idx.Declined > 0 {
+		// Reconcile: indexed == eligible - declined - skipped (truncated files
+		// still contribute a bounded prefix, so they are not subtracted).
+		fmt.Fprintf(os.Stdout, "scan: eligible=%d declined=%d\n", idx.Scanned, idx.Declined)
+	}
 	return nil
 }
 
