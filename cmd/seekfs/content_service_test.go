@@ -6,6 +6,19 @@ import (
 	"testing"
 )
 
+func TestContentChangeExcluded(t *testing.T) {
+	for _, n := range []string{"v.gsx", "v.gsx.123456.tmp", "v.gsx.lock", "v.gsi", "v.gsi.wal", "v.gsi.999.tmp", ".seekfs-content.gsx"} {
+		if !contentChangeExcluded(n) {
+			t.Errorf("%q should be excluded from content change intake", n)
+		}
+	}
+	for _, n := range []string{"main.go", "notes.txt", "report.pdf", "index.html"} {
+		if contentChangeExcluded(n) {
+			t.Errorf("%q should NOT be excluded", n)
+		}
+	}
+}
+
 func TestContentEligibleForExtraction(t *testing.T) {
 	if contentEligibleForExtraction(0, contentAttrDirectory) {
 		t.Fatal("a directory must not be eligible")

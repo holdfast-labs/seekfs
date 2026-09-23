@@ -67,6 +67,22 @@ func contentEligibleForExtraction(mode, attrs uint32) bool {
 	return true
 }
 
+// contentChangeExcluded reports whether a USN change names a search-index file
+// that content extraction must never process: the `.gsx` content sidecar (and
+// its `.gsx.<rand>.tmp` atomic-write temp) and the `.gsi`/`.gsi.wal` record
+// index (and its temp). These live on the indexed volume, so the service's own
+// writes are re-observed as changes; charging their size to catch-up's byte
+// budget wedges it in a rebuild loop (and extraction would skip them anyway —
+// no registered extractor). Substring match, so temp names are covered; mirrors
+// the walk builder's `.gsx` / `.seekfs` skip.
+func contentChangeExcluded(name string) bool {
+	n := strings.ToLower(name)
+	if strings.HasPrefix(n, ".seekfs") {
+		return true
+	}
+	return strings.Contains(n, ".gsx") || strings.Contains(n, ".gsi")
+}
+
 // contentHealth is the content telemetry surfaced through the service response
 // and `loaded --json`.
 type contentHealth struct {
@@ -1172,6 +1188,9 @@ func (c *contentCoordinator) observeChanges(changes []usnChange) {
 			c.observedUSN = uint64(ch.USN)
 		}
 		if ch.FRN == 0 {
+			continue
+		}
+		if contentChangeExcluded(ch.Name) {
 			continue
 		}
 		if !contentEligibleForExtraction(0, ch.Attr) {

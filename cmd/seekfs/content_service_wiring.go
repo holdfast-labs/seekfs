@@ -455,6 +455,9 @@ func (s *goSearchService) contentCatchUpBatchBytes(vol *serviceVolumeIndex, chan
 		if !contentEligibleForExtraction(0, ch.Attr) {
 			continue
 		}
+		if contentChangeExcluded(ch.Name) {
+			continue
+		}
 		size, known := vol.contentFRNSizeLocked(ch.FRN)
 		if !known {
 			size = contentCatchUpUnknownFileBytes
