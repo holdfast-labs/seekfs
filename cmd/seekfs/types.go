@@ -428,6 +428,10 @@ type appConfig struct {
 	OutputFormat string
 	SeekFSDir    string
 	RemoteAddr   string
+	// Content scope. Content holds global [content] / top-level content_* keys;
+	// ContentByVolume holds [content."<volume>"] overrides keyed by volume name.
+	Content         contentScopeConfig
+	ContentByVolume map[string]contentScopeConfig
 }
 
 type queryOptions struct {

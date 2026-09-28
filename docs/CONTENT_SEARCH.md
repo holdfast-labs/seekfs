@@ -67,6 +67,19 @@ Offline build + query:
 With the flag unset, `content`/`content-index` exit 1 with "content search is
 disabled"; the rest of seekfs is unchanged.
 
+The service's new content build scope defaults to detected Git worktrees plus
+Documents, Desktop, and Downloads on the volume. It excludes common generated
+directories and system paths. `content-index -db <gsi> --estimate --json`
+reports the prospective scope without writing a sidecar; `--scoped` applies it
+to an offline build. `--scoped` refuses an `off` scope and errors if the byte
+budget is exceeded. A service build that reaches the budget marks content
+health incomplete. Set `[content]` keys `mode` (`auto`, `explicit`, `off`),
+`roots`, `exclude`, `exts`, `git`, `system_excludes`, and `budget_bytes` in
+`seekfs.toml`; `[content."C:"]` overrides one volume. Environment overrides
+are `SEEKFS_CONTENT_SCOPE`, `SEEKFS_CONTENT_ROOTS`, and
+`SEEKFS_CONTENT_EXCLUDE`. Existing sidecars may have been built under the
+earlier broad scope; rebuild them to apply the new scope to stored content.
+
 ### 2b. Content matching semantics
 
 A `content:` leaf is a **case-insensitive literal substring** match by default:

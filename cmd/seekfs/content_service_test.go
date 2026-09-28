@@ -53,7 +53,7 @@ func contentTestState() *contentVolumeState {
 func TestContentHealthSurfacesBuildPolicy(t *testing.T) {
 	t.Setenv("SEEKFS_CONTENT_SEARCH", "1")
 	idx := newContentIndex()
-	idx.Policy = contentBuildPolicy{MaxRaw: 8, MaxText: 4, Skipped: 2, Truncated: 1}
+	idx.Policy = contentBuildPolicy{MaxRaw: 8, MaxText: 4, Skipped: 2, Truncated: 1, ScopeDropped: 1}
 	r, err := openContentReader(idx)
 	if err != nil {
 		t.Fatal(err)
@@ -63,6 +63,9 @@ func TestContentHealthSurfacesBuildPolicy(t *testing.T) {
 	h := st.healthSnapshot(0)
 	if h.MaxRaw != 8 || h.MaxText != 4 || h.Skipped != 2 || h.Truncated != 1 {
 		t.Fatalf("health policy not surfaced: %+v", h)
+	}
+	if !h.Incomplete || h.State != contentStateDegraded {
+		t.Fatalf("budget-limited sidecar not marked incomplete: %+v", h)
 	}
 }
 

@@ -48,6 +48,9 @@ func (s *goSearchService) attachContentForVolume(vol *serviceVolumeIndex) {
 	if vol == nil || !contentSearchEnabled() || vol.content == nil {
 		return
 	}
+	if contentScopeForVolume(s.contentCfg, vol.volume).disabled() {
+		return
+	}
 	// Only USN volumes can join content docs (keyed by FRN) to records. Walk
 	// volumes use synthesized FRNs and a path-keyed `.gsx`, so attaching would
 	// advertise `ready` with a resolver that maps nothing.
@@ -59,7 +62,7 @@ func (s *goSearchService) attachContentForVolume(vol *serviceVolumeIndex) {
 	// the old "drain enabled" guard: after a journal reset invalidates the base
 	// the drain stays enabled, so keying on it would skip the re-attach of a
 	// freshly rebuilt sidecar (PF-3/WP1e).
-	if vol.content.stateOf() == contentStateReady {
+	if vol.content.readerView() != nil {
 		return
 	}
 	gsx := contentIndexPathForDB(vol.dbPath)
@@ -528,6 +531,8 @@ func (s *goSearchService) contentDrainLoop(vol *serviceVolumeIndex) {
 	if vol == nil || vol.contentCoord == nil {
 		return
 	}
+	var scope *contentScopeResolved
+	var scopeGen uint64
 	// Capture the per-volume done channel once: a volume swap that installs a
 	// different coordinator must not let this loop observe a new channel and
 	// outlive its volume (M10/P6-4). The loop ends at either s.stop (shutdown)
@@ -545,6 +550,16 @@ func (s *goSearchService) contentDrainLoop(vol *serviceVolumeIndex) {
 			if vol.contentCoord == nil {
 				return
 			}
+			// Re-resolve only when the filename index generation changes; a
+			// full repo-marker scan on every drain tick would be expensive.
+			if vol.index != nil && (scope == nil || scopeGen != vol.replayGen.Load()) {
+				resolved, ok := s.resolvedContentScope(vol)
+				if !ok {
+					return
+				}
+				scope = &resolved
+				scopeGen = vol.replayGen.Load()
+			}
 			// M10 residual: keep trying to own the sidecar lock on the drain
 			// cadence, so a service that lost the startup race acquires it once
 			// the CLI build releases it.
@@ -554,7 +569,16 @@ func (s *goSearchService) contentDrainLoop(vol *serviceVolumeIndex) {
 			// which the search path trims under searchMu (a different lock).
 			pathCache := make(map[int]string, 64)
 			vol.contentCoord.processQueue(func(frn uint64) (string, bool) {
-				return s.contentResolvePath(vol, frn, pathCache)
+				path, ok := s.contentResolvePath(vol, frn, pathCache)
+				if !ok {
+					return "", false
+				}
+				if scope != nil {
+					if _, _, allowed := scope.allows(path); !allowed {
+						return "", false
+					}
+				}
+				return path, true
 			})
 			// M1: after the tick's extractions, fold if the delta has grown
 			// past its bound. A fold failure keeps the delta and backs off.

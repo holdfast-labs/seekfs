@@ -53,6 +53,12 @@ func contentTestService(t *testing.T) *goSearchService {
 
 func contentBuildTestVolume(t *testing.T, dir string, journal, checkpoint uint64, records []CompactRecord) (*serviceVolumeIndex, string) {
 	t.Helper()
+	// Pin the fixture directory as an explicit content root: the service build
+	// now derives an auto scope from the index (git worktrees + known folders),
+	// and a synthetic temp volume is neither, so without this the build would
+	// index nothing.
+	t.Setenv("SEEKFS_CONTENT_SCOPE", "explicit")
+	t.Setenv("SEEKFS_CONTENT_ROOTS", dir)
 	idx := &Index{Source: "usn", Volume: dir, Compact: true, JournalID: journal, Checkpoint: int64(checkpoint)}
 	idx.Records = append([]CompactRecord(nil), records...)
 	contentIndexFRNs(idx)

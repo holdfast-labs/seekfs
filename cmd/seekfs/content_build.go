@@ -12,6 +12,7 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
@@ -31,6 +32,10 @@ type contentBuildOptions struct {
 	Encoding string
 	Under    string
 	Exts     map[string]struct{}
+	// Scope, when non-nil, replaces the extension + single-Under gate with the
+	// resolved auto scope (roots, excludes, git worktrees, extension registry).
+	// The caller resolves it (contentScope.resolve) after detecting repos.
+	Scope *contentScopeResolved
 }
 
 func defaultContentBuildOptions() contentBuildOptions {
@@ -63,6 +68,10 @@ func (o contentBuildOptions) extractSettings() contentExtractSettings {
 
 // allows reports whether a path is in scope for a build.
 func (o contentBuildOptions) allows(path string) bool {
+	if o.Scope != nil {
+		_, _, ok := o.Scope.allows(path)
+		return ok
+	}
 	if len(o.Exts) > 0 {
 		if _, ok := o.Exts[contentPathExtension(path)]; !ok {
 			return false
@@ -343,6 +352,7 @@ func buildContentIndexForIndex(ctx context.Context, idx *Index, opts contentBuil
 	cache := make(map[int]string, 1024)
 	docs := make([]contentBuildDoc, 0, 4096)
 	var skipped, truncated int64
+	var scopeBytes int64
 	count := idx.compactRecordCount()
 	for id := 0; id < count; id++ {
 		if err := ctx.Err(); err != nil {
@@ -355,6 +365,19 @@ func buildContentIndexForIndex(ctx context.Context, idx *Index, opts contentBuil
 		path := idx.reconstructCompactPathCached(id, cache)
 		if path == "" || !opts.allows(path) {
 			continue
+		}
+		if opts.Scope != nil {
+			n := rec.Size
+			if n < 0 {
+				n = 0
+			}
+			if n > contentExtractMaxTextBytes {
+				n = contentExtractMaxTextBytes
+			}
+			if scopeBytes+n > opts.Scope.BudgetBytes {
+				return nil, fmt.Errorf("content-index: scoped build exceeds %d-byte budget; narrow the scope or raise budget_bytes", opts.Scope.BudgetBytes)
+			}
+			scopeBytes += n
 		}
 		doc, res, ok := contentBuildDocSafe(ctx, contentBuildItem{frn: rec.FRN, path: path})
 		if res.Truncated {

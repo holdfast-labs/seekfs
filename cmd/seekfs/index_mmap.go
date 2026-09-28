@@ -1131,9 +1131,14 @@ func loadConfig(path string) (appConfig, error) {
 		return appConfig{}, err
 	}
 	cfg := appConfig{}
+	section := ""
 	for _, line := range strings.Split(string(data), "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
+			section = parseContentConfigSection(strings.TrimSpace(line[1 : len(line)-1]))
 			continue
 		}
 		parts := strings.SplitN(line, "=", 2)
@@ -1142,6 +1147,12 @@ func loadConfig(path string) (appConfig, error) {
 		}
 		key := strings.TrimSpace(parts[0])
 		value := strings.TrimSpace(parts[1])
+		if section != "" {
+			if section != "ignore" {
+				applyContentScopeConfig(&cfg, section, key, value)
+			}
+			continue
+		}
 		switch key {
 		case "db", "db_path":
 			if s := parseTOMLString(value); s != "" {
@@ -1168,6 +1179,17 @@ func loadConfig(path string) (appConfig, error) {
 			cfg.SeekFSDir = parseTOMLString(value)
 		case "remote_addr":
 			cfg.RemoteAddr = parseTOMLString(value)
+		case "content_scope":
+			cfg.Content.Mode = parseTOMLString(value)
+		case "content_roots":
+			cfg.Content.Roots = append(cfg.Content.Roots, parseTOMLStringArray(value)...)
+		case "content_exclude":
+			cfg.Content.Exclude = append(cfg.Content.Exclude, parseTOMLStringArray(value)...)
+		case "content_budget_bytes":
+			var n int64
+			if _, err := fmt.Sscanf(value, "%d", &n); err == nil {
+				cfg.Content.BudgetBytes = n
+			}
 		}
 	}
 	return cfg, nil

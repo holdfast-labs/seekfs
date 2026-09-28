@@ -68,7 +68,7 @@ func TestContentIndexRoundTrip(t *testing.T) {
 func TestContentIndexPolicyRoundTrip(t *testing.T) {
 	idx := newContentIndex()
 	idx.Docs = contentTestDocs()
-	idx.Policy = contentBuildPolicy{MaxRaw: 1 << 20, MaxText: 1 << 19, Skipped: 3, Truncated: 2}
+	idx.Policy = contentBuildPolicy{MaxRaw: 1 << 20, MaxText: 1 << 19, Skipped: 3, Truncated: 2, ScopeDropped: 1}
 	got, err := contentIndexDecode(contentIndexEncode(idx))
 	if err != nil {
 		t.Fatalf("contentDecode: %v", err)

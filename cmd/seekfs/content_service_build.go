@@ -145,6 +145,47 @@ func defaultServiceContentBuildOptions() contentBuildOptions {
 	return opts
 }
 
+// resolvedContentScope derives the effective content scope for a volume from
+// the service config plus the git worktrees detected in the volume's full
+// filename index. ok is false when content is disabled for the volume.
+func (s *goSearchService) resolvedContentScope(vol *serviceVolumeIndex) (contentScopeResolved, bool) {
+	if s == nil || vol == nil || vol.index == nil {
+		return contentScopeResolved{}, false
+	}
+	scope := contentScopeForVolume(s.contentCfg, vol.volume)
+	if scope.disabled() {
+		return contentScopeResolved{}, false
+	}
+	s.indexMu.RLock()
+	repos := contentDetectGitRepos(vol.index)
+	s.indexMu.RUnlock()
+	return scope.resolve(vol.volume, repos), true
+}
+
+// contentApplyScopeBudget trims items to the scope's byte budget, charging each
+// file min(size, contentExtractMaxTextBytes). truncated is true when items were
+// dropped; the caller surfaces it as an incomplete (but usable) build.
+func contentApplyScopeBudget(items []contentBuildItem, budget int64) ([]contentBuildItem, bool) {
+	if budget <= 0 {
+		return items, false
+	}
+	var total int64
+	for i := range items {
+		n := items[i].size
+		if n < 0 {
+			n = 0
+		}
+		if n > contentExtractMaxTextBytes {
+			n = contentExtractMaxTextBytes
+		}
+		total += n
+		if total > budget {
+			return items[:i], true
+		}
+	}
+	return items, false
+}
+
 // contentServiceEncodingLabel returns the service's SEEKFS_CONTENT_ENCODING
 // value, or "auto". A blank/invalid label resolves to auto. It is read at build
 // and delta time so both paths agree without shared mutable state.
@@ -238,9 +279,12 @@ func (s *goSearchService) scheduleContentBuild(vol *serviceVolumeIndex) {
 	if s == nil || vol == nil || !contentSearchEnabled() || vol.content == nil {
 		return
 	}
+	if contentScopeForVolume(s.contentCfg, vol.volume).disabled() {
+		return
+	}
 	// Reuse an existing valid sidecar when there is one.
 	s.attachContentForVolume(vol)
-	if vol.content.stateOf() == contentStateReady {
+	if vol.content.readerView() != nil {
 		return
 	}
 	s.indexMu.RLock()
@@ -270,6 +314,9 @@ func (s *goSearchService) scheduleContentBuild(vol *serviceVolumeIndex) {
 // contentCatchUpFailed bounds its use with contentBuildAttempts.
 func (s *goSearchService) scheduleContentRebuild(vol *serviceVolumeIndex) {
 	if s == nil || vol == nil || !contentSearchEnabled() || vol.content == nil {
+		return
+	}
+	if contentScopeForVolume(s.contentCfg, vol.volume).disabled() {
 		return
 	}
 	s.indexMu.RLock()
@@ -425,6 +472,7 @@ func (s *goSearchService) contentBuildCurrent(vol *serviceVolumeIndex, gen uint6
 // generation change reschedules.
 func (s *goSearchService) runContentBuild(vol *serviceVolumeIndex, reuseSidecar bool) {
 	retry := false
+	var scopeDropped int64
 	contentBuildGate <- struct{}{}
 	gateReleased := false
 	releaseGate := func() {
@@ -481,12 +529,17 @@ func (s *goSearchService) runContentBuild(vol *serviceVolumeIndex, reuseSidecar 
 	// the incomplete flag via setReady and skips the rebuild).
 	if reuseSidecar {
 		s.attachContentForVolume(vol)
-		if vol.content.stateOf() == contentStateReady {
+		if vol.content.readerView() != nil {
 			return
 		}
 	}
 	gen := vol.replayGen.Load()
 	opts := defaultServiceContentBuildOptions()
+	// Auto scope: derive content roots from the full filename index (git
+	// worktrees + configured/known roots), never the whole volume by default.
+	if resolved, ok := s.resolvedContentScope(vol); ok {
+		opts.Scope = &resolved
+	}
 
 	items, journalID, checkpoint, snapshotResult := s.snapshotContentBuildItems(vol, opts)
 	contentBuildSnapshotHook(s, vol)
@@ -500,6 +553,12 @@ func (s *goSearchService) runContentBuild(vol *serviceVolumeIndex, reuseSidecar 
 		// against the new generation instead of building against a torn mix.
 		retry = true
 		return
+	}
+	if opts.Scope != nil {
+		if trimmed, truncated := contentApplyScopeBudget(items, opts.Scope.BudgetBytes); truncated {
+			scopeDropped = int64(len(items) - len(trimmed))
+			items = trimmed
+		}
 	}
 
 	vol.content.markIndexing(len(items))
@@ -596,7 +655,7 @@ func (s *goSearchService) runContentBuild(vol *serviceVolumeIndex, reuseSidecar 
 	cidx.Origin = contentOriginUSN
 	cidx.JournalID = journalID
 	cidx.CheckpointUSN = uint64(checkpoint)
-	cidx.Policy = contentBuildPolicy{MaxRaw: settings.maxRaw, MaxText: settings.maxText, Skipped: skipped, Truncated: truncated}
+	cidx.Policy = contentBuildPolicy{MaxRaw: settings.maxRaw, MaxText: settings.maxText, Skipped: skipped, Truncated: truncated, ScopeDropped: scopeDropped}
 
 	// Re-check before publishing: the volume could have been rebuilt (or the
 	// service stopped) during the minutes-long extraction.
@@ -626,7 +685,7 @@ func (s *goSearchService) runContentBuild(vol *serviceVolumeIndex, reuseSidecar 
 	// re-validates the journal generation, so a base swapped in during the
 	// save is not overwritten with this build.
 	s.attachContentForVolume(vol)
-	if vol.content.stateOf() == contentStateReady {
+	if vol.content.readerView() != nil {
 		return
 	}
 	if !s.contentBuildCurrent(vol, gen, journalID) {

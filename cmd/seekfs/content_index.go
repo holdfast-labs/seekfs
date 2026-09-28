@@ -78,13 +78,14 @@ const (
 // size/encoding policy visible to the service's content health instead of a
 // silent drop.
 type contentBuildPolicy struct {
-	MaxRaw    int64
-	MaxText   int64
-	Skipped   int64
-	Truncated int64
+	MaxRaw       int64
+	MaxText      int64
+	Skipped      int64
+	Truncated    int64
+	ScopeDropped int64
 }
 
-const contentPolicySize = 32
+const contentPolicySize = 40
 
 func (p contentBuildPolicy) encode() []byte {
 	b := make([]byte, contentPolicySize)
@@ -92,19 +93,24 @@ func (p contentBuildPolicy) encode() []byte {
 	binary.LittleEndian.PutUint64(b[8:], uint64(p.MaxText))
 	binary.LittleEndian.PutUint64(b[16:], uint64(p.Skipped))
 	binary.LittleEndian.PutUint64(b[24:], uint64(p.Truncated))
+	binary.LittleEndian.PutUint64(b[32:], uint64(p.ScopeDropped))
 	return b
 }
 
 func decodeContentPolicy(data []byte) (contentBuildPolicy, bool) {
-	if len(data) < contentPolicySize {
+	if len(data) < 32 {
 		return contentBuildPolicy{}, false
 	}
-	return contentBuildPolicy{
+	p := contentBuildPolicy{
 		MaxRaw:    int64(binary.LittleEndian.Uint64(data[0:])),
 		MaxText:   int64(binary.LittleEndian.Uint64(data[8:])),
 		Skipped:   int64(binary.LittleEndian.Uint64(data[16:])),
 		Truncated: int64(binary.LittleEndian.Uint64(data[24:])),
-	}, true
+	}
+	if len(data) >= contentPolicySize {
+		p.ScopeDropped = int64(binary.LittleEndian.Uint64(data[32:]))
+	}
+	return p, true
 }
 
 // contentHashLen is the width of the content hash stored per document.

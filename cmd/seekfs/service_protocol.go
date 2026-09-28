@@ -428,6 +428,9 @@ type goSearchService struct {
 	// has not yet succeeded, so the bounded retry (drain tick) logs once instead
 	// of flooding while another process holds the lock.
 	contentLockWarned map[string]bool
+	// contentCfg is the resolved seekfs.toml, used to derive the per-volume
+	// content scope for the service-owned build.
+	contentCfg appConfig
 }
 
 // signalServiceStop closes the stop channel exactly once.  It is safe to call

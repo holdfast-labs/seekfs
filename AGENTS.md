@@ -6,9 +6,9 @@
   text-content search, definitions, import references, or exact line
   matches, use `rg`.
 - Full-text content search is under development on the `content-search`
-  branch, off by default (`SEEKFS_CONTENT_SEARCH=1`) and not yet wired into
-  the service. See `docs/CONTENT_SEARCH.md` for the design, status, and the
-  agent continuation handoff. Default behavior is unchanged.
+  branch and off by default. With `SEEKFS_CONTENT_SEARCH=1`, the service
+  builds and serves a scoped content index. See `docs/CONTENT_SEARCH.md`
+  for design, status, and the agent continuation handoff.
 - Prefer `seekfs search`/`seekfs count` against the resident service for
   file discovery by name or path. Put flags before the query, and quote
   multi-term queries.

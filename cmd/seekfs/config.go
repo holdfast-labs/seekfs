@@ -56,6 +56,16 @@ func parseTOMLStringArray(value string) []string {
 	return out
 }
 
+func parseTOMLBool(value string) (bool, bool) {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "true", "1", "yes", "on":
+		return true, true
+	case "false", "0", "no", "off":
+		return false, true
+	}
+	return false, false
+}
+
 func loadIndexes(paths []string) ([]*Index, error) {
 	indexes := make([]*Index, 0, len(paths))
 	for _, path := range paths {

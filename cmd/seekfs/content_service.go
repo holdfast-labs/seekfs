@@ -635,6 +635,11 @@ func (s *contentVolumeState) setReady(idx *contentIndex, reader *contentReader, 
 	// A freshly attached base is complete as of its checkpoint; any earlier
 	// catch-up truncation belonged to the replaced base.
 	s.health.Incomplete = false
+	if idx.Policy.ScopeDropped > 0 {
+		s.health.Incomplete = true
+		s.state = contentStateDegraded
+		s.health.State = contentStateDegraded
+	}
 	s.catchUpFailed = false
 	s.health.Docs = len(idx.Docs)
 	s.health.SidecarBytes = idx.EncodedSize

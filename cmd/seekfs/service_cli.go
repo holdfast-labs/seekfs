@@ -53,7 +53,7 @@ func cmdService(args []string) error {
 	if isService {
 		processMode = "windows-service"
 	}
-	handler := &goSearchService{pipeName: *pipeName, sddl: *sddl, processMode: processMode, stop: make(chan struct{}), dbs: dbs, remoteAddr: *remoteAddr}
+	handler := &goSearchService{pipeName: *pipeName, sddl: *sddl, processMode: processMode, stop: make(chan struct{}), dbs: dbs, remoteAddr: *remoteAddr, contentCfg: cfg}
 	if isService {
 		return svc.Run(serviceName, handler)
 	}
@@ -572,6 +572,14 @@ func printConfigKey(cfg appConfig, key string) error {
 		fmt.Println(cfg.DefaultLimit)
 	case "output_format":
 		fmt.Println(cfg.OutputFormat)
+	case "content_scope":
+		fmt.Println(cfg.Content.Mode)
+	case "content_roots":
+		fmt.Println(formatStringArray(cfg.Content.Roots))
+	case "content_exclude":
+		fmt.Println(formatStringArray(cfg.Content.Exclude))
+	case "content_budget_bytes":
+		fmt.Println(cfg.Content.BudgetBytes)
 	default:
 		return fmt.Errorf("unknown config key %q", key)
 	}
@@ -579,7 +587,7 @@ func printConfigKey(cfg appConfig, key string) error {
 }
 
 func setConfigKey(path, key, value string) error {
-	allowed := map[string]bool{"dbs": true, "db_paths": true, "volumes": true, "service_pipe": true, "default_limit": true, "output_format": true, "seekfs_dir": true}
+	allowed := map[string]bool{"dbs": true, "db_paths": true, "volumes": true, "service_pipe": true, "default_limit": true, "output_format": true, "seekfs_dir": true, "content_scope": true, "content_roots": true, "content_exclude": true, "content_budget_bytes": true}
 	if !allowed[key] {
 		return fmt.Errorf("unknown config key %q", key)
 	}

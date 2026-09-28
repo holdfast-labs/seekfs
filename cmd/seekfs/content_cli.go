@@ -8,6 +8,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -23,6 +24,10 @@ func cmdContentIndex(args []string) error {
 	under := fs.String("under", "", "only index files under this path")
 	exts := fs.String("ext", "", "comma-separated extension allowlist, e.g. .go,.md,.txt")
 	all := fs.Bool("all", false, "with -db, explicitly opt in to a whole-volume build (every extractable file)")
+	scoped := fs.Bool("scoped", false, "with -db, derive the auto content scope from the index (git worktrees + configured/known roots)")
+	estimate := fs.Bool("estimate", false, "with -db, print the auto content scope estimate (files/bytes/repos) and exit")
+	jsonOut := fs.Bool("json", false, "with -estimate, emit JSON")
+	configPath := fs.String("config", "", "optional seekfs.toml config path")
 	encoding := fs.String("encoding", "auto", "text encoding override: auto, none, or a WHATWG label (latin1, windows-1252, utf-16le, sjis, ...)")
 	maxRaw := fs.Int64("max-raw", 0, "max raw source bytes per file (0 = default 32 MiB, clamped to the hard ceiling)")
 	maxText := fs.Int64("max-text", 0, "max extracted text bytes per file (0 = default 16 MiB, clamped to the hard ceiling)")
@@ -65,8 +70,37 @@ func cmdContentIndex(args []string) error {
 	}
 	// M5: a -db build with no scope indexes the whole volume, which is a
 	// resource/semantics footgun. Require an explicit scope or opt-in.
-	if *db != "" && !*all && strings.TrimSpace(*under) == "" && len(opts.Exts) == 0 {
-		return fmt.Errorf("content-index: -db without -ext/-under would index the whole volume; pass -ext <list>, -under <path>, or -all to opt in")
+	if *db != "" && !*all && !*scoped && !*estimate && strings.TrimSpace(*under) == "" && len(opts.Exts) == 0 {
+		return fmt.Errorf("content-index: -db without a scope would index the whole volume; pass -ext <list>, -under <path>, -all, or --scoped")
+	}
+
+	// --estimate is read-only: it must run before the volume lock so it can
+	// estimate against a volume a live service owns.
+	if *estimate {
+		if *db == "" {
+			return errors.New("content-index: --estimate requires -db")
+		}
+		rec, lerr := loadIndex(*db)
+		if lerr != nil {
+			return fmt.Errorf("content-index: load %s: %w", *db, lerr)
+		}
+		cfg, _ := loadConfig(*configPath)
+		scope := contentScopeForVolume(cfg, rec.Volume)
+		est := scanContentScope(rec, scope, rec.Volume, opts.MaxFiles)
+		if *jsonOut {
+			enc := json.NewEncoder(os.Stdout)
+			enc.SetIndent("", "  ")
+			return enc.Encode(est)
+		}
+		fmt.Fprintf(os.Stdout, "content scope estimate for %s (mode=%s):\n", rec.Volume, scope.Mode)
+		fmt.Fprintf(os.Stdout, "  files=%d bytes=%d projected_gsx=%d max_files_hit=%v\n", est.Files, est.Bytes, est.ProjectedGSXBytes, est.MaxFilesHit)
+		for _, r := range est.Repos {
+			fmt.Fprintf(os.Stdout, "  repo: %s\n", r)
+		}
+		for _, u := range est.ByUnit {
+			fmt.Fprintf(os.Stdout, "  %s [%s]: files=%d bytes=%d\n", u.Root, u.Kind, u.Files, u.Bytes)
+		}
+		return nil
 	}
 
 	outPath := *out
@@ -96,6 +130,15 @@ func cmdContentIndex(args []string) error {
 		rec, lerr := loadIndex(*db)
 		if lerr != nil {
 			return fmt.Errorf("content-index: load %s: %w", *db, lerr)
+		}
+		cfg, _ := loadConfig(*configPath)
+		if *scoped {
+			scope := contentScopeForVolume(cfg, rec.Volume)
+			if scope.disabled() {
+				return errors.New("content-index: content scope is off for this volume")
+			}
+			resolved := scope.resolve(rec.Volume, contentDetectGitRepos(rec))
+			opts.Scope = &resolved
 		}
 		idx, err = buildContentIndexForIndex(context.Background(), rec, opts)
 	} else {
