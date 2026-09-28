@@ -96,7 +96,7 @@ func TestLoadConfigContentSections(t *testing.T) {
 		"mode = \"explicit\"\n" +
 		"roots = [\"C:\\\\src\", \"C:\\\\work\"]\n" +
 		"git = false\n" +
-		"[content.\"F:\"]\n" +
+		"[content.\"f:\"]\n" +
 		"roots = [\"F:\\\\proj\"]\n" +
 		"[other]\n" +
 		"mode = \"ignored\"\n"
@@ -209,6 +209,11 @@ func TestContentScopeEstimateAndDetect(t *testing.T) {
 	// MaxFiles truncation is surfaced: two includable files, cap 1.
 	if capped := scanContentScope(idx, defaultContentScope(), "C:", 1); !capped.MaxFilesHit || capped.Files != 1 {
 		t.Fatalf("maxFiles=1 => files=%d hit=%v; want 1/true", capped.Files, capped.MaxFilesHit)
+	}
+	budgeted := defaultContentScope()
+	budgeted.BudgetBytes = 110
+	if capped := scanContentScope(idx, budgeted, "C:", 0); !capped.BudgetHit || capped.Files != 1 || capped.Bytes != 100 {
+		t.Fatalf("budget=110 => files=%d bytes=%d hit=%v; want 1/100/true", capped.Files, capped.Bytes, capped.BudgetHit)
 	}
 }
 

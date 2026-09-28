@@ -812,6 +812,16 @@ func TestContentSnapshotAbortsOnGenerationChange(t *testing.T) {
 	}
 }
 
+func TestContentSnapshotReportsFileLimit(t *testing.T) {
+	vol, _ := contentBuildTestVolume(t, t.TempDir(), 3, 10, contentManyRecords(2))
+	opts := defaultContentBuildOptions()
+	opts.MaxFiles = 1
+	items, _, _, result := contentTestService(t).snapshotContentBuildItems(vol, opts)
+	if result != contentBuildSnapshotLimited || len(items) != 1 {
+		t.Fatalf("snapshot result=%d items=%d; want limited/1", result, len(items))
+	}
+}
+
 // A volume whose generation keeps changing must not spin builds forever: after
 // contentBuildMaxAttempts retries the build gives up and surfaces degraded with
 // a BuildError in health.

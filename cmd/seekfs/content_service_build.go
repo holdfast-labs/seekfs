@@ -114,6 +114,8 @@ const (
 	// contentBuildSnapshotChanged: the base generation moved mid-pass. Abort
 	// and reschedule against the new generation.
 	contentBuildSnapshotChanged
+	// contentBuildSnapshotLimited: the file-count cap truncated the corpus.
+	contentBuildSnapshotLimited
 )
 
 // contentBuildSnapshotHook runs immediately after the metadata snapshot lock is
@@ -149,7 +151,7 @@ func defaultServiceContentBuildOptions() contentBuildOptions {
 // the service config plus the git worktrees detected in the volume's full
 // filename index. ok is false when content is disabled for the volume.
 func (s *goSearchService) resolvedContentScope(vol *serviceVolumeIndex) (contentScopeResolved, bool) {
-	if s == nil || vol == nil || vol.index == nil {
+	if s == nil || vol == nil {
 		return contentScopeResolved{}, false
 	}
 	scope := contentScopeForVolume(s.contentCfg, vol.volume)
@@ -157,6 +159,10 @@ func (s *goSearchService) resolvedContentScope(vol *serviceVolumeIndex) (content
 		return contentScopeResolved{}, false
 	}
 	s.indexMu.RLock()
+	if vol.index == nil {
+		s.indexMu.RUnlock()
+		return contentScopeResolved{}, false
+	}
 	repos := contentDetectGitRepos(vol.index)
 	s.indexMu.RUnlock()
 	return scope.resolve(vol.volume, repos), true
@@ -411,7 +417,7 @@ func (s *goSearchService) snapshotContentBuildItems(vol *serviceVolumeIndex, opt
 		contentBuildSnapshotBatchHook(s, vol)
 		if opts.MaxFiles > 0 && len(items) > opts.MaxFiles {
 			items = items[:opts.MaxFiles]
-			break
+			return items, journalID, checkpoint, contentBuildSnapshotLimited
 		}
 	}
 	return items, journalID, checkpoint, contentBuildSnapshotOK
@@ -553,10 +559,14 @@ func (s *goSearchService) runContentBuild(vol *serviceVolumeIndex, reuseSidecar 
 		// against the new generation instead of building against a torn mix.
 		retry = true
 		return
+	case contentBuildSnapshotLimited:
+		// The exact number beyond the cap is unknown. Persist a nonzero
+		// marker so attach and restart report the partial corpus.
+		scopeDropped = 1
 	}
 	if opts.Scope != nil {
 		if trimmed, truncated := contentApplyScopeBudget(items, opts.Scope.BudgetBytes); truncated {
-			scopeDropped = int64(len(items) - len(trimmed))
+			scopeDropped += int64(len(items) - len(trimmed))
 			items = trimmed
 		}
 	}

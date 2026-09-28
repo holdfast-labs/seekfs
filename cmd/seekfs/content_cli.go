@@ -84,7 +84,10 @@ func cmdContentIndex(args []string) error {
 		if lerr != nil {
 			return fmt.Errorf("content-index: load %s: %w", *db, lerr)
 		}
-		cfg, _ := loadConfig(*configPath)
+		cfg, err := loadConfig(*configPath)
+		if err != nil {
+			return fmt.Errorf("content-index: config: %w", err)
+		}
 		scope := contentScopeForVolume(cfg, rec.Volume)
 		est := scanContentScope(rec, scope, rec.Volume, opts.MaxFiles)
 		if *jsonOut {
@@ -93,7 +96,7 @@ func cmdContentIndex(args []string) error {
 			return enc.Encode(est)
 		}
 		fmt.Fprintf(os.Stdout, "content scope estimate for %s (mode=%s):\n", rec.Volume, scope.Mode)
-		fmt.Fprintf(os.Stdout, "  files=%d bytes=%d projected_gsx=%d max_files_hit=%v\n", est.Files, est.Bytes, est.ProjectedGSXBytes, est.MaxFilesHit)
+		fmt.Fprintf(os.Stdout, "  files=%d bytes=%d projected_gsx=%d max_files_hit=%v budget_hit=%v\n", est.Files, est.Bytes, est.ProjectedGSXBytes, est.MaxFilesHit, est.BudgetHit)
 		for _, r := range est.Repos {
 			fmt.Fprintf(os.Stdout, "  repo: %s\n", r)
 		}
@@ -131,7 +134,10 @@ func cmdContentIndex(args []string) error {
 		if lerr != nil {
 			return fmt.Errorf("content-index: load %s: %w", *db, lerr)
 		}
-		cfg, _ := loadConfig(*configPath)
+		cfg, cfgErr := loadConfig(*configPath)
+		if cfgErr != nil {
+			return fmt.Errorf("content-index: config: %w", cfgErr)
+		}
 		if *scoped {
 			scope := contentScopeForVolume(cfg, rec.Volume)
 			if scope.disabled() {

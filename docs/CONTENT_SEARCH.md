@@ -73,7 +73,8 @@ directories and system paths. `content-index -db <gsi> --estimate --json`
 reports the prospective scope without writing a sidecar; `--scoped` applies it
 to an offline build. `--scoped` refuses an `off` scope and errors if the byte
 budget is exceeded. A service build that reaches the budget marks content
-health incomplete. Set `[content]` keys `mode` (`auto`, `explicit`, `off`),
+health incomplete; estimates report `budget_hit` when the budget limits the
+reported files and bytes. Set `[content]` keys `mode` (`auto`, `explicit`, `off`),
 `roots`, `exclude`, `exts`, `git`, `system_excludes`, and `budget_bytes` in
 `seekfs.toml`; `[content."C:"]` overrides one volume. Environment overrides
 are `SEEKFS_CONTENT_SCOPE`, `SEEKFS_CONTENT_ROOTS`, and

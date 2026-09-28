@@ -54,7 +54,10 @@ func (s *goSearchService) attachContentForVolume(vol *serviceVolumeIndex) {
 	// Only USN volumes can join content docs (keyed by FRN) to records. Walk
 	// volumes use synthesized FRNs and a path-keyed `.gsx`, so attaching would
 	// advertise `ready` with a resolver that maps nothing.
-	if vol.index == nil || vol.index.Source != "usn" {
+	s.indexMu.RLock()
+	eligible := vol.index != nil && vol.index.Source == "usn"
+	s.indexMu.RUnlock()
+	if !eligible {
 		return
 	}
 	s.acquireContentVolumeLock(vol)
@@ -552,7 +555,10 @@ func (s *goSearchService) contentDrainLoop(vol *serviceVolumeIndex) {
 			}
 			// Re-resolve only when the filename index generation changes; a
 			// full repo-marker scan on every drain tick would be expensive.
-			if vol.index != nil && (scope == nil || scopeGen != vol.replayGen.Load()) {
+			s.indexMu.RLock()
+			hasIndex := vol.index != nil
+			s.indexMu.RUnlock()
+			if hasIndex && (scope == nil || scopeGen != vol.replayGen.Load()) {
 				resolved, ok := s.resolvedContentScope(vol)
 				if !ok {
 					return

@@ -156,7 +156,7 @@ func contentScopeForVolume(cfg appConfig, volume string) contentScope {
 		}
 	}
 	apply(cfg.Content)
-	if ov, ok := cfg.ContentByVolume[volume]; ok {
+	if ov, ok := cfg.ContentByVolume[strings.ToUpper(volume)]; ok {
 		apply(ov)
 	}
 	applyContentScopeEnv(&s)
@@ -210,6 +210,7 @@ func parseContentConfigSection(inner string) string {
 // global Content config or the per-volume override.
 func applyContentScopeConfig(cfg *appConfig, section, key, value string) {
 	if vol, ok := strings.CutPrefix(section, "content:"); ok {
+		vol = strings.ToUpper(vol)
 		if cfg.ContentByVolume == nil {
 			cfg.ContentByVolume = make(map[string]contentScopeConfig)
 		}

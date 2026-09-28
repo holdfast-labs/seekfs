@@ -27,6 +27,7 @@ type contentEstimate struct {
 	Repos             []string           `json:"repos,omitempty"`
 	Excluded          map[string]int64   `json:"excluded,omitempty"` // reason -> files
 	MaxFilesHit       bool               `json:"max_files_hit,omitempty"`
+	BudgetHit         bool               `json:"budget_hit,omitempty"`
 	ProjectedGSXBytes int64              `json:"projected_gsx_bytes"`
 }
 
@@ -113,6 +114,10 @@ func scanContentScope(idx *Index, scope contentScope, volume string, maxFiles in
 		}
 		if n > contentExtractMaxTextBytes {
 			n = contentExtractMaxTextBytes
+		}
+		if est.Bytes+n > resolved.BudgetBytes {
+			est.BudgetHit = true
+			break
 		}
 		est.Files++
 		est.Bytes += n
