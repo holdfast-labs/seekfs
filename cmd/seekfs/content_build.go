@@ -366,24 +366,18 @@ func buildContentIndexForIndex(ctx context.Context, idx *Index, opts contentBuil
 		if path == "" || !opts.allows(path) {
 			continue
 		}
-		if opts.Scope != nil {
-			n := rec.Size
-			if n < 0 {
-				n = 0
-			}
-			if n > contentExtractMaxTextBytes {
-				n = contentExtractMaxTextBytes
-			}
-			if scopeBytes+n > opts.Scope.BudgetBytes {
-				return nil, fmt.Errorf("content-index: scoped build exceeds %d-byte budget; narrow the scope or raise budget_bytes", opts.Scope.BudgetBytes)
-			}
-			scopeBytes += n
-		}
 		doc, res, ok := contentBuildDocSafe(ctx, contentBuildItem{frn: rec.FRN, path: path})
 		if res.Truncated {
 			truncated++
 		}
 		if ok {
+			if opts.Scope != nil {
+				n := int64(len(doc.text))
+				if n > opts.Scope.BudgetBytes-scopeBytes {
+					return nil, fmt.Errorf("content-index: scoped build exceeds %d-byte extracted-text budget; narrow the scope or raise budget_bytes", opts.Scope.BudgetBytes)
+				}
+				scopeBytes += n
+			}
 			docs = append(docs, doc)
 			continue
 		}

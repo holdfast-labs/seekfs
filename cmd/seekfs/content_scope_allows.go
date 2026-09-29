@@ -32,6 +32,7 @@ type contentScopeResolved struct {
 	Mode           contentScopeMode
 	Roots          []string // effective include roots (normalized)
 	Repos          []string // detected git worktree roots (normalized)
+	ExplicitRoots  []string // configured roots, before known folders are added
 	Excludes       []string // normalized exclude prefixes
 	ExtSet         map[string]struct{}
 	BudgetBytes    int64
@@ -52,6 +53,7 @@ func (s contentScope) resolve(volume string, repoRoots []string) contentScopeRes
 		r.Roots = append(r.Roots, repoRoots...)
 	}
 	r.Roots = append(r.Roots, s.Roots...)
+	r.ExplicitRoots = dedupeContentPaths(append([]string(nil), s.Roots...))
 	if s.Mode == contentScopeAuto {
 		r.Roots = append(r.Roots, contentKnownFolders(volume)...)
 	}
@@ -72,6 +74,28 @@ func (s contentScope) resolve(volume string, repoRoots []string) contentScopeRes
 	}
 	r.Excludes = dedupeContentPaths(r.Excludes)
 	return r
+}
+
+// priority orders budget candidates by user intent: repositories first,
+// configured roots next, then automatically detected known folders.
+func (r contentScopeResolved) priority(path string) int {
+	p := contentNormPath(path)
+	for _, repo := range r.Repos {
+		if contentPathUnder(p, repo) {
+			return 0
+		}
+	}
+	for _, root := range r.ExplicitRoots {
+		if contentPathUnder(p, root) {
+			return 1
+		}
+	}
+	for _, root := range r.Roots {
+		if contentPathUnder(p, root) {
+			return 2
+		}
+	}
+	return 3
 }
 
 // allows decides whether path is in scope, returning the matching include unit

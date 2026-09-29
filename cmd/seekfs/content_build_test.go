@@ -58,6 +58,20 @@ func TestContentBuildMissingRootErrors(t *testing.T) {
 	}
 }
 
+func TestContentScopedIndexBudgetUsesExtractedText(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "a.txt"), []byte("ten letters"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	vol, _ := contentBuildTestVolume(t, dir, 3, 10, []CompactRecord{{FRN: 1, Parent: -1, Name: "a.txt", Size: 1}})
+	scope := contentScope{Mode: contentScopeExplicit, Roots: []string{contentNormPath(dir)}, BudgetBytes: 5}.resolve(dir, nil)
+	opts := defaultContentBuildOptions()
+	opts.Scope = &scope
+	if _, err := buildContentIndexForIndex(context.Background(), vol.index, opts); err == nil {
+		t.Fatal("scoped build ignored extracted-text budget")
+	}
+}
+
 func TestContentBuildRespectsExtAndUnder(t *testing.T) {
 	dir := t.TempDir()
 	sub := filepath.Join(dir, "sub")

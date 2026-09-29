@@ -78,6 +78,23 @@ func TestContentIndexPolicyRoundTrip(t *testing.T) {
 	}
 }
 
+func TestContentIndexScopeIdentityRoundTrip(t *testing.T) {
+	idx := newContentIndex()
+	idx.ScopeHash = defaultContentScope().resolve("C:", []string{`C:\repo`}).fingerprint()
+	got, err := contentIndexDecode(contentIndexEncode(idx))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ScopeHash != idx.ScopeHash {
+		t.Fatal("scope identity did not survive encoding")
+	}
+	idx.ScopeHash = [32]byte{}
+	idx.Sections[contentSectionScope] = []byte("bad")
+	if _, err := contentIndexDecode(contentIndexEncode(idx)); err == nil {
+		t.Fatal("malformed scope identity accepted")
+	}
+}
+
 func TestContentIndexEncodingIsDeterministic(t *testing.T) {
 	mk := func() *contentIndex {
 		idx := newContentIndex()

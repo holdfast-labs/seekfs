@@ -204,6 +204,7 @@ func TestContentAttachExtractorIdentityRefresh(t *testing.T) {
 		if mutate != nil {
 			mutate(base)
 		}
+		stampContentTestScope(vol.volume, base)
 		if err := contentSaveFile(gsx, base); err != nil {
 			t.Fatal(err)
 		}
@@ -310,6 +311,7 @@ func TestContentExtractorRefreshReextractsOnlyStaleClass(t *testing.T) {
 	base.Origin = contentOriginUSN
 	base.JournalID = journal
 	base.CheckpointUSN = uint64(baseCP)
+	stampContentTestScope(idx.Volume, base)
 	if err := contentSaveFile(contentIndexPathForDB(dbPath), base); err != nil {
 		t.Fatal(err)
 	}
@@ -414,6 +416,7 @@ func TestContentExtractorRefreshOverThresholdRebuilds(t *testing.T) {
 	base.Origin = contentOriginUSN
 	base.JournalID = 7
 	base.CheckpointUSN = 50
+	stampContentTestScope(vol.volume, base)
 	if err := contentSaveFile(gsx, base); err != nil {
 		t.Fatal(err)
 	}
@@ -449,6 +452,7 @@ func TestContentExtractorRefreshDeletedDocTombstoned(t *testing.T) {
 	base.Origin = contentOriginUSN
 	base.JournalID = 7
 	base.CheckpointUSN = 100
+	stampContentTestScope(vol.volume, base)
 	if err := contentSaveFile(gsx, base); err != nil {
 		t.Fatal(err)
 	}

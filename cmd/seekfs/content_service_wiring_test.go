@@ -165,6 +165,41 @@ func TestContentServiceReacquiresVolumeLockAfterContention(t *testing.T) {
 	}
 }
 
+func TestContentAttachRejectsOldOrChangedScope(t *testing.T) {
+	t.Setenv("SEEKFS_CONTENT_SEARCH", "1")
+	for _, tc := range []struct {
+		name  string
+		stamp bool
+	}{
+		{"unscoped", false},
+		{"narrowed", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			idx := &Index{Source: "usn", Volume: "C:", Compact: true, JournalID: 5, Checkpoint: 50}
+			idx.Records = []CompactRecord{{FRN: 10, ParentFRN: 1, Parent: -1, Name: "a.txt", Size: 10}}
+			contentIndexFRNs(idx)
+			vol := newServiceVolumeIndex(filepath.Join(t.TempDir(), "seekfs_c.gsi"), idx)
+			base := newContentIndex()
+			base.Origin, base.JournalID, base.CheckpointUSN = contentOriginUSN, 5, 50
+			base.Docs = []contentDoc{{DocID: 0, FRN: 10, ContentType: contentClassText, ExtractorVersion: 1}}
+			if tc.stamp {
+				stampContentTestScope("C:", base)
+			}
+			if err := contentSaveFile(contentIndexPathForDB(vol.dbPath), base); err != nil {
+				t.Fatal(err)
+			}
+			s := contentTestService(t)
+			no := false
+			s.contentCfg.Content = contentScopeConfig{Mode: "explicit", Roots: []string{`C:\narrow`}, Git: &no}
+			s.attachContentForVolume(vol)
+			releaseVolumeContentOnCleanup(t, vol)
+			if vol.content.readerView() != nil || vol.content.stateOf() != contentStateStale {
+				t.Fatalf("old scope attached: state=%s", vol.content.stateOf())
+			}
+		})
+	}
+}
+
 func TestRebindContentAfterBaseSwap(t *testing.T) {
 	t.Setenv("SEEKFS_CONTENT_SEARCH", "1")
 	idx := &Index{Volume: "C:", Derived: indexDerivedSections{

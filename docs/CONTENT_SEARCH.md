@@ -73,13 +73,21 @@ directories and system paths. `content-index -db <gsi> --estimate --json`
 reports the prospective scope without writing a sidecar; `--scoped` applies it
 to an offline build. `--scoped` refuses an `off` scope and errors if the byte
 budget is exceeded. A service build that reaches the budget marks content
-health incomplete; estimates report `budget_hit` when the budget limits the
-reported files and bytes. Set `[content]` keys `mode` (`auto`, `explicit`, `off`),
+health incomplete. Estimates apply the same root priority and use source size
+as a proxy for extracted text; compressed documents can make the actual build
+reach the budget earlier. `budget_hit` reports when the estimate's proxy reaches
+the limit. Set `[content]` keys `mode` (`auto`, `explicit`, `off`),
 `roots`, `exclude`, `exts`, `git`, `system_excludes`, and `budget_bytes` in
 `seekfs.toml`; `[content."C:"]` overrides one volume. Environment overrides
 are `SEEKFS_CONTENT_SCOPE`, `SEEKFS_CONTENT_ROOTS`, and
-`SEEKFS_CONTENT_EXCLUDE`. Existing sidecars may have been built under the
-earlier broad scope; rebuild them to apply the new scope to stored content.
+`SEEKFS_CONTENT_EXCLUDE`. Sidecars store a fingerprint of their resolved scope;
+the service rebuilds an older sidecar or one whose scope changed before serving
+its stored content.
+
+The service selects Git repositories before configured roots, then known
+folders. It spools accepted extracted text to temporary disk before assembling
+the FRN-sorted sidecar, so a large scoped build needs temporary disk space up
+to its extracted-text budget.
 
 ### 2b. Content matching semantics
 

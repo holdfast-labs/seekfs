@@ -822,6 +822,80 @@ func TestContentSnapshotReportsFileLimit(t *testing.T) {
 	}
 }
 
+func TestContentSnapshotFileLimitPrefersRepository(t *testing.T) {
+	dir := t.TempDir()
+	repo := filepath.Join(dir, "repo")
+	vol, _ := contentBuildTestVolume(t, dir, 3, 10, []CompactRecord{
+		{FRN: 1, Parent: -1, Name: "a.txt", Size: 8},
+		{FRN: 2, Parent: -1, Name: "repo", Mode: uint32(os.ModeDir)},
+		{FRN: 3, Parent: 1, ParentFRN: 2, Name: ".git", Mode: uint32(os.ModeDir)},
+		{FRN: 4, Parent: 1, ParentFRN: 2, Name: "z.txt", Size: 8},
+	})
+	s := contentTestService(t)
+	scope, ok := s.resolvedContentScope(vol)
+	if !ok || len(scope.Repos) != 1 || scope.Repos[0] != contentNormPath(repo) {
+		t.Fatalf("detected repos = %v, ok=%v; want %q", scope.Repos, ok, repo)
+	}
+	opts := defaultServiceContentBuildOptions()
+	opts.Scope = &scope
+	opts.MaxFiles = 1
+	items, _, _, result := s.snapshotContentBuildItems(vol, opts)
+	if result != contentBuildSnapshotLimited || len(items) != 1 || filepath.Base(items[0].path) != "z.txt" {
+		t.Fatalf("limited snapshot = %+v, result=%d; want repo file", items, result)
+	}
+}
+
+func TestContentServiceBuildBudgetUsesExtractedTextAndPriority(t *testing.T) {
+	t.Setenv("SEEKFS_CONTENT_SEARCH", "1")
+	stubContentCatchUpSync(t)
+	stubContentBuildSync(t)
+	dir := t.TempDir()
+	repo := filepath.Join(dir, "repo")
+	if err := os.MkdirAll(filepath.Join(repo, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for path, body := range map[string]string{
+		filepath.Join(dir, "a.html"):  "<html><body>rootword</body></html>",
+		filepath.Join(repo, "z.html"): "<html><body>repoword</body></html>",
+	} {
+		if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	const journal = uint64(92)
+	const cp = int64(100)
+	stubContentCatchUpJournal(t, usnJournalDataV0{UsnJournalID: journal, FirstUsn: 1, LowestValidUsn: 1, NextUsn: cp})
+	vol, gsx := contentBuildTestVolume(t, dir, journal, uint64(cp), []CompactRecord{
+		{FRN: 1, Parent: -1, Name: "a.html", Size: 34},
+		{FRN: 2, Parent: -1, Name: "repo", Mode: uint32(os.ModeDir)},
+		{FRN: 3, Parent: 1, ParentFRN: 2, Name: ".git", Mode: uint32(os.ModeDir)},
+		{FRN: 4, Parent: 1, ParentFRN: 2, Name: "z.html", Size: 34},
+	})
+	s := contentTestService(t)
+	s.contentCfg.Content.BudgetBytes = 16
+	s.ensureContentBuild(vol)
+	built, err := contentLoadFile(gsx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	releaseContentIndexOnCleanup(t, built)
+	if len(built.Docs) != 2 || built.Policy.ScopeDropped != 0 {
+		t.Fatalf("budgeted index docs=%d dropped=%d; want both short extracted texts", len(built.Docs), built.Policy.ScopeDropped)
+	}
+	// A single extracted-text allowance must choose the repo, even though the
+	// explicit-root file comes first in the record index and by path.
+	s.contentCfg.Content.BudgetBytes = 8
+	s.scheduleContentRebuild(vol)
+	built, err = contentLoadFile(gsx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	releaseContentIndexOnCleanup(t, built)
+	if len(built.Docs) != 1 || built.Docs[0].FRN != 4 || built.Policy.ScopeDropped != 1 {
+		t.Fatalf("priority index docs=%+v dropped=%d; want only repo file", built.Docs, built.Policy.ScopeDropped)
+	}
+}
+
 // A volume whose generation keeps changing must not spin builds forever: after
 // contentBuildMaxAttempts retries the build gives up and surfaces degraded with
 // a BuildError in health.

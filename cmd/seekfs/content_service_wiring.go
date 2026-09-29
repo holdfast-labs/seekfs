@@ -93,6 +93,13 @@ func (s *goSearchService) attachContentForVolume(vol *serviceVolumeIndex) {
 		serviceLog("content index for volume %s is not FRN-keyed (origin=%d); leaving unavailable", vol.volume, idx.Origin)
 		return
 	}
+	resolvedScope, ok := s.resolvedContentScope(vol)
+	if !ok || idx.ScopeHash == ([32]byte{}) || idx.ScopeHash != resolvedScope.fingerprint() {
+		reason := "content scope changed or sidecar predates scope identity"
+		serviceLog("content index for volume %s %s; rebuilding", vol.volume, reason)
+		vol.content.markStale(reason)
+		return
+	}
 	// P1/WP11: a base whose docs were produced by an older/other extractor
 	// version (or written before the class was populated) would serve stale
 	// text. A registered-class version bump is refreshed in place: the stale

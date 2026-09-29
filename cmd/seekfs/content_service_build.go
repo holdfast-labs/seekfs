@@ -24,12 +24,10 @@ package main
 // if the journal generation changed under it and reschedules (with a bounded
 // attempt budget).
 //
-// Memory. The build streams extracted docs straight into the text store and the
-// external posting builders (assembleContentIndexStream); it never accumulates a
-// []contentBuildDoc of the raw corpus. Peak transient heap is one document's raw
-// text plus the two contentBuildArenaBytes posting arenas and the text store
-// being assembled, adding only metadata (the item list and a bounded path cache)
-// per record; the published index is bounded by its encoded sections.
+// Memory. The build spools extracted text to one temporary file in priority
+// order, then streams selected docs to assembleContentIndexStream in FRN order;
+// it never retains the raw corpus in memory. Peak transient heap is one
+// document's text plus posting arenas, assembled text, and capped metadata.
 //
 // IO governor. Extraction is serial and paused every batch so filename search
 // and USN replay keep the disk; the loop is cancelable through s.stop and the
@@ -49,10 +47,13 @@ package main
 // whole-volume build is never the default.
 
 import (
+	"container/heap"
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -168,30 +169,6 @@ func (s *goSearchService) resolvedContentScope(vol *serviceVolumeIndex) (content
 	return scope.resolve(vol.volume, repos), true
 }
 
-// contentApplyScopeBudget trims items to the scope's byte budget, charging each
-// file min(size, contentExtractMaxTextBytes). truncated is true when items were
-// dropped; the caller surfaces it as an incomplete (but usable) build.
-func contentApplyScopeBudget(items []contentBuildItem, budget int64) ([]contentBuildItem, bool) {
-	if budget <= 0 {
-		return items, false
-	}
-	var total int64
-	for i := range items {
-		n := items[i].size
-		if n < 0 {
-			n = 0
-		}
-		if n > contentExtractMaxTextBytes {
-			n = contentExtractMaxTextBytes
-		}
-		total += n
-		if total > budget {
-			return items[:i], true
-		}
-	}
-	return items, false
-}
-
 // contentServiceEncodingLabel returns the service's SEEKFS_CONTENT_ENCODING
 // value, or "auto". A blank/invalid label resolves to auto. It is read at build
 // and delta time so both paths agree without shared mutable state.
@@ -260,10 +237,34 @@ var contentDefaultTextExtensions = []string{
 // slice into the record index or its mmap, so extraction can run with every
 // service lock released.
 type contentBuildItem struct {
-	frn     uint64
-	path    string
-	size    int64
-	modUnix int64
+	frn      uint64
+	path     string
+	priority int
+}
+
+func contentBuildItemLess(a, b contentBuildItem) bool {
+	if a.priority != b.priority {
+		return a.priority < b.priority
+	}
+	if a.path != b.path {
+		return a.path < b.path
+	}
+	return a.frn < b.frn
+}
+
+// A max-heap keeps the worst retained candidate at the root when MaxFiles is
+// reached, so a later repository file can replace an earlier known-folder file.
+type contentBuildItemHeap []contentBuildItem
+
+func (h contentBuildItemHeap) Len() int           { return len(h) }
+func (h contentBuildItemHeap) Less(i, j int) bool { return contentBuildItemLess(h[j], h[i]) }
+func (h contentBuildItemHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
+func (h *contentBuildItemHeap) Push(x any)        { *h = append(*h, x.(contentBuildItem)) }
+func (h *contentBuildItemHeap) Pop() any {
+	n := len(*h) - 1
+	x := (*h)[n]
+	*h = (*h)[:n]
+	return x
 }
 
 // ensureContentBuild is the single entry point for service-owned content
@@ -381,7 +382,8 @@ func (s *goSearchService) snapshotContentBuildItems(vol *serviceVolumeIndex, opt
 		return nil, 0, 0, contentBuildSnapshotUnavailable
 	}
 
-	items = make([]contentBuildItem, 0, 1024)
+	top := make(contentBuildItemHeap, 0, 1024)
+	limited := false
 	cache := make(map[int]string, 1024)
 	for start := 0; start < count; start += contentBuildSnapshotBatch {
 		end := start + contentBuildSnapshotBatch
@@ -408,19 +410,33 @@ func (s *goSearchService) snapshotContentBuildItems(vol *serviceVolumeIndex, opt
 			if path == "" || !opts.allows(path) {
 				continue
 			}
-			items = append(items, contentBuildItem{frn: rec.FRN, path: path, size: rec.Size, modUnix: rec.ModUnix})
+			item := contentBuildItem{frn: rec.FRN, path: path}
+			if opts.Scope != nil {
+				item.priority = opts.Scope.priority(path)
+			}
+			if opts.MaxFiles <= 0 || len(top) < opts.MaxFiles {
+				top = append(top, item)
+				continue
+			}
+			if !limited {
+				heap.Init(&top)
+				limited = true
+			}
+			if contentBuildItemLess(item, top[0]) {
+				top[0] = item
+				heap.Fix(&top, 0)
+			}
 		}
 		s.indexMu.RUnlock()
 		if len(cache) > contentBuildPathCacheMax {
 			cache = make(map[int]string, 1024)
 		}
 		contentBuildSnapshotBatchHook(s, vol)
-		if opts.MaxFiles > 0 && len(items) > opts.MaxFiles {
-			items = items[:opts.MaxFiles]
-			return items, journalID, checkpoint, contentBuildSnapshotLimited
-		}
 	}
-	return items, journalID, checkpoint, contentBuildSnapshotOK
+	if limited {
+		return top, journalID, checkpoint, contentBuildSnapshotLimited
+	}
+	return top, journalID, checkpoint, contentBuildSnapshotOK
 }
 
 // contentBuildDocSafe extracts one file into a build doc. It recovers from an
@@ -543,9 +559,11 @@ func (s *goSearchService) runContentBuild(vol *serviceVolumeIndex, reuseSidecar 
 	opts := defaultServiceContentBuildOptions()
 	// Auto scope: derive content roots from the full filename index (git
 	// worktrees + configured/known roots), never the whole volume by default.
-	if resolved, ok := s.resolvedContentScope(vol); ok {
-		opts.Scope = &resolved
+	resolved, ok := s.resolvedContentScope(vol)
+	if !ok {
+		return
 	}
+	opts.Scope = &resolved
 
 	items, journalID, checkpoint, snapshotResult := s.snapshotContentBuildItems(vol, opts)
 	contentBuildSnapshotHook(s, vol)
@@ -564,12 +582,9 @@ func (s *goSearchService) runContentBuild(vol *serviceVolumeIndex, reuseSidecar 
 		// marker so attach and restart report the partial corpus.
 		scopeDropped = 1
 	}
-	if opts.Scope != nil {
-		if trimmed, truncated := contentApplyScopeBudget(items, opts.Scope.BudgetBytes); truncated {
-			scopeDropped += int64(len(items) - len(trimmed))
-			items = trimmed
-		}
-	}
+	// Choose work before applying either cap. The compact index's record order
+	// has no relationship to the scope's priority.
+	sort.Slice(items, func(i, j int) bool { return contentBuildItemLess(items[i], items[j]) })
 
 	vol.content.markIndexing(len(items))
 	contentBuildIndexingHook(vol.content)
@@ -585,73 +600,127 @@ func (s *goSearchService) runContentBuild(vol *serviceVolumeIndex, reuseSidecar 
 		}
 	}()
 
-	total := len(items)
-	// Extract in the (frn, path) order assembleContentIndexStream requires, so
-	// docIDs match the offline builder's for the same records.
-	sort.Slice(items, func(i, j int) bool {
-		if items[i].frn != items[j].frn {
-			return items[i].frn < items[j].frn
-		}
-		return items[i].path < items[j].path
-	})
-
-	// source extracts one doc at a time into the streaming assembler, so the raw
-	// corpus is never accumulated (see the memory budget in the file comment).
-	done := 0
-	var skipped, truncated int64
-	abortReason := ""
-	abortRetry := false
-	source := func() (contentBuildDoc, bool, error) {
-		for done < total {
-			// The atomic generation covers the common abort (a rebuild/journal
-			// reset bumps replayGen); the full journal-id check runs per batch
-			// and before publish so a replayGen-free base swap is caught too.
-			if vol.replayGen.Load() != gen {
-				abortReason, abortRetry = "journal generation changed during build", true
-				return contentBuildDoc{}, false, errContentBuildAborted
-			}
-			if s.serviceStopping() {
-				abortReason = "service stopping"
-				return contentBuildDoc{}, false, errContentBuildAborted
-			}
-			item := items[done]
-			done++
-			doc, res, ok := contentBuildDocSafe(ctx, item)
-			if ok && res.Truncated {
-				truncated++
-			}
-			if !ok && res.Skipped {
-				skipped++
-			}
-			if done%contentBuildBatchSize == 0 {
-				if !s.contentBuildCurrent(vol, gen, journalID) {
-					abortReason, abortRetry = "journal generation changed during build", true
-					return contentBuildDoc{}, false, errContentBuildAborted
-				}
-				vol.content.setBuildProgress(done, total)
-				if contentBuildBatchPause > 0 {
-					select {
-					case <-s.stop:
-						abortReason = "service stopping"
-						return contentBuildDoc{}, false, errContentBuildAborted
-					case <-time.After(contentBuildBatchPause):
-					}
-				}
-			}
-			if ok {
-				return doc, true, nil
-			}
-		}
-		return contentBuildDoc{}, false, nil
-	}
-
 	tmpDir, err := os.MkdirTemp("", "seekfs-content-*")
 	if err != nil {
 		vol.content.markBuildFailed(err.Error())
 		return
 	}
+	defer os.RemoveAll(tmpDir)
+	spool, err := os.Create(filepath.Join(tmpDir, "text.spool"))
+	if err != nil {
+		vol.content.markBuildFailed(err.Error())
+		return
+	}
+	defer spool.Close()
+
+	// Selection extracts in scope priority order. A single spool keeps memory
+	// bounded while the assembler later consumes selected docs in FRN order.
+	type selectedDoc struct {
+		item    contentBuildItem
+		offset  int64
+		length  int
+		modUnix int64
+		class   uint16
+		version uint16
+	}
+	selected := make([]selectedDoc, 0, 1024)
+	total := len(items)
+	done := 0
+	var used, skipped, truncated int64
+	abortReason := ""
+	abortRetry := false
+	for done < total {
+		// The atomic generation covers the common abort (a rebuild/journal
+		// reset bumps replayGen); the full journal-id check runs per batch
+		// and before publish so a replayGen-free base swap is caught too.
+		if vol.replayGen.Load() != gen {
+			abortReason, abortRetry = "journal generation changed during build", true
+			break
+		}
+		if s.serviceStopping() {
+			abortReason = "service stopping"
+			break
+		}
+		item := items[done]
+		done++
+		doc, res, ok := contentBuildDocSafe(ctx, item)
+		if ok && res.Truncated {
+			truncated++
+		}
+		if !ok && res.Skipped {
+			skipped++
+		}
+		if done%contentBuildBatchSize == 0 {
+			if !s.contentBuildCurrent(vol, gen, journalID) {
+				abortReason, abortRetry = "journal generation changed during build", true
+				break
+			}
+			vol.content.setBuildProgress(done, total)
+			if contentBuildBatchPause > 0 {
+				select {
+				case <-s.stop:
+					abortReason = "service stopping"
+					break
+				case <-time.After(contentBuildBatchPause):
+				}
+			}
+		}
+		if abortReason != "" {
+			break
+		}
+		if !ok {
+			continue
+		}
+		n := int64(len(doc.text))
+		if opts.Scope != nil && opts.Scope.BudgetBytes > 0 && n > opts.Scope.BudgetBytes-used {
+			scopeDropped += int64(total - done + 1)
+			break
+		}
+		offset, err := spool.Seek(0, io.SeekCurrent)
+		if err != nil {
+			vol.content.markBuildFailed(err.Error())
+			return
+		}
+		if _, err := spool.Write(doc.text); err != nil {
+			vol.content.markBuildFailed(err.Error())
+			return
+		}
+		selected = append(selected, selectedDoc{item: item, offset: offset, length: len(doc.text), modUnix: doc.modUnix, class: doc.class, version: doc.version})
+		used += n
+	}
+	if abortReason != "" {
+		vol.content.markBuildCanceled(abortReason)
+		retry = abortRetry
+		return
+	}
+	sort.Slice(selected, func(i, j int) bool {
+		if selected[i].item.frn != selected[j].item.frn {
+			return selected[i].item.frn < selected[j].item.frn
+		}
+		return selected[i].item.path < selected[j].item.path
+	})
+	next := 0
+	source := func() (contentBuildDoc, bool, error) {
+		if vol.replayGen.Load() != gen || next%contentBuildBatchSize == 0 && !s.contentBuildCurrent(vol, gen, journalID) {
+			abortReason, abortRetry = "journal generation changed during assembly", true
+			return contentBuildDoc{}, false, errContentBuildAborted
+		}
+		if s.serviceStopping() {
+			abortReason = "service stopping"
+			return contentBuildDoc{}, false, errContentBuildAborted
+		}
+		if next == len(selected) {
+			return contentBuildDoc{}, false, nil
+		}
+		s := selected[next]
+		next++
+		text := make([]byte, s.length)
+		if _, err := spool.ReadAt(text, s.offset); err != nil {
+			return contentBuildDoc{}, false, err
+		}
+		return contentBuildDoc{path: s.item.path, frn: s.item.frn, text: text, modUnix: s.modUnix, class: s.class, version: s.version}, true, nil
+	}
 	cidx, err := assembleContentIndexStream(source, tmpDir)
-	_ = os.RemoveAll(tmpDir)
 	if err != nil {
 		if errors.Is(err, errContentBuildAborted) {
 			vol.content.markBuildCanceled(abortReason)
@@ -666,6 +735,9 @@ func (s *goSearchService) runContentBuild(vol *serviceVolumeIndex, reuseSidecar 
 	cidx.JournalID = journalID
 	cidx.CheckpointUSN = uint64(checkpoint)
 	cidx.Policy = contentBuildPolicy{MaxRaw: settings.maxRaw, MaxText: settings.maxText, Skipped: skipped, Truncated: truncated, ScopeDropped: scopeDropped}
+	if opts.Scope != nil {
+		cidx.ScopeHash = opts.Scope.fingerprint()
+	}
 
 	// Re-check before publishing: the volume could have been rebuilt (or the
 	// service stopped) during the minutes-long extraction.

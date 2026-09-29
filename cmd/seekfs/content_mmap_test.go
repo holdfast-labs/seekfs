@@ -146,6 +146,7 @@ func TestContentMappedReplaceReleasesOldMapping(t *testing.T) {
 	base.JournalID = 5
 	base.CheckpointUSN = 50
 	base.Docs = []contentDoc{{DocID: 0, FRN: 10, ContentType: contentClassText, ExtractorVersion: 1}}
+	stampContentTestScope("C:", base)
 	if err := contentSaveFile(gsx, base); err != nil {
 		t.Fatal(err)
 	}

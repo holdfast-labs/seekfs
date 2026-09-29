@@ -160,6 +160,7 @@ func (s *goSearchService) runContentFold(vol *serviceVolumeIndex) {
 	// Carry the prior extraction policy/caps so health stays truthful; the
 	// snapshot already filtered the corpus the same way the base was.
 	cidx.Policy = base.Policy
+	cidx.ScopeHash = base.ScopeHash
 
 	if !s.contentBuildCurrent(vol, gen, base.JournalID) {
 		// A rebuild/journal reset moved under the fold; keep the delta for the

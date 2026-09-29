@@ -43,6 +43,21 @@ func TestContentIndexDBAllOptInBuildsSidecar(t *testing.T) {
 	if len(built.Docs) != 1 {
 		t.Fatalf("built %d docs; want 1", len(built.Docs))
 	}
+	built.Release()
+	t.Setenv("SEEKFS_CONTENT_SCOPE", "explicit")
+	t.Setenv("SEEKFS_CONTENT_ROOTS", dir)
+	if err := cmdContentIndex([]string{"-db", db, "-scoped"}); err != nil {
+		t.Fatalf("content-index -scoped: %v", err)
+	}
+	scoped, err := contentLoadFile(contentIndexPathForDB(db))
+	if err != nil {
+		t.Fatal(err)
+	}
+	releaseContentIndexOnCleanup(t, scoped)
+	want := contentScopeForVolume(appConfig{}, dir).resolve(dir, nil).fingerprint()
+	if scoped.ScopeHash != want {
+		t.Fatal("scoped offline build did not persist scope identity")
+	}
 }
 
 // M10: two holders of the same sidecar lock must contend, so the CLI fails fast
@@ -108,6 +123,7 @@ func TestContentServiceOwnsVolumeLockAfterAttach(t *testing.T) {
 	usn.JournalID = 5
 	usn.CheckpointUSN = 50
 	usn.Docs = []contentDoc{{DocID: 0, FRN: 10, ContentType: contentClassText, ExtractorVersion: 1}}
+	stampContentTestScope("C:", usn)
 	if err := contentSaveFile(gsx, usn); err != nil {
 		t.Fatal(err)
 	}
@@ -140,6 +156,7 @@ func TestContentAttachZeroJoinRefused(t *testing.T) {
 	usn.CheckpointUSN = 50
 	// FRN 999 has no base record: the resolver maps nothing.
 	usn.Docs = []contentDoc{{DocID: 0, FRN: 999, ContentType: contentClassText, ExtractorVersion: 1}}
+	stampContentTestScope("C:", usn)
 	if err := contentSaveFile(contentIndexPathForDB(vol.dbPath), usn); err != nil {
 		t.Fatal(err)
 	}

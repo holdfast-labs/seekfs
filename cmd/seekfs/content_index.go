@@ -71,6 +71,7 @@ const (
 	contentSectionDelta    uint32 = 'C'<<24 | 'X'<<16 | 'D'<<8 | 'X'
 	contentSectionPaths    uint32 = 'C'<<24 | 'X'<<16 | 'P'<<8 | 'T'
 	contentSectionPolicy   uint32 = 'C'<<24 | 'X'<<16 | 'P'<<8 | 'L'
+	contentSectionScope    uint32 = 'C'<<24 | 'X'<<16 | 'S'<<8 | 'C'
 )
 
 // contentBuildPolicy is the extraction policy a `.gsx` was built with and the
@@ -155,6 +156,9 @@ type contentIndex struct {
 	Sections      map[uint32][]byte
 	// Policy is the build's extraction policy + skip/truncation counts (CXPL).
 	Policy contentBuildPolicy
+	// ScopeHash identifies the resolved scope. Zero means this sidecar predates
+	// scope identity and is not safe for service attachment.
+	ScopeHash [32]byte
 	// EncodedSize is the encoded `.gsx` byte size: set by decode from the file
 	// length and by encode from the produced bytes. Not persisted; surfaced in
 	// content health so sidecar growth is observable (WP10/M7).
@@ -305,6 +309,9 @@ func contentIndexEncode(idx *contentIndex) []byte {
 	if idx.Policy != (contentBuildPolicy{}) {
 		idx.Sections[contentSectionPolicy] = idx.Policy.encode()
 	}
+	if idx.ScopeHash != ([32]byte{}) {
+		idx.Sections[contentSectionScope] = idx.ScopeHash[:]
+	}
 
 	var body bytes.Buffer
 	headerSize := contentHeaderSize()
@@ -428,6 +435,12 @@ func contentIndexDecode(data []byte) (*contentIndex, error) {
 		if p, ok := decodeContentPolicy(sec); ok {
 			idx.Policy = p
 		}
+	}
+	if sec, ok := idx.Sections[contentSectionScope]; ok {
+		if len(sec) != len(idx.ScopeHash) {
+			return nil, errors.New("content index invalid scope identity")
+		}
+		copy(idx.ScopeHash[:], sec)
 	}
 	table, ok := idx.Sections[contentSectionDocTable]
 	if !ok {

@@ -52,6 +52,7 @@ func newContentFoldFixture(t *testing.T, files []contentFixtureFile) *contentFol
 	base.Origin = contentOriginUSN
 	base.JournalID = journal
 	base.CheckpointUSN = uint64(baseCP)
+	stampContentTestScope("C:", base)
 	if err := contentSaveFile(contentIndexPathForDB(dbPath), base); err != nil {
 		t.Fatal(err)
 	}

@@ -6,9 +6,25 @@ package main
 // `.gsx` size — plus the git worktree detection the scope resolve depends on.
 
 import (
+	"container/heap"
 	"os"
+	"sort"
 	"strings"
 )
+
+type contentEstimateCandidate struct {
+	item            contentBuildItem
+	unit, kind, ext string
+	bytes           int64
+}
+
+type contentEstimateHeap []contentEstimateCandidate
+
+func (h contentEstimateHeap) Len() int           { return len(h) }
+func (h contentEstimateHeap) Less(i, j int) bool { return contentBuildItemLess(h[j].item, h[i].item) }
+func (h contentEstimateHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
+func (h *contentEstimateHeap) Push(x any)        { *h = append(*h, x.(contentEstimateCandidate)) }
+func (h *contentEstimateHeap) Pop() any          { n := len(*h) - 1; x := (*h)[n]; *h = (*h)[:n]; return x }
 
 // contentScopeUnit is one include root's contribution to an estimate.
 type contentScopeUnit struct {
@@ -80,7 +96,7 @@ func scanContentScope(idx *Index, scope contentScope, volume string, maxFiles in
 
 	count := idx.compactRecordCount()
 	cache := make(map[int]string, 1024)
-	unitIndex := make(map[string]int)
+	candidates := make(contentEstimateHeap, 0, 1024)
 	for id := 0; id < count; id++ {
 		rec := idx.compactRecord(id)
 		if rec.Deleted || rec.FRN == 0 || rec.Mode&uint32(os.ModeDir) != 0 {
@@ -104,10 +120,6 @@ func scanContentScope(idx *Index, scope contentScope, volume string, maxFiles in
 			est.Excluded["exclude"]++
 			continue
 		}
-		if maxFiles > 0 && est.Files >= int64(maxFiles) {
-			est.MaxFilesHit = true
-			break
-		}
 		n := rec.Size
 		if n < 0 {
 			n = 0
@@ -115,19 +127,38 @@ func scanContentScope(idx *Index, scope contentScope, volume string, maxFiles in
 		if n > contentExtractMaxTextBytes {
 			n = contentExtractMaxTextBytes
 		}
-		if est.Bytes+n > resolved.BudgetBytes {
+		c := contentEstimateCandidate{item: contentBuildItem{frn: rec.FRN, path: path, priority: resolved.priority(path)}, unit: unit, kind: kind, ext: ext, bytes: n}
+		if maxFiles <= 0 || len(candidates) < maxFiles {
+			candidates = append(candidates, c)
+			continue
+		}
+		if !est.MaxFilesHit {
+			heap.Init(&candidates)
+			est.MaxFilesHit = true
+		}
+		if contentBuildItemLess(c.item, candidates[0].item) {
+			candidates[0] = c
+			heap.Fix(&candidates, 0)
+		}
+	}
+	sort.Slice(candidates, func(i, j int) bool {
+		return contentBuildItemLess(candidates[i].item, candidates[j].item)
+	})
+	unitIndex := make(map[string]int)
+	for _, c := range candidates {
+		if est.Bytes+c.bytes > resolved.BudgetBytes {
 			est.BudgetHit = true
 			break
 		}
 		est.Files++
-		est.Bytes += n
-		est.ByExt[ext]++
-		if i, seen := unitIndex[unit]; seen {
+		est.Bytes += c.bytes
+		est.ByExt[c.ext]++
+		if i, seen := unitIndex[c.unit]; seen {
 			est.ByUnit[i].Files++
-			est.ByUnit[i].Bytes += n
+			est.ByUnit[i].Bytes += c.bytes
 		} else {
-			unitIndex[unit] = len(est.ByUnit)
-			est.ByUnit = append(est.ByUnit, contentScopeUnit{Root: unit, Kind: kind, Files: 1, Bytes: n})
+			unitIndex[c.unit] = len(est.ByUnit)
+			est.ByUnit = append(est.ByUnit, contentScopeUnit{Root: c.unit, Kind: c.kind, Files: 1, Bytes: c.bytes})
 		}
 	}
 	est.ProjectedGSXBytes = int64(float64(est.Bytes) * contentGSXOverheadMultiplier)

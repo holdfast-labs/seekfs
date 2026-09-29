@@ -6,6 +6,12 @@ import (
 	"testing"
 )
 
+// stampContentTestScope makes hand-built USN fixtures represent a sidecar
+// produced under the current default service scope.
+func stampContentTestScope(volume string, idx *contentIndex) {
+	idx.ScopeHash = contentScopeForVolume(appConfig{}, volume).resolve(volume, nil).fingerprint()
+}
+
 func TestContentScopeSectionParsing(t *testing.T) {
 	cases := map[string]string{
 		"content":       "content",
@@ -174,6 +180,30 @@ func TestContentScopeResolvedAllows(t *testing.T) {
 	}
 }
 
+func TestContentScopeFingerprintAndPriority(t *testing.T) {
+	s := defaultContentScope()
+	s.Roots = normalizeContentPaths([]string{`C:\work`, `C:\notes`})
+	a := s.resolve("C:", []string{contentNormPath(`C:\repo`)})
+	s.Roots[0], s.Roots[1] = s.Roots[1], s.Roots[0]
+	b := s.resolve("C:", []string{contentNormPath(`C:\repo`)})
+	if a.fingerprint() != b.fingerprint() {
+		t.Fatal("root order changed scope identity")
+	}
+	b.Excludes = append(b.Excludes, contentNormPath(`C:\repo\private`))
+	if a.fingerprint() == b.fingerprint() {
+		t.Fatal("narrowed scope kept old identity")
+	}
+	if got := a.priority(`C:\repo\a.txt`); got != 0 {
+		t.Fatalf("repo priority = %d", got)
+	}
+	if got := a.priority(`C:\work\a.txt`); got != 1 {
+		t.Fatalf("explicit root priority = %d", got)
+	}
+	if got := a.priority(`C:\else\a.txt`); got != 3 {
+		t.Fatalf("unmatched priority = %d", got)
+	}
+}
+
 func TestContentScopeEstimateAndDetect(t *testing.T) {
 	d := uint32(os.ModeDir)
 	recs := []CompactRecord{
@@ -217,18 +247,17 @@ func TestContentScopeEstimateAndDetect(t *testing.T) {
 	}
 }
 
-func TestContentApplyScopeBudget(t *testing.T) {
-	items := []contentBuildItem{{size: 100}, {size: 100}, {size: 100}}
-	out, trunc := contentApplyScopeBudget(items, 250)
-	if !trunc || len(out) != 2 {
-		t.Fatalf("budget trim = %d items trunc=%v; want 2/true", len(out), trunc)
-	}
-	if out, trunc = contentApplyScopeBudget(items, 0); trunc || len(out) != 3 {
-		t.Fatalf("zero budget = %d/%v; want 3/false (unbounded)", len(out), trunc)
-	}
-	// A huge file charges only contentExtractMaxTextBytes toward the budget.
-	big := []contentBuildItem{{size: contentExtractMaxTextBytes * 4}, {size: 10}}
-	if out, trunc = contentApplyScopeBudget(big, contentExtractMaxTextBytes+5); !trunc || len(out) != 1 {
-		t.Fatalf("per-file cap trim = %d/%v; want 1/true", len(out), trunc)
+func TestContentScopeEstimatePrefersRepository(t *testing.T) {
+	dir := t.TempDir()
+	vol, _ := contentBuildTestVolume(t, dir, 3, 10, []CompactRecord{
+		{FRN: 1, Parent: -1, Name: "a.txt", Size: 10},
+		{FRN: 2, Parent: -1, Name: "repo", Mode: uint32(os.ModeDir)},
+		{FRN: 3, Parent: 1, ParentFRN: 2, Name: ".git", Mode: uint32(os.ModeDir)},
+		{FRN: 4, Parent: 1, ParentFRN: 2, Name: "z.txt", Size: 10},
+	})
+	scope := contentScope{Mode: contentScopeExplicit, Roots: normalizeContentPaths([]string{dir}), IncludeGit: true, SystemExcludes: true, BudgetBytes: 100}
+	est := scanContentScope(vol.index, scope, dir, 1)
+	if !est.MaxFilesHit || est.Files != 1 || len(est.ByUnit) != 1 || est.ByUnit[0].Kind != "repo" {
+		t.Fatalf("limited estimate = %+v; want one repository file", est)
 	}
 }

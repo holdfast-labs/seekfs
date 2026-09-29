@@ -153,6 +153,9 @@ func cmdContentIndex(args []string) error {
 	if err != nil {
 		return err
 	}
+	if opts.Scope != nil {
+		idx.ScopeHash = opts.Scope.fingerprint()
+	}
 	if err := contentSaveFile(outPath, idx); err != nil {
 		return err
 	}

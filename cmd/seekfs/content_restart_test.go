@@ -100,6 +100,7 @@ func TestContentRestartCatchUpAfterDrain(t *testing.T) {
 	base.Origin = contentOriginUSN
 	base.JournalID = journal
 	base.CheckpointUSN = uint64(baseCP)
+	stampContentTestScope(vol.volume, base)
 	if err := contentSaveFile(contentIndexPathForDB(dbPath), base); err != nil {
 		t.Fatal(err)
 	}
@@ -195,6 +196,7 @@ func TestContentAttachCheckpointBranches(t *testing.T) {
 		cidx.Origin = contentOriginUSN
 		cidx.JournalID = journal
 		cidx.CheckpointUSN = cp
+		stampContentTestScope("C:", cidx)
 		if err := contentSaveFile(gsx, cidx); err != nil {
 			t.Fatal(err)
 		}
@@ -324,6 +326,7 @@ func TestContentAttachSkipsNonReadyVolume(t *testing.T) {
 	cidx.Origin = contentOriginUSN
 	cidx.JournalID = 7
 	cidx.CheckpointUSN = 50
+	stampContentTestScope("C:", cidx)
 	if err := contentSaveFile(contentIndexPathForDB(vol.dbPath), cidx); err != nil {
 		t.Fatal(err)
 	}
@@ -373,6 +376,7 @@ func TestContentAttachRacesJournalReset(t *testing.T) {
 	cidx.Origin = contentOriginUSN
 	cidx.JournalID = 7
 	cidx.CheckpointUSN = 50
+	stampContentTestScope("C:", cidx)
 	if err := contentSaveFile(contentIndexPathForDB(dbPath), cidx); err != nil {
 		t.Fatal(err)
 	}
@@ -426,6 +430,7 @@ func TestContentCatchUpCapsDegrade(t *testing.T) {
 		cidx.Origin = contentOriginUSN
 		cidx.JournalID = 7
 		cidx.CheckpointUSN = 50
+		stampContentTestScope("C:", cidx)
 		if err := contentSaveFile(contentIndexPathForDB(vol.dbPath), cidx); err != nil {
 			t.Fatal(err)
 		}
@@ -508,6 +513,7 @@ func TestContentCatchUpAllCreateByteCapDegrade(t *testing.T) {
 	cidx.Origin = contentOriginUSN
 	cidx.JournalID = 7
 	cidx.CheckpointUSN = 50
+	stampContentTestScope("C:", cidx)
 	if err := contentSaveFile(contentIndexPathForDB(vol.dbPath), cidx); err != nil {
 		t.Fatal(err)
 	}
@@ -558,6 +564,7 @@ func TestContentCatchUpReadErrorDegraded(t *testing.T) {
 	cidx.Origin = contentOriginUSN
 	cidx.JournalID = 7
 	cidx.CheckpointUSN = 50
+	stampContentTestScope("C:", cidx)
 	if err := contentSaveFile(contentIndexPathForDB(vol.dbPath), cidx); err != nil {
 		t.Fatal(err)
 	}
@@ -637,6 +644,7 @@ func TestContentRestartCatchUpCreateAndRename(t *testing.T) {
 	base.Origin = contentOriginUSN
 	base.JournalID = 7
 	base.CheckpointUSN = 50
+	stampContentTestScope("C:", base)
 	if err := contentSaveFile(contentIndexPathForDB(vol.dbPath), base); err != nil {
 		t.Fatal(err)
 	}
@@ -681,6 +689,7 @@ func TestContentAttachRejectsZeroCheckpoint(t *testing.T) {
 	cidx.Origin = contentOriginUSN
 	cidx.JournalID = 5
 	cidx.CheckpointUSN = 0
+	stampContentTestScope("C:", cidx)
 	if err := contentSaveFile(contentIndexPathForDB(vol.dbPath), cidx); err != nil {
 		t.Fatal(err)
 	}
@@ -765,6 +774,7 @@ func TestContentCatchUpCapSelfHealsRebuild(t *testing.T) {
 	base.JournalID = journal
 	base.CheckpointUSN = 50
 	base.Docs = []contentDoc{{DocID: 0, FRN: 10, ContentType: contentClassText, ExtractorVersion: 1}}
+	stampContentTestScope(vol.volume, base)
 	if err := contentSaveFile(contentIndexPathForDB(vol.dbPath), base); err != nil {
 		t.Fatal(err)
 	}
