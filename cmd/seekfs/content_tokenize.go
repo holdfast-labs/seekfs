@@ -38,11 +38,8 @@ func contentTokenizeQuery(q string) []string {
 				if i+1 < n && q[i+1] == '/' {
 					if end, ok := contentSkipRegexSpan(q, i+2); ok {
 						i = end
-						// A regex may be followed by flags (e.g. /re/i) up to
-						// the next space.
-						for i < n && !contentIsSpace(q[i]) {
-							i++
-						}
+						// Continue scanning flags/OR alternatives normally so a
+						// following quoted phrase keeps its embedded whitespace.
 						continue
 					}
 				}
@@ -121,6 +118,10 @@ func contentUnquoteToken(tok string) string {
 func contentTokenIsRegexSpan(tok string) (string, bool) {
 	p := strings.Index(tok, ":/")
 	if p < 0 {
+		return "", false
+	}
+	// A regex inside an OR alternative is not a regex spanning the whole token.
+	if len(featureSplitAlternatives(tok)) > 1 {
 		return "", false
 	}
 	rest := tok[p+2:]

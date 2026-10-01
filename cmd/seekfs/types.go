@@ -432,6 +432,9 @@ type appConfig struct {
 	// ContentByVolume holds [content."<volume>"] overrides keyed by volume name.
 	Content         contentScopeConfig
 	ContentByVolume map[string]contentScopeConfig
+	Features        map[string]featureConfig
+	PluginPath      string
+	Plugins         map[string]pluginDefinition
 }
 
 type queryOptions struct {
@@ -515,6 +518,7 @@ type parsedQuery struct {
 	DateFilters       []dateFilter
 	AttrFilters       []uint32
 	Content           []contentLeaf
+	Features          []featureLeaf
 	SortColumn        string
 	OrGroups          [][]parsedQuery
 	NotGroups         []parsedQuery

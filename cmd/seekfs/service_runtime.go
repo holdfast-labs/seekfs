@@ -36,6 +36,7 @@ func (s *goSearchService) runStandalone() error {
 }
 
 func (s *goSearchService) loadConfiguredIndexes() error {
+	s.initializeFeatures()
 	s.indexMu.Lock()
 	s.loading = true
 	s.loadErr = ""
@@ -58,6 +59,9 @@ func (s *goSearchService) loadConfiguredIndexes() error {
 		return err
 	}
 	s.indexMu.Lock()
+	for _, vol := range volumes {
+		s.prepareFeatureVolume(vol)
+	}
 	s.indexes = indexes
 	s.volumes = volumes
 	s.loadErr = ""
@@ -80,13 +84,8 @@ func (s *goSearchService) loadConfiguredIndexes() error {
 			go s.staleRecoveryLoop(vol)
 		}
 	}
-	if contentSearchEnabled() {
-		for _, vol := range volumes {
-			// Attach an existing sidecar or schedule the service-owned build
-			// (PF-3/WP1d): a fresh install with the flag on is content-ready
-			// without any manual `content-index` step.
-			s.ensureContentBuild(vol)
-		}
+	for _, vol := range volumes {
+		s.featuresVolumeReady(vol)
 	}
 	go s.replayStallWatchdog()
 	serviceLog("loaded %d dbs entries=%d elapsed=%s", len(indexes), total, time.Since(start).Round(time.Millisecond))

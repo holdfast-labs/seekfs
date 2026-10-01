@@ -548,43 +548,53 @@ func TestContentCatchUpAllCreateByteCapDegrade(t *testing.T) {
 // A USN read error during catch-up is a degraded (incomplete) volume, never a
 // silent partial delta or a wrong `ready`.
 func TestContentCatchUpReadErrorDegraded(t *testing.T) {
-	t.Setenv("SEEKFS_CONTENT_SEARCH", "1")
-	stubContentCatchUpSync(t)
-	stubContentCatchUpJournal(t, usnJournalDataV0{UsnJournalID: 7, FirstUsn: 1, LowestValidUsn: 1, NextUsn: 100})
+	for _, failure := range []string{"read error", "no progress", "regressed cursor"} {
+		t.Run(failure, func(t *testing.T) {
+			t.Setenv("SEEKFS_CONTENT_SEARCH", "1")
+			stubContentCatchUpSync(t)
+			stubContentCatchUpJournal(t, usnJournalDataV0{UsnJournalID: 7, FirstUsn: 1, LowestValidUsn: 1, NextUsn: 100})
 
-	dir := t.TempDir()
-	idx := &Index{Source: "usn", Volume: "C:", Compact: true, JournalID: 7, Checkpoint: 100}
-	idx.Records = []CompactRecord{{FRN: 10, ParentFRN: 1, Parent: -1, Name: "a.txt", Size: 10}}
-	contentIndexFRNs(idx)
-	vol := newServiceVolumeIndex(filepath.Join(dir, "seekfs_c.gsi"), idx)
-	cidx, err := assembleContentIndex([]contentBuildDoc{{path: `C:\a.txt`, frn: 10, text: []byte("alpha"), class: contentClassText, version: 1}}, t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	cidx.Origin = contentOriginUSN
-	cidx.JournalID = 7
-	cidx.CheckpointUSN = 50
-	stampContentTestScope("C:", cidx)
-	if err := contentSaveFile(contentIndexPathForDB(vol.dbPath), cidx); err != nil {
-		t.Fatal(err)
-	}
-	stubContentCatchUpRead(t, func(volume string, journalID uint64, startUSN int64, buffer []byte) (int64, []usnChange, error) {
-		return startUSN, nil, errors.New("journal read failed")
-	})
-	scheduled := stubContentBuildSchedule(t)
+			dir := t.TempDir()
+			idx := &Index{Source: "usn", Volume: "C:", Compact: true, JournalID: 7, Checkpoint: 100}
+			idx.Records = []CompactRecord{{FRN: 10, ParentFRN: 1, Parent: -1, Name: "a.txt", Size: 10}}
+			contentIndexFRNs(idx)
+			vol := newServiceVolumeIndex(filepath.Join(dir, "seekfs_c.gsi"), idx)
+			cidx, err := assembleContentIndex([]contentBuildDoc{{path: `C:\a.txt`, frn: 10, text: []byte("alpha"), class: contentClassText, version: 1}}, t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			cidx.Origin = contentOriginUSN
+			cidx.JournalID = 7
+			cidx.CheckpointUSN = 50
+			stampContentTestScope("C:", cidx)
+			if err := contentSaveFile(contentIndexPathForDB(vol.dbPath), cidx); err != nil {
+				t.Fatal(err)
+			}
+			stubContentCatchUpRead(t, func(volume string, journalID uint64, startUSN int64, buffer []byte) (int64, []usnChange, error) {
+				if failure == "no progress" {
+					return startUSN, nil, nil
+				}
+				if failure == "regressed cursor" {
+					return startUSN - 1, nil, nil
+				}
+				return startUSN, nil, errors.New("journal read failed")
+			})
+			scheduled := stubContentBuildSchedule(t)
 
-	s := &goSearchService{stop: make(chan struct{})}
-	defer close(s.stop)
-	s.attachContentForVolume(vol)
-	releaseVolumeContentOnCleanup(t, vol)
-	if !vol.content.healthIncomplete() {
-		t.Fatal("a catch-up read error must mark the volume incomplete")
-	}
-	if got := vol.content.stateOf(); got != contentStateDegraded {
-		t.Fatalf("state = %q; want degraded", got)
-	}
-	if *scheduled == 0 {
-		t.Fatal("an errored catch-up must schedule a rebuild")
+			s := &goSearchService{stop: make(chan struct{})}
+			defer close(s.stop)
+			s.attachContentForVolume(vol)
+			releaseVolumeContentOnCleanup(t, vol)
+			if !vol.content.healthIncomplete() {
+				t.Fatal("a catch-up read error must mark the volume incomplete")
+			}
+			if got := vol.content.stateOf(); got != contentStateDegraded {
+				t.Fatalf("state = %q; want degraded", got)
+			}
+			if *scheduled == 0 {
+				t.Fatal("an errored catch-up must schedule a rebuild")
+			}
+		})
 	}
 }
 

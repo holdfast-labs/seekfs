@@ -155,7 +155,7 @@ func (s *goSearchService) resolvedContentScope(vol *serviceVolumeIndex) (content
 	if s == nil || vol == nil {
 		return contentScopeResolved{}, false
 	}
-	scope := contentScopeForVolume(s.contentCfg, vol.volume)
+	scope := contentScopeForVolume(s.contentConfig(), vol.volume)
 	if scope.disabled() {
 		return contentScopeResolved{}, false
 	}
@@ -283,10 +283,17 @@ func (s *goSearchService) ensureContentBuild(vol *serviceVolumeIndex) {
 // is usable and the volume is a ready USN volume with a live watermark, it
 // schedules exactly one background build.
 func (s *goSearchService) scheduleContentBuild(vol *serviceVolumeIndex) {
-	if s == nil || vol == nil || !contentSearchEnabled() || vol.content == nil {
+	if s == nil || vol == nil {
 		return
 	}
-	if contentScopeForVolume(s.contentCfg, vol.volume).disabled() {
+	if !s.beginContentTask(vol) {
+		return
+	}
+	defer endContentTask(vol)
+	if !contentSearchEnabled() || vol.content == nil {
+		return
+	}
+	if contentScopeForVolume(s.contentConfig(), vol.volume).disabled() {
 		return
 	}
 	// Reuse an existing valid sidecar when there is one.
@@ -310,7 +317,11 @@ func (s *goSearchService) scheduleContentBuild(vol *serviceVolumeIndex) {
 	if !vol.contentBuildBusy.CompareAndSwap(false, true) {
 		return
 	}
-	contentBuildRun(func() { s.runContentBuild(vol, true) })
+	if !s.beginContentTask(vol) {
+		vol.contentBuildBusy.Store(false)
+		return
+	}
+	contentBuildRun(func() { defer endContentTask(vol); s.runContentBuild(vol, true) })
 }
 
 // scheduleContentRebuild schedules a content rebuild for vol without first
@@ -320,10 +331,17 @@ func (s *goSearchService) scheduleContentBuild(vol *serviceVolumeIndex) {
 // permanently degraded with a gated fold and an ever-growing delta.
 // contentCatchUpFailed bounds its use with contentBuildAttempts.
 func (s *goSearchService) scheduleContentRebuild(vol *serviceVolumeIndex) {
-	if s == nil || vol == nil || !contentSearchEnabled() || vol.content == nil {
+	if s == nil || vol == nil {
 		return
 	}
-	if contentScopeForVolume(s.contentCfg, vol.volume).disabled() {
+	if !s.beginContentTask(vol) {
+		return
+	}
+	defer endContentTask(vol)
+	if !contentSearchEnabled() || vol.content == nil {
+		return
+	}
+	if contentScopeForVolume(s.contentConfig(), vol.volume).disabled() {
 		return
 	}
 	s.indexMu.RLock()
@@ -340,7 +358,11 @@ func (s *goSearchService) scheduleContentRebuild(vol *serviceVolumeIndex) {
 	if !vol.contentBuildBusy.CompareAndSwap(false, true) {
 		return
 	}
-	contentBuildRun(func() { s.runContentBuild(vol, false) })
+	if !s.beginContentTask(vol) {
+		vol.contentBuildBusy.Store(false)
+		return
+	}
+	contentBuildRun(func() { defer endContentTask(vol); s.runContentBuild(vol, false) })
 }
 
 // snapshotContentBuildItems copies the FRN/path/size/modtime metadata for every
@@ -386,6 +408,9 @@ func (s *goSearchService) snapshotContentBuildItems(vol *serviceVolumeIndex, opt
 	limited := false
 	cache := make(map[int]string, 1024)
 	for start := 0; start < count; start += contentBuildSnapshotBatch {
+		if s.contentStopped(vol) {
+			return nil, 0, 0, contentBuildSnapshotUnavailable
+		}
 		end := start + contentBuildSnapshotBatch
 		if end > count {
 			end = count
@@ -479,7 +504,7 @@ func contentBuildDocSafe(ctx context.Context, item contentBuildItem) (doc conten
 // replay generation and the journal id must be unchanged. A journal reset or
 // base rebuild bumps replayGen, so a build that spans one aborts.
 func (s *goSearchService) contentBuildCurrent(vol *serviceVolumeIndex, gen uint64, journalID uint64) bool {
-	if vol.replayGen.Load() != gen {
+	if s.contentStopped(vol) || vol.replayGen.Load() != gen {
 		return false
 	}
 	s.indexMu.RLock()
@@ -493,9 +518,20 @@ func (s *goSearchService) contentBuildCurrent(vol *serviceVolumeIndex, gen uint6
 // unavailable/indexing/degraded, never ready with an unusable index, and a
 // generation change reschedules.
 func (s *goSearchService) runContentBuild(vol *serviceVolumeIndex, reuseSidecar bool) {
+	if vol == nil {
+		return
+	}
 	retry := false
 	var scopeDropped int64
-	contentBuildGate <- struct{}{}
+	select {
+	case contentBuildGate <- struct{}{}:
+	case <-contentActivationDone(vol):
+		vol.contentBuildBusy.Store(false)
+		return
+	case <-s.stop:
+		vol.contentBuildBusy.Store(false)
+		return
+	}
 	gateReleased := false
 	releaseGate := func() {
 		if !gateReleased {
@@ -512,7 +548,7 @@ func (s *goSearchService) runContentBuild(vol *serviceVolumeIndex, reuseSidecar 
 		// Release the gate before a rescheduled build, so the nested build can
 		// acquire it (the defer would otherwise still hold it).
 		releaseGate()
-		if !retry || s.serviceStopping() {
+		if !retry || s.contentStopped(vol) {
 			return
 		}
 		// Backoff and cap consecutive generation-change retries. The budget is
@@ -525,6 +561,8 @@ func (s *goSearchService) runContentBuild(vol *serviceVolumeIndex, reuseSidecar 
 		if contentBuildRetryBackoff > 0 {
 			select {
 			case <-s.stop:
+				return
+			case <-contentActivationDone(vol):
 				return
 			case <-time.After(contentBuildRetryBackoff):
 			}
@@ -539,6 +577,9 @@ func (s *goSearchService) runContentBuild(vol *serviceVolumeIndex, reuseSidecar 
 		}
 	}()
 	if vol == nil || vol.content == nil {
+		return
+	}
+	if s.contentStopped(vol) {
 		return
 	}
 	// A valid sidecar may have become attachable since this build was scheduled
@@ -596,6 +637,8 @@ func (s *goSearchService) runContentBuild(vol *serviceVolumeIndex, reuseSidecar 
 		select {
 		case <-s.stop:
 			cancel()
+		case <-contentActivationDone(vol):
+			cancel()
 		case <-ctx.Done():
 		}
 	}()
@@ -637,7 +680,7 @@ func (s *goSearchService) runContentBuild(vol *serviceVolumeIndex, reuseSidecar 
 			abortReason, abortRetry = "journal generation changed during build", true
 			break
 		}
-		if s.serviceStopping() {
+		if s.contentStopped(vol) {
 			abortReason = "service stopping"
 			break
 		}
@@ -661,6 +704,8 @@ func (s *goSearchService) runContentBuild(vol *serviceVolumeIndex, reuseSidecar 
 				case <-s.stop:
 					abortReason = "service stopping"
 					break
+				case <-contentActivationDone(vol):
+					abortReason = "content plugin stopping"
 				case <-time.After(contentBuildBatchPause):
 				}
 			}
@@ -705,7 +750,7 @@ func (s *goSearchService) runContentBuild(vol *serviceVolumeIndex, reuseSidecar 
 			abortReason, abortRetry = "journal generation changed during assembly", true
 			return contentBuildDoc{}, false, errContentBuildAborted
 		}
-		if s.serviceStopping() {
+		if s.contentStopped(vol) {
 			abortReason = "service stopping"
 			return contentBuildDoc{}, false, errContentBuildAborted
 		}

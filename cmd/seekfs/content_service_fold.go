@@ -85,7 +85,14 @@ func (s *goSearchService) maybeFoldContentDelta(vol *serviceVolumeIndex) {
 // covered by the fold are removed and the new base is published; on failure the
 // delta is kept verbatim so no persisted-and-acknowledged content is dropped.
 func (s *goSearchService) runContentFold(vol *serviceVolumeIndex) {
-	if vol == nil || vol.content == nil || vol.contentCoord == nil {
+	if vol == nil {
+		return
+	}
+	if !s.beginContentTask(vol) {
+		return
+	}
+	defer endContentTask(vol)
+	if vol.content == nil || vol.contentCoord == nil {
 		return
 	}
 	// A fold needs a usable attached base. ready and degraded both have one —
@@ -136,7 +143,13 @@ func (s *goSearchService) runContentFold(vol *serviceVolumeIndex) {
 		return
 	}
 	contentFoldAssembleHook()
-	cidx, err := assembleContentIndexStream(newContentFoldSource(reader, snap).next, tmpDir)
+	source := newContentFoldSource(reader, snap)
+	cidx, err := assembleContentIndexStream(func() (contentBuildDoc, bool, error) {
+		if s.contentStopped(vol) {
+			return contentBuildDoc{}, false, errContentBuildAborted
+		}
+		return source.next()
+	}, tmpDir)
 	_ = os.RemoveAll(tmpDir)
 	if err != nil {
 		serviceLog("content fold assemble failed volume=%s err=%v", vol.volume, err)

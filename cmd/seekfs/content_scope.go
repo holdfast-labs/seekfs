@@ -156,6 +156,9 @@ func contentScopeForVolume(cfg appConfig, volume string) contentScope {
 		}
 	}
 	apply(cfg.Content)
+	if d, ok := cfg.Plugins["content"]; ok && d.Installed {
+		apply(d.Content)
+	}
 	if ov, ok := cfg.ContentByVolume[strings.ToUpper(volume)]; ok {
 		apply(ov)
 	}

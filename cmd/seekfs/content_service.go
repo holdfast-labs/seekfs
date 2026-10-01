@@ -1113,10 +1113,11 @@ func (s *contentVolumeState) hasContentForFRN(frn uint64) bool {
 // are promoted for extraction on Close or a quiet window; read-only closes never
 // produce work.
 type contentCoordinator struct {
-	mu    sync.Mutex
-	state *contentVolumeState
-	dirty map[uint64]struct{}
-	queue map[uint64]struct{}
+	extractCtx context.Context
+	mu         sync.Mutex
+	state      *contentVolumeState
+	dirty      map[uint64]struct{}
+	queue      map[uint64]struct{}
 	// deferred parks distinct changes that could not be admitted because the
 	// delta is at its hard ceiling. Keyed by FRN; replayed once the delta
 	// drains. Bounded in memory (an FRN per change, not its text).
@@ -1268,6 +1269,9 @@ func (c *contentCoordinator) enqueueFRNs(frns []uint64) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	for _, frn := range frns {
+		if c.extractCtx != nil && c.extractCtx.Err() != nil {
+			break
+		}
 		if frn == 0 {
 			continue
 		}
@@ -1451,6 +1455,13 @@ func contentWithExtractDocTimeout(ctx context.Context) (context.Context, context
 // file's content hash matches prior, changed is false and the caller can skip it
 // (touch-only writes never reindex).
 func contentExtractDeltaDoc(frn uint64, path string, prior [contentHashLen]byte, havePrior bool) (doc contentDeltaDoc, changed bool, err error) {
+	return contentExtractDeltaDocContext(context.Background(), frn, path, prior, havePrior)
+}
+
+func contentExtractDeltaDocContext(baseCtx context.Context, frn uint64, path string, prior [contentHashLen]byte, havePrior bool) (doc contentDeltaDoc, changed bool, err error) {
+	if baseCtx != nil && baseCtx.Err() != nil {
+		return contentDeltaDoc{}, false, baseCtx.Err()
+	}
 	f, err := contentOpenNoRecall(path)
 	if err != nil {
 		return contentDeltaDoc{}, false, err
@@ -1470,7 +1481,10 @@ func contentExtractDeltaDoc(frn uint64, path string, prior [contentHashLen]byte,
 	// call goes through contentExtractSafely so the drain shares the build's
 	// isolation: a parser panic is a skip, and a ctx-ignoring parser is cut off
 	// by the boundary-enforced deadline instead of wedging the serial drain.
-	ctx := contentWithExtractSettings(context.Background(), contentServiceExtractSettings())
+	if baseCtx == nil {
+		baseCtx = context.Background()
+	}
+	ctx := contentWithExtractSettings(baseCtx, contentServiceExtractSettings())
 	res, err := contentExtractSafely(ctx, e, f, size)
 	if err != nil || res.Skipped || len(res.Text) == 0 {
 		return contentDeltaDoc{}, false, err
@@ -1516,6 +1530,9 @@ func (c *contentCoordinator) processQueue(resolvePath func(frn uint64) (string, 
 	frns := c.takeQueued()
 	changed := 0
 	for _, frn := range frns {
+		if c.extractCtx != nil && c.extractCtx.Err() != nil {
+			break
+		}
 		// At the hard ceiling a distinct change cannot be admitted without
 		// unbounded memory: defer it and surface the volume incomplete. Updating
 		// an existing slot is always allowed, so acknowledged content is never
@@ -1530,7 +1547,7 @@ func (c *contentCoordinator) processQueue(resolvePath func(frn uint64) (string, 
 			continue
 		}
 		prior, havePrior := delta.priorHash(frn)
-		doc, didChange, err := contentExtractDeltaDoc(frn, path, prior, havePrior)
+		doc, didChange, err := contentExtractDeltaDocContext(c.extractCtx, frn, path, prior, havePrior)
 		if err != nil {
 			c.state.noteExtractionError()
 			continue

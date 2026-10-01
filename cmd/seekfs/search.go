@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -195,6 +196,9 @@ func entryToJSON(entry Entry) jsonResult {
 }
 
 func searchAll(indexes []*Index, opts queryOptions, countOnly bool) ([]Entry, error) {
+	if pq, err := parseQuery(opts); err == nil && queryHasFeatureLeaf(pq) {
+		return nil, fmt.Errorf("feature queries require the resident seekfs service")
+	}
 	if pq, err := parseQuery(opts); err == nil && queryHasAnyContentLeaf(pq) {
 		// Content is only queryable through the service's FRN-keyed volumes;
 		// a direct-index search has no content resolver. Refuse rather than
@@ -365,6 +369,9 @@ func searchServiceVolumes(volumes []*serviceVolumeIndex, opts queryOptions, coun
 	pq, err := parseQuery(opts)
 	if err != nil {
 		return nil, err
+	}
+	if queryHasFeatureLeaf(pq) {
+		return nil, fmt.Errorf("feature queries require the service feature dispatcher")
 	}
 	if pq.Impossible {
 		opts.Trace.setPlannerMode("impossible-query")

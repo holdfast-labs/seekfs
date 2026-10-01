@@ -17,6 +17,10 @@ import (
 )
 
 type serviceResponse struct {
+	PluginAPI                int                 `json:"plugin_api,omitempty"`
+	PluginConfig             string              `json:"plugin_config,omitempty"`
+	Plugins                  []pluginStatus      `json:"plugins,omitempty"`
+	Features                 []featureHealth     `json:"features,omitempty"`
 	OK                       bool                `json:"ok"`
 	Message                  string              `json:"message,omitempty"`
 	Fuzzy                    bool                `json:"fuzzy,omitempty"`
@@ -430,7 +434,16 @@ type goSearchService struct {
 	contentLockWarned map[string]bool
 	// contentCfg is the resolved seekfs.toml, used to derive the per-volume
 	// content scope for the service-owned build.
-	contentCfg appConfig
+	contentCfg     appConfig
+	featuresOnce   sync.Once
+	features       atomic.Pointer[serviceFeatures]
+	pluginSettings atomic.Pointer[pluginSettings]
+	pluginUpdateMu sync.Mutex
+	pluginQueueMu  sync.Mutex
+	pluginPending  map[string]pluginDefinition
+	pluginApplying atomic.Bool
+	pluginErrorMu  sync.Mutex
+	pluginError    string
 }
 
 // signalServiceStop closes the stop channel exactly once.  It is safe to call
@@ -459,9 +472,14 @@ type serviceVolumeIndex struct {
 	// records it walked; restart catch-up then replays the overlay changes.
 	baseCheckpoint int64
 	// content is the per-volume content-search state and coordinator. Both are
-	// nil unless content search is enabled (SEEKFS_CONTENT_SEARCH=1).
-	content      *contentVolumeState
-	contentCoord *contentCoordinator
+	// nil unless content search is enabled by config or environment.
+	content           *contentVolumeState
+	contentCoord      *contentCoordinator
+	featureFeed       *featureChangeFeed
+	contentActivation atomic.Pointer[contentActivation]
+	contentTasksMu    sync.Mutex
+	contentTasks      int
+	contentTasksDone  chan struct{}
 	// contentBuildBusy serializes service-owned content builds: at most one
 	// runs per volume at a time, and it is left set for the whole build.
 	contentBuildBusy atomic.Bool

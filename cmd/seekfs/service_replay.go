@@ -224,7 +224,7 @@ func (s *goSearchService) rebuildVolumeInPlace(vol *serviceVolumeIndex) error {
 	// WP1e/PB4: content must self-heal after a filename rebuild (a journal
 	// reset invalidated the FRN-keyed content index). Re-attach a still-valid
 	// sidecar, or schedule the background content rebuild.
-	s.ensureContentBuild(vol)
+	s.featuresVolumeReady(vol)
 	return nil
 }
 
@@ -346,7 +346,7 @@ func (vol *serviceVolumeIndex) applyUSNChanges(changes []usnChange) {
 	// content store would feed its own writes back. Built only when content is
 	// enabled so the default replay path pays nothing.
 	var applied []usnChange
-	if vol.contentCoord != nil {
+	if vol.contentCoord != nil || vol.featureFeed != nil {
 		applied = make([]usnChange, 0, len(changes))
 	}
 	for i, change := range changes {
@@ -368,7 +368,7 @@ func (vol *serviceVolumeIndex) applyUSNChanges(changes []usnChange) {
 			continue
 		}
 		vol.recordOverlayChange(change, i == lastChange[change.FRN] && change.Reason&usnReasonNeedsInfoRefresh != 0)
-		if vol.contentCoord != nil {
+		if vol.contentCoord != nil || vol.featureFeed != nil {
 			applied = append(applied, change)
 		}
 		if change.USN > vol.checkpoint {
@@ -382,9 +382,7 @@ func (vol *serviceVolumeIndex) applyUSNChanges(changes []usnChange) {
 	// Content search consumes the same applied change stream as the record
 	// overlay (own-artifact churn already excluded). Nil unless the feature is
 	// enabled, so the default path is untouched.
-	if vol.contentCoord != nil {
-		vol.contentCoord.observeChanges(applied)
-	}
+	vol.observeFeatureChanges(applied)
 }
 
 // filterOwnedReplayChanges drops changes that fall inside directories holding

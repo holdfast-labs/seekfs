@@ -570,6 +570,11 @@ func queryCanceled(pq parsedQuery) bool {
 // dm:, --recent, and --modified-after would otherwise silently match nothing.
 // Failing loudly is consistent with rejecting unknown filters at parse time.
 func checkQueryCapabilities(pq parsedQuery, idx *Index) error {
+	for _, leaf := range featureAllLeaves(pq) {
+		if leaf.matches == nil {
+			return fmt.Errorf("feature queries require the resident seekfs service")
+		}
+	}
 	needsSize, needsMod := queryNeedsSizeOrMod(pq)
 	if needsSize && !idx.compactHasSize() {
 		return errors.New("size: filters require an index with file sizes; the current index has none (rebuild with a size-capable indexer)")

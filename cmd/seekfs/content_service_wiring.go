@@ -3,7 +3,7 @@ package main
 // P2.5 service wiring: attach a loaded `.gsx` to a service volume, keep its
 // resolver in step with base swaps, and drain changed files on a timer.
 //
-// Everything here is inert unless SEEKFS_CONTENT_SEARCH=1.
+// Everything here is inert unless the optional content feature is enabled.
 
 import (
 	"fmt"
@@ -45,10 +45,17 @@ func contentBaseFRNColumns(idx *Index) ([]uint64, []uint32, bool) {
 // A missing or unreadable index leaves the volume in the `unavailable` state, so
 // queries are refused rather than reported as no matches.
 func (s *goSearchService) attachContentForVolume(vol *serviceVolumeIndex) {
-	if vol == nil || !contentSearchEnabled() || vol.content == nil {
+	if vol == nil {
 		return
 	}
-	if contentScopeForVolume(s.contentCfg, vol.volume).disabled() {
+	if !s.beginContentTask(vol) {
+		return
+	}
+	defer endContentTask(vol)
+	if !contentSearchEnabled() || vol.content == nil {
+		return
+	}
+	if contentScopeForVolume(s.contentConfig(), vol.volume).disabled() {
 		return
 	}
 	// Only USN volumes can join content docs (keyed by FRN) to records. Walk
@@ -215,15 +222,17 @@ func (s *goSearchService) attachContentForVolume(vol *serviceVolumeIndex) {
 			vol.content.markExtractorRefresh(len(refreshFRNs))
 			vol.contentCoord.enqueueFRNs(refreshFRNs)
 		}
-		if startDrain {
-			go s.contentDrainLoop(vol)
+		if startDrain && s.beginContentTask(vol) {
+			go func() { defer endContentTask(vol); s.contentDrainLoop(vol) }()
 		}
 		// Catch up OFF the startup path: a far-behind base must not block
 		// startup or grow an unbounded delta. Catch-up runs after the drain is
 		// enabled so the FRNs it enqueues are actually processed; files changed
 		// while the service was stopped become findable in content, matching
 		// filename search.
-		contentCatchUpAsync(func() { s.contentCatchUpAfterAttach(vol, idx) })
+		if s.beginContentTask(vol) {
+			contentCatchUpAsync(func() { defer endContentTask(vol); s.contentCatchUpAfterAttach(vol, idx) })
+		}
 	}
 	serviceLog("content index loaded for volume %s docs=%d", vol.volume, len(idx.Docs))
 }
@@ -337,6 +346,9 @@ func (s *goSearchService) contentCatchUpAfterAttach(vol *serviceVolumeIndex, idx
 	if vol == nil || vol.contentCoord == nil || idx == nil || vol.volume == "" {
 		return
 	}
+	if s.contentStopped(vol) {
+		return
+	}
 	from := int64(idx.CheckpointUSN)
 	if idx.JournalID == 0 || from <= 0 {
 		// Not USN-valid (a hand-built or walk-derived base). Leave it alone;
@@ -382,6 +394,9 @@ func (s *goSearchService) contentCatchUpAfterAttach(vol *serviceVolumeIndex, idx
 	processed := 0
 	var processedBytes int64
 	for cur < target {
+		if s.contentStopped(vol) {
+			return
+		}
 		if !s.contentCatchUpGenerationCurrent(vol, idx.JournalID) {
 			// A journal reset or base swap landed mid-loop; the rest of the
 			// read is for a generation these FRNs can no longer join. Abort
@@ -398,7 +413,8 @@ func (s *goSearchService) contentCatchUpAfterAttach(vol *serviceVolumeIndex, idx
 			return
 		}
 		if next <= cur {
-			break
+			s.contentCatchUpFailed(vol, "journal read made no progress")
+			return
 		}
 		processed += len(changes)
 		processedBytes += s.contentCatchUpBatchBytes(vol, changes)
@@ -553,6 +569,8 @@ func (s *goSearchService) contentDrainLoop(vol *serviceVolumeIndex) {
 	for {
 		select {
 		case <-s.stop:
+			return
+		case <-contentActivationDone(vol):
 			return
 		case <-done:
 			return

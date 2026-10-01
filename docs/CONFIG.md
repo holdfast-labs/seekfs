@@ -46,6 +46,25 @@ db_paths = ["F:\\seekfs_c.gsi", "F:\\seekfs_f.gsi"]
 This parser intentionally supports only the simple string, integer, and string
 array forms used by `seekfs`.
 
+## Optional features
+
+Use the plugin CLI to select and configure optional features:
+
+```powershell
+seekfs plugin list
+seekfs plugin add content
+seekfs plugin doctor content --wait
+seekfs plugin config content --root F:\work --git=false
+```
+
+Plugin settings are written to `plugin.toml` beside the service's `seekfs.toml`;
+the plugin CLI leaves core config intact and applies changes live. Legacy
+`[features.<name>]` and `[content]` settings remain supported. Other compatible
+executables can be registered with `plugin add NAME --command <absolute-path>`.
+See [FEATURES.md](FEATURES.md) for configuration,
+query syntax, limits and the companion protocol. `seekfs loaded --json` reports
+feature health independently of filename-search health.
+
 ## Editing Config
 
 Use `seekfs config` so agents and users do not need to locate the file manually:

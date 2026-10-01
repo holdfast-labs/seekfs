@@ -78,6 +78,19 @@ func commonPathBareExtensionTerm(term string) bool {
 }
 
 func queryLooksPathScoped(query string) bool {
+	if queryHasFeatureToken(query) {
+		for _, token := range contentTokenizeQuery(query) {
+			for _, part := range featureSplitAlternatives(token) {
+				if strings.HasPrefix(strings.TrimLeft(part, "!-"), "feature:") {
+					continue
+				}
+				if strings.ContainsAny(part, `\/`) {
+					return true
+				}
+			}
+		}
+		return false
+	}
 	for _, field := range strings.Fields(query) {
 		if strings.ContainsAny(field, `\/`) {
 			return true
@@ -143,7 +156,7 @@ func (pq parsedQuery) isEmpty() bool {
 	return len(pq.Terms) == 0 && len(pq.Exts) == 0 && len(pq.Dirs) == 0 &&
 		len(pq.Globs) == 0 && len(pq.Regexps) == 0 && pq.Type == "" &&
 		len(pq.Parents) == 0 && pq.Under == "" && !pq.HasModAfter && len(pq.SizeFilters) == 0 &&
-		len(pq.DateFilters) == 0 && len(pq.AttrFilters) == 0 && len(pq.Content) == 0 &&
+		len(pq.DateFilters) == 0 && len(pq.AttrFilters) == 0 && len(pq.Content) == 0 && len(pq.Features) == 0 &&
 		len(pq.OrGroups) == 0 && len(pq.NotGroups) == 0
 }
 
@@ -183,8 +196,8 @@ func applyQueryToken(pq *parsedQuery, raw string) error {
 	// matches the group if it matches any alternative. We only treat '|' as an
 	// operator when it joins token-like alternatives (not inside a regex, which
 	// uses the regex: prefix and is handled before this point).
-	if _, isRegexSpan := contentTokenIsRegexSpan(raw); strings.Contains(raw, "|") && !strings.HasPrefix(raw, "regex:") && !isRegexSpan {
-		parts := strings.Split(raw, "|")
+	if _, isRegexSpan := contentTokenIsRegexSpan(raw); strings.Contains(raw, "|") && len(featureSplitAlternatives(raw)) > 1 && !strings.HasPrefix(raw, "regex:") && !isRegexSpan {
+		parts := featureSplitAlternatives(raw)
 		group := make([]parsedQuery, 0, len(parts))
 		for _, part := range parts {
 			if part == "" {
@@ -211,6 +224,12 @@ func applyQueryToken(pq *parsedQuery, raw string) error {
 	}
 
 	switch {
+	case strings.HasPrefix(raw, "feature:"):
+		leaf, err := parseFeatureLeaf(strings.TrimPrefix(raw, "feature:"))
+		if err != nil {
+			return err
+		}
+		pq.Features = append(pq.Features, leaf)
 	case strings.HasPrefix(raw, "ext:"):
 		ext := strings.TrimPrefix(raw, "ext:")
 		ext = strings.TrimPrefix(ext, ".")
@@ -358,6 +377,7 @@ func mergeSubquery(dst *parsedQuery, src parsedQuery) {
 	dst.DateFilters = append(dst.DateFilters, src.DateFilters...)
 	dst.AttrFilters = append(dst.AttrFilters, src.AttrFilters...)
 	dst.Content = append(dst.Content, src.Content...)
+	dst.Features = append(dst.Features, src.Features...)
 	if src.Type != "" {
 		dst.Type = src.Type
 	}
@@ -543,6 +563,11 @@ func isRegexLiteralRune(r rune) bool {
 // recurse in the callers so content-aware verification can apply its own
 // per-alternative (joint) semantics.
 func entryMatchesScalar(entry Entry, pq parsedQuery, matchPath bool) bool {
+	for _, leaf := range pq.Features {
+		if _, ok := leaf.matches[entry.FRN]; !ok {
+			return false
+		}
+	}
 	path := filepath.Clean(entry.Path)
 	name := entry.Name
 	if name == "" {

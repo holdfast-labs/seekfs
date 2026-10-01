@@ -23,7 +23,8 @@ content inline, single and multi volume, but is **off by default** behind
 `exists:`, relevance, and biased order (see the WP7 section of the roadmap). The
 documented §7 residuals remain. `.gsx` is format **v4**. P4 document-extraction
 quality remains deferred (see §7). Content search is off by default; with
-`SEEKFS_CONTENT_SEARCH=1`, `content:` queries work through the service once the
+`[features.content] enabled = true` or `SEEKFS_CONTENT_SEARCH=1`, `content:`
+queries work through the service once the
 service-owned build has attached an FRN-keyed `.gsx`.
 
 This document is the committed handoff for an agent continuing the work. The
@@ -39,13 +40,24 @@ implementation (not the Microsoft `tgrep` binary), reusing seekfs's own
 trigram/posting/mmap machinery and its USN change stream for freshness.
 
 Two user problem sets: **A** text/code content (developers), **B** user
-documents (PDF/DOCX/XLSX/MD/email). The offline path (Set A for text/code)
-works today; documents have extractors but are not wired into service queries
-yet.
+documents (PDF/DOCX/XLSX/MD/email). Both use the shared extractors in offline and
+service builds.
 
 ## 2. Enable and use
 
-Everything is gated behind the environment variable:
+Enable the built-in plugin from the CLI:
+
+```powershell
+seekfs plugin add content
+seekfs plugin doctor content --wait
+```
+
+This writes `plugin.toml` beside the service's config and starts indexing in the
+background without restarting seekfs. `plugin config content --root <path>`
+selects explicit roots; see [FEATURES.md](FEATURES.md) for setup and diagnostics.
+Legacy `[features.content] enabled = true` in `seekfs.toml` still works.
+
+The existing environment override also works:
 
 ```powershell
 $env:SEEKFS_CONTENT_SEARCH = "1"
@@ -64,8 +76,9 @@ Offline build + query:
 # writes C:\ProgramData\seekfs\indexes\seekfs_c.gsx with origin=2 (FRN-keyed)
 ```
 
-With the flag unset, `content`/`content-index` exit 1 with "content search is
-disabled"; the rest of seekfs is unchanged.
+With neither config nor the flag enabling content, `content`/`content-index`
+exit 1 with "content search is disabled". See [FEATURES.md](FEATURES.md) for the
+shared feature lifecycle and compatible companion-service backend.
 
 The service's new content build scope defaults to detected Git worktrees plus
 Documents, Desktop, and Downloads on the volume. It excludes common generated
@@ -620,13 +633,11 @@ Residual / known limitations (all explicit deferrals):
   1 MiB fixed cap silently dropped the tail of e.g.
   `cmd/trace/static/trace_viewer_full.html`). A token larger than the (bounded)
   cap still stops extraction as a `Truncated` bounded prefix, not silently.
-- **RTF: group-scoped properties are single scalars, not saved/restored per
-  group.** `\ucN` and `\ansicpgN` are held in one variable for the whole scan,
-  so a nested override leaks to the rest of the document instead of reverting
-  when its group closes (most documents set them once at the top level).
-- **RTF: `\field` is skipped whole.** The visible `{\fldrslt …}` text of a
-  field or hyperlink is dropped along with its `\fldinst`; a follow-up could
-  index `\fldrslt` only.
+- **RTF group properties and fields fixed (extractor v2).** `\ucN` and
+  `\ansicpgN` are restored at group boundaries; Unicode fallback ends at a
+  brace. Fields retain visible `\fldrslt` text while skipping `\fldinst`.
+  Existing RTF and MSG documents (which share the RTF parser) are refreshed
+  through the extractor-version mechanism.
 - **RTF: DBCS codepages.** `\ansicpg932/936/949/950` (CJK) are not mapped and
   fall back to CP1252, yielding mojibake; v1 covers single-byte pages only.
 

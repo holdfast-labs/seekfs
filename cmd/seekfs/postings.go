@@ -1717,6 +1717,7 @@ func cloneParsedQuery(pq parsedQuery) parsedQuery {
 	out.DateFilters = append([]dateFilter(nil), pq.DateFilters...)
 	out.AttrFilters = append([]uint32(nil), pq.AttrFilters...)
 	out.Content = append([]contentLeaf(nil), pq.Content...)
+	out.Features = append([]featureLeaf(nil), pq.Features...)
 	if len(pq.OrGroups) > 0 {
 		out.OrGroups = make([][]parsedQuery, len(pq.OrGroups))
 		for i, group := range pq.OrGroups {
@@ -1777,7 +1778,7 @@ func parseQuery(opts queryOptions) (parsedQuery, error) {
 		pq.HasModAfter = true
 	}
 	tokens := strings.Fields(opts.Query)
-	if queryHasContentToken(opts.Query) {
+	if queryHasContentToken(opts.Query) || queryHasFeatureToken(opts.Query) {
 		// Content queries need the quote/regex-span-aware tokenizer so
 		// content:"a b" and content:/a|b/ stay one constraint. Non-content
 		// queries keep the historical strings.Fields behavior.

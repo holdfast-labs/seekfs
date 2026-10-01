@@ -1,16 +1,14 @@
 package main
 
-// The parsed representation of `content:` constraints and the P0 gate stub.
-//
-// Content search is off by default and the content index does not exist yet, so
-// every `content:` query is rejected with a clear error rather than being
-// planned as a name query. That keeps the "off means normal seekfs" contract
-// and guarantees no silently wrong results before the P1/P2 wiring lands.
+// Parsed content constraints and optional-feature selection. Disabled content
+// is rejected explicitly rather than being interpreted as a filename term.
 
 import (
 	"fmt"
 	"os"
 	"strings"
+	"sync"
+	"sync/atomic"
 )
 
 // contentLeafKind discriminates the three content constraint forms.
@@ -31,12 +29,31 @@ type contentLeaf struct {
 	LeafID int
 }
 
-// contentSearchEnabled reports whether content search is switched on. Default
-// off: content is opt-in, and until the index and planner land the flag only
-// selects between "disabled" and "not yet built".
+// contentSearchEnabled honors the environment override, then the service's
+// configured selection (or a cached default config for offline commands).
 func contentSearchEnabled() bool {
-	return os.Getenv("SEEKFS_CONTENT_SEARCH") == "1"
+	if selected := servicePluginContentSelection.Load(); selected != nil {
+		return *selected
+	}
+	if value, ok := os.LookupEnv("SEEKFS_CONTENT_SEARCH"); ok {
+		return value == "1"
+	}
+	if cfg := serviceContentSelection.Load(); cfg != nil {
+		return *cfg
+	}
+	defaultContentSelection.Do(func() {
+		cfg, err := loadConfig("")
+		if err == nil {
+			defaultContentSelected = featureContentEnabled(cfg)
+		}
+	})
+	return defaultContentSelected
 }
+
+var serviceContentSelection atomic.Pointer[bool]
+var servicePluginContentSelection atomic.Pointer[bool]
+var defaultContentSelection sync.Once
+var defaultContentSelected bool
 
 // queryHasContentToken reports whether the raw query contains a token that
 // STARTS with content:/!content:/-content:. A substring match would switch the
@@ -55,7 +72,7 @@ func queryHasContentToken(query string) bool {
 // an absent or still-building content index must never look like "no matches".
 func contentUnavailableError() error {
 	if !contentSearchEnabled() {
-		return fmt.Errorf("content search is disabled; set SEEKFS_CONTENT_SEARCH=1 to opt in")
+		return fmt.Errorf("content search is disabled; run seekfs plugin add content to enable it")
 	}
 	return fmt.Errorf("content indexing unavailable: the content index is not built or still building")
 }

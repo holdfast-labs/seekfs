@@ -68,6 +68,8 @@ func run(args []string) error {
 		return cmdDoctor(args[1:])
 	case "config":
 		return cmdConfig(args[1:])
+	case "plugin", "plugins":
+		return cmdPlugin(args[1:])
 	case "defaults":
 		return cmdDefaults(args[1:])
 	case "uninstall":
@@ -196,6 +198,7 @@ func printUsage(w io.Writer) {
   seekfs loaded [--json]
   seekfs defaults [--json]
   seekfs config path|show|get|set
+  seekfs plugin list|add|remove|enable|disable|config|doctor|reload|path
   seekfs service-index-usn -volume C: -db seekfs.gsi [-pipe \\.\pipe\seekfs-service]
   seekfs bench [-db index.gsi...] [-service] [-count] [--json] [-iterations 100]
   seekfs ui [-pipe \\.\pipe\seekfs-service] [-n 200]
@@ -273,7 +276,7 @@ Query filters:
   type:dir          Only directories.
   content:foo       Case-insensitive literal substring in file content; not a
                     whole-word match (foo matches foobar). Needs the
-                    SEEKFS_CONTENT_SEARCH=1 env var; content:/re/ is a regex
+                    content plugin (seekfs plugin add content); content:/re/ is a regex
                     match for word boundaries or alternation.
   a|b               OR alternatives within a term, such as ext:png|jpg.
   !term, -term      Exclude a term or filter.

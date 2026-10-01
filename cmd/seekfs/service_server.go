@@ -123,11 +123,11 @@ func classifyServiceCommand(command string) serviceCommandClass {
 	switch command {
 	case "search", "info", "status":
 		return serviceCommandReadOnly
-	case "watch-delta":
+	case "watch-delta", "plugin-list":
 		// watch-delta is a read-only local operation but is deferred remotely
 		// until Phase 7: it exposes cursor semantics that need scoped identity.
 		return serviceCommandLocalOnly
-	case "index-usn":
+	case "index-usn", "plugin-reload":
 		return serviceCommandMutate
 	default:
 		return serviceCommandUnknown
@@ -195,6 +195,8 @@ func (s *goSearchService) handleServiceCommand(w io.Writer, principal servicePri
 		s.serviceCommandIndexUSN(w, req)
 	case "status":
 		s.serviceCommandStatus(w)
+	case "plugin-list", "plugin-reload":
+		s.serviceCommandPlugins(w, req)
 	default:
 		_ = json.NewEncoder(w).Encode(serviceResponse{OK: false, Message: "unknown command"})
 	}
@@ -265,11 +267,15 @@ func (s *goSearchService) serviceCommandInfo(w io.Writer, req *serviceRequest) {
 		message = loadErr
 	}
 	health, healthMessage := classifyServiceHealth(loading, loadErr, infos)
-	_ = json.NewEncoder(w).Encode(serviceInfoResponseFor(serviceResponse{OK: loadErr == "", Message: message, Entries: total, Loading: loading, DBs: infos, Runtime: runtimeMemorySnapshot(), Health: health, HealthMessage: healthMessage, Content: s.contentHealthSnapshot()}, s.pipeName, s.processMode))
+	_ = json.NewEncoder(w).Encode(serviceInfoResponseFor(serviceResponse{OK: loadErr == "", Message: message, Entries: total, Loading: loading, DBs: infos, Runtime: runtimeMemorySnapshot(), Health: health, HealthMessage: healthMessage, Content: s.contentHealthSnapshot(), Features: s.featureHealthSnapshot(), PluginAPI: 1, PluginConfig: s.pluginFilePath()}, s.pipeName, s.processMode))
 }
 
 func (s *goSearchService) serviceCommandSearch(w io.Writer, caps serviceCapabilities, req *serviceRequest) {
 	serviceNoteQueryActivity()
+	if queryHasFeatureToken(req.Query) {
+		s.serviceCommandFeatureSearch(w, caps, req)
+		return
+	}
 	s.indexMu.RLock()
 	if len(s.indexes) == 0 {
 		loading := s.loading
@@ -380,6 +386,10 @@ func (s *goSearchService) serviceCommandSearch(w io.Writer, caps serviceCapabili
 
 func (s *goSearchService) serviceCommandWatchDelta(w io.Writer, req *serviceRequest) {
 	serviceNoteQueryActivity()
+	if queryHasFeatureToken(req.Query) {
+		_ = json.NewEncoder(w).Encode(serviceResponse{OK: false, Message: "watch does not support generic feature predicates"})
+		return
+	}
 	s.indexMu.RLock()
 	if len(s.indexes) == 0 {
 		loading := s.loading
@@ -510,7 +520,7 @@ func (s *goSearchService) serviceCommandIndexUSN(w io.Writer, req *serviceReques
 	s.startBackgroundNameTrigramBuilds([]*serviceVolumeIndex{vol})
 	// A runtime-added or re-indexed volume gets content attached or scheduled
 	// (PF-3), instead of staying content-unavailable until a restart.
-	s.ensureContentBuild(vol)
+	s.featuresVolumeReady(vol)
 	serviceLog("index-usn complete volume=%s entries=%d", req.Volume, idx.entryCount())
 	_ = json.NewEncoder(w).Encode(serviceResponse{OK: true, Message: "indexed", Entries: idx.entryCount()})
 }
@@ -545,7 +555,7 @@ func (s *goSearchService) replaceLoadedVolume(dbPath string, idx *Index) {
 	s.indexMu.Unlock()
 	s.startBackgroundNameOrderBuilds([]*serviceVolumeIndex{vol})
 	s.startBackgroundNameTrigramBuilds([]*serviceVolumeIndex{vol})
-	s.ensureContentBuild(vol)
+	s.featuresVolumeReady(vol)
 }
 
 func (s *goSearchService) replaceLoadedVolumeLocked(dbPath string, idx *Index) *serviceVolumeIndex {
@@ -553,6 +563,7 @@ func (s *goSearchService) replaceLoadedVolumeLocked(dbPath string, idx *Index) *
 		return nil
 	}
 	vol := newServiceVolumeIndex(dbPath, idx)
+	s.prepareFeatureVolume(vol)
 	for i, existing := range s.volumes {
 		if existing != nil && (samePath(existing.dbPath, dbPath) || strings.EqualFold(existing.volume, idx.Volume)) {
 			replaceServiceVolumeContents(existing, vol)
@@ -571,14 +582,7 @@ func replaceServiceVolumeContents(dst, src *serviceVolumeIndex) {
 	if dst == nil || src == nil {
 		return
 	}
-	// The destination's content coordinator is preserved below (content is
-	// generation-independent), so its drain keeps running across a base swap. A
-	// replacement object that carries a different coordinator must not leave a
-	// drain of its own behind: retire it (P6-4). This is a no-op today because
-	// the replacement is always a fresh, undrained volume.
-	if src.contentCoord != nil && src.contentCoord != dst.contentCoord {
-		src.stopContentDrain()
-	}
+	replaceFeatureVolumeState(dst, src)
 	prevJournalID := dst.journalID
 	dst.dbPath = src.dbPath
 	dst.index = src.index
@@ -628,16 +632,7 @@ func replaceServiceVolumeContents(dst, src *serviceVolumeIndex) {
 	dst.dirty = src.dirty
 	dst.lastPersist = src.lastPersist
 	dst.searchCount = src.searchCount
-	// Content is generation-independent: keep dst's loaded content state and
-	// rebind its resolver against the new record table. A base swap must never
-	// re-extract. A real journal reset (the journal id changed) is different:
-	// the FRN-keyed content docs belong to the old journal generation, so the
-	// content index is invalidated rather than served stale.
-	if prevJournalID != 0 && src.journalID != 0 && prevJournalID != src.journalID {
-		invalidateContentAfterBaseReset(dst, fmt.Sprintf("journal id changed from %d to %d", prevJournalID, src.journalID))
-		return
-	}
-	rebindContentAfterBaseSwap(dst)
+	dst.featuresBaseReplaced(prevJournalID)
 }
 
 func snapshotServiceVolumesForSearch(volumes []*serviceVolumeIndex) []*serviceVolumeIndex {

@@ -196,6 +196,7 @@ func percentile(sorted []float64, p float64) float64 {
 
 type serviceRequest struct {
 	Command       string              `json:"command"`
+	PluginConfig  string              `json:"plugin_config,omitempty"`
 	Volume        string              `json:"volume,omitempty"`
 	DB            string              `json:"db,omitempty"`
 	Query         string              `json:"query,omitempty"`
