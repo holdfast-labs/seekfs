@@ -44,7 +44,7 @@ const contentMSGHeaderLimit = 1 << 20
 type contentMSGLExtractor struct{}
 
 func (contentMSGLExtractor) Name() string    { return "msg" }
-func (contentMSGLExtractor) Version() uint16 { return 1 }
+func (contentMSGLExtractor) Version() uint16 { return 2 }
 func (contentMSGLExtractor) Class() uint16   { return contentClassMSG }
 
 func (contentMSGLExtractor) Extensions() []string { return []string{".msg"} }

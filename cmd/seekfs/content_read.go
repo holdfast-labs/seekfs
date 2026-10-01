@@ -154,9 +154,13 @@ func (r *contentReader) search(term string, limit int) []contentHit {
 	if t == "" {
 		return nil
 	}
-	candidates := r.candidates(t, 0)
+	next := r.candidateStream(t)
 	var hits []contentHit
-	for _, id := range candidates {
+	for {
+		id, ok := next()
+		if !ok {
+			break
+		}
 		text := r.docText(id)
 		if len(text) == 0 {
 			continue
@@ -203,8 +207,14 @@ func (r *contentReader) candidateStream(term string) func() (uint32, bool) {
 		return r.allDocIDStream()
 	}
 	streams := make([]func() (uint32, bool), 0, len(term)-2)
+	seen := make(map[string]struct{})
 	for i := 0; i+3 <= len(term); i++ {
-		postings, found := r.grams.postings(term[i : i+3])
+		gram := term[i : i+3]
+		if _, ok := seen[gram]; ok {
+			continue
+		}
+		seen[gram] = struct{}{}
+		postings, found := r.grams.postings(gram)
 		if !found {
 			return contentEmptyDocIDStream
 		}

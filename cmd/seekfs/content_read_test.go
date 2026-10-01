@@ -70,6 +70,34 @@ func TestContentBuildAndSearch(t *testing.T) {
 	}
 }
 
+// A small result limit must not allocate an all-document candidate slice.
+func TestContentOfflineLimitedSearchStreamsCandidates(t *testing.T) {
+	r := &contentReader{idx: &contentIndex{Docs: make([]contentDoc, 100000)}, text: []byte("a")}
+	for i := range r.idx.Docs {
+		r.idx.Docs[i].TextLen = 1
+	}
+	if hits := r.search("a", 1); len(hits) != 1 || hits[0].DocID != 0 {
+		t.Fatalf("limited search = %v", hits)
+	}
+	if allocs := testing.AllocsPerRun(10, func() { r.search("a", 1) }); allocs > 15 {
+		t.Fatalf("limited search allocated %.0f times; candidate enumeration should be lazy", allocs)
+	}
+}
+
+func TestContentRepeatedTrigramsStillVerifyFullTerm(t *testing.T) {
+	r, err := openContentReader(buildTestContentIndex(t, map[string]string{
+		"a.txt": "aaaaaa", "b.txt": "aaa", "c.txt": "abababab",
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for term, want := range map[string]string{"aaaaaa": "a.txt", "ababab": "c.txt"} {
+		if hits := r.search(term, 0); len(hits) != 1 || hits[0].Path != want {
+			t.Errorf("search(%q) = %v; want %s", term, hits, want)
+		}
+	}
+}
+
 // Offline `content -db` search: a byte-length-changing fold rune (İ 2->1 byte)
 // before the match must not shift the reported Offset or the snippet window.
 // The folded match offset is mapped back to the raw text for both, so the

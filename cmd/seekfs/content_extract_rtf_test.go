@@ -77,6 +77,22 @@ func TestContentRTFUnicodeAndCodepage(t *testing.T) {
 	}
 }
 
+func TestContentRTFGroupPropertiesAndFields(t *testing.T) {
+	for _, tc := range []struct{ raw, want string }{
+		{`{\rtf1\uc1 {\uc0\u233?}\u233?tail}`, "é?étail"},
+		{`{\rtf1\ansicpg1252 {\ansicpg1251\'e9}\'e9}`, "йé"},
+		{`{\rtf1{\fonttbl\uc0\ansicpg1251 ignored}\u233?\'e9}`, "éé"},
+		{`{\rtf1 before {\field{\*\fldinst HYPERLINK "hidden"}{\fldrslt visible}} after}`, "before visible after"},
+		{`{\rtf1{\field{\fldinst hidden}{\fldrslt visible}}}`, "visible"},
+		{`{\rtf1{\u233}tail}`, "étail"},
+		{`{\rtf1\u233{tail}}`, "étail"},
+	} {
+		if got := string(contentRTFExtract(t, []byte(tc.raw)).Text); got != tc.want {
+			t.Errorf("Extract(%q) = %q; want %q", tc.raw, got, tc.want)
+		}
+	}
+}
+
 // A \uN inside a skipped destination must not arm a fallback count: the
 // skipped region writes nothing, so the next characters of real text are not
 // consumed as phantom fallback (regression: body text came out as "eal").

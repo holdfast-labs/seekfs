@@ -10,7 +10,7 @@ package main
 // emits at most maxText, checks ctx periodically, and drops NULs.
 //
 // Destination groups that carry no visible text (\fonttbl, \colortbl, \pict,
-// \info, \field, ... and any \* ignorable destination) are skipped whole.
+// \info, \fldinst, ... and any \* ignorable destination) are skipped whole.
 // Control words are otherwise ignored, which is the spec's rule for unknown
 // words; only the text-bearing ones are translated.
 
@@ -38,7 +38,7 @@ const (
 type contentRTFExtractor struct{}
 
 func (contentRTFExtractor) Name() string    { return "rtf" }
-func (contentRTFExtractor) Version() uint16 { return 1 }
+func (contentRTFExtractor) Version() uint16 { return 2 }
 func (contentRTFExtractor) Class() uint16   { return contentClassRTF }
 
 func (contentRTFExtractor) Extensions() []string { return []string{".rtf"} }
@@ -70,6 +70,7 @@ func (contentRTFExtractor) Extract(ctx context.Context, r io.ReaderAt, size int6
 	depth := 0
 	skipping := false
 	skipDepth := 0
+	var groups []struct{ cp, uc int }
 
 	for i := 0; i < len(doc); {
 		if i&0x3FFF == 0 {
@@ -83,21 +84,24 @@ func (contentRTFExtractor) Extract(ctx context.Context, r io.ReaderAt, size int6
 		}
 		switch b := doc[i]; {
 		case b == '{':
+			fallback = 0 // A group boundary ends Unicode fallback text.
 			depth++
 			if depth > contentRTFMaxGroupDepth {
 				truncated = true
 				i = len(doc)
 				continue
 			}
+			groups = append(groups, struct{ cp, uc int }{cp, uc})
 			i++
 		case b == '}':
+			fallback = 0
 			if skipping && depth <= skipDepth {
 				skipping = false
-				// A \uN inside the skipped region armed no fallback (see below),
-				// but one armed just before the region must not leak past it.
-				fallback = 0
 			}
 			if depth > 0 {
+				state := groups[len(groups)-1]
+				cp, uc = state.cp, state.uc
+				groups = groups[:len(groups)-1]
 				depth--
 			}
 			i++
@@ -333,7 +337,7 @@ func contentRTFWriteControl(out *bytes.Buffer, s string, skipping bool) {
 func contentRTFSkipWord(word string) bool {
 	switch word {
 	case "fonttbl", "colortbl", "stylesheet", "info",
-		"pict", "object", "field",
+		"pict", "object", "fldinst",
 		"header", "headerl", "headerr", "headerf",
 		"footer", "footerl", "footerr", "footerf",
 		"footnote", "annotation",
