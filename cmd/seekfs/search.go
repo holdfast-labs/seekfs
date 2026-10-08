@@ -370,6 +370,9 @@ func searchServiceVolumes(volumes []*serviceVolumeIndex, opts queryOptions, coun
 	if err != nil {
 		return nil, err
 	}
+	if countOnly {
+		markCountDivergent(opts, pq)
+	}
 	if queryHasFeatureLeaf(pq) {
 		return nil, fmt.Errorf("feature queries require the service feature dispatcher")
 	}
@@ -428,7 +431,7 @@ func searchServiceVolumes(volumes []*serviceVolumeIndex, opts queryOptions, coun
 		return matches, err
 	}
 	if len(volumes) > 1 {
-		return nil, globalMultiVolumePlannerDeclineError(opts)
+		return nil, globalMultiVolumePlannerDeclineError(opts, volumes)
 	}
 	if len(volumes) == 1 {
 		if opts.Trace != nil && strings.HasPrefix(opts.Trace.Decline, "global-") {
@@ -443,12 +446,11 @@ func searchServiceVolumes(volumes []*serviceVolumeIndex, opts queryOptions, coun
 		pathCache := make(map[int]string)
 		hidden := vol.snapshotHiddenBaseIDs()
 		candidateFn := vol.nameTermCandidates
+		// Top-N/limited lanes decline via hiddenBlocksTruncation when hidden
+		// is non-empty, so the candidate set stays complete and the verify
+		// loop cannot underfill the page. No lane needs a nil bypass anymore.
 		if vol.hasActiveOverlay() && !countOnly {
-			if hidden.empty() {
-				candidateFn = vol.overlayAwareNameTermCandidates
-			} else {
-				candidateFn = nil
-			}
+			candidateFn = vol.overlayAwareNameTermCandidates
 		}
 		baseOpts := opts
 		if vol.hasActiveOverlay() && !countOnly {

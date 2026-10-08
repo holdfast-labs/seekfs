@@ -55,10 +55,12 @@ func contentScanVisitBudgetOf(pq parsedQuery) int {
 	return contentDefaultScanVisitBudget
 }
 
-// boundContentPathCache resets a content scan's path memo once it reaches
-// contentScanPathCacheCap, keeping the scan's memory O(contentScanPathCacheCap)
-// rather than O(records visited).
-func boundContentPathCache(cache map[int]string) map[int]string {
+// boundPathCache resets a scan's path-reconstruction memo once it reaches
+// contentScanPathCacheCap, keeping the scan's memory O(cap) rather than
+// O(records visited). The memo is pure cache: dropping it only repeats
+// parent-chain walks, never changes results. Shared by content and
+// non-content scans alike.
+func boundPathCache(cache map[int]string) map[int]string {
 	if len(cache) >= contentScanPathCacheCap {
 		return make(map[int]string, contentScanPathCacheCap)
 	}

@@ -601,14 +601,14 @@ func TestContentScanPathCacheBounded(t *testing.T) {
 	for i := 0; i < contentScanPathCacheCap; i++ {
 		cache[i] = "path"
 	}
-	if bounded := boundContentPathCache(cache); len(bounded) != 0 {
+	if bounded := boundPathCache(cache); len(bounded) != 0 {
 		t.Fatalf("cache at cap not reset: len=%d", len(bounded))
 	}
 	below := make(map[int]string, contentScanPathCacheCap)
 	for i := 0; i < contentScanPathCacheCap-1; i++ {
 		below[i] = "path"
 	}
-	if got := boundContentPathCache(below); len(got) != contentScanPathCacheCap-1 {
+	if got := boundPathCache(below); len(got) != contentScanPathCacheCap-1 {
 		t.Fatalf("cache below cap was reset: len=%d", len(got))
 	}
 }

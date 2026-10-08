@@ -6,6 +6,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestGlobalNamePlannerDefaultAcrossVolumes(t *testing.T) {
@@ -434,6 +435,202 @@ func TestGlobalNamePlannerAppliesSizeFilter(t *testing.T) {
 	}
 	if paths := pathsOf(under); !slices.Equal(paths, []string{`C:\small.pdf`}) {
 		t.Fatalf("under paths = %v, want [C:\\small.pdf]", paths)
+	}
+}
+
+// TestGlobalNameUnderUsesNameFirstFilter covers the --under slow-path
+// regression: a selective filename term scoped by Under must use the global
+// filename trigram (name-first, then Under subtree intersection) instead of
+// falling to the full compact-name-order scan.
+func TestGlobalNameUnderUsesNameFirstFilter(t *testing.T) {
+	records := []CompactRecord{
+		{FRN: 1, ParentFRN: 1, Parent: -1, Name: ".", Mode: uint32(os.ModeDir)},
+		{FRN: 2, ParentFRN: 1, Parent: 0, Name: "scope", Mode: uint32(os.ModeDir)},
+		{FRN: 3, ParentFRN: 1, Parent: 0, Name: "other", Mode: uint32(os.ModeDir)},
+		{FRN: 4, ParentFRN: 2, Parent: 1, Name: "run_pipeline.bat"},
+		{FRN: 5, ParentFRN: 3, Parent: 2, Name: "run_pipeline.bat"},
+		{FRN: 6, ParentFRN: 1, Parent: 0, Name: "unrelated.txt"},
+	}
+	idx := &Index{Source: "usn", Volume: "F:", Roots: []string{`F:\`}, Compact: true, Records: records}
+	buildOrders(idx)
+	vol := newServiceVolumeIndex("f-under-name.gsi", idx)
+	vol.rebuildNameTrigramsLocked()
+	volumes := []*serviceVolumeIndex{vol}
+
+	trace := &searchTrace{}
+	got, err := searchServiceVolumes(volumes, queryOptions{Query: "run_pipeline", Under: `F:\scope`, Limit: 20, Trace: trace}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].Name != "run_pipeline.bat" || !strings.HasPrefix(got[0].Path, `F:\scope`) {
+		t.Fatalf("paths = %v, want single F:\\scope run_pipeline.bat", pathsOf(got))
+	}
+	if trace.PlannerMode != "global-name" || trace.Source == "compact-name-order-scan" {
+		t.Fatalf("trace = %+v, want global-name (not full scan)", trace)
+	}
+	if trace.Complete == nil || !*trace.Complete {
+		t.Fatalf("trace complete = %v, want true", trace.Complete)
+	}
+	// Outside the scope the same name must still resolve (proves the filter,
+	// not the term, narrowed the scoped query).
+	ungot, err := searchServiceVolumes(volumes, queryOptions{Query: "run_pipeline", Limit: 20, Trace: &searchTrace{}}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ungot) != 2 {
+		t.Fatalf("unscoped paths = %v, want both run_pipeline hits", pathsOf(ungot))
+	}
+}
+
+// TestGlobalNameCheapPredicatesUseNameFirst covers the same slow-lane class
+// as Under: selective name + cheap predicate (type:/dir:/case:/dm:/Exists)
+// must use the global filename trigram (name-first, then verify) instead of
+// the full bounded scan.
+func cheapPredicateTestVolumes(t *testing.T) []*serviceVolumeIndex {
+	t.Helper()
+	now := time.Now().Add(-time.Hour).UnixNano()
+	old := time.Date(2020, time.January, 1, 0, 0, 0, 0, time.UTC).UnixNano()
+	records := []CompactRecord{
+		{FRN: 1, ParentFRN: 1, Parent: -1, Name: ".", Mode: modeFromAttrs(fileAttributeDir)},
+		{FRN: 2, ParentFRN: 1, Parent: 0, Name: "scope", Mode: modeFromAttrs(fileAttributeDir)},
+		{FRN: 3, ParentFRN: 1, Parent: 0, Name: "other", Mode: modeFromAttrs(fileAttributeDir)},
+		{FRN: 4, ParentFRN: 2, Parent: 1, Name: "run_pipeline.bat", Mode: modeFromAttrs(fileAttributeArchive), ModUnix: now},
+		{FRN: 5, ParentFRN: 3, Parent: 2, Name: "run_pipeline.bat", Mode: modeFromAttrs(fileAttributeArchive), ModUnix: old},
+		{FRN: 6, ParentFRN: 1, Parent: 0, Name: "run_pipeline-cache", Mode: modeFromAttrs(fileAttributeDir)},
+		{FRN: 7, ParentFRN: 1, Parent: 0, Name: "unrelated.txt", Mode: modeFromAttrs(fileAttributeArchive)},
+		{FRN: 8, ParentFRN: 1, Parent: 0, Name: "run_pipeline", Mode: modeFromAttrs(fileAttributeDir)},
+		{FRN: 9, ParentFRN: 8, Parent: 7, Name: "notes.txt"},
+	}
+	idx := &Index{Source: "usn", Volume: "F:", Roots: []string{`F:\`}, Compact: true, Records: records}
+	buildOrders(idx)
+	// Build complete gram sections (PNGR selective + PNGC) so the
+	// top-ranked and posting-intersection lanes engage exactly as in
+	// production; without them every test would silently exercise only
+	// the fallback lanes.
+	selective := buildSelectiveNameTrigramIndex(idx, 1)
+	idx.Derived.NameTrigrams = decodeGramPostingIndex(encodeGramPostingSection(selective, nil), idx.compactRecordCount())
+	extra := optionalSelfNameGramIndex(idx, selective)
+	idx.Derived.SelfNameTrigrams = decodeGramPostingIndex(encodeGramPostingSection(extra, nil), idx.compactRecordCount())
+	vol := newServiceVolumeIndex("f-cheap-predicates.gsi", idx)
+	vol.rebuildNameTrigramsLocked()
+	return []*serviceVolumeIndex{vol}
+}
+
+func TestGlobalNameCheapPredicatesUseNameFirst(t *testing.T) {
+	volumes := cheapPredicateTestVolumes(t)
+
+	tests := []struct {
+		name  string
+		opts  queryOptions
+		want  []string
+		count int
+	}{
+		{name: "type file", opts: queryOptions{Query: "run_pipeline type:file", Limit: 20}, want: []string{`F:\other\run_pipeline.bat`, `F:\scope\run_pipeline.bat`}, count: 2},
+		{name: "type dir", opts: queryOptions{Query: "run_pipeline type:dir", Limit: 20}, want: []string{`F:\run_pipeline`, `F:\run_pipeline-cache`}, count: 2},
+		{name: "case miss", opts: queryOptions{Query: "case:true RUN_PIPELINE", Limit: 20}, want: nil, count: 0},
+		{name: "case hit", opts: queryOptions{Query: "case:true run_pipeline", Limit: 20}, want: []string{`F:\run_pipeline`, `F:\run_pipeline-cache`, `F:\other\run_pipeline.bat`, `F:\scope\run_pipeline.bat`}, count: 4},
+		{name: "dir filter", opts: queryOptions{Query: "run_pipeline dir:scope", Limit: 20}, want: []string{`F:\scope\run_pipeline.bat`}, count: 1},
+		{name: "under filter", opts: queryOptions{Query: "run_pipeline", Under: `F:\scope`, Limit: 20}, want: []string{`F:\scope\run_pipeline.bat`}, count: 1},
+		{name: "dm today", opts: queryOptions{Query: "run_pipeline dm:today", Limit: 20}, want: []string{`F:\scope\run_pipeline.bat`}, count: 1},
+		{name: "exists miss", opts: queryOptions{Query: "run_pipeline", Exists: true, Limit: 20}, want: nil, count: 0},
+		{name: "ext hit", opts: queryOptions{Query: "run_pipeline ext:bat", Limit: 20}, want: []string{`F:\other\run_pipeline.bat`, `F:\scope\run_pipeline.bat`}, count: 2},
+		{name: "ext miss", opts: queryOptions{Query: "run_pipeline ext:txt", Limit: 20}, want: nil, count: 0},
+		{name: "glob hit", opts: queryOptions{Query: "run_pipeline glob:*.bat", Limit: 20}, want: []string{`F:\other\run_pipeline.bat`, `F:\scope\run_pipeline.bat`}, count: 2},
+		{name: "glob miss", opts: queryOptions{Query: "run_pipeline glob:*.txt", Limit: 20}, want: nil, count: 0},
+		{name: "parent filter", opts: queryOptions{Query: "run_pipeline parent:scope", Limit: 20}, want: []string{`F:\scope\run_pipeline.bat`}, count: 1},
+		{name: "attrib archive", opts: queryOptions{Query: "run_pipeline attrib:A", Limit: 20}, want: []string{`F:\other\run_pipeline.bat`, `F:\scope\run_pipeline.bat`}, count: 2},
+		{name: "attrib dir", opts: queryOptions{Query: "run_pipeline attrib:D", Limit: 20}, want: []string{`F:\run_pipeline`, `F:\run_pipeline-cache`}, count: 2},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			trace := &searchTrace{}
+			tc.opts.Trace = trace
+			got, err := searchServiceVolumes(volumes, tc.opts, false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if paths := pathsOf(got); !slices.Equal(paths, tc.want) {
+				t.Fatalf("paths = %v, want %v", paths, tc.want)
+			}
+			if trace.PlannerMode != "global-name" || trace.Source == "compact-name-order-scan" ||
+				strings.Contains(trace.Source, "bounded-scan") {
+				t.Fatalf("trace = %+v, want global-name fast lane", trace)
+			}
+			if trace.Complete == nil || !*trace.Complete {
+				t.Fatalf("trace complete = %v, want true", trace.Complete)
+			}
+			cotrace := &searchTrace{}
+			copts := tc.opts
+			copts.Trace = cotrace
+			n, ok, err := countServiceVolumes(volumes, copts)
+			if err != nil || !ok || n != tc.count {
+				t.Fatalf("count = %d ok=%v err=%v, want %d true nil", n, ok, err, tc.count)
+			}
+		})
+	}
+}
+
+// TestGlobalNameUnderSkipsTopRanked pins the truncation guard: with Limit 1
+// the global top-1 name hit is F:\run_pipeline-cache (outside the scope), so
+// taking the truncated top-ranked lane would verify to zero and miss the
+// in-scope hit. The complete lane must be used instead.
+func TestGlobalNameUnderSkipsTopRanked(t *testing.T) {
+	volumes := cheapPredicateTestVolumes(t)
+	trace := &searchTrace{}
+	got, err := searchServiceVolumes(volumes, queryOptions{Query: "run_pipeline", Under: `F:\scope`, Limit: 1, Trace: trace}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if paths := pathsOf(got); !slices.Equal(paths, []string{`F:\scope\run_pipeline.bat`}) {
+		t.Fatalf("paths = %v, want scoped hit despite global top-1 being out of scope", paths)
+	}
+	if trace.PlannerMode != "global-name" {
+		t.Fatalf("planner mode = %q, want global-name", trace.PlannerMode)
+	}
+}
+
+// TestGlobalNameUnderAbsentScopeDeclines pins fallback preservation: a scope
+// missing from the index must decline the global lane (not fast-empty) so the
+// single-volume path can try the filesystem-under fallback.
+func TestGlobalNameUnderAbsentScopeDeclines(t *testing.T) {
+	volumes := cheapPredicateTestVolumes(t)
+	trace := &searchTrace{}
+	got, err := searchServiceVolumes(volumes, queryOptions{Query: "run_pipeline", Under: `F:\nope`, Limit: 20, Trace: trace}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("paths = %v, want empty", pathsOf(got))
+	}
+	if trace.PlannerMode == "global-name" {
+		t.Fatalf("planner mode = global-name, want decline to single-volume (fallback preserved)")
+	}
+}
+
+// TestGlobalNameUnderMultiVolume pins volume filtering: the C: volume's hit
+// must not leak into an F:-scoped query.
+func TestGlobalNameUnderMultiVolume(t *testing.T) {
+	fvol := cheapPredicateTestVolumes(t)[0]
+	crecords := []CompactRecord{
+		{FRN: 1, ParentFRN: 1, Parent: -1, Name: ".", Mode: modeFromAttrs(fileAttributeDir)},
+		{FRN: 2, ParentFRN: 1, Parent: 0, Name: "run_pipeline.bat", Mode: modeFromAttrs(fileAttributeArchive)},
+	}
+	cidx := &Index{Source: "usn", Volume: "C:", Roots: []string{`C:\`}, Compact: true, Records: crecords}
+	buildOrders(cidx)
+	cvol := newServiceVolumeIndex("c-under-multi.gsi", cidx)
+	cvol.rebuildNameTrigramsLocked()
+	volumes := []*serviceVolumeIndex{cvol, fvol}
+
+	trace := &searchTrace{}
+	got, err := searchServiceVolumes(volumes, queryOptions{Query: "run_pipeline", Under: `F:\scope`, Limit: 20, Trace: trace}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if paths := pathsOf(got); !slices.Equal(paths, []string{`F:\scope\run_pipeline.bat`}) {
+		t.Fatalf("paths = %v, want only the F: scoped hit", paths)
+	}
+	if trace.PlannerMode != "global-name" || !slices.Equal(trace.EligibleVolumes, []string{"F:"}) {
+		t.Fatalf("trace = %+v, want global-name over F: only", trace)
 	}
 }
 

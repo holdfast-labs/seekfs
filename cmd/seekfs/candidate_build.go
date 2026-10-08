@@ -29,7 +29,7 @@ func (vol *serviceVolumeIndex) plannedCandidates(pq parsedQuery) ([]int, bool) {
 		return out, true
 	}
 	out := plan.execute()
-	if compactCandidateCanSkipEntryMatches(pq, true) && pq.Limit > 0 {
+	if compactCandidateCanSkipEntryMatches(pq, true) && pq.Limit > 0 && !pq.hiddenBlocksTruncation() {
 		out = topCandidateIDsByRank(out, pq.Limit, vol.index, vol.rankForQuery(pq))
 	}
 	// topCandidateIDsByRank intentionally only knows persisted ranks.  Apply
@@ -42,7 +42,7 @@ func (vol *serviceVolumeIndex) plannedCandidates(pq parsedQuery) ([]int, bool) {
 }
 
 func (vol *serviceVolumeIndex) exactTopPlannedCandidates(pq parsedQuery) ([]int, bool) {
-	if vol == nil || vol.queryIndex == nil || pq.Limit <= 0 ||
+	if vol == nil || vol.queryIndex == nil || pq.Limit <= 0 || pq.hiddenBlocksTruncation() ||
 		len(pq.Exts) != 1 || len(pq.Globs) > 0 || len(pq.Dirs) > 0 ||
 		pq.Type != "" || pq.Under != "" || pq.HasModAfter || pq.Exists ||
 		(pq.SortColumn != "" && pq.SortColumn != "size" && pq.SortColumn != "modified" && pq.SortColumn != "extension" && pq.SortColumn != "type" && pq.SortColumn != "path") ||
@@ -180,7 +180,7 @@ func queryNeedsPath(pq parsedQuery) bool {
 	if len(pq.Dirs) > 0 || len(pq.Regexps) > 0 || len(pq.Parents) > 0 {
 		return true
 	}
-	if pq.Under != "" || pq.Exists {
+	if pq.Under != "" || pq.Exists || len(pq.Features) > 0 {
 		return true
 	}
 	for _, group := range pq.OrGroups {
@@ -233,7 +233,11 @@ func (vol *serviceVolumeIndex) recordMatchesNonPath(id int, rec CompactRecord, p
 		}
 	}
 	for _, sf := range pq.SizeFilters {
-		if !sf.matches(rec.Size) {
+		// Directories filter by recursive subtree bytes, matching the
+		// size order key and entryMatchesScalar; raw rec.Size would miss
+		// large-subtree dirs. Base (not overlay-delta) values: live
+		// changes are handled on the overlay side via hidden/merge.
+		if !sf.matches(scalarRecordBaseSize(vol.index, id, rec)) {
 			return false
 		}
 	}

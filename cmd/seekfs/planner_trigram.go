@@ -291,7 +291,7 @@ func (vol *serviceVolumeIndex) nameTrigramPathNameTopCandidates(pq parsedQuery) 
 		pq.Under != "" || pq.Type != "" || len(pq.Exts) > 0 || len(pq.Globs) > 0 ||
 		len(pq.Dirs) > 0 || len(pq.Regexps) > 0 || len(pq.OrGroups) > 0 ||
 		len(pq.NotGroups) > 0 || pq.HasModAfter || pq.Exists ||
-		pq.CWDBias != "" || pq.RootBias != "" || countNonVolumeTerms(pq.Terms) != 1 {
+		pq.CWDBias != "" || pq.RootBias != "" || countNonVolumeTerms(pq.Terms) != 1 || pq.hiddenBlocksTruncation() {
 		pq.Trace.replaceDecline("path-name-trigram-top:unsupported-query")
 		return nil, false
 	}

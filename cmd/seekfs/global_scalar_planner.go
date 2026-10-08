@@ -2,8 +2,8 @@ package main
 
 import (
 	"cmp"
+	"os"
 	"slices"
-	"sort"
 	"strings"
 	"time"
 )
@@ -90,7 +90,22 @@ func scalarOrderValue(order []uint32, idx *Index, pos int) (int64, bool) {
 		return 0, false
 	}
 	rec := idx.compactRecord(id)
-	return rec.Size, true
+	return scalarRecordBaseSize(idx, id, rec), true
+}
+
+// scalarRecordBaseSize reports the size a record sorts by in the persisted
+// size order: recursive subtree bytes for directories, own size otherwise.
+// The guards mirror buildCompactSizeOrderRankWithDirBytes exactly, so probe
+// and order can never disagree on which key a record sorts by — the previous
+// raw-size probe binary-searched an effectively-sorted array and collapsed
+// ranges containing large-subtree directories. Overlay size deltas are
+// deliberately excluded: the order is built from base values, and live
+// changes are accounted through the hidden/overlay split instead.
+func scalarRecordBaseSize(idx *Index, id int, rec CompactRecord) int64 {
+	if rec.Mode&uint32(os.ModeDir) != 0 && idx != nil && id >= 0 && id < len(idx.Derived.SubtreeBytes) {
+		return int64(idx.Derived.SubtreeBytes[id])
+	}
+	return rec.Size
 }
 
 func lowerBoundSize(order []uint32, idx *Index, value int64) (int, bool) {
@@ -372,7 +387,7 @@ func executeGlobalScalarBase(snapshot globalQuerySnapshot, pq parsedQuery, colle
 			stats.interval += max(0, scalar.end-scalar.start)
 			order, start, end = scalar.order, scalar.start, scalar.end
 			if !collect && scalarPredicateOnly(volumePQ) {
-				count += countVisibleScalarRange(scalar, hidden)
+				count += countVisibleScalarRange(scalar, hidden, vol, volumePQ.SizeFilters[0].matches)
 				setScalarDriver(&stats, "interval-cardinality")
 				continue
 			}
@@ -485,9 +500,19 @@ func scalarPredicateOnly(pq parsedQuery) bool {
 		len(pq.DateFilters) == 0 && !pq.HasModAfter
 }
 
-func countVisibleScalarRange(scalar scalarRange, hidden hiddenBaseIDs) int {
+// countVisibleScalarRange counts range members minus overlay-hidden ones. A
+// hidden id is in the range exactly when its base size satisfies the same
+// predicate the bounds were derived from (a correct bound interval holds
+// every match, so membership is a value check, not a position search — the
+// previous binary search over the size-ordered array for the id was
+// invalid). Base sizes are used throughout: live overlay changes are counted
+// on the overlay side instead.
+func countVisibleScalarRange(scalar scalarRange, hidden hiddenBaseIDs, vol *serviceVolumeIndex, matches func(int64) bool) int {
 	count := max(0, scalar.end-scalar.start)
 	if count == 0 || hidden.empty() {
+		return count
+	}
+	if vol == nil || vol.index == nil || matches == nil {
 		return count
 	}
 	seen := make(map[int32]struct{}, len(hidden.tombstone)+len(hidden.shadowed))
@@ -497,8 +522,14 @@ func countVisibleScalarRange(scalar scalarRange, hidden hiddenBaseIDs) int {
 				continue
 			}
 			seen[id] = struct{}{}
-			pos := sort.Search(len(scalar.order), func(pos int) bool { return scalar.order[pos] >= uint32(id) })
-			if pos >= scalar.start && pos < scalar.end && pos < len(scalar.order) && scalar.order[pos] == uint32(id) {
+			if id < 0 || int(id) >= vol.index.compactRecordCount() {
+				continue
+			}
+			rec := vol.index.compactRecord(int(id))
+			if rec.Deleted {
+				continue
+			}
+			if matches(scalarRecordBaseSize(vol.index, int(id), rec)) {
 				count--
 			}
 		}

@@ -204,7 +204,7 @@ func attribMaskString(mask uint32) string {
 }
 
 func (vol *serviceVolumeIndex) limitedPathTermCandidates(pq parsedQuery) ([]int, bool) {
-	if vol == nil || vol.index == nil || !pq.MatchPath || countNonVolumeTerms(pq.Terms) != 1 {
+	if vol == nil || vol.index == nil || !pq.MatchPath || countNonVolumeTerms(pq.Terms) != 1 || pq.hiddenBlocksTruncation() {
 		return nil, false
 	}
 	for _, term := range pq.Terms {
@@ -228,7 +228,7 @@ func (vol *serviceVolumeIndex) limitedDottedPathScanCandidates(pq parsedQuery) (
 		len(pq.Exts) > 0 || len(pq.Dirs) > 0 || len(pq.Globs) > 0 || len(pq.Regexps) > 0 ||
 		len(pq.SizeFilters) > 0 || len(pq.DateFilters) > 0 || len(pq.AttrFilters) > 0 ||
 		len(pq.OrGroups) > 0 || len(pq.NotGroups) > 0 ||
-		countNonVolumeTerms(pq.Terms) != 1 {
+		countNonVolumeTerms(pq.Terms) != 1 || pq.hiddenBlocksTruncation() {
 		return nil, false
 	}
 	for _, term := range pq.Terms {
@@ -259,7 +259,7 @@ func (vol *serviceVolumeIndex) pathDirectoryTermTopCandidates(pq parsedQuery) ([
 		len(pq.Exts) != 1 || len(pq.Dirs) > 0 || len(pq.Globs) > 0 || len(pq.Regexps) > 0 ||
 		len(pq.SizeFilters) > 0 || len(pq.DateFilters) > 0 || len(pq.AttrFilters) > 0 ||
 		len(pq.OrGroups) > 0 || len(pq.NotGroups) > 0 ||
-		countNonVolumeTerms(pq.Terms) != 1 {
+		countNonVolumeTerms(pq.Terms) != 1 || pq.hiddenBlocksTruncation() {
 		return nil, false
 	}
 	term := ""

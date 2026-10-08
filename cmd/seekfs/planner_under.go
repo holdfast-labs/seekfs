@@ -199,7 +199,7 @@ func (vol *serviceVolumeIndex) cacheUnderRoots(key string, roots []int) {
 }
 
 func (vol *serviceVolumeIndex) underLimitedTermCandidates(roots []int, pq parsedQuery) ([]int, bool) {
-	if vol == nil || vol.index == nil || pq.CountOnly || pq.Limit <= 0 || len(roots) == 0 || len(pq.Terms) != 1 || len(pq.Exts) > 0 || len(pq.Dirs) > 0 || len(pq.Globs) > 0 || len(pq.Regexps) > 0 || pq.Type != "" || pq.HasModAfter || pq.Exists || pq.CaseSensitive {
+	if vol == nil || vol.index == nil || pq.CountOnly || pq.Limit <= 0 || len(roots) == 0 || len(pq.Terms) != 1 || len(pq.Exts) > 0 || len(pq.Dirs) > 0 || len(pq.Globs) > 0 || len(pq.Regexps) > 0 || pq.Type != "" || pq.HasModAfter || pq.Exists || pq.CaseSensitive || pq.hiddenBlocksTruncation() {
 		return nil, false
 	}
 	term := pq.Terms[0]

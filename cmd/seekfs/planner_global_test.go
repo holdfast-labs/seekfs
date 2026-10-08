@@ -217,6 +217,35 @@ func TestMultiVolumePlannerDeclineDoesNotUsePerVolumeTerminal(t *testing.T) {
 	}
 }
 
+// TestMultiVolumeDeclineErrorNamesScope pins the actionable decline: it must
+// keep wrapping the sentinel (callers match on it) while naming the volumes,
+// the record scale, and how to narrow the query.
+func TestMultiVolumeDeclineErrorNamesScope(t *testing.T) {
+	volumes := []*serviceVolumeIndex{
+		newServiceVolumeIndex("c-decline-msg.gsi", singleFileCompactIndex("C:", "needle.txt")),
+		newServiceVolumeIndex("f-decline-msg.gsi", singleFileCompactIndex("F:", "needle.txt")),
+	}
+	volumes[0].overlay.watermark.Store(1)
+	volumes[0].snap.Store(nil)
+
+	_, err := searchServiceVolumes(volumes, queryOptions{Query: "needle", Trace: &searchTrace{}}, false)
+	if !errors.Is(err, errGlobalMultiVolumePlannerDeclined) {
+		t.Fatalf("search error = %v, want decline sentinel", err)
+	}
+	for _, want := range []string{"C:", "F:", "--under", "records"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("decline error = %q, want it to mention %q", err.Error(), want)
+		}
+	}
+	_, _, err = countServiceVolumes(volumes, queryOptions{Query: "needle", Trace: &searchTrace{}})
+	if !errors.Is(err, errGlobalMultiVolumePlannerDeclined) {
+		t.Fatalf("count error = %v, want decline sentinel", err)
+	}
+	if !strings.Contains(err.Error(), "--under") {
+		t.Fatalf("count decline error = %q, want scoping hint", err.Error())
+	}
+}
+
 func TestBareShortNameSubstringKeepsSubstringSemantics(t *testing.T) {
 	idx := shortSubstringCompactIndex()
 	got, err := searchCompactWithCache(idx, queryOptions{Query: "md", Limit: 10}, false, make(map[int]string), nil)

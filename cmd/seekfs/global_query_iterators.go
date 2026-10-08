@@ -1,6 +1,7 @@
 package main
 
 import (
+	"os"
 	"slices"
 	"sort"
 	"strings"
@@ -12,8 +13,22 @@ func globalPathTermIterator(volumes []*serviceVolumeIndex, term string) (globalI
 	}
 	children := make([]globalIDIterator, 0, len(volumes))
 	for volumeIndex, vol := range volumes {
-		if vol == nil || vol.index == nil || !vol.pathComponentPostingAvailable(term) {
+		if vol == nil || vol.index == nil {
 			return nil, false
+		}
+		if !vol.pathComponentPostingAvailable(term) {
+			// No component posting for this term (typically a filename-only
+			// fragment): bridge it from the selective name trigram plus
+			// budgeted dir-subtree expansion. The bridge declines broad
+			// terms without materializing them, so callers keep their
+			// bounded-scan fallback exactly where they have it today.
+			ids, ok := vol.bridgePathTermIDs(term)
+			if !ok {
+				return nil, false
+			}
+			it := newGlobalRecordIterator(volumeIndex, ids)
+			children = append(children, &it)
+			continue
 		}
 		if len(volumes) == 1 && vol.index.compactRecordCount() > serviceResidentChildRangeMaxRecords &&
 			len(vol.subtreeOrder) == 0 && len(vol.childOffsets) > 0 {
@@ -65,6 +80,120 @@ func globalPathTermIterator(volumes []*serviceVolumeIndex, term string) (globalI
 	return newGlobalMergeIterator(children...), true
 }
 
+// bridgePathTermIDs serves a separator-free path term from the selective
+// filename trigram when no component posting exists for it.
+//
+// Path-contains-term is exactly {records whose own name contains term} union
+// {descendants of dirs whose name contains term}, so the complete trigram
+// name set plus the subtrees of the dirs among it is the exact candidate
+// set — no component index involved. It declines (false) instead of
+// materializing whenever selectivity cannot be shown cheaply: short or
+// non-ASCII terms, a declined trigram (broad/omitted grams), missing subtree
+// intervals (which would force a full-volume scan iterator), or a streamed
+// total past serviceComponentTrigramExpansionMaxIDs. Callers fall back to
+// their bounded scan on decline, exactly as before.
+func (vol *serviceVolumeIndex) bridgePathTermIDs(term string) ([]int, bool) {
+	if vol == nil || vol.index == nil || len(term) < 3 || !asciiOnlyString(term) {
+		return nil, false
+	}
+	// Drive from names only (never MatchPath: the filename lane declines
+	// path-scoped queries). Extra predicates are enforced by the caller's
+	// verification; the trigram set is a complete superset for them.
+	namePQ := parsedQuery{Terms: []string{term}, Trace: &searchTrace{}}
+	nameIDs, ok := vol.filenameTrigramCandidates(namePQ)
+	if !ok {
+		return nil, false
+	}
+	budget := serviceComponentTrigramExpansionMaxIDs - len(nameIDs)
+	if budget < 0 {
+		return nil, false
+	}
+	seen := make(map[int]struct{}, len(nameIDs)+64)
+	for _, id := range nameIDs {
+		seen[id] = struct{}{}
+	}
+	for _, id := range nameIDs {
+		rec := vol.index.compactRecord(id)
+		if rec.Deleted || rec.Mode&uint32(os.ModeDir) == 0 {
+			continue
+		}
+		if !vol.subtreeIntervalValid(id) {
+			return nil, false
+		}
+		// Exact O(1) cardinality from the persisted interval; decline before
+		// materializing past budget. Overlaps with nameIDs or nested roots
+		// only over-count, which is decline-safe.
+		if n := vol.estimatedDescendantOrSelfCount(id); n > budget {
+			return nil, false
+		} else {
+			budget -= n
+		}
+		start, end := vol.subtreeStart[id], vol.subtreeEnd[id]
+		for pos := start; pos < end; pos++ {
+			child := int(vol.subtreeOrder[pos])
+			if child < 0 || child >= vol.index.compactRecordCount() {
+				return nil, false
+			}
+			if vol.index.compactRecord(child).Deleted {
+				continue
+			}
+			seen[child] = struct{}{}
+		}
+	}
+	out := make([]int, 0, len(seen))
+	for id := range seen {
+		out = append(out, id)
+	}
+	sort.Ints(out)
+	return out, true
+}
+
+// subtreeIntervalValid mirrors newGlobalSubtreeIterator's preconditions
+// without materializing: every root must resolve to a usable persisted
+// interval, otherwise expansion would fall back to a full-volume scan.
+func (vol *serviceVolumeIndex) subtreeIntervalValid(root int) bool {
+	return vol != nil && vol.index != nil &&
+		len(vol.subtreeOrder) > 0 && len(vol.subtreeStart) > 0 && len(vol.subtreeEnd) > 0 &&
+		root >= 0 && root < len(vol.subtreeStart) && root < len(vol.subtreeEnd) &&
+		vol.subtreeStart[root] != ^uint32(0) &&
+		vol.subtreeStart[root] <= vol.subtreeEnd[root] &&
+		int(vol.subtreeEnd[root]) <= len(vol.subtreeOrder)
+}
+
+// nameGramCountUpperBound bounds records whose name contains term using only
+// gram posting counts — no list materialization. It reports unknown (false)
+// when the gram index cannot bound the term, so callers keep their legacy
+// exact path instead of declining servable queries.
+func (vol *serviceVolumeIndex) nameGramCountUpperBound(term string) (int, bool) {
+	if vol == nil || vol.index == nil || len(term) < 3 || !asciiOnlyString(term) {
+		return 0, false
+	}
+	trigrams := vol.nameTrigramIndex()
+	if trigrams == nil && vol.index != nil {
+		trigrams = vol.index.Derived.SelfNameTrigrams
+	}
+	if trigrams == nil {
+		return 0, false
+	}
+	upper := -1
+	for _, gram := range trigrams.termGramKeys(strings.ToLower(term)) {
+		_, count, _, _, exactEmpty := vol.nameGramPosting(gram)
+		if exactEmpty {
+			return 0, true
+		}
+		if count <= 0 {
+			return 0, false
+		}
+		if upper < 0 || count < upper {
+			upper = count
+		}
+	}
+	if upper < 0 {
+		return 0, false
+	}
+	return upper, true
+}
+
 func sortGlobalPathProbeTerms(volumes []*serviceVolumeIndex, terms []string) []string {
 	probes := append([]string(nil), terms...)
 	sort.SliceStable(probes, func(i, j int) bool {
@@ -104,6 +233,25 @@ func estimateGlobalPathTerm(volumes []*serviceVolumeIndex, term string) int {
 		}
 		if ok {
 			total += candidate.len()
+			continue
+		}
+		// No component posting: never materialize the full name-substring
+		// list blindly (it may be millions for common fragments). A trigram
+		// gram-count upper bound decides cheaply; the exact list is built
+		// only when the bound already fits the scan cap, so its allocation
+		// is bounded too. Terms the gram index cannot bound keep the legacy
+		// exact path when pathGrams exist (the iterator may still serve
+		// them), else decline without allocating.
+		if upper, boundOK := vol.nameGramCountUpperBound(term); boundOK {
+			if upper > serviceComponentMultiTermScanMaxIDs {
+				total += upper + 1
+				continue
+			}
+			total += len(vol.nameTermPosting(term))
+			continue
+		}
+		if vol.queryIndex == nil || vol.queryIndex.pathGrams == nil {
+			total += serviceComponentMultiTermScanMaxIDs + 1
 			continue
 		}
 		total += len(vol.nameTermPosting(term))

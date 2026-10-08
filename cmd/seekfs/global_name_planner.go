@@ -11,11 +11,13 @@ func globalNameQuerySupported(pq parsedQuery) bool {
 		return false
 	}
 	hasTerms := len(nonVolumeTerms(pq.Terms)) > 0 || (hasGlobs && len(globLiteralTerms(pq.Globs, pq.CaseSensitive)) > 0)
-	return !pq.CaseSensitive && !pq.MatchPath && hasTerms &&
-		pq.Type == "" && pq.Under == "" && !pq.Exists && !pq.HasModAfter &&
-		len(pq.Dirs) == 0 &&
-		len(pq.Regexps) == 0 && len(pq.RegexTerms) == 0 && len(pq.Parents) == 0 &&
-		len(pq.AttrFilters) == 0 &&
+	// Extra predicates (Under/Type/Dirs/Parents/Exists/ModAfter/Attrs/case)
+	// are allowed: the complete candidate path derives the full name set
+	// from the trigram (which declines when broad) and the later
+	// verification enforces every predicate exactly. The truncated
+	// top-ranked path is skipped whenever such a predicate is present.
+	return !pq.MatchPath && hasTerms &&
+		len(pq.Regexps) == 0 && len(pq.RegexTerms) == 0 &&
 		len(pq.OrGroups) == 0 && len(pq.NotGroups) == 0 && pq.CWDBias == "" && pq.RootBias == ""
 }
 
@@ -28,7 +30,12 @@ func searchServiceVolumesGlobalNameSnapshot(snapshot globalQuerySnapshot, opts q
 	if !globalNameQuerySupported(pq) {
 		return nil, false, nil
 	}
-	if !countOnly && countNonVolumeTerms(pq.Terms) == 1 && pq.Limit > 0 {
+	// Top-ranked truncation is unsafe with path-needing predicates
+	// (Under/Dirs/Parents/Exists are invisible to recordMatchesNonPath, so
+	// top-N by rank filtered later can underfill); those queries use the
+	// complete path below.
+	if !countOnly && countNonVolumeTerms(pq.Terms) == 1 && pq.Limit > 0 &&
+		pq.Under == "" && len(pq.Dirs) == 0 && len(pq.Parents) == 0 && !pq.Exists {
 		if ranked, ok, err := globalNameTopRanked(snapshot, pq, opts.Trace); ok {
 			if err != nil {
 				return nil, true, err
@@ -66,7 +73,13 @@ func countServiceVolumesGlobalNameSnapshot(snapshot globalQuerySnapshot, opts qu
 	if !globalNameQuerySupported(pq) {
 		return 0, false, nil
 	}
+	// The posting-intersection fast count verifies the name substring only;
+	// any other predicate (including ext:/glob: filters) must take the
+	// verifying path below so counts stay exact.
 	if countNonVolumeTerms(pq.Terms) == 1 && len(pq.SizeFilters) == 0 && len(pq.DateFilters) == 0 &&
+		pq.Type == "" && len(pq.Dirs) == 0 && len(pq.Parents) == 0 && pq.Under == "" &&
+		!pq.Exists && !pq.HasModAfter && !pq.CaseSensitive && len(pq.AttrFilters) == 0 &&
+		len(pq.Exts) == 0 && len(pq.Globs) == 0 &&
 		!globalSnapshotsHaveHidden(snapshot.overlays) {
 		count := 0
 		completeSource := true
@@ -122,6 +135,12 @@ func countServiceVolumesGlobalNameSnapshot(snapshot globalQuerySnapshot, opts qu
 		opts.Trace.setSource("exact-empty", 0)
 	}
 	count := 0
+	// Path-needing predicates (Under/Dirs/Parents/Exists/Features) cannot be
+	// decided from the record alone; reconstruct and match the full entry
+	// exactly like the search path does. Under was already intersected
+	// above, so this re-check only confirms the subtree pre-filter.
+	needPath := queryNeedsPath(pq)
+	pathCaches := make([]map[int]string, len(snapshot.volumes))
 	for pos, id := range ids {
 		if pos&1023 == 0 && queryCanceled(pq) {
 			return 0, true, errQueryCanceled
@@ -136,7 +155,19 @@ func countServiceVolumesGlobalNameSnapshot(snapshot globalQuerySnapshot, opts qu
 		volumePQ := pq
 		dropSatisfiedVolumeTerms(&volumePQ, vol.index.Volume)
 		rec := vol.index.compactRecord(id.local)
-		if !rec.Deleted && vol.recordMatchesNonPath(id.local, rec, volumePQ) {
+		if rec.Deleted {
+			continue
+		}
+		if !needPath {
+			if vol.recordMatchesNonPath(id.local, rec, volumePQ) {
+				count++
+			}
+			continue
+		}
+		if pathCaches[id.volume] == nil {
+			pathCaches[id.volume] = make(map[int]string)
+		}
+		if _, ok := compactCandidateEntryIfMatch(vol.index, volumePQ, id.local, pathCaches[id.volume], true, false); ok {
 			count++
 		}
 	}
@@ -215,10 +246,37 @@ func globalNameCandidateIDs(snapshot globalQuerySnapshot, pq parsedQuery, trace 
 	if !globalPlannerSnapshotReady(snapshot, trace, "global-name") {
 		return nil, false
 	}
+	// Under filtering is name-first: trigram gives the complete name set
+	// (declines when broad), then we intersect with the Under subtree.
+	// Verification later re-checks Under via entryMatches, so this is exact.
+	var underRoots []globalRecordID
+	if pq.Under != "" {
+		var ok bool
+		underRoots, ok = globalUnderRoots(snapshot.volumes, pq.Under)
+		if !ok {
+			return nil, false
+		}
+		if len(underRoots) == 0 {
+			// Scope not in index: decline so the single-volume path can
+			// try the filesystem-under fallback (new/unindexed files).
+			return nil, false
+		}
+	}
 	out := make([]globalRecordID, 0)
 	for volumeIndex, vol := range snapshot.volumes {
 		volumePQ := pq
 		volumePQ.Trace = &searchTrace{}
+		// Trigram lane declines on extra predicates; clear them here. The
+		// trigram returns the complete name superset (it declines when
+		// broad), Under is intersected below, and every other predicate is
+		// enforced exactly by verification later. Clearing case only widens
+		// to the insensitive superset, which verification narrows exactly.
+		volumePQ.Under = ""
+		volumePQ.Type = ""
+		volumePQ.Dirs = nil
+		volumePQ.Exists = false
+		volumePQ.HasModAfter = false
+		volumePQ.CaseSensitive = false
 		dropSatisfiedVolumeTerms(&volumePQ, vol.index.Volume)
 		ids, ok := vol.filenameTrigramCandidates(volumePQ)
 		if !ok {
@@ -247,6 +305,16 @@ func globalNameCandidateIDs(snapshot globalQuerySnapshot, pq parsedQuery, trace 
 		}
 	}
 	sortGlobalRecordIDs(out)
+	if len(underRoots) > 0 {
+		out = filterGlobalIDsBySubtrees(snapshot.volumes, underRoots, out)
+		if len(out) == 0 {
+			// Nothing under the scope in the index: decline so the
+			// single-volume path can try the filesystem-under fallback
+			// (new/unindexed files). Returning fast-empty here would
+			// silently miss files the old path used to find.
+			return nil, false
+		}
+	}
 	return filterGlobalIDsHidden(out, snapshot.overlays), true
 }
 

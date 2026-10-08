@@ -599,6 +599,11 @@ type searchTrace struct {
 	// shapes: a count never stats, so it can exceed the search result set. The
 	// count is still returned; this only makes the divergence visible.
 	ContentCountDivergent bool
+	// CountDivergent is the non-content twin of ContentCountDivergent: search
+	// stat-filters stale entries under --under/Exists while counts do not, so
+	// a count may exceed a matching search after deletions. Set on potential,
+	// like its twin, not on proven divergence.
+	CountDivergent bool
 	// ContentCandidatesVerified records that the content candidate source
 	// already ran the full inline content predicate (the rank-ordered bounded
 	// content scan), so the downstream verify loop can skip re-evaluating it.
@@ -630,6 +635,18 @@ func (t *searchTrace) setSource(source string, candidates int) {
 	}
 	t.Source = source
 	t.Candidates = candidates
+}
+
+// markCountDivergent flags Under/Exists counts whose totals may exceed a
+// matching search (search stat-filters stale entries while counts do not).
+// Content queries set their own twin flag instead, so they are excluded.
+func markCountDivergent(opts queryOptions, pq parsedQuery) {
+	if opts.Trace == nil || queryHasAnyContentLeaf(pq) {
+		return
+	}
+	if opts.Under != "" || opts.Exists {
+		opts.Trace.CountDivergent = true
+	}
 }
 
 func (t *searchTrace) setDecline(reason string) {

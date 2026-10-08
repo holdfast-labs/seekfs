@@ -440,6 +440,7 @@ func countVerifiedGlobalIDsContent(volumes []*serviceVolumeIndex, ids []globalRe
 		if pathCaches[id.volume] == nil {
 			pathCaches[id.volume] = make(map[int]string)
 		}
+		pathCaches[id.volume] = boundPathCache(pathCaches[id.volume])
 		volumePQ := pq
 		dropSatisfiedVolumeTerms(&volumePQ, vol.index.Volume)
 		if _, ok := compactCandidateEntryIfMatchIn(vol, vol.index, volumePQ, id.local, pathCaches[id.volume], true, false, matcher); ok {
@@ -472,6 +473,7 @@ func rankedEntriesFromGlobalIDs(volumes []*serviceVolumeIndex, ids []globalRecor
 		if pathCaches[id.volume] == nil {
 			pathCaches[id.volume] = make(map[int]string)
 		}
+		pathCaches[id.volume] = boundPathCache(pathCaches[id.volume])
 		volumePQ := pq
 		dropSatisfiedVolumeTerms(&volumePQ, vol.index.Volume)
 		entry, ok := compactCandidateEntryIfMatchIn(vol, vol.index, volumePQ, id.local, pathCaches[id.volume], true, compactCandidateCanSkipEntryMatches(volumePQ, matcher == nil), matcher)

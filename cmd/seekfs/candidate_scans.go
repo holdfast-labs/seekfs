@@ -456,7 +456,7 @@ func (vol *serviceVolumeIndex) boundedScanCandidatesFiltered(pq parsedQuery, fil
 				break
 			}
 			if contentQuery {
-				cache = boundContentPathCache(cache)
+				cache = boundPathCache(cache)
 			}
 			id := compactUint32OrderAt(order, pos)
 			if filter != nil && !filter.contains(id) {
@@ -519,7 +519,7 @@ func (vol *serviceVolumeIndex) boundedScanCandidatesFiltered(pq parsedQuery, fil
 				continue
 			}
 			visited++
-			cache = boundContentPathCache(cache)
+			cache = boundPathCache(cache)
 			if _, ok := compactCandidateEntryIfMatchIn(vol, vol.index, pq, id, cache, true, false, contentMatcher); !ok {
 				continue
 			}

@@ -110,7 +110,7 @@ func (vol *serviceVolumeIndex) extensionShapedPathTopCandidates(pq parsedQuery) 
 		len(pq.Exts) > 0 || len(pq.Globs) > 0 ||
 		len(pq.SizeFilters) > 0 || len(pq.DateFilters) > 0 || len(pq.AttrFilters) > 0 ||
 		pq.CWDBias != "" || pq.RootBias != "" ||
-		countNonVolumeTerms(pq.Terms) != 1 {
+		countNonVolumeTerms(pq.Terms) != 1 || pq.hiddenBlocksTruncation() {
 		return nil, false
 	}
 	term := ""
@@ -197,7 +197,7 @@ func (vol *serviceVolumeIndex) bareExtensionMultiPathTopCandidates(pq parsedQuer
 		len(pq.Exts) > 0 || len(pq.Globs) > 0 ||
 		len(pq.SizeFilters) > 0 || len(pq.DateFilters) > 0 || len(pq.AttrFilters) > 0 ||
 		pq.CWDBias != "" || pq.RootBias != "" ||
-		countNonVolumeTerms(pq.Terms) < 2 {
+		countNonVolumeTerms(pq.Terms) < 2 || pq.hiddenBlocksTruncation() {
 		return nil, false
 	}
 	hasAnchor := false

@@ -769,10 +769,13 @@ func countServiceVolumesGlobalOnlySnapshot(snapshot globalQuerySnapshot, opts qu
 					continue
 				}
 			}
-			coverage, fastOK := vol.mappedComponentCoverageForQuery(term, pq)
-			if !fastOK {
-				coverage, fastOK = vol.mappedComponentSubstringCoverage(term)
-			}
+			// Only substring-complete coverage may be counted blindly: the
+			// exact-root fallback (mappedComponentCoverageForQuery) misses
+			// substring-dir subtrees whenever the term is not an exact
+			// component, silently undercounting. Without PCMP-backed
+			// substring enumeration, fall through to the verified paths
+			// below instead.
+			coverage, fastOK := vol.mappedComponentSubstringCoverage(term)
 			if fastOK {
 				var hidden func(int) bool
 				if volumeIndex >= 0 && volumeIndex < len(snapshots) && snapshots[volumeIndex] != nil {

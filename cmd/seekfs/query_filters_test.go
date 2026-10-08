@@ -614,6 +614,53 @@ func TestUnderSearchFiltersStaleFilesystemEntriesByDefault(t *testing.T) {
 	}
 }
 
+// TestCountUnderDivergenceFlagged pins the CountDivergent marker: like its
+// content twin, it is set on potential (Under/Exists shapes, where search
+// stat-filters stale entries and counts do not), never on plain counts or
+// searches.
+func TestCountUnderDivergenceFlagged(t *testing.T) {
+	records := []CompactRecord{
+		{FRN: 1, ParentFRN: 1, Parent: -1, Name: ".", Mode: modeFromAttrs(fileAttributeDir)},
+		{FRN: 2, ParentFRN: 1, Parent: 0, Name: "scope", Mode: modeFromAttrs(fileAttributeDir)},
+		{FRN: 3, ParentFRN: 2, Parent: 1, Name: "run_pipeline.bat", Mode: modeFromAttrs(fileAttributeArchive)},
+	}
+	idx := &Index{Source: "usn", Volume: "F:", Roots: []string{`F:\`}, Compact: true, Records: records}
+	buildOrders(idx)
+	vol := newServiceVolumeIndex("divergence.gsi", idx)
+	vol.rebuildNameTrigramsLocked()
+	volumes := []*serviceVolumeIndex{vol}
+
+	underTrace := &searchTrace{}
+	n, ok, err := countServiceVolumes(volumes, queryOptions{Query: "run_pipeline", Under: `F:\scope`, Limit: 20, Trace: underTrace})
+	if err != nil || !ok || n != 1 {
+		t.Fatalf("under count = %d ok=%v err=%v, want 1 true nil", n, ok, err)
+	}
+	if !underTrace.CountDivergent {
+		t.Fatal("count under scope did not set CountDivergent")
+	}
+	searchTr := &searchTrace{}
+	if _, err := searchServiceVolumes(volumes, queryOptions{Query: "run_pipeline", Under: `F:\scope`, Limit: 20, Trace: searchTr}, false); err != nil {
+		t.Fatal(err)
+	}
+	if searchTr.CountDivergent {
+		t.Fatal("scoped search set CountDivergent; only counts diverge")
+	}
+	existsTrace := &searchTrace{}
+	if _, _, err := countServiceVolumes(volumes, queryOptions{Query: "run_pipeline", Exists: true, Limit: 20, Trace: existsTrace}); err != nil {
+		t.Fatal(err)
+	}
+	if !existsTrace.CountDivergent {
+		t.Fatal("count with Exists did not set CountDivergent")
+	}
+	plainTrace := &searchTrace{}
+	if _, _, err := countServiceVolumes(volumes, queryOptions{Query: "run_pipeline", Limit: 20, Trace: plainTrace}); err != nil {
+		t.Fatal(err)
+	}
+	if plainTrace.CountDivergent {
+		t.Fatal("plain count set CountDivergent without Under/Exists")
+	}
+}
+
 func TestImplicitFilenameGlobQuery(t *testing.T) {
 	pq, err := parseQuery(queryOptions{Query: "*_test.go", MatchPath: true})
 	if err != nil {

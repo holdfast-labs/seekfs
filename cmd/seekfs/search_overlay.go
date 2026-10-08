@@ -684,6 +684,10 @@ func filesystemUnderFallbackSearchLimited(opts queryOptions, countOnly bool, max
 		if entryMatches(entry, pq, pq.MatchPath) {
 			matches = append(matches, entry)
 			if limit > 0 && len(matches) >= limit {
+				// A full top-N page, not a full enumeration: complete stays
+				// as-is (true unless a visit cap tripped). Callers must not
+				// read it as "the whole scope was walked" — counts never
+				// take this path (countOnly returns early above).
 				return filepath.SkipAll
 			}
 		}

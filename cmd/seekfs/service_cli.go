@@ -23,13 +23,17 @@ func cmdService(args []string) error {
 	configPath := fs.String("config", "", "optional seekfs.toml config path")
 	pipeName := fs.String("pipe", defaultServicePipe, "service named pipe")
 	sddl := fs.String("sddl", defaultServiceSDDL, "pipe security descriptor SDDL")
-	lowMemory := fs.Bool("lowmem", false, "run service in low-memory mmap mode")
+	lowMemory := fs.Bool("lowmem", false, "run service in low-memory mmap mode (on by default; SEEKFS_MEMORY_MODE=resident opts out)")
 	remoteAddr := fs.String("remote-addr", "", "loopback address for the Mode L transport (e.g. 127.0.0.1:0); empty disables it (default)")
 	fs.Var(&dbs, "db", "index database path to load for service search; repeatable")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	if *lowMemory {
+	// The installed/Windows service path (install/setup-service/launch) never
+	// passes -lowmem, so default the service to low-memory mmap mode here.
+	// An explicit SEEKFS_MEMORY_MODE (e.g. resident) is respected unless the
+	// -lowmem flag overrides it.
+	if v, ok := os.LookupEnv("SEEKFS_MEMORY_MODE"); *lowMemory || !ok || strings.TrimSpace(v) == "" {
 		_ = os.Setenv("SEEKFS_MEMORY_MODE", "lowmem")
 	}
 	cfg, err := loadConfig(*configPath)
@@ -714,6 +718,9 @@ func waitForDoctor(pipeName string, timeout time.Duration) doctorResponse {
 		if resp.OK || time.Now().After(deadline) {
 			return resp
 		}
+		// probeDoctor opens the pipe, queries info, and runs a probe search:
+		// polling without pause spins CPU and pipe handles for minutes.
+		time.Sleep(500 * time.Millisecond)
 	}
 }
 

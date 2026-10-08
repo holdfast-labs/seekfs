@@ -178,10 +178,12 @@ func globalComponentQuerySupportedMulti(pq parsedQuery, terms []string, multi bo
 		// route through the content candidate + post-filter path.
 		return false
 	}
-	minTerms := 2
-	if queryHasExplicitPathTerm(pq.Raw) || globalComponentVolumeAnchored(pq) {
-		minTerms = 1
-	}
+	// Single plain terms are admitted: the probe estimate (capped, never
+	// materializing past the scan cap) and the iterator's own budgeted
+	// expansion decline broad terms, so selectivity — not term count —
+	// decides. Previously minTerms was 2 here, forcing every selective
+	// single-term path query into a full scan.
+	minTerms := 1
 	if len(pq.OrGroups) != 0 || len(pq.NotGroups) != 0 {
 		minTerms = 1
 	}
@@ -401,6 +403,7 @@ func collectGlobalVerifiedTopN(it globalIDIterator, volumes []*serviceVolumeInde
 		if pathCaches[id.volume] == nil {
 			pathCaches[id.volume] = make(map[int]string)
 		}
+		pathCaches[id.volume] = boundPathCache(pathCaches[id.volume])
 		volumePQ := pq
 		dropSatisfiedVolumeTerms(&volumePQ, vol.index.Volume)
 		entry, ok := compactCandidateEntryIfMatchIn(vol, vol.index, volumePQ, id.local, pathCaches[id.volume], true, false, matcher)
@@ -451,6 +454,7 @@ func countGlobalVerifiedIterator(it globalIDIterator, volumes []*serviceVolumeIn
 		if pathCaches[id.volume] == nil {
 			pathCaches[id.volume] = make(map[int]string)
 		}
+		pathCaches[id.volume] = boundPathCache(pathCaches[id.volume])
 		volumePQ := pq
 		dropSatisfiedVolumeTerms(&volumePQ, vol.index.Volume)
 		_, ok = compactCandidateEntryIfMatchIn(vol, vol.index, volumePQ, id.local, pathCaches[id.volume], true, false, matcher)

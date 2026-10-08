@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"sort"
 	"testing"
 	"time"
 )
@@ -455,6 +456,91 @@ func scalarRangeFixture() *serviceVolumeIndex {
 	vol := newServiceVolumeIndex("scalar-range-fixture.gsi", idx)
 	installScalarOrders(vol)
 	return vol
+}
+
+// scalarDirAggregateFixture builds a volume where directory raw sizes and
+// subtree totals disagree: bigdir reports raw Size 5 but owns a 500MB child.
+// The size order (built from SubtreeBytes, like production) sorts it by the
+// aggregate, so any raw-size probe or check misplaces it.
+func scalarDirAggregateFixture() *serviceVolumeIndex {
+	const mb = 1024 * 1024
+	idx := &Index{
+		Source: "usn", Volume: "F:", Compact: true, Roots: []string{`F:\`},
+		Records: []CompactRecord{
+			{FRN: 1, ParentFRN: 1, Parent: -1, Name: ".", Mode: modeFromAttrs(fileAttributeDir)},
+			{FRN: 2, ParentFRN: 1, Parent: 0, Name: "bigdir", Mode: modeFromAttrs(fileAttributeDir), Size: 5},
+			{FRN: 3, ParentFRN: 2, Parent: 1, Name: "child500.bin", Mode: modeFromAttrs(fileAttributeArchive), Size: 500 * mb},
+			{FRN: 4, ParentFRN: 1, Parent: 0, Name: "big.bin", Mode: modeFromAttrs(fileAttributeArchive), Size: 600 * mb},
+			{FRN: 5, ParentFRN: 1, Parent: 0, Name: "tiny.txt", Mode: modeFromAttrs(fileAttributeArchive), Size: 10},
+		},
+	}
+	idx.Derived.SubtreeBytes = []uint64{1100*mb + 10, 500 * mb, 0, 0, 0}
+	buildOrders(idx)
+	vol := newServiceVolumeIndex("scalar-dir-aggregate.gsi", idx)
+	installScalarOrders(vol)
+	return vol
+}
+
+// TestScalarSizeFilterUsesDirectoryAggregate pins count/search agreement for
+// directory sizes: with raw-size probing the range collapses past bigdir
+// (raw 5 sorts it nowhere near its 500MB aggregate) and both count and search
+// miss it; the effective-size key must be used on both sides.
+func TestScalarSizeFilterUsesDirectoryAggregate(t *testing.T) {
+	volumes := []*serviceVolumeIndex{scalarDirAggregateFixture()}
+	for _, tc := range []struct {
+		name  string
+		query string
+		want  []string
+	}{
+		{name: "bare size", query: "size:>100mb", want: []string{`F:`, `F:\big.bin`, `F:\bigdir`, `F:\bigdir\child500.bin`}},
+		{name: "type dir", query: "type:dir size:>100mb", want: []string{`F:`, `F:\bigdir`}},
+		{name: "type file", query: "type:file size:>100mb", want: []string{`F:\big.bin`, `F:\bigdir\child500.bin`}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			trace := &searchTrace{}
+			got, err := searchServiceVolumes(volumes, queryOptions{Query: tc.query, Limit: 20, Trace: trace}, false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			paths := pathsOf(got)
+			sort.Strings(paths)
+			if !slices.Equal(paths, tc.want) {
+				t.Fatalf("search paths = %v, want %v (trace=%+v)", paths, tc.want, trace)
+			}
+			if trace.Complete == nil || !*trace.Complete {
+				t.Fatalf("trace complete = %v, want true", trace.Complete)
+			}
+			n, ok, err := countServiceVolumes(volumes, queryOptions{Query: tc.query, Trace: &searchTrace{}})
+			if err != nil || !ok || n != len(tc.want) {
+				t.Fatalf("count = %d ok=%v err=%v, want %d true nil", n, ok, err, len(tc.want))
+			}
+		})
+	}
+}
+
+// TestScalarCountExcludesTombstonedRangeMember pins the overlay correction:
+// deleting big.bin must decrement the count by exactly one (a positional
+// search over the size-ordered array cannot find the hidden id).
+func TestScalarCountExcludesTombstonedRangeMember(t *testing.T) {
+	vol := scalarDirAggregateFixture()
+	vol.applyUSNChanges([]usnChange{{FRN: 4, USN: 10, Reason: usnReasonFileDelete}})
+	volumes := []*serviceVolumeIndex{vol}
+	n, ok, err := countServiceVolumes(volumes, queryOptions{Query: "size:>100mb", Trace: &searchTrace{}})
+	if err != nil || !ok || n != 3 {
+		t.Fatalf("count after delete = %d ok=%v err=%v, want 3", n, ok, err)
+	}
+	got, err := searchServiceVolumes(volumes, queryOptions{Query: "size:>100mb", Limit: 20, Trace: &searchTrace{}}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != n {
+		t.Fatalf("search len = %d, count = %d; want agreement", len(got), n)
+	}
+	for _, e := range got {
+		if e.Name == "big.bin" {
+			t.Fatalf("deleted big.bin still returned: %v", pathsOf(got))
+		}
+	}
 }
 
 func installScalarOrders(vol *serviceVolumeIndex) {

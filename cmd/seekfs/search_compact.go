@@ -189,6 +189,14 @@ func (h hiddenBaseIDs) empty() bool {
 	return len(h.tombstone) == 0 && len(h.shadowed) == 0
 }
 
+// hiddenBlocksTruncation reports whether top-N/limited candidate lanes must
+// decline. With overlay-hidden base records, the verify loop drops hidden
+// ids from a truncated set and the page underfills with no way to recover;
+// complete lanes stay exact because every surviving match is still present.
+func (pq parsedQuery) hiddenBlocksTruncation() bool {
+	return !pq.hidden.empty()
+}
+
 func (h hiddenBaseIDs) contains(id int) bool {
 	if id < 0 {
 		return false
@@ -299,6 +307,9 @@ func searchCompactWithCacheHidden(idx *Index, opts queryOptions, countOnly bool,
 		if queryPathTermPrecheckSafe(pq) && !idx.compactPathContainsAll(recIndex, pq.Terms) {
 			continue
 		}
+		// Bound the path memo: full scans would otherwise retain every
+		// visited path (see boundPathCache).
+		pathCache = boundPathCache(pathCache)
 		if skipEntryMatches {
 			results = append(results, compactEntryFromRecord(idx, recIndex, rec, pathCache, false))
 			if !countOnly && len(results) >= limit {
@@ -345,7 +356,8 @@ func compactCandidateCanSkipEntryMatches(pq parsedQuery, usedCandidates bool) bo
 		len(pq.DateFilters) > 0 ||
 		len(pq.AttrFilters) > 0 ||
 		len(pq.OrGroups) > 0 ||
-		len(pq.NotGroups) > 0 {
+		len(pq.NotGroups) > 0 ||
+		len(pq.Features) > 0 {
 		return false
 	}
 	if len(pq.Terms) == 0 {
@@ -431,6 +443,7 @@ func verifyCompactCandidateOrderParallel(idx *Index, pq parsedQuery, order []int
 				if hidden.contains(recIndex) {
 					continue
 				}
+				localCache = boundPathCache(localCache)
 				if entry, ok := compactCandidateEntryIfMatchIn(contentVol, idx, pq, recIndex, localCache, true, skipEntryMatches, matcher); ok {
 					local = append(local, entry)
 					if len(local) >= limit {
@@ -466,6 +479,7 @@ func verifyCompactCandidateOrderRange(idx *Index, pq parsedQuery, order []int, p
 		if hidden.contains(recIndex) {
 			continue
 		}
+		pathCache = boundPathCache(pathCache)
 		if entry, ok := compactCandidateEntryIfMatchIn(contentVol, idx, pq, recIndex, pathCache, true, skipEntryMatches, matcher); ok {
 			out = append(out, entry)
 			if len(out) >= limit {
@@ -548,14 +562,33 @@ var errQueryCanceled = errors.New("query superseded")
 
 var errGlobalMultiVolumePlannerDeclined = errors.New("global planner declined multi-volume query")
 
-func globalMultiVolumePlannerDeclineError(opts queryOptions) error {
+func globalMultiVolumePlannerDeclineError(opts queryOptions, volumes []*serviceVolumeIndex) error {
 	if queryCanceled(parsedQuery{DeadlineUnix: opts.DeadlineUnix, Cancel: opts.Cancel}) {
 		return errQueryCanceled
 	}
-	if opts.Trace != nil && opts.Trace.Decline != "" {
-		return fmt.Errorf("%w: %s", errGlobalMultiVolumePlannerDeclined, opts.Trace.Decline)
+	// A bare decline reads as a broken query. Name the scale and how to
+	// narrow it: per-volume fallback was deliberately removed (it cannot
+	// preserve global rank/limit semantics), so the actionable path is a
+	// more selective query, not a retry.
+	names := make([]string, 0, len(volumes))
+	total := 0
+	for _, vol := range volumes {
+		if vol == nil || vol.index == nil {
+			continue
+		}
+		if vol.index.Volume != "" {
+			names = append(names, vol.index.Volume)
+		}
+		total += vol.index.compactRecordCount()
 	}
-	return errGlobalMultiVolumePlannerDeclined
+	scope := ""
+	if len(names) > 0 {
+		scope = fmt.Sprintf(" across %s (%d records)", strings.Join(names, ", "), total)
+	}
+	if opts.Trace != nil && opts.Trace.Decline != "" {
+		return fmt.Errorf("%w%s: %s; narrow with --under <dir>, a volume prefix, or a more selective term", errGlobalMultiVolumePlannerDeclined, scope, opts.Trace.Decline)
+	}
+	return fmt.Errorf("%w%s; narrow with --under <dir>, a volume prefix, or a more selective term", errGlobalMultiVolumePlannerDeclined, scope)
 }
 
 func queryCanceled(pq parsedQuery) bool {
@@ -807,7 +840,9 @@ func (vol *serviceVolumeIndex) nameTermCandidates(pq parsedQuery) ([]int, bool) 
 			return candidates, true
 		}
 		if candidates, ok := vol.nameTrigramCandidates(pq); ok {
-			if compactCandidateCanSkipEntryMatches(pq, true) && pq.Limit > 0 {
+			// See hiddenBlocksTruncation: never truncate before the verify
+			// loop can drop hidden ids.
+			if compactCandidateCanSkipEntryMatches(pq, true) && pq.Limit > 0 && !pq.hiddenBlocksTruncation() {
 				candidates = topCandidateIDsByRank(candidates, pq.Limit, vol.index, vol.rankForQuery(pq))
 			} else {
 				sortCandidateIDs(candidates, pq, vol.index, vol.rankForQuery(pq))
@@ -846,7 +881,11 @@ func (vol *serviceVolumeIndex) nameTermCandidates(pq parsedQuery) ([]int, bool) 
 	}
 	if pq.MatchPath {
 		if candidates, ok := vol.nameTrigramCandidates(pq); ok {
-			if compactCandidateCanSkipEntryMatches(pq, true) && pq.Limit > 0 {
+			// A truncated top-N here would underfill the page once the
+			// verify loop drops hidden ids; keep the complete rank order
+			// instead so later base matches backfill (see
+			// hiddenBlocksTruncation).
+			if compactCandidateCanSkipEntryMatches(pq, true) && pq.Limit > 0 && !pq.hiddenBlocksTruncation() {
 				candidates = topCandidateIDsByRank(candidates, pq.Limit, vol.index, vol.rankForQuery(pq))
 			} else {
 				sortCandidateIDs(candidates, pq, vol.index, vol.rankForQuery(pq))

@@ -22,6 +22,7 @@ func countServiceVolumes(volumes []*serviceVolumeIndex, opts queryOptions) (int,
 	if err != nil {
 		return 0, true, err
 	}
+	markCountDivergent(opts, pq)
 	if pq.Impossible {
 		opts.Trace.setPlannerMode("impossible-query")
 		opts.Trace.setSource("impossible-query", 0)
@@ -106,7 +107,7 @@ func countServiceVolumes(volumes []*serviceVolumeIndex, opts queryOptions) (int,
 		return count, true, err
 	}
 	if len(volumes) > 1 {
-		return 0, true, globalMultiVolumePlannerDeclineError(opts)
+		return 0, true, globalMultiVolumePlannerDeclineError(opts, volumes)
 	}
 	if opts.Trace != nil && strings.HasPrefix(opts.Trace.Decline, "global-") {
 		opts.Trace.setFallback("service-count-single-volume")
