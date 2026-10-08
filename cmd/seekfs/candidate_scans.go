@@ -497,27 +497,7 @@ func (vol *serviceVolumeIndex) boundedScanCandidatesHiddenTop(pq parsedQuery, hi
 	if vol == nil || vol.index == nil || limit <= 0 {
 		return nil, false
 	}
-	recordCount := vol.index.compactRecordCount()
-	order := vol.orderForQuery(pq)
-	out := make([]int, 0, min(limit, 1024))
-	cache := make(map[int]string)
-	for pos := 0; pos < compactUint32OrderLen(order, recordCount); pos++ {
-		if pos&1023 == 0 && queryCanceled(pq) {
-			return nil, false
-		}
-		id := compactUint32OrderAt(order, pos)
-		if !hidden.empty() && hidden.contains(id) {
-			continue
-		}
-		if _, ok := compactCandidateEntryIfMatch(vol.index, pq, id, cache, true, false); !ok {
-			continue
-		}
-		out = append(out, id)
-		if len(out) >= limit {
-			break
-		}
-	}
-	return out, true
+	return vol.boundedScanHiddenTop(pq, hidden, limit, nil)
 }
 
 // boundedScanMembershipFilter pre-filters the bounded name/id-order scan to a
@@ -554,13 +534,95 @@ func (vol *serviceVolumeIndex) boundedScanCandidatesHiddenTopFiltered(pq parsedQ
 			filter.members[int(id)] = struct{}{}
 		}
 	}
+	return vol.boundedScanHiddenTop(pq, hidden, limit, filter)
+}
+
+// boundedScanHiddenTop is the shared first-limit-in-scan-order scan behind
+// boundedScanCandidatesHiddenTop(Filtered). A serial prefix preserves the
+// cheap dense-hit early stop (matches clustered early in the order return
+// without spawning workers); only when the prefix underfills does the
+// remainder fan out. Ranges are contiguous and ordered, so taking the
+// prefix hits plus workers' hits greedily in partition order yields
+// exactly the serial prefix set.
+func (vol *serviceVolumeIndex) boundedScanHiddenTop(pq parsedQuery, hidden hiddenBaseIDs, limit int, filter *boundedScanMembershipFilter) ([]int, bool) {
 	recordCount := vol.index.compactRecordCount()
 	order := vol.orderForQuery(pq)
+	orderLen := compactUint32OrderLen(order, recordCount)
+	const serialPrefixPositions = 4 * serviceTrigramParallelVerifyMinIDs
+	// A narrowing membership filter makes most positions a cheap map
+	// lookup, so the serial early stop beats parallel fan-out; parallelize
+	// only the unfiltered scan, where every position pays full entry
+	// verification.
+	if filter != nil || orderLen < 2*serviceTrigramParallelVerifyMinIDs {
+		return vol.boundedScanHiddenTopRange(pq, hidden, limit, filter, order, 0, orderLen, nil, nil, 0)
+	}
+	prefixEnd := min(orderLen, serialPrefixPositions)
+	out, ok := vol.boundedScanHiddenTopRange(pq, hidden, limit, filter, order, 0, prefixEnd, nil, nil, 0)
+	if !ok || len(out) >= limit || prefixEnd >= orderLen {
+		return out, ok
+	}
+	workers := min(runtime.GOMAXPROCS(0), max(1, (orderLen-prefixEnd)/serviceTrigramParallelVerifyMinIDs))
+	if workers <= 1 {
+		rest, ok := vol.boundedScanHiddenTopRange(pq, hidden, limit-len(out), filter, order, prefixEnd, orderLen, nil, nil, 0)
+		if !ok {
+			return nil, false
+		}
+		return append(out, rest...), true
+	}
+	var stopped atomic.Bool
+	counts := make([]atomic.Int64, workers)
+	parts := make([][]int, workers)
+	var wg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		start := prefixEnd + w*(orderLen-prefixEnd)/workers
+		end := prefixEnd + (w+1)*(orderLen-prefixEnd)/workers
+		wg.Add(1)
+		go func(w, start, end int) {
+			defer wg.Done()
+			parts[w], _ = vol.boundedScanHiddenTopRange(pq, hidden, limit, filter, order, start, end, &stopped, counts, w)
+		}(w, start, end)
+	}
+	wg.Wait()
+	if stopped.Load() {
+		return nil, false
+	}
+	for _, part := range parts {
+		for _, id := range part {
+			out = append(out, id)
+			if len(out) >= limit {
+				return out, true
+			}
+		}
+	}
+	return out, true
+}
+
+// boundedScanHiddenTopRange scans one [start, end) slice of the scan order,
+// collecting up to limit matches. It is the serial whole-order path as well
+// as the per-worker parallel path. In the parallel path, counts/workerIndex
+// implement cooperative early termination: worker k aborts once strictly
+// earlier workers have already banked limit matches, because the greedy
+// ordered merge would cut everything worker k finds anyway. This keeps the
+// dense-hit cost at the serial early-stop level while sparse scans still
+// fan out.
+func (vol *serviceVolumeIndex) boundedScanHiddenTopRange(pq parsedQuery, hidden hiddenBaseIDs, limit int, filter *boundedScanMembershipFilter, order []uint32, start, end int, stopped *atomic.Bool, counts []atomic.Int64, workerIndex int) ([]int, bool) {
 	out := make([]int, 0, min(limit, 1024))
 	cache := make(map[int]string)
-	for pos := 0; pos < compactUint32OrderLen(order, recordCount); pos++ {
-		if pos&1023 == 0 && queryCanceled(pq) {
+	for pos := start; pos < end; pos++ {
+		if pos&1023 == 0 && (stopped != nil && stopped.Load() || queryCanceled(pq)) {
+			if stopped != nil {
+				stopped.Store(true)
+			}
 			return nil, false
+		}
+		if counts != nil && pos&1023 == 0 && pos > start {
+			var earlier int64
+			for k := 0; k < workerIndex && earlier < int64(limit); k++ {
+				earlier += counts[k].Load()
+			}
+			if earlier >= int64(limit) {
+				return out, true
+			}
 		}
 		id := compactUint32OrderAt(order, pos)
 		if filter != nil && !filter.contains(id) {
@@ -573,6 +635,9 @@ func (vol *serviceVolumeIndex) boundedScanCandidatesHiddenTopFiltered(pq parsedQ
 			continue
 		}
 		out = append(out, id)
+		if counts != nil {
+			counts[workerIndex].Add(1)
+		}
 		if len(out) >= limit {
 			break
 		}
@@ -580,15 +645,134 @@ func (vol *serviceVolumeIndex) boundedScanCandidatesHiddenTopFiltered(pq parsedQ
 	return out, true
 }
 
+// plainTermNameTrigramExactEmpty reports whether a top-level plain term
+// provably matches nothing on this volume: some required name gram is
+// absent from both the selective index and the companion (the same
+// exact-zero proof globalNameAllExactEmpty uses, but metadata-only -- no
+// posting iterator is constructed, so a miss costs map lookups only).
+// Every path-mode match must contain each top-level term as a substring of
+// its full path (entryMatches enforces containsAll over pq.Terms), and every
+// path component is some record's name, so a term absent from all names
+// cannot match any path. Only case-insensitive ASCII terms qualify, and
+// volumes with overlay additions are skipped because recent record names are
+// not covered by the base gram counts.
+func (vol *serviceVolumeIndex) plainTermNameTrigramExactEmpty(pq parsedQuery) bool {
+	if vol == nil || vol.index == nil || !pq.MatchPath || pq.CaseSensitive || pq.Fuzzy {
+		return false
+	}
+	if len(vol.recentIDs) > 0 {
+		return false
+	}
+	for _, term := range nonVolumeTerms(pq.Terms) {
+		if len(term) < 3 || strings.ContainsAny(term, `\/*?[]:`) {
+			continue
+		}
+		if strings.IndexFunc(term, func(r rune) bool { return r > 127 }) >= 0 {
+			continue
+		}
+		grams := vol.nameTrigramIndex().termGramKeys(term)
+		if len(grams) == 0 && vol.index.Derived.SelfNameTrigrams != nil {
+			grams = vol.index.Derived.SelfNameTrigrams.termGramKeys(term)
+		}
+		for _, gram := range grams {
+			if _, _, _, _, exactEmpty := vol.nameGramPosting(gram); exactEmpty {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// planPlainTermPathFilter builds a membership pre-filter for bounded scans
+// of plain-term path queries from the trigram path-term posting (name matches
+// plus descendant expansion, the same source the single-volume lane plans
+// from). Every path-mode match must contain each top-level term in its full
+// path, so the smallest term posting is an exact superset of the match set,
+// and an empty posting proves the volume cannot match. The posting is only
+// attempted when the rarest required gram is selective (metadata-only
+// check): intersecting and expanding a common term costs more than the
+// unfiltered scan it would narrow, so common terms decline exactly as if
+// the filter did not exist. Scan order is unchanged, preserving
+// bounded-scan top-N semantics exactly like the ext/dir/regex filters.
+func (vol *serviceVolumeIndex) planPlainTermPathFilter(pq parsedQuery) (filter *boundedScanMembershipFilter, empty bool, ok bool) {
+	if vol == nil || vol.index == nil || !pq.MatchPath || pq.CaseSensitive || pq.Fuzzy {
+		return nil, false, false
+	}
+	if len(vol.recentIDs) > 0 {
+		return nil, false, false
+	}
+	var best []int
+	for _, term := range nonVolumeTerms(pq.Terms) {
+		if len(term) < 3 || strings.ContainsAny(term, `\/*?[]:`) {
+			continue
+		}
+		if strings.IndexFunc(term, func(r rune) bool { return r > 127 }) >= 0 {
+			continue
+		}
+		if !vol.plainTermPostingWorthBuilding(term) {
+			continue
+		}
+		ids, ok := vol.completeNameTrigramPathTermPosting(term)
+		if !ok {
+			continue
+		}
+		if len(ids) == 0 {
+			return nil, true, true
+		}
+		if best == nil || len(ids) < len(best) {
+			best = ids
+		}
+	}
+	if best == nil || len(best) > serviceComponentMultiTermScanMaxIDs {
+		return nil, false, false
+	}
+	members := make(map[int]struct{}, len(best))
+	for _, id := range best {
+		members[id] = struct{}{}
+	}
+	return &boundedScanMembershipFilter{members: members}, false, true
+}
+
+// plainTermPostingWorthBuilding reports whether intersecting a term's name
+// grams is cheap enough to attempt: every required gram must be stored with
+// a small posting. The intersection result is bounded by the rarest gram,
+// so a term whose rarest gram already exceeds the expansion budget can only
+// produce a filter too large to help (or a declined build after paying full
+// intersect+expand cost); skipping it keeps the prefilter metadata-only.
+func (vol *serviceVolumeIndex) plainTermPostingWorthBuilding(term string) bool {
+	grams := vol.nameTrigramIndex().termGramKeys(term)
+	if len(grams) == 0 && vol.index.Derived.SelfNameTrigrams != nil {
+		grams = vol.index.Derived.SelfNameTrigrams.termGramKeys(term)
+	}
+	if len(grams) == 0 {
+		return false
+	}
+	for _, gram := range grams {
+		_, count, stored, _, exactEmpty := vol.nameGramPosting(gram)
+		if exactEmpty {
+			return true
+		}
+		if !stored || count > serviceComponentTrigramExpansionMaxIDs {
+			return false
+		}
+	}
+	return true
+}
+
 // boundedScanPrefilter tries the cheap exact superset pre-filters for the
-// bounded scan in priority order: ext:/glob-ext:, a bounded type:dir subtree,
-// and a required regex literal run.  It returns (exactEmpty, filterOK):
-// exactEmpty means the query provably matches nothing on this volume (caller
-// short-circuits), filterOK means a membership filter was set, and neither
-// means no filter applies and the unfiltered scan runs.
+// bounded scan in priority order: a trigram-proven empty plain term,
+// ext:/glob-ext:, a bounded type:dir subtree, a required regex literal run,
+// and finally the smallest plain-term path posting.  It returns
+// (exactEmpty, filterOK): exactEmpty means the query provably matches
+// nothing on this volume (caller short-circuits), filterOK means a membership
+// filter was set, and neither means no filter applies and the unfiltered
+// scan runs.
 func (vol *serviceVolumeIndex) boundedScanPrefilter(pq parsedQuery, filter **boundedScanMembershipFilter) (exactEmpty, filterOK bool) {
 	if vol == nil || vol.index == nil || pq.CaseSensitive {
 		return false, false
+	}
+	if vol.plainTermNameTrigramExactEmpty(pq) {
+		return true, true
 	}
 	if source, hasSource := vol.planExtFilterSource(pq); hasSource {
 		*filter = &boundedScanMembershipFilter{source: source}
@@ -603,6 +787,13 @@ func (vol *serviceVolumeIndex) boundedScanPrefilter(pq parsedQuery, filter **bou
 			return true, true
 		}
 		*filter = regexFilter
+		return false, true
+	}
+	if plainFilter, plainEmpty, hasPlainFilter := vol.planPlainTermPathFilter(pq); hasPlainFilter {
+		if plainEmpty {
+			return true, true
+		}
+		*filter = plainFilter
 		return false, true
 	}
 	return false, false

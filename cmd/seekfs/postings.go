@@ -1002,6 +1002,19 @@ func (vol *serviceVolumeIndex) componentPostingCountCandidate(component string) 
 	return postingCountCandidate{}, false
 }
 
+// extTypeMatches reports whether a record mode satisfies a type: filter.
+// Unknown or empty filters match everything; full verification downstream
+// remains authoritative.
+func extTypeMatches(mode uint32, typ string) bool {
+	if typ == "file" {
+		return mode&uint32(os.ModeDir) == 0
+	}
+	if typ == "dir" {
+		return mode&uint32(os.ModeDir) != 0
+	}
+	return true
+}
+
 func (vol *serviceVolumeIndex) extTopPosting(ext string, limit int, pq parsedQuery) ([]int, bool) {
 	if vol == nil || vol.queryIndex == nil || limit <= 0 {
 		return nil, false
@@ -1015,6 +1028,12 @@ func (vol *serviceVolumeIndex) extTopPosting(ext string, limit int, pq parsedQue
 		seen := make(map[int]struct{}, len(ids32)+len(vol.recentIDs))
 		for _, id32 := range ids32 {
 			id := int(id32)
+			if pq.Type != "" {
+				rec := vol.index.compactRecord(id)
+				if rec.Deleted || !extTypeMatches(rec.Mode, pq.Type) {
+					continue
+				}
+			}
 			list = append(list, id)
 			seen[id] = struct{}{}
 		}
@@ -1024,9 +1043,20 @@ func (vol *serviceVolumeIndex) extTopPosting(ext string, limit int, pq parsedQue
 			}
 			rec := vol.index.compactRecord(id)
 			actual := strings.TrimPrefix(filepath.Ext(rec.Name), ".")
-			if strings.EqualFold(actual, ext) {
-				list = append(list, id)
+			if !strings.EqualFold(actual, ext) {
+				continue
 			}
+			if pq.Type != "" && (rec.Deleted || !extTypeMatches(rec.Mode, pq.Type)) {
+				continue
+			}
+			list = append(list, id)
+			seen[id] = struct{}{}
+		}
+		if pq.Type != "" && len(list) < limit {
+			// The stored top list cannot supply a full type-filtered page;
+			// decline so the rank-walk path (or another lane) answers
+			// exactly instead of truncating.
+			return nil, false
 		}
 		return topCandidateIDsByRank(list, limit, vol.index, vol.nameOrderRanks()), true
 	}
@@ -1042,6 +1072,57 @@ func (vol *serviceVolumeIndex) extTopPosting(ext string, limit int, pq parsedQue
 // posting count must be reconciled against recent records whose actual
 // extension matches.  It mirrors extTopPosting's merge gate (resident extTop
 // and default sort) so search and count stay in parity.
+// countExtPostingTyped counts ext posting records satisfying a type: filter.
+// It mirrors countExtPostingWithRecent's sources exactly (persisted posting
+// plus the legacy recentIDs merge), additionally requiring a matching record
+// mode. The hidden exclusion set is applied uniformly; callers pass an empty
+// set when no overlay snapshot hides base records. Without it the ext count
+// fast path would count the whole posting for type:file/dir queries.
+func (vol *serviceVolumeIndex) countExtPostingTyped(ext, typ string, hidden hiddenBaseIDs, mergeRecent bool) (int, bool) {
+	if vol == nil {
+		return 0, false
+	}
+	posting, ok := vol.extPostingCountCandidate(ext)
+	if !ok {
+		return 0, false
+	}
+	ids := posting.materialize()
+	seen := make(map[int]struct{}, len(ids))
+	count := 0
+	for _, id32 := range ids {
+		id := int(id32)
+		seen[id] = struct{}{}
+		if !hidden.empty() && hidden.contains(id) {
+			continue
+		}
+		if id < 0 || id >= vol.index.compactRecordCount() {
+			continue
+		}
+		rec := vol.index.compactRecord(id)
+		if rec.Deleted || !extTypeMatches(rec.Mode, typ) {
+			continue
+		}
+		count++
+	}
+	if mergeRecent {
+		for id := range vol.recentIDs {
+			if _, exists := seen[id]; exists || id < 0 || id >= vol.index.compactRecordCount() {
+				continue
+			}
+			if !hidden.empty() && hidden.contains(id) {
+				continue
+			}
+			rec := vol.index.compactRecord(id)
+			actual := strings.TrimPrefix(filepath.Ext(rec.Name), ".")
+			if rec.Deleted || !strings.EqualFold(actual, ext) || !extTypeMatches(rec.Mode, typ) {
+				continue
+			}
+			count++
+		}
+	}
+	return count, true
+}
+
 func (vol *serviceVolumeIndex) countExtPostingWithRecent(ext string, pq parsedQuery) (int, bool) {
 	if vol == nil {
 		return 0, false
@@ -1108,7 +1189,7 @@ func (vol *serviceVolumeIndex) mappedExtTopPosting(ext string, limit int, pq par
 				continue
 			}
 			rec := vol.index.compactRecord(int(id))
-			if rec.Deleted {
+			if rec.Deleted || !extTypeMatches(rec.Mode, pq.Type) {
 				continue
 			}
 			item := extRankItem{id: id, rank: extRankOf(id, ranks)}
@@ -1142,7 +1223,7 @@ func (vol *serviceVolumeIndex) mappedExtTopPosting(ext string, limit int, pq par
 		}
 		rec := vol.index.compactRecord(id)
 		actual := strings.TrimPrefix(filepath.Ext(rec.Name), ".")
-		if rec.Deleted || !strings.EqualFold(actual, ext) {
+		if rec.Deleted || !strings.EqualFold(actual, ext) || !extTypeMatches(rec.Mode, pq.Type) {
 			continue
 		}
 		top = append(top, id32)

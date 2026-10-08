@@ -244,11 +244,12 @@ func TestGlobalPlannerExtTypeFileDeclinesUnsafeTopN(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if trace.PlannerMode == "global-ext" || trace.PlannerMode == "global-count-ext" {
-		t.Fatalf("planner mode = %q, want safe fallback for type:file ext", trace.PlannerMode)
-	}
-	if trace.PlannerMode != "global-components" {
-		t.Fatalf("planner mode = %q, want global-components; decline=%s fallback=%s", trace.PlannerMode, trace.Decline, trace.Fallback)
+	// The ext lane serves type:file/dir exactly: the top-N posting paths
+	// filter by record mode before truncating (and the rank-truncated
+	// iterator draws from type-matching records only), so the directory
+	// foo.bin cannot displace the file bar.bin even at limit 1.
+	if trace.PlannerMode != "global-ext" {
+		t.Fatalf("planner mode = %q, want global-ext; decline=%s fallback=%s", trace.PlannerMode, trace.Decline, trace.Fallback)
 	}
 	if gotPaths := pathsOf(got); !sameOrderedStrings(gotPaths, []string{`F:\workspace\bar.bin`}) {
 		t.Fatalf("paths = %v, want only file result", gotPaths)
@@ -261,11 +262,23 @@ func TestGlobalPlannerExtTypeFileDeclinesUnsafeTopN(t *testing.T) {
 	if !ok {
 		t.Fatal("countServiceVolumes declined type:file ext:bin")
 	}
-	if countTrace.PlannerMode != "global-count-components" {
-		t.Fatalf("count planner mode = %q, want global-count-components; decline=%s", countTrace.PlannerMode, countTrace.Decline)
+	if countTrace.PlannerMode != "global-count-ext" {
+		t.Fatalf("count planner mode = %q, want global-count-ext; decline=%s", countTrace.PlannerMode, countTrace.Decline)
 	}
 	if count != 1 {
 		t.Fatalf("count = %d, want 1", count)
+	}
+	// The mirror query must find the directory and exclude the file.
+	dirTrace := &searchTrace{}
+	dirGot, err := searchServiceVolumes(volumes, queryOptions{Query: "type:dir ext:bin", Limit: 1, Trace: dirTrace}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dirTrace.PlannerMode != "global-ext" {
+		t.Fatalf("dir planner mode = %q, want global-ext; decline=%s fallback=%s", dirTrace.PlannerMode, dirTrace.Decline, dirTrace.Fallback)
+	}
+	if gotPaths := pathsOf(dirGot); !sameOrderedStrings(gotPaths, []string{`C:\workspace\foo.bin`}) {
+		t.Fatalf("dir paths = %v, want only directory result", gotPaths)
 	}
 }
 

@@ -199,6 +199,28 @@ func (m *MMapRecords) recordOffset(i int) (int, bool) {
 	return base, true
 }
 
+// parentNameAt fetches a record's parent id and name with a single offset
+// decode for parent-chain walks, instead of a full record assembly plus a
+// second decode for the name.
+func (m *MMapRecords) parentNameAt(i int) (int32, string) {
+	if m == nil || i < 0 || i >= m.count {
+		return -1, ""
+	}
+	base, ok := m.recordOffset(i)
+	if !ok {
+		return -1, ""
+	}
+	parent, nameID := m.recordRefs(base + 16)
+	var p int32
+	if (!m.wideRefs && parent == compactNarrowParentSentinel) || (m.wideRefs && parent == compactWideParentSentinel) {
+		p = -1
+	} else {
+		p = int32(parent)
+	}
+	name, _ := m.nameByID(nameID)
+	return p, name
+}
+
 func (m *MMapRecords) recordRefs(off int) (uint32, uint32) {
 	if m.wideRefs {
 		if off+8 > len(m.recordData) {
@@ -421,10 +443,12 @@ func (p *PackedRecords) modeAt(i int) uint32 {
 	if p == nil || i < 0 {
 		return 0
 	}
-	id := uint32(i)
-	j := sort.Search(len(p.ModeExtraIDs), func(j int) bool { return p.ModeExtraIDs[j] >= id })
-	if j < len(p.ModeExtraIDs) && p.ModeExtraIDs[j] == id && j < len(p.ModeExtraValues) {
-		return p.ModeExtraValues[j]
+	if len(p.ModeExtraIDs) > 0 {
+		id := uint32(i)
+		j := sort.Search(len(p.ModeExtraIDs), func(j int) bool { return p.ModeExtraIDs[j] >= id })
+		if j < len(p.ModeExtraIDs) && p.ModeExtraIDs[j] == id && j < len(p.ModeExtraValues) {
+			return p.ModeExtraValues[j]
+		}
 	}
 	word := i >> 6
 	if word >= len(p.DirBits) {
@@ -543,6 +567,16 @@ func (p *PackedRecords) nameAt(i int) string {
 		return ""
 	}
 	return stringView(p.NameBlob[int(off):end])
+}
+
+// parentNameAt fetches a record's parent id and name with single bounds
+// checks for parent-chain walks, instead of a full record assembly plus a
+// second name lookup.
+func (p *PackedRecords) parentNameAt(i int) (int32, string) {
+	if p == nil || i < 0 || i >= len(p.FRNs) {
+		return -1, ""
+	}
+	return p.Parents[i], p.nameAt(i)
 }
 
 func (p *PackedRecords) lowerNameAt(i int) string {

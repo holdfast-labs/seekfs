@@ -140,6 +140,14 @@ func searchServiceVolumesGlobalExtOnlySnapshot(snapshot globalQuerySnapshot, opt
 			hiddenIt := newGlobalHiddenIterator(&it, snapshots)
 			source = &hiddenIt
 		}
+		if pq.Type == "file" || pq.Type == "dir" {
+			// The rank-truncated top-N below must be drawn from
+			// type-matching records only; truncating the unfiltered
+			// posting first could discard every match of the wanted
+			// type (e.g. the rare dirs among a common extension).
+			typeIt := &globalTypeFilterIterator{base: source, volumes: volumes, typ: pq.Type}
+			source = typeIt
+		}
 		rankOf := candidateRanker(vol.index, vol.rankForQuery(pq))
 		ids = append(ids, collectGlobalTopN([]globalIDIterator{source}, limit, func(id globalRecordID) int {
 			return rankOf(id.local)
@@ -698,7 +706,25 @@ func countServiceVolumesGlobalOnlySnapshot(snapshot globalQuerySnapshot, opts qu
 		extFilters, _ := globalExtPostingFilters(pq)
 		extFilter := extFilters[0]
 		baseCount := 0
-		if globalSnapshotsHaveHidden(snapshots) {
+		typed := pq.Type == "file" || pq.Type == "dir"
+		if typed {
+			// The raw posting length counts every extension match
+			// regardless of record type; verify the mode per posting id
+			// (plus the legacy recent merge when no overlay hides base
+			// records, mirroring the untyped sources exactly).
+			for volumeIndex, vol := range volumes {
+				var hidden hiddenBaseIDs
+				if volumeIndex >= 0 && volumeIndex < len(snapshots) && snapshots[volumeIndex] != nil {
+					hidden = hiddenBaseIDs{tombstone: snapshots[volumeIndex].tombstoneIDs, shadowed: snapshots[volumeIndex].shadowedIDs}
+				}
+				count, ok := vol.countExtPostingTyped(extFilter.ext, pq.Type, hidden, !globalSnapshotsHaveHidden(snapshots))
+				if !ok {
+					opts.Trace.addDeclineForVolume("global-ext:missing-posting", vol.volume)
+					return 0, false, nil
+				}
+				baseCount += count
+			}
+		} else if globalSnapshotsHaveHidden(snapshots) {
 			ids, ok := globalExtPostingIDs(volumes, extFilter.ext, 0, opts.Trace)
 			if !ok {
 				return 0, false, nil

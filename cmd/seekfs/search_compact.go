@@ -113,6 +113,22 @@ func (idx *Index) compactNameAt(i int) string {
 	return idx.Records[i].Name
 }
 
+// compactParentNameAt fetches a record's parent id and name in one dispatch
+// for parent-chain walks, avoiding a full record assembly plus a second
+// name lookup per level.
+func (idx *Index) compactParentNameAt(i int) (int32, string) {
+	if idx.MMapRecords != nil {
+		return idx.MMapRecords.parentNameAt(i)
+	}
+	if idx.PackedRecords != nil {
+		return idx.PackedRecords.parentNameAt(i)
+	}
+	if i < 0 || i >= len(idx.Records) {
+		return -1, ""
+	}
+	return idx.Records[i].Parent, idx.Records[i].Name
+}
+
 func (idx *Index) compactLowerNameAt(i int) string {
 	if idx.MMapRecords != nil {
 		return idx.MMapRecords.lowerNameAt(i)

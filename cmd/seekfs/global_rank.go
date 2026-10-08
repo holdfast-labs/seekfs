@@ -3,9 +3,12 @@ package main
 import (
 	"cmp"
 	"container/heap"
+	"runtime"
 	"slices"
 	"sort"
 	"strings"
+	"sync"
+	"sync/atomic"
 )
 
 func globalExtOnlySupported(pq parsedQuery) bool {
@@ -17,7 +20,10 @@ func globalExtOnlySupported(pq parsedQuery) bool {
 		pq.CaseSensitive {
 		return false
 	}
-	return pq.Type == ""
+	// type:file/dir only narrows the ext posting; every lane verifies the
+	// full entry afterwards, and the top-N posting paths filter (or
+	// decline) by type before truncating.
+	return pq.Type == "" || pq.Type == "file" || pq.Type == "dir"
 }
 
 func globalExtDefaultSupported(pq parsedQuery) bool {
@@ -367,23 +373,110 @@ func collectGlobalVerifiedTopN(it globalIDIterator, volumes []*serviceVolumeInde
 		return nil, 0, nil
 	}
 	global := len(volumes) > 1 || globalSnapshotsHaveOverlayRecords(snapshots)
-	h := &globalVerifiedTopHeap{pq: pq, global: global}
-	heap.Init(h)
-	pathCaches := make([]map[int]string, len(volumes))
+	// Drain the iterator once: verification dominates iterator cost
+	// (profiled), and the top-N heap must see every candidate anyway, so
+	// draining up front costs nothing asymptotically while letting the
+	// verify phase fan out without serializing on iterator state.
+	ids, canceled := collectGlobalIteratorCancelable(it, 0, func() bool { return queryCanceled(pq) })
+	if canceled {
+		return nil, 0, errQueryCanceled
+	}
 	rankers := make([]func(int) int, len(volumes))
 	for i, vol := range volumes {
 		if vol != nil && vol.index != nil {
 			rankers[i] = candidateRanker(vol.index, vol.rankForQuery(pq))
 		}
 	}
-	verified := 0
-	for {
-		id, ok := it.Next()
-		if !ok {
-			break
+	volumePQs := make([]parsedQuery, len(volumes))
+	for i, vol := range volumes {
+		volumePQs[i] = pq
+		volumePQs[i].Terms = append([]string(nil), pq.Terms...)
+		if vol != nil && vol.index != nil {
+			dropSatisfiedVolumeTerms(&volumePQs[i], vol.index.Volume)
 		}
-		if verified&1023 == 0 && queryCanceled(pq) {
-			return nil, verified, errQueryCanceled
+	}
+	if len(ids) < 2*serviceTrigramParallelVerifyMinIDs {
+		out, verified := collectGlobalVerifiedTopNRange(ids, volumes, snapshots, volumePQs, rankers, pq, limit, global, nil)
+		return out, verified, nil
+	}
+	workers := min(runtime.GOMAXPROCS(0), max(1, len(ids)/serviceTrigramParallelVerifyMinIDs))
+	if workers <= 1 {
+		out, verified := collectGlobalVerifiedTopNRange(ids, volumes, snapshots, volumePQs, rankers, pq, limit, global, nil)
+		return out, verified, nil
+	}
+	var stopped atomic.Bool
+	type workerResult struct {
+		items    []globalRankedEntry
+		verified int
+	}
+	results := make([]workerResult, workers)
+	var wg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		start := w * len(ids) / workers
+		end := (w + 1) * len(ids) / workers
+		wg.Add(1)
+		go func(w, start, end int) {
+			defer wg.Done()
+			items, verified := collectGlobalVerifiedTopNRange(ids[start:end], volumes, snapshots, volumePQs, rankers, pq, limit, global, &stopped)
+			results[w].items = items
+			results[w].verified = verified
+		}(w, start, end)
+	}
+	wg.Wait()
+	if stopped.Load() {
+		verified := 0
+		for i := range results {
+			verified += results[i].verified
+		}
+		return nil, verified, errQueryCanceled
+	}
+	// Every global top-N entry is a partition top-N entry of its own
+	// partition, so merging the per-worker heaps and re-selecting yields
+	// exactly the serial set; the comparator is a total order, so the
+	// final sort is deterministic.
+	h := &globalVerifiedTopHeap{pq: pq, global: global}
+	heap.Init(h)
+	verified := 0
+	for i := range results {
+		verified += results[i].verified
+		for _, item := range results[i].items {
+			if h.Len() < limit {
+				heap.Push(h, item)
+				continue
+			}
+			if compareGlobalVerifiedEntries(item, h.items[0], pq, global) < 0 {
+				h.items[0] = item
+				heap.Fix(h, 0)
+			}
+		}
+	}
+	out := append([]globalRankedEntry(nil), h.items...)
+	sortGlobalRankedEntries(out, pq)
+	return out, verified, nil
+}
+
+// collectGlobalVerifiedTopNRange verifies one slice of candidate IDs with
+// worker-local path caches and a bounded heap. It is the serial whole-slice
+// path as well as the per-worker parallel path; stopped, when non-nil, is
+// shared across workers for prompt cancellation.
+func collectGlobalVerifiedTopNRange(ids []globalRecordID, volumes []*serviceVolumeIndex, snapshots []*volumeSnapshot, volumePQs []parsedQuery, rankers []func(int) int, pq parsedQuery, limit int, global bool, stopped *atomic.Bool) ([]globalRankedEntry, int) {
+	h := &globalVerifiedTopHeap{pq: pq, global: global}
+	heap.Init(h)
+	pathCaches := make([]map[int]string, len(volumes))
+	rankOf := func(volume int, local int) int {
+		rank := int(^uint(0) >> 1)
+		if volume >= 0 && volume < len(rankers) && rankers[volume] != nil {
+			rank = rankers[volume](local)
+		}
+		return rank
+	}
+	verified := 0
+	for _, id := range ids {
+		if verified&1023 == 0 && (stopped != nil && stopped.Load() || queryCanceled(pq)) {
+			if stopped != nil {
+				stopped.Store(true)
+			}
+			return nil, verified
 		}
 		if globalHiddenContains(snapshots, id) || id.volume < 0 || id.volume >= len(volumes) {
 			continue
@@ -395,18 +488,12 @@ func collectGlobalVerifiedTopN(it globalIDIterator, volumes []*serviceVolumeInde
 		if pathCaches[id.volume] == nil {
 			pathCaches[id.volume] = make(map[int]string)
 		}
-		volumePQ := pq
-		dropSatisfiedVolumeTerms(&volumePQ, vol.index.Volume)
-		entry, ok := compactCandidateEntryIfMatch(vol.index, volumePQ, id.local, pathCaches[id.volume], true, false)
+		entry, ok := compactCandidateEntryIfMatch(vol.index, volumePQs[id.volume], id.local, pathCaches[id.volume], true, false)
 		verified++
 		if !ok {
 			continue
 		}
-		rank := int(^uint(0) >> 1)
-		if rankers[id.volume] != nil {
-			rank = rankers[id.volume](id.local)
-		}
-		item := globalRankedEntry{entry: entry, rank: rank, volume: id.volume, tie: entry.Path}
+		item := globalRankedEntry{entry: entry, rank: rankOf(id.volume, id.local), volume: id.volume, tie: entry.Path}
 		if h.Len() < limit {
 			heap.Push(h, item)
 			continue
@@ -418,22 +505,76 @@ func collectGlobalVerifiedTopN(it globalIDIterator, volumes []*serviceVolumeInde
 	}
 	out := append([]globalRankedEntry(nil), h.items...)
 	sortGlobalRankedEntries(out, pq)
-	return out, verified, nil
+	return out, verified
 }
 
 func countGlobalVerifiedIterator(it globalIDIterator, volumes []*serviceVolumeIndex, snapshots []*volumeSnapshot, pq parsedQuery) (int, int, error) {
 	if it == nil {
 		return 0, 0, nil
 	}
+	ids, canceled := collectGlobalIteratorCancelable(it, 0, func() bool { return queryCanceled(pq) })
+	if canceled {
+		return 0, 0, errQueryCanceled
+	}
+	volumePQs := make([]parsedQuery, len(volumes))
+	for i, vol := range volumes {
+		volumePQs[i] = pq
+		volumePQs[i].Terms = append([]string(nil), pq.Terms...)
+		if vol != nil && vol.index != nil {
+			dropSatisfiedVolumeTerms(&volumePQs[i], vol.index.Volume)
+		}
+	}
+	if len(ids) < 2*serviceTrigramParallelVerifyMinIDs {
+		count, verified := countGlobalVerifiedRange(ids, volumes, snapshots, volumePQs, pq, nil)
+		return count, verified, nil
+	}
+	workers := min(runtime.GOMAXPROCS(0), max(1, len(ids)/serviceTrigramParallelVerifyMinIDs))
+	if workers <= 1 {
+		count, verified := countGlobalVerifiedRange(ids, volumes, snapshots, volumePQs, pq, nil)
+		return count, verified, nil
+	}
+	var stopped atomic.Bool
+	type workerCount struct {
+		count    int
+		verified int
+	}
+	results := make([]workerCount, workers)
+	var wg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		start := w * len(ids) / workers
+		end := (w + 1) * len(ids) / workers
+		wg.Add(1)
+		go func(w, start, end int) {
+			defer wg.Done()
+			count, verified := countGlobalVerifiedRange(ids[start:end], volumes, snapshots, volumePQs, pq, &stopped)
+			results[w].count = count
+			results[w].verified = verified
+		}(w, start, end)
+	}
+	wg.Wait()
+	count, verified := 0, 0
+	for i := range results {
+		count += results[i].count
+		verified += results[i].verified
+	}
+	if stopped.Load() {
+		return 0, verified, errQueryCanceled
+	}
+	return count, verified, nil
+}
+
+// countGlobalVerifiedRange counts one slice of candidate IDs with
+// worker-local path caches. It is the serial whole-slice path as well as
+// the per-worker parallel path.
+func countGlobalVerifiedRange(ids []globalRecordID, volumes []*serviceVolumeIndex, snapshots []*volumeSnapshot, volumePQs []parsedQuery, pq parsedQuery, stopped *atomic.Bool) (int, int) {
 	pathCaches := make([]map[int]string, len(volumes))
 	count, verified := 0, 0
-	for {
-		id, ok := it.Next()
-		if !ok {
-			break
-		}
-		if verified&1023 == 0 && queryCanceled(pq) {
-			return 0, verified, errQueryCanceled
+	for _, id := range ids {
+		if verified&1023 == 0 && (stopped != nil && stopped.Load() || queryCanceled(pq)) {
+			if stopped != nil {
+				stopped.Store(true)
+			}
+			return 0, verified
 		}
 		if globalHiddenContains(snapshots, id) || id.volume < 0 || id.volume >= len(volumes) {
 			continue
@@ -445,15 +586,13 @@ func countGlobalVerifiedIterator(it globalIDIterator, volumes []*serviceVolumeIn
 		if pathCaches[id.volume] == nil {
 			pathCaches[id.volume] = make(map[int]string)
 		}
-		volumePQ := pq
-		dropSatisfiedVolumeTerms(&volumePQ, vol.index.Volume)
-		_, ok = compactCandidateEntryIfMatch(vol.index, volumePQ, id.local, pathCaches[id.volume], true, false)
+		_, ok := compactCandidateEntryIfMatch(vol.index, volumePQs[id.volume], id.local, pathCaches[id.volume], true, false)
 		verified++
 		if ok {
 			count++
 		}
 	}
-	return count, verified, nil
+	return count, verified
 }
 
 func globalRankItemBetter(a, b globalRankItem) bool {

@@ -77,7 +77,7 @@ func countServiceVolumesGlobalNameSnapshot(snapshot globalQuerySnapshot, opts qu
 				if volumePQ.Trace.FilenameDriver == "posting-intersection-pngc" {
 					usedPNGC = true
 				}
-				if volumePQ.Trace != nil {
+				if opts.Trace != nil && volumePQ.Trace != nil {
 					opts.Trace.FilenameDriver = volumePQ.Trace.FilenameDriver
 					opts.Trace.FilenameRequiredGrams += volumePQ.Trace.FilenameRequiredGrams
 					opts.Trace.FilenamePostingHint = max(opts.Trace.FilenamePostingHint, volumePQ.Trace.FilenamePostingHint)
@@ -160,7 +160,7 @@ func globalNameTopRanked(snapshot globalQuerySnapshot, pq parsedQuery, trace *se
 		dropSatisfiedVolumeTerms(&volumePQ, vol.index.Volume)
 		candidates, ok := vol.completeFilenameTopPosting(nonVolumeTerms(pq.Terms)[0], pq.Limit, volumePQ)
 		if ok {
-			if volumePQ.Trace != nil && volumePQ.Trace.FilenameDriver != "" {
+			if trace != nil && volumePQ.Trace != nil && volumePQ.Trace.FilenameDriver != "" {
 				trace.FilenameDriver = volumePQ.Trace.FilenameDriver
 				trace.FilenameRequiredGrams += volumePQ.Trace.FilenameRequiredGrams
 				trace.FilenameRecordsVerified += volumePQ.Trace.FilenameRecordsVerified
@@ -226,7 +226,7 @@ func globalNameCandidateIDs(snapshot globalQuerySnapshot, pq parsedQuery, trace 
 			trace.addDeclineForVolume(reason, vol.volume)
 			return nil, false
 		}
-		if volumePQ.Trace != nil && volumePQ.Trace.FilenameDriver != "" {
+		if trace != nil && volumePQ.Trace != nil && volumePQ.Trace.FilenameDriver != "" {
 			trace.FilenameDriver = volumePQ.Trace.FilenameDriver
 			trace.FilenameRequiredGrams += volumePQ.Trace.FilenameRequiredGrams
 			trace.FilenameRecordsVerified += volumePQ.Trace.FilenameRecordsVerified

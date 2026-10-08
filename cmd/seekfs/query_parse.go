@@ -524,8 +524,23 @@ func entryMatches(entry Entry, pq parsedQuery, matchPath bool) bool {
 	if name == "" {
 		name = filepath.Base(path)
 	}
-	cmpPath := normalizeCase(path, pq.CaseSensitive)
-	cmpName := normalizeCase(name, pq.CaseSensitive)
+	// Reuse the prebuilt lowercase strings when they describe exactly the
+	// strings under test. compactEntryFromRecord builds LowerPath as
+	// ToLower(Path) and LowerName as ToLower(Name) (compactLowerNameAt is
+	// exactly strings.ToLower, including edge cases like U+0130), so when
+	// Clean is a no-op the recompute below would only reproduce them while
+	// allocating a fresh copy per candidate. ToLower and Clean commute
+	// here: Clean only reacts to separators and dot elements, which
+	// lowercasing neither creates nor removes, so Clean(Lower(Path)) would
+	// equal Lower(Clean(Path)) whenever they differ at all.
+	var cmpPath, cmpName string
+	if pq.CaseSensitive {
+		cmpPath, cmpName = path, name
+	} else if entry.LowerPath != "" && path == entry.Path && entry.LowerName != "" && name == entry.Name {
+		cmpPath, cmpName = entry.LowerPath, entry.LowerName
+	} else {
+		cmpPath, cmpName = strings.ToLower(path), strings.ToLower(name)
+	}
 	haystack := cmpName
 	if matchPath {
 		haystack = cmpPath
@@ -883,14 +898,14 @@ func (idx *Index) compactPathContainsTerm(i int, term string) bool {
 		if cur < 0 || cur >= idx.compactRecordCount() {
 			return false
 		}
-		rec := idx.compactRecord(cur)
-		if containsFoldASCII(idx.compactNameAt(cur), term) {
+		parent, name := idx.compactParentNameAt(cur)
+		if containsFoldASCII(name, term) {
 			return true
 		}
-		if rec.Parent < 0 || int(rec.Parent) == cur {
+		if parent < 0 || int(parent) == cur {
 			return false
 		}
-		cur = int(rec.Parent)
+		cur = int(parent)
 	}
 	return false
 }
@@ -924,14 +939,14 @@ func (idx *Index) reconstructCompactPathCached(i int, cache map[int]string) stri
 			break
 		}
 		seen[cur] = struct{}{}
-		rec := idx.compactRecord(cur)
-		if rec.Name != "." {
-			parts = append(parts, rec.Name)
+		parent, name := idx.compactParentNameAt(cur)
+		if name != "." {
+			parts = append(parts, name)
 		}
-		if rec.Parent < 0 {
+		if parent < 0 {
 			break
 		}
-		cur = int(rec.Parent)
+		cur = int(parent)
 	}
 	root := idx.Volume
 	rootName := ""
