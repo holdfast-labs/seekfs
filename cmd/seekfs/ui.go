@@ -27,7 +27,10 @@ import (
 const uiSearchDeadline = 15 * time.Second
 const uiServiceTimeout = 20 * time.Second
 
-//go:embed ui_frontend/*
+// Embed only runtime assets. The source radar SVG wraps a large raster image;
+// the existing multi-resolution ICO serves both the favicon and header logo.
+//
+//go:embed ui_frontend/*.html ui_frontend/*.css ui_frontend/*.js ui_frontend/assets/*.ico
 var seekfsUIAssets embed.FS
 
 type UIApp struct {

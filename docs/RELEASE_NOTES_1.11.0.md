@@ -24,6 +24,8 @@ and the minimal prompt-style desktop UI.
   quieter result rows, and context-menu shortcut hints.
 - Ctrl+K or `/` focuses search; Escape clears a nonempty prompt. The clear
   button resets the query and sort and returns focus to the prompt.
+- Reuse the existing multi-resolution icon for the favicon, excluding a 2 MB
+  raster-wrapper SVG from the desktop executable.
 
 ## Performance evidence
 
