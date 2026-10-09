@@ -9,6 +9,7 @@ const state = {
   lastClicked: -1,
   sort: "",
   lastQuery: "",
+  typeFilter: "",
 };
 
 const els = {
@@ -22,7 +23,33 @@ const els = {
   healthDot: document.getElementById("health-dot"),
   healthText: document.getElementById("health-text"),
   health: document.getElementById("health"),
+  clear: document.getElementById("clear"),
+  count: document.getElementById("count"),
+  filters: Array.from(document.querySelectorAll(".segmented button")),
 };
+
+function setEmpty(title, sub) {
+  if (!els.empty) return;
+  const titleEl = els.empty.querySelector(".empty-title");
+  const subEl = els.empty.querySelector(".empty-sub");
+  if (titleEl || subEl) {
+    if (titleEl) titleEl.textContent = title || "";
+    if (subEl) subEl.textContent = sub || "";
+    return;
+  }
+  els.empty.textContent = title || "";
+}
+
+function setCount(n) {
+  if (!els.count) return;
+  const value = Number(n || 0);
+  els.count.textContent = value.toLocaleString();
+}
+
+function syncClearButton() {
+  if (!els.clear || !els.query) return;
+  els.clear.hidden = !els.query.value;
+}
 
 function api() {
   return window.go && window.go.main && window.go.main.UIApp;
@@ -550,6 +577,7 @@ async function refreshStatus() {
 function buildQueryWithSort(rawQuery) {
   const fields = rawQuery.split(/\s+/).filter(Boolean);
   const kept = [];
+  let hasTypeFilter = false;
   for (const field of fields) {
     const matched = /^sort:([a-z]+)/i.exec(field);
     if (matched) {
@@ -557,8 +585,12 @@ function buildQueryWithSort(rawQuery) {
       if (sortSupported(matched[1].toLowerCase())) state.sort = matched[1].toLowerCase();
       continue;
     }
+    if (/^type:(file|dir)$/i.test(field)) hasTypeFilter = true;
     kept.push(field);
   }
+  // Toolbar All/Files/Folders segmented control (FSearch-style type filter).
+  // A typed `type:` token in the query wins over the toolbar selection.
+  if (state.typeFilter && !hasTypeFilter) kept.unshift(state.typeFilter);
   // The service sorts before it applies the result limit, so the page always
   // holds the globally top-N rows for the active sort rather than the first N
   // matches reordered locally.
@@ -573,16 +605,19 @@ async function searchNow() {
   state.lastQuery = rawQuery;
   const seq = ++state.seq;
   hideMenu();
-  if (!rawQuery) {
+  syncClearButton();
+  if (!rawQuery && !state.typeFilter) {
     renderRows([]);
+    setCount(0);
     els.summary.textContent = "Ready";
-    els.empty.textContent = "Type to search";
+    setEmpty("Type to search", "");
     return;
   }
   if (!query) {
     renderRows([]);
+    setCount(0);
     els.summary.textContent = "Keep typing";
-    els.empty.textContent = "Type to search";
+    setEmpty("Keep typing", "");
     return;
   }
   els.summary.textContent = "Searching...";
@@ -594,7 +629,8 @@ async function searchNow() {
   } catch (err) {
     if (seq !== state.seq) return;
     renderRows([]);
-    els.empty.textContent = err.message;
+    setCount(0);
+    setEmpty(err.message, "");
     els.summary.textContent = err.message;
   }
 }
@@ -604,14 +640,16 @@ function handleSearchResponse(response) {
   if ((response.message || "").toLowerCase() === "query superseded") return;
   if (!response.ok) {
     renderRows([]);
-    els.empty.textContent = response.message || "Search failed";
+    setCount(0);
+    setEmpty(response.message || "Search failed", "");
     els.summary.textContent = response.message || "Search failed";
     return;
   }
   renderRows(response.results || []);
   const count = response.count || (response.results || []).length;
+  setCount(count);
   els.summary.textContent = `${count.toLocaleString()} items  |  ${response.elapsed_ms} ms`;
-  els.empty.textContent = "No matches";
+  setEmpty("No matches", "");
 }
 
 const searchSoon = debounce(searchNow, 90);
@@ -1074,7 +1112,17 @@ els.query.addEventListener("input", (event) => {
     state.sort = "";
     applySortIndicator();
   }
+  syncClearButton();
   searchSoon();
+});
+
+els.query.addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && els.query.value) {
+    event.stopPropagation();
+    els.query.value = "";
+    syncClearButton();
+    searchNow();
+  }
 });
 
 els.menu.addEventListener("click", async (event) => {
@@ -1104,6 +1152,17 @@ document.addEventListener("keydown", (event) => {
 document.addEventListener("keydown", (event) => {
   const tag = event.target && event.target.tagName ? event.target.tagName.toLowerCase() : "";
   const inEditable = tag === "input" || tag === "textarea" || (event.target && event.target.isContentEditable);
+  if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "k") {
+    event.preventDefault();
+    els.query.focus();
+    els.query.select();
+    return;
+  }
+  if (event.key === "/" && !inEditable) {
+    event.preventDefault();
+    els.query.focus();
+    return;
+  }
   if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "a") {
     if (inEditable) {
       // The search input selects its own text on Ctrl+A; treat a
