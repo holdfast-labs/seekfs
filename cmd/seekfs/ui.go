@@ -114,7 +114,7 @@ func cmdUI(args []string) error {
 		Height:           760,
 		MinWidth:         860,
 		MinHeight:        540,
-		BackgroundColour: &options.RGBA{R: 13, G: 17, B: 23, A: 1},
+		BackgroundColour: &options.RGBA{R: 11, G: 11, B: 14, A: 1},
 		AssetServer:      &assetserver.Options{Assets: assets},
 		OnStartup:        app.startup,
 		Bind:             []interface{}{app},
