@@ -462,6 +462,6 @@ func cmdIndex(args []string) error {
 	if err := saveIndex(*db, idx); err != nil {
 		return err
 	}
-	fmt.Printf("indexed %d entries in %s\n", len(idx.Entries), time.Since(start).Round(time.Millisecond))
+	fmt.Printf("indexed %d entries in %s\n", idx.entryCount(), time.Since(start).Round(time.Millisecond))
 	return nil
 }
