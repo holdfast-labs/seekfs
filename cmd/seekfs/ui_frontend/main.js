@@ -9,7 +9,6 @@ const state = {
   lastClicked: -1,
   sort: "",
   lastQuery: "",
-  typeFilter: "",
 };
 
 const els = {
@@ -25,7 +24,6 @@ const els = {
   health: document.getElementById("health"),
   clear: document.getElementById("clear"),
   count: document.getElementById("count"),
-  filters: Array.from(document.querySelectorAll(".segmented button")),
 };
 
 function setEmpty(title, sub) {
@@ -577,7 +575,6 @@ async function refreshStatus() {
 function buildQueryWithSort(rawQuery) {
   const fields = rawQuery.split(/\s+/).filter(Boolean);
   const kept = [];
-  let hasTypeFilter = false;
   for (const field of fields) {
     const matched = /^sort:([a-z]+)/i.exec(field);
     if (matched) {
@@ -585,12 +582,8 @@ function buildQueryWithSort(rawQuery) {
       if (sortSupported(matched[1].toLowerCase())) state.sort = matched[1].toLowerCase();
       continue;
     }
-    if (/^type:(file|dir)$/i.test(field)) hasTypeFilter = true;
     kept.push(field);
   }
-  // Toolbar All/Files/Folders segmented control (FSearch-style type filter).
-  // A typed `type:` token in the query wins over the toolbar selection.
-  if (state.typeFilter && !hasTypeFilter) kept.unshift(state.typeFilter);
   // The service sorts before it applies the result limit, so the page always
   // holds the globally top-N rows for the active sort rather than the first N
   // matches reordered locally.
@@ -606,7 +599,7 @@ async function searchNow() {
   const seq = ++state.seq;
   hideMenu();
   syncClearButton();
-  if (!rawQuery && !state.typeFilter) {
+  if (!rawQuery) {
     renderRows([]);
     setCount(0);
     els.summary.textContent = "Ready";
@@ -1123,6 +1116,15 @@ els.query.addEventListener("keydown", (event) => {
     syncClearButton();
     searchNow();
   }
+});
+
+els.clear.addEventListener("click", () => {
+  els.query.value = "";
+  state.sort = "";
+  applySortIndicator();
+  syncClearButton();
+  els.query.focus();
+  searchNow();
 });
 
 els.menu.addEventListener("click", async (event) => {

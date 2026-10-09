@@ -600,7 +600,9 @@ func buildQueryMemo(vol *serviceVolumeIndex, idx *Index, ident *nameIdentity, pq
 	}
 	m.nameBits = make([]uint16, ident.count)
 	m.nameNeg = make([]uint16, ident.count)
-	scoreDistinctNames(idx, ident, m)
+	if !scoreDistinctNames(idx, ident, m, pq) {
+		return nil
+	}
 	if pq.MatchPath && (m.reqMask != 0 || len(m.negs) > 0) {
 		// Only fold when some slot can match through ancestors.
 		// Pure own-name queries (extension/glob only) skip the fold:
@@ -611,7 +613,9 @@ func buildQueryMemo(vol *serviceVolumeIndex, idx *Index, ident *nameIdentity, pq
 			// every record through the legacy path under a memo label.
 			return nil
 		}
-		foldDirTopo(idx, ident, topo, m, n)
+		if !foldDirTopo(idx, ident, topo, m, n, pq) {
+			return nil
+		}
 		m.folded = true
 	}
 	return m
@@ -620,31 +624,37 @@ func buildQueryMemo(vol *serviceVolumeIndex, idx *Index, ident *nameIdentity, pq
 // scoreDistinctNames evaluates every distinct name once, in parallel across
 // chunks. Mask misses skip the substring work; only mask-passing names pay
 // for exemplar verification.
-func scoreDistinctNames(idx *Index, ident *nameIdentity, m *queryMemo) {
+func scoreDistinctNames(idx *Index, ident *nameIdentity, m *queryMemo, pq parsedQuery) bool {
 	count := ident.count
 	if count == 0 {
-		return
+		return !queryCanceled(pq)
 	}
 	workers := min(runtime.GOMAXPROCS(0), max(1, count/serviceTrigramParallelVerifyMinIDs))
 	if workers <= 1 {
-		scoreNameRange(idx, ident, m, 0, count)
-		return
+		return scoreNameRange(idx, ident, m, 0, count, pq)
 	}
 	var wg sync.WaitGroup
+	var canceled atomic.Bool
 	for w := 0; w < workers; w++ {
 		start := w * count / workers
 		end := (w + 1) * count / workers
 		wg.Add(1)
 		go func(start, end int) {
 			defer wg.Done()
-			scoreNameRange(idx, ident, m, start, end)
+			if !scoreNameRange(idx, ident, m, start, end, pq) {
+				canceled.Store(true)
+			}
 		}(start, end)
 	}
 	wg.Wait()
+	return !canceled.Load() && !queryCanceled(pq)
 }
 
-func scoreNameRange(idx *Index, ident *nameIdentity, m *queryMemo, start, end int) {
+func scoreNameRange(idx *Index, ident *nameIdentity, m *queryMemo, start, end int, pq parsedQuery) bool {
 	for id := start; id < end; id++ {
+		if (id-start)&1023 == 0 && queryCanceled(pq) {
+			return false
+		}
 		s := ident.identName(idx, uint32(id))
 		if s == "" {
 			continue
@@ -688,6 +698,7 @@ func scoreNameRange(idx *Index, ident *nameIdentity, m *queryMemo, start, end in
 		}
 		m.nameNeg[id] = neg
 	}
+	return !queryCanceled(pq)
 }
 
 // memoNameExt mirrors entryMatches' extension derivation on an already
@@ -802,11 +813,14 @@ func memoParentOf(idx *Index, id int) int32 {
 // Nodes whose parent is unvisited or invalid stay unvisited and slow-path
 // (with their descendants, which consult the unvisited mark), keeping the
 // lane exact under every graph shape.
-func foldDirTopo(idx *Index, ident *nameIdentity, topo *dirTopo, m *queryMemo, n int) {
+func foldDirTopo(idx *Index, ident *nameIdentity, topo *dirTopo, m *queryMemo, n int, pq parsedQuery) bool {
 	m.dirBits = make([]uint16, n)
 	m.dirNeg = make([]uint16, n)
 	m.visited = make([]uint64, (n+63)/64)
-	for _, d := range topo.order {
+	for pos, d := range topo.order {
+		if pos&1023 == 0 && queryCanceled(pq) {
+			return false
+		}
 		if int(d) >= n {
 			continue
 		}
@@ -836,6 +850,7 @@ func foldDirTopo(idx *Index, ident *nameIdentity, topo *dirTopo, m *queryMemo, n
 		m.dirNeg[d] = ownNeg | pneg
 		m.visited[int(d)/64] |= 1 << uint(int(d)%64)
 	}
+	return !queryCanceled(pq)
 }
 
 // memoFoldChildren reads a record's children without allocating on the

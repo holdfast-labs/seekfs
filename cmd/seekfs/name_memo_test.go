@@ -266,6 +266,19 @@ func TestMemoDirectoryAggregateSize(t *testing.T) {
 	}
 }
 
+func TestMemoBuildCancellationDoesNotPublish(t *testing.T) {
+	volumes := memoTestVolumes(t)
+	vol := volumes[0]
+	pq := mustParsePrefilterQuery(t, queryOptions{Query: "workspace", MatchPath: true})
+	pq.Cancel = func() bool { return true }
+	if memo, _ := vol.memoFor(pq); memo != nil {
+		t.Fatal("canceled name scoring published a memo")
+	}
+	if vol.index.nameMemo.memo != nil {
+		t.Fatal("canceled memo remained cached")
+	}
+}
+
 func TestMemoLaneCycleSafe(t *testing.T) {
 	idx := &Index{Source: "usn", Volume: "C:", Compact: true}
 	add := func(frn, parentFRN uint64, parent int32, name string, mode uint32) {

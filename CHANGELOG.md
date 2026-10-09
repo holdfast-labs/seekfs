@@ -10,6 +10,7 @@ second copy to drift out of date.
 
 ## Releases
 
+- [1.11.0](docs/RELEASE_NOTES_1.11.0.md)
 - [1.10.3](docs/RELEASE_NOTES_1.10.3.md)
 - [1.10.2](docs/RELEASE_NOTES_1.10.2.md)
 - [1.10.1](docs/RELEASE_NOTES_1.10.1.md)

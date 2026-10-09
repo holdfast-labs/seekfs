@@ -6,7 +6,19 @@ import (
 )
 
 func TestGlobalMemoTopNParity(t *testing.T) {
-	volumes := memoTestVolumes(t)
+	var volumes []*serviceVolumeIndex
+	for v, n := range []int{2000, 500} {
+		idx := dottedPathBenchmarkIndex(n)
+		if v == 1 {
+			idx.Volume = "E:"
+		}
+		for id := range idx.Records {
+			idx.Records[id].Size = int64(id%13) * 100
+			idx.Records[id].ModUnix += int64(id%17) * 1000000
+		}
+		idx.packCompactRecords(true)
+		volumes = append(volumes, newServiceVolumeIndex("mixed.gsi", idx))
+	}
 	ids := make([]globalRecordID, 0)
 	for v, vol := range volumes {
 		for id := 0; id < vol.index.compactRecordCount(); id++ {

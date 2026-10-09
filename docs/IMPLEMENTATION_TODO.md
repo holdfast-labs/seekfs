@@ -4,7 +4,7 @@
 - [x] Defer candidate materialization until after bounded rank selection.
 - [x] Verify result/count parity, cancellation, mutation and overlay handling.
 - [ ] Run static analysis, Go/UI/frontend tests, race checks and CLI integration.
-- [ ] Commit and push reviewed search changes.
-- [ ] Merge `ui/minimal-prompt-polish` and fix UI integration issues.
+- [x] Commit and push reviewed search changes.
+- [x] Merge `ui/minimal-prompt-polish` and fix UI integration issues.
 - [x] Benchmark the combined implementation and document measured results.
 - [ ] Build release binaries, pass remote CI and publish the release.
