@@ -28,3 +28,24 @@ and automated UI/frontend tests passed, but do not replace those native checks.
 
 The package smoke test also caught and fixed the walk-index command reporting
 zero entries after compact conversion; it now reports the actual record count.
+
+## Published archive
+
+[v1.11.0](https://github.com/holdfast-labs/seekfs/releases/tag/v1.11.0)
+was published from `00daffe` after all Windows CI jobs passed for the final
+runtime code at `ecfc16c`; the intervening commit only adds validation notes.
+The release workflow also passed.
+
+Downloaded the published archive and matched its checksum:
+
+```text
+3679fc1edd4b1a0a7c3d6d60eb8ddc52246f5c00da0a07e3cdf9aa9b546e919a
+```
+
+CLI integration passed against the downloaded binary. The downloaded desktop
+executable also launched and loaded the isolated six-entry index with healthy
+status. Its service identified itself as `v1.11.0`, commit `00daffe`, and returned
+the two matching files in ascending size order with count two. The native
+input limitation above remained reproducible. Temporary package configuration
+was removed after testing. The canonical local zip in `dist` is the downloaded
+published archive.
