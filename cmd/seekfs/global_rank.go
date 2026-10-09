@@ -382,9 +382,17 @@ func collectGlobalVerifiedTopN(it globalIDIterator, volumes []*serviceVolumeInde
 		return nil, 0, errQueryCanceled
 	}
 	rankers := make([]func(int) int, len(volumes))
+	ranksComplete := true
 	for i, vol := range volumes {
 		if vol != nil && vol.index != nil {
-			rankers[i] = candidateRanker(vol.index, vol.rankForQuery(pq))
+			ranks := vol.rankForQuery(pq)
+			n := vol.index.compactRecordCount()
+			if len(ranks) < n && !(pq.SortColumn == "" && len(vol.index.CompactNameOrder) >= n) {
+				ranksComplete = false
+			}
+			rankers[i] = candidateRanker(vol.index, ranks)
+		} else {
+			ranksComplete = false
 		}
 	}
 	volumePQs := make([]parsedQuery, len(volumes))
@@ -395,7 +403,7 @@ func collectGlobalVerifiedTopN(it globalIDIterator, volumes []*serviceVolumeInde
 			dropSatisfiedVolumeTerms(&volumePQs[i], vol.index.Volume)
 		}
 	}
-	if out, verified, ok, err := collectGlobalMemoTopN(ids, volumes, snapshots, volumePQs, rankers, pq, limit); ok {
+	if out, verified, ok, err := collectGlobalMemoTopN(ids, volumes, snapshots, volumePQs, rankers, ranksComplete, pq, limit); ok {
 		return out, verified, err
 	}
 	if len(ids) < 2*serviceTrigramParallelVerifyMinIDs {

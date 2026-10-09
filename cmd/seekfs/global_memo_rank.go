@@ -8,8 +8,10 @@ import "container/heap"
 // Overlay records are merged by the caller after hidden base IDs are removed.
 // Queries requiring path verification or ranks that are unavailable retain
 // the existing verifier. Unfoldable records still use that verifier inline.
-func collectGlobalMemoTopN(ids []globalRecordID, volumes []*serviceVolumeIndex, snapshots []*volumeSnapshot, volumePQs []parsedQuery, rankers []func(int) int, pq parsedQuery, limit int) ([]globalRankedEntry, int, bool, error) {
-	if !globalVolumesHaveRankForQuery(volumes, pq) {
+func collectGlobalMemoTopN(ids []globalRecordID, volumes []*serviceVolumeIndex, snapshots []*volumeSnapshot, volumePQs []parsedQuery, rankers []func(int) int, ranksComplete bool, pq parsedQuery, limit int) ([]globalRankedEntry, int, bool, error) {
+	// The caller has already resolved the rank arrays. Rechecking through
+	// rankForQuery could rebuild an uncached scalar/path rank a second time.
+	if !ranksComplete {
 		return nil, 0, false, nil
 	}
 	memos := make([]*queryMemo, len(volumes))
