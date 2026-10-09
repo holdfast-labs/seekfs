@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>seekfs — launch videos</title>
+<style>
+  :root{color-scheme:dark;font-family:system-ui,sans-serif;background:#080d12;color:#f0f4f6}
+  body{max-width:1100px;margin:0 auto;padding:48px 24px 80px}
+  header{display:flex;align-items:center;gap:20px;margin-bottom:32px}
+  header img{width:72px;height:72px}h1{margin:0;font-size:40px;letter-spacing:-1px}
+  h2{font-size:22px;margin-top:36px}p{line-height:1.6;color:#a9bac4}a{color:#40e8b5}
+  video{display:block;width:100%;background:#080d12;border:1px solid #314149;border-radius:14px}
+  .demos{display:grid;grid-template-columns:1fr 1fr;gap:24px}
+  @media(max-width:760px){.demos{grid-template-columns:1fr}}
+</style>
+<header><img src="seekfs-logo.png" alt="seekfs radar logo"><div><h1>Find your files.<br>Keep your flow.</h1></div></header>
+<p>Launch media for seekfs v1.11.0. <a href="https://github.com/holdfast-labs/seekfs">View on GitHub</a></p>
+<h2>Launch cut · 30 seconds · with original music</h2>
+<video controls playsinline preload="metadata" poster="seekfs-launch-poster.png" aria-label="seekfs launch video"><source src="seekfs-launch.mp4" type="video/mp4"></video>
+<div class="demos">
+  <section><h2>Desktop search · 16 seconds</h2><video controls muted playsinline preload="metadata" poster="seekfs-desktop-poster.png" aria-label="Desktop search and filters"><source src="seekfs-desktop.mp4" type="video/mp4"></video></section>
+  <section><h2>CLI, JSON and counts · 18 seconds</h2><video controls muted playsinline preload="metadata" aria-label="CLI search JSON and counts"><source src="seekfs-cli.mp4" type="video/mp4"></video></section>
+</div>
+<p>Illustrated walkthroughs rendered with fframes, using verified public-fixture results. Search names and paths, combine filters, get counts and emit JSON. <a href="README.md">Sources and details</a></p>
+</html>
