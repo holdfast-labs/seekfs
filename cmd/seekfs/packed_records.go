@@ -2,7 +2,6 @@ package main
 
 import (
 	"encoding/binary"
-	"os"
 	"sort"
 	"strings"
 	"sync"
@@ -199,9 +198,67 @@ func (m *MMapRecords) recordOffset(i int) (int, bool) {
 	return base, true
 }
 
-// parentNameAt fetches a record's parent id and name with a single offset
-// decode for parent-chain walks, instead of a full record assembly plus a
-// second decode for the name.
+// modeOff locates the scalar field block after the record references.
+func (m *MMapRecords) modeOff(i int) (int, bool) {
+	if m == nil || i < 0 || i >= m.count {
+		return 0, false
+	}
+	base, ok := m.recordOffset(i)
+	if !ok {
+		return 0, false
+	}
+	refBytes := 6
+	if m.wideRefs {
+		refBytes = 8
+	}
+	return base + 16 + refBytes, true
+}
+
+// modeAt reads just the mode word: one bounds-checked load for memo scan
+// loops that never touch the name or FRN paths.
+func (m *MMapRecords) modeAt(i int) (uint32, bool) {
+	off, ok := m.modeOff(i)
+	if !ok || off+4 > len(m.recordData) {
+		return 0, false
+	}
+	return binary.LittleEndian.Uint32(m.recordData[off:]), true
+}
+
+// sizeAt reads just the size word.
+func (m *MMapRecords) sizeAt(i int) (int64, bool) {
+	off, ok := m.modeOff(i)
+	if !ok || off+12 > len(m.recordData) {
+		return 0, false
+	}
+	return int64(binary.LittleEndian.Uint64(m.recordData[off+4:])), true
+}
+
+// parentAt reads just a record's parent id.
+func (m *MMapRecords) parentAt(i int) (int32, bool) {
+	if m == nil || i < 0 || i >= m.count {
+		return 0, false
+	}
+	base, ok := m.recordOffset(i)
+	if !ok {
+		return 0, false
+	}
+	parent, _ := m.recordRefs(base + 16)
+	if (!m.wideRefs && parent == compactNarrowParentSentinel) || (m.wideRefs && parent == compactWideParentSentinel) {
+		return -1, true
+	}
+	return int32(parent), true
+}
+
+// modUnixAt reads just the mtime word.
+func (m *MMapRecords) modUnixAt(i int) (int64, bool) {
+	off, ok := m.modeOff(i)
+	if !ok || off+20 > len(m.recordData) {
+		return 0, false
+	}
+	return int64(binary.LittleEndian.Uint64(m.recordData[off+12:])), true
+}
+
+// parentNameAt fetches a record's parent id and name with one offset decode.
 func (m *MMapRecords) parentNameAt(i int) (int32, string) {
 	if m == nil || i < 0 || i >= m.count {
 		return -1, ""
@@ -325,9 +382,7 @@ func (p *PackedRecords) Append(rec CompactRecord) {
 	p.NameOffs = append(p.NameOffs, 0)
 	p.NameLens = append(p.NameLens, 0)
 	p.LowerOffs = append(p.LowerOffs, 0)
-	if need := (len(p.FRNs) + 63) / 64; len(p.DirBits) < need {
-		p.DirBits = append(p.DirBits, 0)
-	}
+	p.Modes = append(p.Modes, 0)
 	if p.Size32 != nil {
 		p.Size32 = append(p.Size32, 0)
 		p.setSize(len(p.FRNs)-1, rec.Size)
@@ -355,8 +410,13 @@ func (p *PackedRecords) parentFRNAt(i int) uint64 {
 	if p == nil || i < 0 || i >= len(p.FRNs) {
 		return 0
 	}
-	if value, ok := p.ParentFRNExtras[i]; ok {
-		return value
+	// The extras map is almost always empty (it only holds records whose
+	// stored parent FRN differs from the parent index's FRN); skip the
+	// hash lookup so the hot record-decode path stays array reads.
+	if len(p.ParentFRNExtras) > 0 {
+		if value, ok := p.ParentFRNExtras[i]; ok {
+			return value
+		}
 	}
 	parent := int(p.Parents[i])
 	if parent >= 0 && parent < len(p.FRNs) {
@@ -440,74 +500,22 @@ func (p *PackedRecords) setDeleted(i int, value bool) {
 }
 
 func (p *PackedRecords) modeAt(i int) uint32 {
-	if p == nil || i < 0 {
+	if p == nil || i < 0 || i >= len(p.Modes) {
 		return 0
 	}
-	if len(p.ModeExtraIDs) > 0 {
-		id := uint32(i)
-		j := sort.Search(len(p.ModeExtraIDs), func(j int) bool { return p.ModeExtraIDs[j] >= id })
-		if j < len(p.ModeExtraIDs) && p.ModeExtraIDs[j] == id && j < len(p.ModeExtraValues) {
-			return p.ModeExtraValues[j]
-		}
-	}
-	word := i >> 6
-	if word >= len(p.DirBits) {
-		return 0
-	}
-	if p.DirBits[word]&(uint64(1)<<uint(i&63)) != 0 {
-		return uint32(os.ModeDir)
-	}
-	return 0
+	return p.Modes[i]
 }
 
 func (p *PackedRecords) setMode(i int, mode uint32) {
 	if p == nil || i < 0 || i >= len(p.FRNs) {
 		return
 	}
-	word := i >> 6
-	if word >= len(p.DirBits) {
-		next := make([]uint64, word+1)
-		copy(next, p.DirBits)
-		p.DirBits = next
+	if i >= len(p.Modes) {
+		next := make([]uint32, i+1)
+		copy(next, p.Modes)
+		p.Modes = next
 	}
-	mask := uint64(1) << uint(i&63)
-	if mode&uint32(os.ModeDir) != 0 {
-		p.DirBits[word] |= mask
-	} else {
-		p.DirBits[word] &^= mask
-	}
-	if mode == 0 || mode == uint32(os.ModeDir) {
-		p.removeModeExtra(i)
-		return
-	}
-	p.upsertModeExtra(i, mode)
-}
-
-func (p *PackedRecords) upsertModeExtra(i int, value uint32) {
-	id := uint32(i)
-	j := sort.Search(len(p.ModeExtraIDs), func(j int) bool { return p.ModeExtraIDs[j] >= id })
-	if j < len(p.ModeExtraIDs) && p.ModeExtraIDs[j] == id {
-		p.ModeExtraValues[j] = value
-		return
-	}
-	p.ModeExtraIDs = append(p.ModeExtraIDs, 0)
-	copy(p.ModeExtraIDs[j+1:], p.ModeExtraIDs[j:])
-	p.ModeExtraIDs[j] = id
-	p.ModeExtraValues = append(p.ModeExtraValues, 0)
-	copy(p.ModeExtraValues[j+1:], p.ModeExtraValues[j:])
-	p.ModeExtraValues[j] = value
-}
-
-func (p *PackedRecords) removeModeExtra(i int) {
-	id := uint32(i)
-	j := sort.Search(len(p.ModeExtraIDs), func(j int) bool { return p.ModeExtraIDs[j] >= id })
-	if j >= len(p.ModeExtraIDs) || p.ModeExtraIDs[j] != id {
-		return
-	}
-	copy(p.ModeExtraIDs[j:], p.ModeExtraIDs[j+1:])
-	p.ModeExtraIDs = p.ModeExtraIDs[:len(p.ModeExtraIDs)-1]
-	copy(p.ModeExtraValues[j:], p.ModeExtraValues[j+1:])
-	p.ModeExtraValues = p.ModeExtraValues[:len(p.ModeExtraValues)-1]
+	p.Modes[i] = mode
 }
 
 func (p *PackedRecords) setSize(i int, value int64) {

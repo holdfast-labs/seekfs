@@ -395,13 +395,22 @@ func collectGlobalVerifiedTopN(it globalIDIterator, volumes []*serviceVolumeInde
 			dropSatisfiedVolumeTerms(&volumePQs[i], vol.index.Volume)
 		}
 	}
+	if out, verified, ok, err := collectGlobalMemoTopN(ids, volumes, snapshots, volumePQs, rankers, pq, limit); ok {
+		return out, verified, err
+	}
 	if len(ids) < 2*serviceTrigramParallelVerifyMinIDs {
-		out, verified := collectGlobalVerifiedTopNRange(ids, volumes, snapshots, volumePQs, rankers, pq, limit, global, nil)
+		out, verified, canceled := collectGlobalVerifiedTopNRange(ids, volumes, snapshots, volumePQs, rankers, pq, limit, global, nil)
+		if canceled {
+			return nil, verified, errQueryCanceled
+		}
 		return out, verified, nil
 	}
 	workers := min(runtime.GOMAXPROCS(0), max(1, len(ids)/serviceTrigramParallelVerifyMinIDs))
 	if workers <= 1 {
-		out, verified := collectGlobalVerifiedTopNRange(ids, volumes, snapshots, volumePQs, rankers, pq, limit, global, nil)
+		out, verified, canceled := collectGlobalVerifiedTopNRange(ids, volumes, snapshots, volumePQs, rankers, pq, limit, global, nil)
+		if canceled {
+			return nil, verified, errQueryCanceled
+		}
 		return out, verified, nil
 	}
 	var stopped atomic.Bool
@@ -417,9 +426,12 @@ func collectGlobalVerifiedTopN(it globalIDIterator, volumes []*serviceVolumeInde
 		wg.Add(1)
 		go func(w, start, end int) {
 			defer wg.Done()
-			items, verified := collectGlobalVerifiedTopNRange(ids[start:end], volumes, snapshots, volumePQs, rankers, pq, limit, global, &stopped)
+			items, verified, canceled := collectGlobalVerifiedTopNRange(ids[start:end], volumes, snapshots, volumePQs, rankers, pq, limit, global, &stopped)
 			results[w].items = items
 			results[w].verified = verified
+			if canceled {
+				stopped.Store(true)
+			}
 		}(w, start, end)
 	}
 	wg.Wait()
@@ -459,7 +471,7 @@ func collectGlobalVerifiedTopN(it globalIDIterator, volumes []*serviceVolumeInde
 // worker-local path caches and a bounded heap. It is the serial whole-slice
 // path as well as the per-worker parallel path; stopped, when non-nil, is
 // shared across workers for prompt cancellation.
-func collectGlobalVerifiedTopNRange(ids []globalRecordID, volumes []*serviceVolumeIndex, snapshots []*volumeSnapshot, volumePQs []parsedQuery, rankers []func(int) int, pq parsedQuery, limit int, global bool, stopped *atomic.Bool) ([]globalRankedEntry, int) {
+func collectGlobalVerifiedTopNRange(ids []globalRecordID, volumes []*serviceVolumeIndex, snapshots []*volumeSnapshot, volumePQs []parsedQuery, rankers []func(int) int, pq parsedQuery, limit int, global bool, stopped *atomic.Bool) ([]globalRankedEntry, int, bool) {
 	h := &globalVerifiedTopHeap{pq: pq, global: global}
 	heap.Init(h)
 	pathCaches := make([]map[int]string, len(volumes))
@@ -476,7 +488,7 @@ func collectGlobalVerifiedTopNRange(ids []globalRecordID, volumes []*serviceVolu
 			if stopped != nil {
 				stopped.Store(true)
 			}
-			return nil, verified
+			return nil, verified, true
 		}
 		if globalHiddenContains(snapshots, id) || id.volume < 0 || id.volume >= len(volumes) {
 			continue
@@ -505,7 +517,7 @@ func collectGlobalVerifiedTopNRange(ids []globalRecordID, volumes []*serviceVolu
 	}
 	out := append([]globalRankedEntry(nil), h.items...)
 	sortGlobalRankedEntries(out, pq)
-	return out, verified
+	return out, verified, false
 }
 
 func countGlobalVerifiedIterator(it globalIDIterator, volumes []*serviceVolumeIndex, snapshots []*volumeSnapshot, pq parsedQuery) (int, int, error) {
@@ -525,12 +537,18 @@ func countGlobalVerifiedIterator(it globalIDIterator, volumes []*serviceVolumeIn
 		}
 	}
 	if len(ids) < 2*serviceTrigramParallelVerifyMinIDs {
-		count, verified := countGlobalVerifiedRange(ids, volumes, snapshots, volumePQs, pq, nil)
+		count, verified, canceled := countGlobalVerifiedRange(ids, volumes, snapshots, volumePQs, pq, nil)
+		if canceled {
+			return 0, verified, errQueryCanceled
+		}
 		return count, verified, nil
 	}
 	workers := min(runtime.GOMAXPROCS(0), max(1, len(ids)/serviceTrigramParallelVerifyMinIDs))
 	if workers <= 1 {
-		count, verified := countGlobalVerifiedRange(ids, volumes, snapshots, volumePQs, pq, nil)
+		count, verified, canceled := countGlobalVerifiedRange(ids, volumes, snapshots, volumePQs, pq, nil)
+		if canceled {
+			return 0, verified, errQueryCanceled
+		}
 		return count, verified, nil
 	}
 	var stopped atomic.Bool
@@ -546,9 +564,12 @@ func countGlobalVerifiedIterator(it globalIDIterator, volumes []*serviceVolumeIn
 		wg.Add(1)
 		go func(w, start, end int) {
 			defer wg.Done()
-			count, verified := countGlobalVerifiedRange(ids[start:end], volumes, snapshots, volumePQs, pq, &stopped)
+			count, verified, canceled := countGlobalVerifiedRange(ids[start:end], volumes, snapshots, volumePQs, pq, &stopped)
 			results[w].count = count
 			results[w].verified = verified
+			if canceled {
+				stopped.Store(true)
+			}
 		}(w, start, end)
 	}
 	wg.Wait()
@@ -566,7 +587,7 @@ func countGlobalVerifiedIterator(it globalIDIterator, volumes []*serviceVolumeIn
 // countGlobalVerifiedRange counts one slice of candidate IDs with
 // worker-local path caches. It is the serial whole-slice path as well as
 // the per-worker parallel path.
-func countGlobalVerifiedRange(ids []globalRecordID, volumes []*serviceVolumeIndex, snapshots []*volumeSnapshot, volumePQs []parsedQuery, pq parsedQuery, stopped *atomic.Bool) (int, int) {
+func countGlobalVerifiedRange(ids []globalRecordID, volumes []*serviceVolumeIndex, snapshots []*volumeSnapshot, volumePQs []parsedQuery, pq parsedQuery, stopped *atomic.Bool) (int, int, bool) {
 	pathCaches := make([]map[int]string, len(volumes))
 	count, verified := 0, 0
 	for _, id := range ids {
@@ -574,7 +595,7 @@ func countGlobalVerifiedRange(ids []globalRecordID, volumes []*serviceVolumeInde
 			if stopped != nil {
 				stopped.Store(true)
 			}
-			return 0, verified
+			return 0, verified, true
 		}
 		if globalHiddenContains(snapshots, id) || id.volume < 0 || id.volume >= len(volumes) {
 			continue
@@ -592,7 +613,7 @@ func countGlobalVerifiedRange(ids []globalRecordID, volumes []*serviceVolumeInde
 			count++
 		}
 	}
-	return count, verified
+	return count, verified, false
 }
 
 func globalRankItemBetter(a, b globalRankItem) bool {

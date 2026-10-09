@@ -101,6 +101,15 @@ func (vol *serviceVolumeIndex) plannedCountHidden(pq parsedQuery, hidden hiddenB
 			return count, true
 		}
 	}
+	// Name-memo count first: bit checks plus scalar record reads, no
+	// posting decode and no path reconstruction at all. Hidden ids are
+	// skipped inline; overlay records are merged by the caller, exactly as
+	// with the plan-execute path below.
+	if count, ok := vol.memoCount(pq, hidden); ok {
+		pq.Trace.setSource("memo-count", count)
+		pq.Trace.setComplete(true)
+		return count, true
+	}
 	plan, ok := vol.buildCandidatePlan(pq)
 	if !ok {
 		return 0, false

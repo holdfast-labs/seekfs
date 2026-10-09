@@ -501,6 +501,7 @@ func (s *goSearchService) serviceCommandIndexUSN(w io.Writer, req *serviceReques
 	releaseServiceMemoryAfterSave()
 	s.startBackgroundNameOrderBuilds([]*serviceVolumeIndex{vol})
 	s.startBackgroundNameTrigramBuilds([]*serviceVolumeIndex{vol})
+	s.startBackgroundNameIdentityBuilds([]*serviceVolumeIndex{vol})
 	serviceLog("index-usn complete volume=%s entries=%d", req.Volume, idx.entryCount())
 	_ = json.NewEncoder(w).Encode(serviceResponse{OK: true, Message: "indexed", Entries: idx.entryCount()})
 }
@@ -535,6 +536,7 @@ func (s *goSearchService) replaceLoadedVolume(dbPath string, idx *Index) {
 	s.indexMu.Unlock()
 	s.startBackgroundNameOrderBuilds([]*serviceVolumeIndex{vol})
 	s.startBackgroundNameTrigramBuilds([]*serviceVolumeIndex{vol})
+	s.startBackgroundNameIdentityBuilds([]*serviceVolumeIndex{vol})
 }
 
 func (s *goSearchService) replaceLoadedVolumeLocked(dbPath string, idx *Index) *serviceVolumeIndex {

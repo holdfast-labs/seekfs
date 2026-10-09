@@ -1349,9 +1349,7 @@ func (vol *serviceVolumeIndex) residentMemoryInfo() *residentMemoryInfo {
 			int64(len(p.NameOffs))*4 +
 			int64(len(p.NameLens))*2 +
 			int64(len(p.LowerOffs))*4 +
-			int64(len(p.DirBits))*8 +
-			int64(len(p.ModeExtraIDs))*4 +
-			int64(len(p.ModeExtraValues))*4 +
+			int64(len(p.Modes))*4 +
 			int64(len(p.Size32))*4 +
 			int64(len(p.Size64IDs))*4 +
 			int64(len(p.Size64Values))*8 +
@@ -1384,6 +1382,17 @@ func (vol *serviceVolumeIndex) residentMemoryInfo() *residentMemoryInfo {
 	info.ChildBytes = (len(vol.childOffsets) + len(vol.childIDs) + len(vol.rootIDs) + len(vol.subtreeOrder) + len(vol.subtreeStart) + len(vol.subtreeEnd)) * 4
 	info.FRNIndexBytes = len(vol.frns)*8 + len(vol.frnRecordIDs)*4
 	info.FRNOverlayEntries = len(vol.frnToID)
+	if ident := vol.index.nameIdent.Load(); ident != nil {
+		info.NameIdentityBytes = int64(len(ident.masks))*8 + int64(len(ident.exemplar)+len(ident.recName)+len(ident.roots))*4
+	}
+	if topo := vol.index.memoTopo.Load(); topo != nil {
+		info.NameIdentityBytes += int64(len(topo.order)) * 4
+	}
+	vol.index.nameMemo.mu.Lock()
+	if memo := vol.index.nameMemo.memo; memo != nil {
+		info.NameMemoBytes = int64(len(memo.nameBits)+len(memo.nameNeg)+len(memo.dirBits)+len(memo.dirNeg))*2 + int64(len(memo.visited))*8
+	}
+	vol.index.nameMemo.mu.Unlock()
 	info.KnownBytes = int64(info.NameBlobBytes) +
 		int64(info.LowerBlobBytes) +
 		info.RecordBytes +
@@ -1393,7 +1402,7 @@ func (vol *serviceVolumeIndex) residentMemoryInfo() *residentMemoryInfo {
 		int64(info.NameTrigramBytes) +
 		int64(info.TypePostBytes) +
 		int64(info.ChildBytes) +
-		int64(info.FRNIndexBytes)
+		int64(info.FRNIndexBytes) + info.NameIdentityBytes + info.NameMemoBytes
 	return info
 }
 
@@ -1532,7 +1541,7 @@ func newPackedRecords(records []CompactRecord) *PackedRecords {
 		NameOffs:    make([]uint32, len(records)),
 		NameLens:    make([]uint16, len(records)),
 		LowerOffs:   make([]uint32, len(records)),
-		DirBits:     make([]uint64, (len(records)+63)/64),
+		Modes:       make([]uint32, len(records)),
 		DeletedBits: make([]uint64, (len(records)+63)/64),
 		NameBlob:    make([]byte, 0, len(records)*16),
 		LowerBlob:   make([]byte, 0, len(records)*16),

@@ -366,6 +366,8 @@ type residentMemoryInfo struct {
 	ChildBytes        int   `json:"child_bytes,omitempty"`
 	FRNIndexBytes     int   `json:"frn_index_bytes,omitempty"`
 	FRNOverlayEntries int   `json:"frn_overlay_entries,omitempty"`
+	NameIdentityBytes int64 `json:"name_identity_bytes,omitempty"`
+	NameMemoBytes     int64 `json:"name_memo_bytes,omitempty"`
 	KnownBytes        int64 `json:"known_bytes,omitempty"`
 }
 

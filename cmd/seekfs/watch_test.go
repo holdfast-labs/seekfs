@@ -340,7 +340,7 @@ func TestRunWatchExecSubstitution(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Setenv("OUTLOG", log)
-	runWatchExec("powershell -NoProfile -File "+script+" {}", delta, false)
+	runWatchExec(`powershell -NoProfile -ExecutionPolicy Bypass -File "`+script+`" {}`, delta, false)
 
 	// PowerShell can take several seconds to start on a loaded CI runner, and
 	// the temp dir vanishes as soon as the test returns, so poll generously.

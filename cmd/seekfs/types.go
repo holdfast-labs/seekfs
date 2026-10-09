@@ -333,6 +333,26 @@ type Index struct {
 	// view.  It is reset when the volume is persisted (the new base already
 	// includes the overlay).
 	dirSizeDelta atomic.Pointer[map[int]int64]
+	// nameIdent holds the lazily built distinct-name identity (name ids,
+	// char masks, exemplars) backing the name-memo query lane. It is built
+	// once in the background after load; queries use it only when present.
+	// Base mutations that can change names (set/appendCompactRecord) reset
+	// it; order-preserving repacks keep it.
+	nameIdent atomic.Pointer[nameIdentity]
+	// nameIdentMu serializes the lazy identity build.
+	nameIdentMu sync.Mutex
+	// memoTopo caches the parents-first order of child-bearing records
+	// for the per-query dir fold. Built with the identity's lock; reset
+	// together with it.
+	memoTopo atomic.Pointer[dirTopo]
+	// memoGen is bumped on every identity reset so a memo built from a
+	// previous identity can never be stored or served afterwards.
+	memoGen atomic.Uint64
+	// nameMemo is the single-entry per-query memo cache (name bits plus
+	// folded dir bits with the identity it was built from). It carries its
+	// own lock; entries are validated by query signature, record count and
+	// generation before use.
+	nameMemo nameMemoCache
 }
 
 type indexDerivedSections struct {
@@ -695,9 +715,7 @@ type PackedRecords struct {
 	NameOffs        []uint32
 	NameLens        []uint16
 	LowerOffs       []uint32
-	DirBits         []uint64
-	ModeExtraIDs    []uint32
-	ModeExtraValues []uint32
+	Modes           []uint32
 	Size32          []uint32
 	Size64IDs       []uint32
 	Size64Values    []int64

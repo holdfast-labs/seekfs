@@ -655,6 +655,13 @@ func countServiceVolumesGlobalBoundedFallbackSnapshot(snapshot globalQuerySnapsh
 				continue
 			}
 		}
+		// Name-memo count: bit checks plus scalar record reads instead of
+		// per-record path verification. Hidden ids are skipped inline and
+		// overlay records merge below, exactly like the brute-force loop.
+		if count, ok := vol.memoCount(volumePQ, hidden); ok {
+			total += count
+			continue
+		}
 		cache := make(map[int]string)
 		for id := 0; id < vol.index.compactRecordCount(); id++ {
 			if id&1023 == 0 && queryCanceled(pq) {

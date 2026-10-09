@@ -153,6 +153,7 @@ func (s *goSearchService) rebuildWalkVolumeInPlace(vol *serviceVolumeIndex, reas
 	s.indexMu.Unlock()
 	releaseServiceMemoryAfterSave()
 	s.startBackgroundNameTrigramBuilds([]*serviceVolumeIndex{vol})
+	s.startBackgroundNameIdentityBuilds([]*serviceVolumeIndex{vol})
 	serviceLog("rebuilt walk index db=%s entries=%d reason=%s", vol.dbPath, loaded.entryCount(), reason)
 	return nil
 }
@@ -220,6 +221,7 @@ func (s *goSearchService) rebuildVolumeInPlace(vol *serviceVolumeIndex) error {
 	s.indexMu.Unlock()
 	releaseServiceMemoryAfterSave()
 	s.startBackgroundNameTrigramBuilds([]*serviceVolumeIndex{vol})
+	s.startBackgroundNameIdentityBuilds([]*serviceVolumeIndex{vol})
 	serviceLog("rebuilt stale index volume=%s db=%s entries=%d", rebuilt.volume, rebuilt.dbPath, rebuilt.index.entryCount())
 	return nil
 }

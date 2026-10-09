@@ -66,6 +66,7 @@ func (s *goSearchService) loadConfiguredIndexes() error {
 	s.sweepStaleIndexTempFiles()
 	s.startBackgroundNameOrderBuilds(volumes)
 	s.startBackgroundNameTrigramBuilds(volumes)
+	s.startBackgroundNameIdentityBuilds(volumes)
 	for _, vol := range volumes {
 		if vol.state == "ready" && vol.index.Compact && vol.index.Source == "usn" {
 			go s.replayVolumeLoop(vol)
@@ -176,6 +177,15 @@ func loadConfiguredVolume(dbPath string) (*Index, *serviceVolumeIndex, error) {
 		} else {
 			serviceLog("lowmem mmap load fallback volume=%s db=%s err=%v", vol.volume, dbPath, mmapErr)
 		}
+		debug.FreeOSMemory()
+	}
+	if idx.Compact && idx.MMapRecords == nil && idx.PackedRecords == nil && len(idx.Records) > 0 {
+		// Heap-backed index (walk builds, legacy loads): fold the record
+		// structs into deduped columnar storage and drop them. The writer
+		// and every query path read through the compact accessors, so the
+		// on-disk bytes and results are unchanged while resident memory
+		// drops by roughly a third (per-record Go strings dominate).
+		idx.packCompactRecords(true)
 		debug.FreeOSMemory()
 	}
 	vol.queryIndex = buildResidentQueryIndex(vol)

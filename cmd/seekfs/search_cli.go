@@ -160,6 +160,7 @@ func cmdBenchAgent(args []string) error {
 			svc := &goSearchService{}
 			svc.startBackgroundNameOrderBuilds(residentVolumes)
 			svc.startBackgroundNameTrigramBuilds(residentVolumes)
+			svc.startBackgroundNameIdentityBuilds(residentVolumes)
 			waitResidentBackgroundIndexes(residentVolumes, *residentWait)
 		} else {
 			indexes, err = loadIndexes(dbs)

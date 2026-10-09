@@ -402,6 +402,13 @@ func (vol *serviceVolumeIndex) boundedScanCandidatesFiltered(pq parsedQuery, fil
 			filter.members[int(id)] = struct{}{}
 		}
 	}
+	// Name-memo lane: the full ordered scan with bit checks instead of
+	// per-candidate path verification. Hidden exclusion does not apply on
+	// this floor (callers without snapshots filter afterwards), matching
+	// the legacy contract exactly.
+	if ids, ok := vol.memoScanAll(pq, hiddenBaseIDs{}, filter); ok {
+		return ids, true
+	}
 	recordCount := vol.index.compactRecordCount()
 	if recordCount == 0 {
 		return []int{}, true
@@ -548,6 +555,12 @@ func (vol *serviceVolumeIndex) boundedScanHiddenTop(pq parsedQuery, hidden hidde
 	recordCount := vol.index.compactRecordCount()
 	order := vol.orderForQuery(pq)
 	orderLen := compactUint32OrderLen(order, recordCount)
+	// Name-memo lane first: bit checks plus scalar record reads replace
+	// posting decode and per-candidate path verification, preserving the
+	// order, hidden, filter, limit and cancellation contract exactly.
+	if ids, ok := vol.memoScanTop(pq, hidden, limit, filter, order, orderLen); ok {
+		return ids, true
+	}
 	const serialPrefixPositions = 4 * serviceTrigramParallelVerifyMinIDs
 	// A narrowing membership filter makes most positions a cheap map
 	// lookup, so the serial early stop beats parallel fan-out; parallelize
@@ -667,7 +680,7 @@ func (vol *serviceVolumeIndex) plainTermNameTrigramExactEmpty(pq parsedQuery) bo
 		if len(term) < 3 || strings.ContainsAny(term, `\/*?[]:`) {
 			continue
 		}
-		if strings.IndexFunc(term, func(r rune) bool { return r > 127 }) >= 0 {
+		if strings.IndexFunc(term, func(r rune) bool { return r > 127 }) >= 0 || vol.plainTermMayOccurInPathPrefix(term) {
 			continue
 		}
 		grams := vol.nameTrigramIndex().termGramKeys(term)
@@ -706,7 +719,7 @@ func (vol *serviceVolumeIndex) planPlainTermPathFilter(pq parsedQuery) (filter *
 		if len(term) < 3 || strings.ContainsAny(term, `\/*?[]:`) {
 			continue
 		}
-		if strings.IndexFunc(term, func(r rune) bool { return r > 127 }) >= 0 {
+		if strings.IndexFunc(term, func(r rune) bool { return r > 127 }) >= 0 || vol.plainTermMayOccurInPathPrefix(term) {
 			continue
 		}
 		if !vol.plainTermPostingWorthBuilding(term) {
@@ -731,6 +744,19 @@ func (vol *serviceVolumeIndex) planPlainTermPathFilter(pq parsedQuery) (filter *
 		members[id] = struct{}{}
 	}
 	return &boundedScanMembershipFilter{members: members}, false, true
+}
+
+// plainTermMayOccurInPathPrefix protects name-only trigram proofs from path
+// components supplied by index metadata. Reconstructed paths start at Volume
+// or Roots[0], whose components need not have corresponding compact records.
+func (vol *serviceVolumeIndex) plainTermMayOccurInPathPrefix(term string) bool {
+	if vol == nil || vol.index == nil || term == "" {
+		return false
+	}
+	if containsFoldASCII(vol.index.Volume, term) {
+		return true
+	}
+	return len(vol.index.Roots) > 0 && containsFoldASCII(vol.index.Roots[0], term)
 }
 
 // plainTermPostingWorthBuilding reports whether intersecting a term's name

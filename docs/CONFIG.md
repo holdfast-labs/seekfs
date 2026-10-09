@@ -87,6 +87,7 @@ only accept the literal `1`.
 | Variable | Meaning | Default |
 | --- | --- | --- |
 | `SEEKFS_MEMORY_MODE` | `lowmem` (aliases `mmap`, `low-memory`) keeps indexes memory-mapped and drops the heaviest resident view; empty keeps everything resident | empty |
+| `SEEKFS_NAME_MEMO` | `0`, `false`, `no`, or `off` disables distinct-name query memoization and deferred rank materialization; low-memory mode also disables it | enabled |
 | `SEEKFS_GO_MEM_LIMIT_MB` | Go runtime soft memory limit, in MiB | runtime default |
 | `SEEKFS_IDLE_RELEASE_SECONDS` | Idle time before the service runs a GC and returns unused memory to the OS | `900` |
 | `SEEKFS_LOW_MEMORY_TRIGRAM_MAX_POSTING` | Low-memory cap on stored trigram posting length | `250000` |

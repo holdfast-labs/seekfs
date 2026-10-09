@@ -176,6 +176,8 @@ func (idx *Index) setCompactRecord(i int, rec CompactRecord) {
 	if i >= 0 && i < len(idx.Records) {
 		idx.Records[i] = rec
 	}
+	// Names may have changed: drop the name identity (rebuilt lazily).
+	idx.resetNameIdentity()
 }
 
 func (idx *Index) appendCompactRecord(rec CompactRecord) int {
@@ -189,6 +191,8 @@ func (idx *Index) appendCompactRecord(rec CompactRecord) int {
 	if idx.PackedRecords == nil || idx.Records != nil {
 		idx.Records = append(idx.Records, rec)
 	}
+	// The record population changed: drop the name identity.
+	idx.resetNameIdentity()
 	return id
 }
 
