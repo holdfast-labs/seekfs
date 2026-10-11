@@ -185,7 +185,7 @@ func (s *goSearchService) featureVolumeMatches(vol *serviceVolumeIndex, v *featu
 				return err
 			}
 		}
-		cache = boundContentPathCache(cache)
+		cache = boundPathCache(cache)
 		return nil
 	}
 	if len(pq.Features) > 0 {

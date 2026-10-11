@@ -293,7 +293,7 @@ func (s *goSearchService) featureChanges(vol *serviceVolumeIndex, v *featureVolu
 		} else {
 			out = append(out, feature.Record{FRN: ch.FRN, Deleted: true})
 		}
-		cache = boundContentPathCache(cache)
+		cache = boundPathCache(cache)
 	}
 	return out, true, nil
 }
