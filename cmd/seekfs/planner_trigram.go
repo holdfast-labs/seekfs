@@ -471,7 +471,9 @@ func (vol *serviceVolumeIndex) nameNgramNameTermPosting(term string, trigrams *c
 		if entry, ok := vol.termCache[cacheKey]; ok {
 			if vol.cacheStampValid(entry.gen) {
 				vol.termMu.Unlock()
-				return vol.withRecentCandidates(entry.ids, entry.gen, func(rec CompactRecord) bool {
+				// Callers rank-sort candidate lists in place; never hand
+				// out the cached slice itself.
+				return vol.withRecentCandidates(append([]int(nil), entry.ids...), entry.gen, func(rec CompactRecord) bool {
 					id, ok := vol.idForFRN(rec.FRN)
 					return ok && vol.nameTrigramCandidateMatches(id, term)
 				}), true
@@ -492,7 +494,7 @@ func (vol *serviceVolumeIndex) nameNgramNameTermPosting(term string, trigrams *c
 	out := vol.verifyNameTrigramCandidateIDs(ids, term)
 	out = uniqueSortedInts(out)
 	vol.cacheNamePosting(cacheKey, out)
-	return vol.withNameTrigramRecentCandidates(out, term), true
+	return vol.withNameTrigramRecentCandidates(append([]int(nil), out...), term), true
 }
 
 func (vol *serviceVolumeIndex) nameTrigramRecentMatches(term string) []int {
