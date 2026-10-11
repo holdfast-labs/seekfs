@@ -786,14 +786,15 @@ func (it *globalPathTermFilterIterator) contains(id globalRecordID) bool {
 		}
 	}
 	if it.fast[id.volume] {
-		// PCMP represents exact directory components.  For a filtered
-		// candidate, walk only its parent chain instead of copying the full
-		// root posting (Users can have millions of descendants).
+		// For a filtered candidate, walk only its parent chain instead of
+		// copying the full root posting (Users can have millions of
+		// descendants). Path terms are substrings, so an ancestor named
+		// "main_content" satisfies "content" just like an exact component.
 		if strings.Contains(vol.index.compactLowerNameAt(id.local), it.term) {
 			return true
 		}
 		for current := id.local; current >= 0 && current < vol.index.compactRecordCount(); {
-			if current != id.local && strings.EqualFold(vol.index.compactLowerNameAt(current), it.term) {
+			if current != id.local && strings.Contains(vol.index.compactLowerNameAt(current), it.term) {
 				return true
 			}
 			rec := vol.index.compactRecord(current)

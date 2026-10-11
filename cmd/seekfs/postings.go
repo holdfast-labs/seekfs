@@ -372,11 +372,55 @@ func (vol *serviceVolumeIndex) buildMappedComponentCoverage(component string, se
 		len(vol.subtreeOrder) == 0 || len(vol.subtreeStart) == 0 || len(vol.subtreeEnd) == 0 {
 		return coverage, false
 	}
-	candidate, ok := vol.componentPostingCountCandidate(component)
-	if !ok || (!candidate.mapped && candidate.ids == nil) {
+	roots, ok := vol.componentSubstringRoots(component)
+	if !ok {
 		return coverage, false
 	}
-	return vol.buildMappedComponentCoverageFromRoots(candidate.materialize(), coverage.selfIDs)
+	return vol.buildMappedComponentCoverageFromRoots(roots, coverage.selfIDs)
+}
+
+// componentSubstringRoots returns every directory whose component name
+// contains component. Path terms are substrings of the full path, so a
+// directory named "main_content" roots matches for "content" just like one
+// named exactly "content"; using only the exact key dropped those subtrees.
+func (vol *serviceVolumeIndex) componentSubstringRoots(component string) ([]uint32, bool) {
+	if vol == nil || vol.index == nil {
+		return nil, false
+	}
+	key := strings.ToLower(component)
+	if vol.index.Derived.Postings != nil {
+		if section, exists := vol.index.Derived.Postings[indexSectionPCMP]; exists {
+			keys, complete := section.matchingStringPostingKeys(key)
+			if !complete {
+				return nil, false
+			}
+			var roots []uint32
+			for _, postingKey := range keys {
+				it, _, ok := section.stringPostingIterator(postingKey)
+				if !ok {
+					return nil, false
+				}
+				for {
+					ids, _, ok := it.nextBlock()
+					if !ok {
+						break
+					}
+					roots = append(roots, ids...)
+				}
+			}
+			return roots, true
+		}
+	}
+	if vol.queryIndex != nil && vol.queryIndex.components != nil {
+		var roots []uint32
+		for name, ids := range vol.queryIndex.components {
+			if strings.Contains(name, key) {
+				roots = append(roots, ids...)
+			}
+		}
+		return roots, true
+	}
+	return nil, false
 }
 
 func (vol *serviceVolumeIndex) buildMappedComponentCoverageFromRoots(roots []uint32, selfIDs []int) (mappedComponentCoverage, bool) {

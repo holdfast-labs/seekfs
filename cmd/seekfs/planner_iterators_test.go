@@ -149,6 +149,37 @@ func TestMappedComponentCoverageMergesNestedRootsAndHiddenSelfHits(t *testing.T)
 	}
 }
 
+func TestMappedComponentCoverageIncludesPartialNameRoots(t *testing.T) {
+	idx := &Index{
+		Version: indexVersion, Source: "usn", Volume: "C:", Compact: true,
+		Records: []CompactRecord{
+			{FRN: 1, ParentFRN: 1, Parent: -1, Name: ".", Mode: uint32(os.ModeDir)},
+			{FRN: 2, ParentFRN: 1, Parent: 0, Name: "content", Mode: uint32(os.ModeDir)},
+			{FRN: 3, ParentFRN: 2, Parent: 1, Name: "a.txt"},
+			{FRN: 4, ParentFRN: 1, Parent: 0, Name: "main_content", Mode: uint32(os.ModeDir)},
+			{FRN: 5, ParentFRN: 4, Parent: 3, Name: "b.txt"},
+		},
+	}
+	buildOrders(idx)
+	vol := newServiceVolumeIndex("component-partial.gsi", idx)
+	vol.buildCompactChildren()
+	vol.buildSubtreeRanges()
+	vol.queryIndex = &residentQueryIndex{components: map[string][]uint32{"content": {1}, "main_content": {3}}}
+
+	coverage, ok := vol.buildMappedComponentCoverage("content", nil)
+	if !ok {
+		t.Fatal("mapped component coverage declined")
+	}
+	// content, a.txt, main_content, b.txt: "content" is a substring of every
+	// path under main_content, so its subtree belongs to the coverage.
+	if coverage.rootCount != 2 || coverage.cardinality != 4 {
+		t.Fatalf("coverage roots/cardinality = %d/%d, want 2/4", coverage.rootCount, coverage.cardinality)
+	}
+	if !coverage.contains(vol, 4) {
+		t.Fatal("main_content\\b.txt missing from content coverage")
+	}
+}
+
 func TestMappedComponentSubstringCoverageUsesCompletePCMPDictionary(t *testing.T) {
 	idx := &Index{
 		Version: indexVersion, Source: "usn", Volume: "C:", Compact: true,
