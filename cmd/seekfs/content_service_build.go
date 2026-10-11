@@ -102,6 +102,10 @@ var (
 // must stop (generation change or shutdown) without publishing a partial index.
 var errContentBuildAborted = errors.New("content build aborted")
 
+// errContentBuildStale reports that the base generation moved before a built
+// sidecar could be published.
+var errContentBuildStale = errors.New("content build stale")
+
 // contentBuildSnapshotResult tells runContentBuild what a metadata snapshot
 // produced.
 type contentBuildSnapshotResult int
@@ -746,68 +750,121 @@ func (s *goSearchService) runContentBuild(vol *serviceVolumeIndex, reuseSidecar 
 		}
 		return selected[i].item.path < selected[j].item.path
 	})
-	next := 0
-	source := func() (contentBuildDoc, bool, error) {
-		if vol.replayGen.Load() != gen || next%contentBuildBatchSize == 0 && !s.contentBuildCurrent(vol, gen, journalID) {
-			abortReason, abortRetry = "journal generation changed during assembly", true
-			return contentBuildDoc{}, false, errContentBuildAborted
+	// sourceOf streams the selected docs at the given positions (ascending
+	// FRN) back out of the spool.
+	sourceOf := func(order []int) contentBuildSource {
+		next := 0
+		return func() (contentBuildDoc, bool, error) {
+			if vol.replayGen.Load() != gen || next%contentBuildBatchSize == 0 && !s.contentBuildCurrent(vol, gen, journalID) {
+				abortReason, abortRetry = "journal generation changed during assembly", true
+				return contentBuildDoc{}, false, errContentBuildAborted
+			}
+			if s.contentStopped(vol) {
+				abortReason = "service stopping"
+				return contentBuildDoc{}, false, errContentBuildAborted
+			}
+			if next == len(order) {
+				return contentBuildDoc{}, false, nil
+			}
+			s := selected[order[next]]
+			next++
+			text := make([]byte, s.length)
+			if _, err := spool.ReadAt(text, s.offset); err != nil {
+				return contentBuildDoc{}, false, err
+			}
+			return contentBuildDoc{path: s.item.path, frn: s.item.frn, text: text, modUnix: s.modUnix, class: s.class, version: s.version}, true, nil
 		}
-		if s.contentStopped(vol) {
-			abortReason = "service stopping"
-			return contentBuildDoc{}, false, errContentBuildAborted
-		}
-		if next == len(selected) {
-			return contentBuildDoc{}, false, nil
-		}
-		s := selected[next]
-		next++
-		text := make([]byte, s.length)
-		if _, err := spool.ReadAt(text, s.offset); err != nil {
-			return contentBuildDoc{}, false, err
-		}
-		return contentBuildDoc{path: s.item.path, frn: s.item.frn, text: text, modUnix: s.modUnix, class: s.class, version: s.version}, true, nil
 	}
-	cidx, err := assembleContentIndexStream(source, tmpDir)
-	if err != nil {
-		if errors.Is(err, errContentBuildAborted) {
-			vol.content.markBuildCanceled(abortReason)
-			retry = abortRetry
-			return
-		}
-		vol.content.markBuildFailed(err.Error())
-		return
+	header := &contentIndex{
+		Origin:        contentOriginUSN,
+		JournalID:     journalID,
+		CheckpointUSN: uint64(checkpoint),
+		Policy:        contentBuildPolicy{MaxRaw: settings.maxRaw, MaxText: settings.maxText, Skipped: skipped, Truncated: truncated, ScopeDropped: scopeDropped},
 	}
-	vol.content.setBuildProgress(done, total)
-	cidx.Origin = contentOriginUSN
-	cidx.JournalID = journalID
-	cidx.CheckpointUSN = uint64(checkpoint)
-	cidx.Policy = contentBuildPolicy{MaxRaw: settings.maxRaw, MaxText: settings.maxText, Skipped: skipped, Truncated: truncated, ScopeDropped: scopeDropped}
 	if opts.Scope != nil {
-		cidx.ScopeHash = opts.Scope.fingerprint()
+		header.ScopeHash = opts.Scope.fingerprint()
 	}
-
-	// Re-check before publishing: the volume could have been rebuilt (or the
-	// service stopped) during the minutes-long extraction.
-	if !s.contentBuildCurrent(vol, gen, journalID) {
-		vol.content.markBuildCanceled("journal generation changed before publish")
-		retry = true
-		return
+	stamp := func(cidx *contentIndex) {
+		cidx.Origin = header.Origin
+		cidx.JournalID = header.JournalID
+		cidx.CheckpointUSN = header.CheckpointUSN
+		cidx.Policy = header.Policy
+		cidx.ScopeHash = header.ScopeHash
 	}
 	gsx := contentIndexPathForDB(vol.dbPath)
 	if gsx == "" {
 		vol.content.markBuildFailed("no content sidecar path")
 		return
 	}
-	if err := contentSaveFile(gsx, cidx); err != nil {
+	// save assembles and writes the sidecar: one file for a corpus within a
+	// shard, otherwise folder shards plus a manifest. Shards are assembled one
+	// at a time, so peak memory is bounded by the largest shard.
+	save := func() error {
+		if used <= contentShardTargetBytes {
+			all := make([]int, len(selected))
+			for i := range all {
+				all[i] = i
+			}
+			cidx, err := assembleContentIndexStream(sourceOf(all), tmpDir)
+			if err != nil {
+				return err
+			}
+			stamp(cidx)
+			if !s.contentBuildCurrent(vol, gen, journalID) {
+				return errContentBuildStale
+			}
+			return contentSaveFile(gsx, cidx)
+		}
+		paths := make([]string, len(selected))
+		sizes := make([]int64, len(selected))
+		for i, d := range selected {
+			paths[i], sizes[i] = d.item.path, int64(d.length)
+		}
+		groups := contentGroupByShard(contentPlanShards(paths, sizes, contentShardTargetBytes), paths)
+		dir := contentShardDir(gsx)
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return err
+		}
+		infos := make([]contentShardInfo, 0, len(groups))
+		for _, g := range groups {
+			cidx, err := assembleContentIndexStream(sourceOf(g.docs), tmpDir)
+			if err != nil {
+				return err
+			}
+			stamp(cidx)
+			info, err := contentSaveShard(dir, cidx, g.prefixes)
+			if err != nil {
+				return err
+			}
+			infos = append(infos, info)
+		}
+		if !s.contentBuildCurrent(vol, gen, journalID) {
+			return errContentBuildStale
+		}
+		serviceLog("content build volume=%s shards=%d", vol.volume, len(infos))
+		return contentSaveManifest(gsx, header, infos)
+	}
+	err = save()
+	vol.content.setBuildProgress(done, total)
+	if err != nil {
 		var sizeErr *contentGSXSizeError
-		if errors.As(err, &sizeErr) {
+		switch {
+		case errors.Is(err, errContentBuildAborted):
+			vol.content.markBuildCanceled(abortReason)
+			retry = abortRetry
+		case errors.Is(err, errContentBuildStale):
+			// The volume could have been rebuilt (or the service stopped)
+			// during the minutes-long extraction.
+			vol.content.markBuildCanceled("journal generation changed before publish")
+			retry = true
+		case errors.As(err, &sizeErr):
 			// Over the size cap: refuse to publish rather than truncate. The
 			// volume is surfaced degraded with the size in health; no base is
 			// written, so no content is silently dropped.
 			vol.content.markSidecarCapped(sizeErr.size, sizeErr.cap)
-			return
+		default:
+			vol.content.markBuildFailed(err.Error())
 		}
-		vol.content.markBuildFailed(err.Error())
 		return
 	}
 	// Publish through the normal attach path: it loads under indexMu and
@@ -815,6 +872,9 @@ func (s *goSearchService) runContentBuild(vol *serviceVolumeIndex, reuseSidecar 
 	// save is not overwritten with this build.
 	s.attachContentForVolume(vol)
 	if vol.content.readerView() != nil {
+		// The replaced base is released by now, so shards it alone named
+		// can be deleted.
+		contentSweepShards(gsx)
 		return
 	}
 	if !s.contentBuildCurrent(vol, gen, journalID) {

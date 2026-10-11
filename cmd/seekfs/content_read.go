@@ -94,6 +94,9 @@ func openContentReader(idx *contentIndex) (*contentReader, error) {
 	if idx == nil {
 		return nil, errors.New("nil content index")
 	}
+	if idx.shards != nil {
+		return &contentReader{idx: idx}, nil
+	}
 	r := &contentReader{
 		idx:   idx,
 		text:  idx.Sections[contentSectionText],
@@ -128,6 +131,12 @@ func openContentReader(idx *contentIndex) (*contentReader, error) {
 
 // docText returns the stored text of a document.
 func (r *contentReader) docText(docID uint32) []byte {
+	if r.idx.shards != nil {
+		if sh, local, ok := r.shardOf(docID); ok {
+			return sh.reader.docText(local)
+		}
+		return nil
+	}
 	if int(docID) >= len(r.idx.Docs) {
 		return nil
 	}
@@ -141,6 +150,12 @@ func (r *contentReader) docText(docID uint32) []byte {
 
 // docPath returns the path for a docID.
 func (r *contentReader) docPath(docID uint32) string {
+	if r.idx.shards != nil {
+		if sh, local, ok := r.shardOf(docID); ok {
+			return sh.reader.docPath(local)
+		}
+		return ""
+	}
 	if int(docID) < len(r.paths) {
 		return r.paths[docID]
 	}
@@ -203,6 +218,15 @@ func (r *contentReader) candidates(term string, budget int) []uint32 {
 // when the term has no trigram constraint. Each trigram list is pulled block by
 // block, so the lists are never held in memory at once.
 func (r *contentReader) candidateStream(term string) func() (uint32, bool) {
+	return r.candidateStreamIn(term, nil)
+}
+
+// candidateStreamIn is candidateStream limited to the shards mask selects
+// (see shardMaskUnder); a nil mask, or an unsharded reader, means all docs.
+func (r *contentReader) candidateStreamIn(term string, mask []bool) func() (uint32, bool) {
+	if r.idx.shards != nil {
+		return r.shardedCandidateStream(term, mask)
+	}
 	if len(term) < 3 || r.grams == nil {
 		return r.allDocIDStream()
 	}

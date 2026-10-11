@@ -144,6 +144,7 @@ when none is usable the query errors rather than returning empty.
 | `content_extract_text.go` / `_ooxml.go` / `_pdf.go` | Extractors: text/code; OOXML/ODF/EPUB; best-effort PDF (spike quality). |
 | `content_open_windows.go` / `_other.go` | `contentOpenNoRecall`: opens with `FILE_FLAG_OPEN_NO_RECALL` so cloud placeholders fail instead of hydrating. |
 | `content_build.go` | Offline builders + options. `buildContentIndexFromDir` (walk, `origin=walk`, path-hash keys), `buildContentIndexForIndex` (USN, `origin=usn`, record-FRN keys), `assembleContentIndex` (streams postings through the external builder), `contentRepairText` (case-preserving stored text), `contentFoldText` (case-folded index view), `contentPathKey`, `contentTermsOf`, `contentGramsOf`, path table codec. |
+| `content_shards.go` | Sharded sidecars: manifest codec (CXSH, format v5), folder shard planner and longest-prefix assigner, composite load, shard-aware candidate streams and `under:` shard mask, per-shard fold planning/source, shard file sweep. |
 | `content_read.go` | `contentReader`: decode sections, trigram-intersection candidates, substring verification, `contentHit{Path,DocID,Offset}`. |
 | `content_resolver.go` | `contentResolver`: merges FRN-sorted docs against the base FRN column → `docID -> recordID` (`contentNoRecordID` = dropped). |
 | `content_query.go` | `contentLeaf`, `contentSearchEnabled`, `contentUnavailableError`, `parseContentLeaf`, `queryHasPositiveContentLeaf`, deterministic `contentAssignLeafIDs`. |
@@ -554,6 +555,46 @@ Residual / known limitations (all explicit deferrals):
   the PDF itself.
 - **Dead code.** `contentPostingIndex.lookup`/`forEach` and
   `contentLossyFixups.toSourceOffset`/`isEmpty` are test-only (annotated).
+
+## 6i. Sharded sidecars (done)
+
+A corpus with more than `contentShardTargetBytes` (64 MiB) of extracted text is
+split by folder. `<gsx>.shards\` holds immutable shard files and the `.gsx`
+becomes a small **manifest** (format v5, section `CXSH`) listing each shard's
+file name, doc count and owned folder prefixes. Smaller corpora still produce a
+single v4 file. Older binaries reject v5, so they rebuild rather than attaching
+an empty index.
+
+- **Ownership.** A path belongs to the shard owning its longest matching
+  folder prefix. The root prefix `""` always exists, so folders created after
+  the build have an owner. The planner keeps a folder whole when its subtree
+  fits. A bigger folder keeps its own files as one unit and is split by child
+  folder. Units are then packed into shards in path order, so neighbouring
+  folders share a shard.
+- **Composite load.** `contentLoadFile` on a manifest maps every shard and
+  returns one `contentIndex` whose `Docs` concatenate the shards with DocIDs
+  rebased. The reader dispatches `docText`/`docPath`/candidate streams by DocID
+  range. The resolver sorts an FRN permutation because the composite is
+  FRN-sorted only within each shard. Health, attach and queries are unchanged.
+- **Build.** Each shard is assembled and saved in turn, then the manifest is
+  saved atomically, so peak memory is bounded by one shard.
+- **Fold.** `planContentShardedFold` marks dirty the shards that hold a delta
+  FRN today and the shards owning each delta doc's path. A rename across
+  folders therefore drops the old copy and adds the new one. Only dirty shards
+  are rewritten, and a new manifest is published. Shard files no manifest
+  names are swept after publish; a file still mapped on Windows is left for a
+  later sweep.
+- **`under:`.** `shardMaskUnder` limits content candidates to the shards that
+  can hold docs under the folder: the folder's owner plus any shard owning a
+  prefix inside it.
+- **Measured (Chromium, 62k files / 508 MB text):** with a single file, every
+  fold re-assembled everything in about 2m13s with a 3.4 GB heap peak. With 64
+  MiB shards (10 shards, 6% larger on disk), a 100-file edit in one folder took
+  13 s, a clustered 8,192-file edit took 15 s (2 shards), and a spread
+  8,192-file edit took 1m43s (all shards), each peaking near 1 GB.
+- **Not yet:** an unsharded base that grows past the target through folds stays
+  one file until the next full rebuild, and shards are not rebalanced between
+  rebuilds. The offline `content-index` CLI still writes a single file.
 
 ## 7. Carried debt / known gaps
 

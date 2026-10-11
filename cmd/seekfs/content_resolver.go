@@ -14,14 +14,17 @@ const contentNoRecordID = ^uint32(0)
 
 // contentResolver maps content docs to base record IDs.
 //
-// docs and docRecordID are parallel and docs is sorted by FRN. docRecordID[i]
-// is the base record ID for docs[i], or contentNoRecordID when dropped.
+// docs and docRecordID are parallel. docRecordID[i] is the base record ID for
+// docs[i], or contentNoRecordID when dropped. docs is FRN-sorted for a
+// single-file base; a sharded base is sorted only within each shard, so order
+// then lists doc indexes in FRN order (nil when docs is already sorted).
 type contentResolver struct {
 	docs        []contentDoc
 	docRecordID []uint32
+	order       []uint32
 }
 
-// buildContentResolver joins the FRN-sorted doc table with the base FRN column.
+// buildContentResolver joins the doc table with the base FRN column.
 // baseFRNs must be sorted ascending with baseIDs parallel to it (this is the
 // shape of the persisted FRNS section). The join is O(len(docs)+len(baseFRNs)).
 func buildContentResolver(docs []contentDoc, baseFRNs []uint64, baseIDs []uint32) *contentResolver {
@@ -29,8 +32,16 @@ func buildContentResolver(docs []contentDoc, baseFRNs []uint64, baseIDs []uint32
 		docs:        docs,
 		docRecordID: make([]uint32, len(docs)),
 	}
+	if !sort.SliceIsSorted(docs, func(i, j int) bool { return docs[i].FRN < docs[j].FRN }) {
+		r.order = make([]uint32, len(docs))
+		for i := range r.order {
+			r.order[i] = uint32(i)
+		}
+		sort.Slice(r.order, func(a, b int) bool { return docs[r.order[a]].FRN < docs[r.order[b]].FRN })
+	}
 	j := 0
-	for i := range docs {
+	for k := range docs {
+		i := r.at(k)
 		frn := docs[i].FRN
 		for j < len(baseFRNs) && baseFRNs[j] < frn {
 			j++
@@ -61,11 +72,19 @@ func (r *contentResolver) docForFRN(frn uint64) (int, bool) {
 	if r == nil {
 		return 0, false
 	}
-	i := sort.Search(len(r.docs), func(i int) bool { return r.docs[i].FRN >= frn })
-	if i < len(r.docs) && r.docs[i].FRN == frn {
-		return i, true
+	k := sort.Search(len(r.docs), func(k int) bool { return r.docs[r.at(k)].FRN >= frn })
+	if k < len(r.docs) && r.docs[r.at(k)].FRN == frn {
+		return r.at(k), true
 	}
 	return 0, false
+}
+
+// at returns the doc index holding the k-th smallest FRN.
+func (r *contentResolver) at(k int) int {
+	if r.order == nil {
+		return k
+	}
+	return int(r.order[k])
 }
 
 // liveDocCount reports how many docs currently map to a base record.

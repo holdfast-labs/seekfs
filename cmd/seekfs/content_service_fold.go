@@ -57,6 +57,10 @@ var (
 // save failure and prove the delta is kept.
 var contentFoldSave = contentSaveFile
 
+// contentFoldSaveManifest publishes a sharded fold's manifest; a var for the
+// same reason as contentFoldSave.
+var contentFoldSaveManifest = contentSaveManifest
+
 // contentFoldSnapshotHook runs after the delta snapshot is taken and before any
 // base text is read. Tests use it to mutate the delta mid-fold (an
 // observeChanges delete) and prove the change is not lost.
@@ -130,7 +134,7 @@ func (s *goSearchService) runContentFold(vol *serviceVolumeIndex) {
 	if len(snap) == 0 {
 		return
 	}
-	reader, _ := vol.content.readerResolverView()
+	reader, resolver := vol.content.readerResolverView()
 	if reader == nil || reader.idx == nil {
 		return
 	}
@@ -142,20 +146,7 @@ func (s *goSearchService) runContentFold(vol *serviceVolumeIndex) {
 		vol.contentCoord.foldFailed(contentFoldRetryBackoff)
 		return
 	}
-	contentFoldAssembleHook()
-	source := newContentFoldSource(reader, snap)
-	cidx, err := assembleContentIndexStream(func() (contentBuildDoc, bool, error) {
-		if s.contentStopped(vol) {
-			return contentBuildDoc{}, false, errContentBuildAborted
-		}
-		return source.next()
-	}, tmpDir)
-	_ = os.RemoveAll(tmpDir)
-	if err != nil {
-		serviceLog("content fold assemble failed volume=%s err=%v", vol.volume, err)
-		vol.contentCoord.foldFailed(contentFoldRetryBackoff)
-		return
-	}
+	defer os.RemoveAll(tmpDir)
 	checkpoint := observedUSN
 	if checkpoint < base.CheckpointUSN {
 		checkpoint = base.CheckpointUSN
@@ -167,26 +158,88 @@ func (s *goSearchService) runContentFold(vol *serviceVolumeIndex) {
 	if vol.contentCoord.hasDeferred() {
 		checkpoint = base.CheckpointUSN
 	}
-	cidx.Origin = contentOriginUSN
-	cidx.JournalID = base.JournalID
-	cidx.CheckpointUSN = checkpoint
-	// Carry the prior extraction policy/caps so health stays truthful; the
-	// snapshot already filtered the corpus the same way the base was.
-	cidx.Policy = base.Policy
-	cidx.ScopeHash = base.ScopeHash
-
-	if !s.contentBuildCurrent(vol, gen, base.JournalID) {
-		// A rebuild/journal reset moved under the fold; keep the delta for the
-		// next fold against the new generation rather than publish stale.
-		vol.contentCoord.foldFailed(contentFoldRetryBackoff)
-		return
+	// The folded base keeps the prior extraction policy/caps so health stays
+	// truthful; the snapshot already filtered the corpus the same way the base
+	// was.
+	header := &contentIndex{Origin: contentOriginUSN, JournalID: base.JournalID, CheckpointUSN: checkpoint, Policy: base.Policy, ScopeHash: base.ScopeHash}
+	stamp := func(cidx *contentIndex) {
+		cidx.Origin = header.Origin
+		cidx.JournalID = header.JournalID
+		cidx.CheckpointUSN = header.CheckpointUSN
+		cidx.Policy = header.Policy
+		cidx.ScopeHash = header.ScopeHash
 	}
 	gsx := contentIndexPathForDB(vol.dbPath)
 	if gsx == "" {
 		vol.contentCoord.foldFailed(contentFoldRetryBackoff)
 		return
 	}
-	if err := contentFoldSave(gsx, cidx); err != nil {
+	stopped := func() bool { return s.contentStopped(vol) }
+	contentFoldAssembleHook()
+	var rewritten int
+	var saveErr error
+	if base.shards == nil {
+		source := newContentFoldSource(reader, snap)
+		cidx, err := assembleContentIndexStream(func() (contentBuildDoc, bool, error) {
+			if stopped() {
+				return contentBuildDoc{}, false, errContentBuildAborted
+			}
+			return source.next()
+		}, tmpDir)
+		if err != nil {
+			serviceLog("content fold assemble failed volume=%s err=%v", vol.volume, err)
+			vol.contentCoord.foldFailed(contentFoldRetryBackoff)
+			return
+		}
+		stamp(cidx)
+		if !s.contentBuildCurrent(vol, gen, base.JournalID) {
+			// A rebuild/journal reset moved under the fold; keep the delta for
+			// the next fold against the new generation rather than publish
+			// stale.
+			vol.contentCoord.foldFailed(contentFoldRetryBackoff)
+			return
+		}
+		rewritten = len(cidx.Docs)
+		saveErr = contentFoldSave(gsx, cidx)
+	} else {
+		// Sharded: rewrite only the shards the delta touches; the others are
+		// named unchanged by the new manifest.
+		plan := planContentShardedFold(reader, resolver, snap)
+		infos := make([]contentShardInfo, len(base.shards))
+		for i, sh := range base.shards {
+			infos[i] = sh.info
+			if !plan.dirty[i] || saveErr != nil {
+				continue
+			}
+			source := contentShardFoldSource(sh, plan.incoming[i], plan.drop)
+			cidx, err := assembleContentIndexStream(func() (contentBuildDoc, bool, error) {
+				if stopped() {
+					return contentBuildDoc{}, false, errContentBuildAborted
+				}
+				return source()
+			}, tmpDir)
+			if err != nil {
+				serviceLog("content fold assemble failed volume=%s shard=%s err=%v", vol.volume, sh.info.File, err)
+				vol.contentCoord.foldFailed(contentFoldRetryBackoff)
+				return
+			}
+			stamp(cidx)
+			rewritten += len(cidx.Docs)
+			infos[i], saveErr = contentSaveShard(contentShardDir(gsx), cidx, sh.info.Prefixes)
+		}
+		if saveErr == nil {
+			if !s.contentBuildCurrent(vol, gen, base.JournalID) {
+				vol.contentCoord.foldFailed(contentFoldRetryBackoff)
+				contentSweepShards(gsx)
+				return
+			}
+			saveErr = contentFoldSaveManifest(gsx, header, infos)
+		}
+		if saveErr != nil {
+			contentSweepShards(gsx) // drop shards no manifest names
+		}
+	}
+	if err := saveErr; err != nil {
 		serviceLog("content fold save failed volume=%s err=%v", vol.volume, err)
 		var sizeErr *contentGSXSizeError
 		if errors.As(err, &sizeErr) {
@@ -209,7 +262,10 @@ func (s *goSearchService) runContentFold(vol *serviceVolumeIndex) {
 	}
 	vol.contentCoord.commitFold(snap)
 	vol.contentCoord.foldSucceeded()
-	serviceLog("content fold volume=%s docs=%d checkpoint=%d", vol.volume, len(cidx.Docs), checkpoint)
+	if base.shards != nil {
+		contentSweepShards(gsx)
+	}
+	serviceLog("content fold volume=%s rewritten_docs=%d checkpoint=%d", vol.volume, rewritten, checkpoint)
 }
 
 // publishFoldedContent attaches the freshly saved `.gsx` under indexMu. Unlike

@@ -180,6 +180,10 @@ type contentIndex struct {
 	// safe: a query holding the reader keeps the index reachable.
 	release     func()
 	releaseOnce sync.Once
+	// shards is set on a composite index loaded from a manifest (see
+	// content_shards.go); Docs then spans every shard and Sections holds only
+	// the manifest's own sections.
+	shards []*contentShard
 }
 
 // contentMappingReleaseHook, when non-nil, runs once each time a mapped `.gsx`
@@ -227,6 +231,9 @@ func (idx *contentIndex) Release() {
 		return
 	}
 	idx.releaseOnce.Do(func() {
+		for _, sh := range idx.shards {
+			sh.idx.Release()
+		}
 		if idx.release != nil {
 			idx.release()
 			idx.release = nil
@@ -396,7 +403,7 @@ func contentIndexDecode(data []byte) (*contentIndex, error) {
 		return nil, errors.New("unsupported content index format")
 	}
 	version := int(binary.LittleEndian.Uint32(data[8:]))
-	if version != contentIndexVersion {
+	if version != contentIndexVersion && version != contentManifestVersion {
 		return nil, fmt.Errorf("unsupported content index version %d", version)
 	}
 	docCount := int(binary.LittleEndian.Uint32(data[16:]))
@@ -459,6 +466,9 @@ func contentIndexDecode(data []byte) (*contentIndex, error) {
 		}
 	}
 	idx.Docs = docs
+	if _, ok := idx.Sections[contentSectionShards]; (version == contentManifestVersion) != ok || ok && len(docs) != 0 {
+		return nil, errors.New("content index manifest is malformed")
+	}
 	return idx, nil
 }
 
@@ -674,6 +684,12 @@ func contentLoadFileMapped(path string) (*contentIndex, error) {
 		return nil, err
 	}
 	idx.attachRelease(release)
+	if idx.Version == contentManifestVersion {
+		if err := contentComposeShards(idx, path); err != nil {
+			idx.Release()
+			return nil, err
+		}
+	}
 	return idx, nil
 }
 

@@ -540,6 +540,9 @@ func (vol *serviceVolumeIndex) contentCandidatesBounded(pq parsedQuery, cap int)
 	// materializing only up to the budget keeps peak memory O(budget + streams)
 	// instead of decoding every posting list in full.
 	var streams []func() (uint32, bool)
+	// A sharded base only reads the shards that can hold docs under the
+	// query's folder scope.
+	mask := reader.shardMaskUnder(pq.Under)
 	if len(pq.Content) > 0 {
 		// A top-level Content leaf is a conjunct, so its postings alone are a
 		// superset of the whole query; OR groups only narrow it further.
@@ -553,7 +556,7 @@ func (vol *serviceVolumeIndex) contentCandidatesBounded(pq parsedQuery, cap int)
 				// empty and falsely report zero; fall back to a scan.
 				return nil, false, false
 			}
-			streams = append(streams, reader.candidateStream(term))
+			streams = append(streams, reader.candidateStreamIn(term, mask))
 		}
 	} else {
 		// No top-level Content: coverage must come from content-driven OR
@@ -561,7 +564,7 @@ func (vol *serviceVolumeIndex) contentCandidatesBounded(pq parsedQuery, cap int)
 		// content, so no postings superset exists; fall back.
 		driven := false
 		for _, group := range pq.OrGroups {
-			groupStream, groupDriven, ok := contentOrGroupCandidateStream(reader, group)
+			groupStream, groupDriven, ok := contentOrGroupCandidateStream(reader, group, mask)
 			if !ok {
 				return nil, false, false
 			}
@@ -652,10 +655,10 @@ func (vol *serviceVolumeIndex) contentCandidatesBounded(pq parsedQuery, cap int)
 // the union is unconstrained (a regex alternative). It is the same k-way union
 // as the historical pairwise unionSortedDocIDs merge, but it materializes no
 // alternative: the caller's budget+1 cap stops it before any full list decodes.
-func contentOrGroupCandidateStream(reader *contentReader, group []parsedQuery) (stream func() (uint32, bool), driven, ok bool) {
+func contentOrGroupCandidateStream(reader *contentReader, group []parsedQuery, mask []bool) (stream func() (uint32, bool), driven, ok bool) {
 	var streams []func() (uint32, bool)
 	for i := range group {
-		altStream, altDriven, altOK := contentAltCandidateStream(reader, group[i])
+		altStream, altDriven, altOK := contentAltCandidateStream(reader, group[i], mask)
 		if !altOK {
 			return nil, false, false
 		}
@@ -680,7 +683,7 @@ func contentOrGroupCandidateStream(reader *contentReader, group []parsedQuery) (
 // constraint at all; a nil stream with driven=true means the constraint is
 // unconstrained (a regex leaf). Every source is a posting-backed stream, so an
 // alternative is never materialized in full.
-func contentAltCandidateStream(reader *contentReader, alt parsedQuery) (stream func() (uint32, bool), driven, ok bool) {
+func contentAltCandidateStream(reader *contentReader, alt parsedQuery, mask []bool) (stream func() (uint32, bool), driven, ok bool) {
 	var streams []func() (uint32, bool)
 	for _, leaf := range alt.Content {
 		driven = true
@@ -691,10 +694,10 @@ func contentAltCandidateStream(reader *contentReader, alt parsedQuery) (stream f
 		if !contentTermTrigramSafe(term) {
 			return nil, false, false
 		}
-		streams = append(streams, reader.candidateStream(term))
+		streams = append(streams, reader.candidateStreamIn(term, mask))
 	}
 	for _, group := range alt.OrGroups {
-		groupStream, groupDriven, groupOK := contentOrGroupCandidateStream(reader, group)
+		groupStream, groupDriven, groupOK := contentOrGroupCandidateStream(reader, group, mask)
 		if !groupOK {
 			return nil, false, false
 		}
