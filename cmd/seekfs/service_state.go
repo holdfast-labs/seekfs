@@ -482,7 +482,7 @@ func (vol *serviceVolumeIndex) needsCompactChildrenBuild() bool {
 	return vol != nil &&
 		vol.index != nil &&
 		vol.index.Compact &&
-		vol.index.Source == "usn" &&
+		(vol.index.Source == "usn" || vol.index.Source == "walk") &&
 		len(vol.childOffsets) == 0 &&
 		len(vol.childIDs) == 0 &&
 		len(vol.index.Derived.ChildOffsets) == 0

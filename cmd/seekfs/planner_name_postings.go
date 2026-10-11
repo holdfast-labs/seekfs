@@ -462,6 +462,16 @@ func (vol *serviceVolumeIndex) nameTermPosting(term string) []int {
 		}
 	}
 	vol.termMu.Unlock()
+	// Service searches run on per-request views whose term cache starts
+	// empty, so a miss here used to cost a full name scan on every query.
+	// The name trigram postings give the same verified set when no recent
+	// records need merging; otherwise keep the scan's exact semantics.
+	if len(vol.recentIDs) == 0 && len(vol.nameTrigramRecent) == 0 {
+		if list, ok := vol.nameTrigramNameTermPostingLimited(term, 0); ok {
+			vol.cacheNamePosting(term, list)
+			return list
+		}
+	}
 	list := vol.scanNameTermPosting(term)
 	vol.cacheNamePosting(term, list)
 	return list

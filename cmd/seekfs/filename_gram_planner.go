@@ -277,6 +277,10 @@ func (vol *serviceVolumeIndex) completeFilenameRankedPosting(term string, limit 
 	h := make(extRankMaxHeap, 0, limit)
 	decoded, skipped, verified := 0, 0, 0
 	decodedBlocks := make(map[[2]int]struct{}, len(its))
+	// The driver gram's IDs are checked against the stored lowercase name
+	// directly: recordMatchesNonPath verifies the full term anyway, and one
+	// substring test is cheaper than a block search per remaining gram.
+	lowerTerm := strings.ToLower(term)
 	prefetchBytes, prefetchRanges, prefetchPages, prefetchStopped := prefetchPostingBlockRefs(its[0], refs, queryPostingPrefetchBytes(), func() bool { return queryCanceled(pq) })
 	if prefetchStopped {
 		return nil, false
@@ -309,29 +313,11 @@ func (vol *serviceVolumeIndex) completeFilenameRankedPosting(term string, limit 
 			decoded++
 		}
 		for _, id32 := range ids {
-			matched := true
-			for i := 1; i < len(its); i++ {
-				found, valid, blockIndex, didDecode := its[i].containsID(id32)
-				if didDecode {
-					key := [2]int{i, blockIndex}
-					if _, seen := decodedBlocks[key]; !seen {
-						decodedBlocks[key] = struct{}{}
-						decoded++
-					}
-				}
-				if !valid {
-					return nil, false
-				}
-				if !found {
-					matched = false
-					break
-				}
-			}
-			if !matched {
-				continue
-			}
 			id := int(id32)
 			if id < 0 || id >= vol.index.compactRecordCount() {
+				continue
+			}
+			if !strings.Contains(vol.index.compactLowerNameAt(id), lowerTerm) {
 				continue
 			}
 			verified++

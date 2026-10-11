@@ -475,8 +475,13 @@ func postingBlockCacheMaxBytes() int64 {
 	return mb * 1024 * 1024
 }
 
+func (c *postingBlockLRU) maxBytes() int64 {
+	c.limitOnce.Do(func() { c.limit = postingBlockCacheMaxBytes() })
+	return c.limit
+}
+
 func (c *postingBlockLRU) get(key postingBlockCacheKey) ([]uint32, bool) {
-	maxBytes := postingBlockCacheMaxBytes()
+	maxBytes := c.maxBytes()
 	if maxBytes <= 0 {
 		return nil, false
 	}
@@ -495,7 +500,7 @@ func (c *postingBlockLRU) get(key postingBlockCacheKey) ([]uint32, bool) {
 }
 
 func (c *postingBlockLRU) add(key postingBlockCacheKey, ids []uint32) {
-	maxBytes := postingBlockCacheMaxBytes()
+	maxBytes := c.maxBytes()
 	if maxBytes <= 0 || len(ids) == 0 {
 		return
 	}

@@ -427,6 +427,10 @@ type postingBlockLRU struct {
 	ll    list.List
 	items map[postingBlockCacheKey]*list.Element
 	bytes int64
+	// limit caches postingBlockCacheMaxBytes for this cache: get/add run per
+	// posting block, and reading the environment there was a syscall each.
+	limitOnce sync.Once
+	limit     int64
 }
 
 var servicePostingBlockCache postingBlockLRU

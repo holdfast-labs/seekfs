@@ -362,10 +362,38 @@ func newServiceVolumeIndex(dbPath string, idx *Index) *serviceVolumeIndex {
 		if vol.needsCompactChildrenBuild() {
 			vol.buildCompactChildren()
 		}
+	} else if idx.Compact {
+		// Walk indexes persist the same folder topology; without it every
+		// under: scope falls back to walking each candidate's parent chain.
+		vol.adoptDerivedTopology()
 	}
 	vol.overlay = newOverlaySegment()
 	vol.publishSnapshot()
 	return vol
+}
+
+// adoptDerivedTopology wires the persisted child graph and DFS subtree
+// intervals into the volume when they cover every record. Partial or stale
+// sections are ignored so the planner keeps its parent-walk fallback.
+func (vol *serviceVolumeIndex) adoptDerivedTopology() {
+	if vol == nil || vol.index == nil {
+		return
+	}
+	derived := vol.index.Derived
+	recordCount := vol.index.compactRecordCount()
+	if len(derived.ChildOffsets) == recordCount+1 && len(derived.ChildIDs) > 0 {
+		vol.childOffsets = derived.ChildOffsets
+		vol.childIDs = derived.ChildIDs
+		vol.rootIDs = derived.RootIDs
+	}
+	if len(derived.SubtreeStart) == recordCount && len(derived.SubtreeEnd) == recordCount && len(derived.SubtreeOrder) > 0 && len(derived.SubtreeOrder) <= recordCount {
+		vol.subtreeStart = derived.SubtreeStart
+		vol.subtreeEnd = derived.SubtreeEnd
+		vol.subtreeOrder = derived.SubtreeOrder
+	}
+	if len(derived.SubtreeBytes) == recordCount {
+		vol.subtreeBytes = derived.SubtreeBytes
+	}
 }
 
 func newOverlaySegment() *overlaySegment {
