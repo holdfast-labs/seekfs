@@ -157,10 +157,29 @@ func fuzzyPigeonholePieces(term string, tau int) []string {
 		parts--
 	}
 	out := make([]string, 0, parts)
+	dropped := false
 	for i := 0; i < parts; i++ {
 		piece := runes[i*len(runes)/parts : (i+1)*len(runes)/parts]
 		if len(piece) >= 3 {
 			out = append(out, string(piece))
+		} else {
+			dropped = true
+		}
+	}
+	if dropped {
+		// A dropped short piece voids the pigeonhole guarantee ("reprt"
+		// splits into "re" and "prt"; the omission breaks "prt"). Every
+		// trigram of the term restores coverage for edits near either end.
+		seen := make(map[string]struct{}, len(out)+len(runes))
+		for _, piece := range out {
+			seen[piece] = struct{}{}
+		}
+		for i := 0; i+3 <= len(runes); i++ {
+			gram := string(runes[i : i+3])
+			if _, dup := seen[gram]; !dup {
+				seen[gram] = struct{}{}
+				out = append(out, gram)
+			}
 		}
 	}
 	return out
@@ -552,9 +571,14 @@ func fuzzyTopTermVariants(volumes []*serviceVolumeIndex, termLower string, n int
 	type scored struct {
 		variant string
 		dist    int
+		seen    int // sampled names containing the variant; 0 = not seen
 		score   int
 	}
 	var out []scored
+	// Deletion variants never contain the corrected spelling of an interior
+	// substitution or omission ("relese" -> "release"); real name windows
+	// found through the pigeonhole pieces do, and are known to match.
+	windows := fuzzyPieceWindowVariants(volumes, termLower, tau)
 	variants := fuzzyDeletionVariants(termLower, tau)
 	sort.Strings(variants)
 	for _, variant := range variants {
@@ -585,11 +609,38 @@ func fuzzyTopTermVariants(volumes []*serviceVolumeIndex, termLower string, n int
 		if !proven || score <= 0 {
 			continue
 		}
-		out = append(out, scored{variant: variant, dist: dist, score: score})
+		out = append(out, scored{variant: variant, dist: dist, seen: windows[variant], score: score})
+	}
+	deletion := make(map[string]struct{}, len(variants))
+	for _, variant := range variants {
+		deletion[variant] = struct{}{}
+	}
+	for variant, count := range windows {
+		if _, dup := deletion[variant]; dup {
+			continue
+		}
+		dist := damerauLevenshteinBounded([]rune(variant), []rune(termLower), tau)
+		if dist <= 0 || dist > tau {
+			continue
+		}
+		score := 0
+		for _, vol := range volumes {
+			if s, ok := fuzzyTermMinGramCount(vol, variant); ok && s > score {
+				score = s
+			}
+		}
+		out = append(out, scored{variant: variant, dist: dist, seen: count, score: score})
 	}
 	sort.Slice(out, func(i, j int) bool {
 		if out[i].dist != out[j].dist {
 			return out[i].dist < out[j].dist
+		}
+		// A variant seen inside real names is guaranteed to match, and the
+		// more names carry it the likelier it is the intended word; a
+		// deletion variant whose grams merely all exist somewhere may not
+		// match at all.
+		if out[i].seen != out[j].seen {
+			return out[i].seen > out[j].seen
 		}
 		if out[i].score != out[j].score {
 			return out[i].score > out[j].score
@@ -604,6 +655,142 @@ func fuzzyTopTermVariants(volumes []*serviceVolumeIndex, termLower string, n int
 		}
 	}
 	return result
+}
+
+// fuzzyPieceWindowVariantBudget bounds how many candidate names one term's
+// window search verifies; the variants only need to surface the common
+// spellings, not every occurrence.
+const fuzzyPieceWindowVariantBudget = 4096
+
+// fuzzyPieceWindowVariants returns substrings of real names that sit within
+// tau edits of termLower, found through the term's pigeonhole pieces. Each
+// is the best-aligned window of one candidate name, so a rewrite to it is
+// guaranteed to match at least that name.
+//
+// The returned map counts how many sampled names contained each window, the
+// best available plausibility signal: "tentative" appears in thousands of
+// names, a stray "tentive" in a handful.
+func fuzzyPieceWindowVariants(volumes []*serviceVolumeIndex, termLower string, tau int) map[string]int {
+	pieces := fuzzyPigeonholePieces(termLower, tau)
+	if len(pieces) == 0 {
+		return nil
+	}
+	termMask := fuzzyLetterMask(termLower)
+	termRunes := []rune(termLower)
+	edgeOK := func(r rune, termEdge rune) bool {
+		return unicode.IsLetter(r) || unicode.IsDigit(r) || r == termEdge
+	}
+	out := make(map[string]int)
+	seenIDs := make(map[[2]int]struct{})
+	// Each piece gets an equal share, sampled evenly across its matches: a
+	// common piece ("tent" inside every "content") must not use up the
+	// budget before the piece that reaches the intended word ("tive").
+	perPiece := max(256, fuzzyPieceWindowVariantBudget/len(pieces))
+	for volIndex, vol := range volumes {
+		if vol == nil || vol.index == nil || vol.nameTrigramIndex() == nil {
+			continue
+		}
+		for _, piece := range pieces {
+			ids := vol.fuzzyPieceCandidateIDs(piece, fuzzyPieceWindowVariantBudget)
+			stride := max(1, (len(ids)+perPiece-1)/perPiece)
+			for i := 0; i < len(ids); i += stride {
+				id := ids[i]
+				if id < 0 || id >= vol.index.compactRecordCount() {
+					continue
+				}
+				if _, dup := seenIDs[[2]int{volIndex, id}]; dup {
+					continue
+				}
+				seenIDs[[2]int{volIndex, id}] = struct{}{}
+				rec := vol.index.compactRecord(id)
+				if rec.Deleted {
+					continue
+				}
+				nameLower := foldFuzzyText(strings.ToLower(rec.Name))
+				if fuzzyLetterMaskMisses(termMask, fuzzyLetterMask(nameLower)) > tau {
+					continue
+				}
+				dist, _, pos, ok := fuzzyNameDistance(nameLower, termLower, tau)
+				if !ok || dist == 0 {
+					continue
+				}
+				window := fuzzyBestWindowAt(nameLower, termLower, pos, tau)
+				if window == "" || strings.ContainsAny(window, " \t\"'\\/*?[]:") {
+					continue
+				}
+				// "-opus" and "_opus" are the same correction as "opus"
+				// with a separator attached; keep word-shaped windows.
+				w := []rune(window)
+				if !edgeOK(w[0], termRunes[0]) || !edgeOK(w[len(w)-1], termRunes[len(termRunes)-1]) {
+					continue
+				}
+				out[window]++
+			}
+		}
+	}
+	return out
+}
+
+// fuzzyPieceCandidateIDs returns names containing piece. Pieces of common
+// words ("exp", "cted") exceed the trigram candidate cap, and declining
+// them left typos of exactly the most common words uncorrectable, so an
+// over-cap piece is sampled from its rarest gram's posting instead: the
+// window search only needs the plausible spellings, not every name.
+func (vol *serviceVolumeIndex) fuzzyPieceCandidateIDs(piece string, budget int) []int {
+	if budget <= 0 {
+		return nil
+	}
+	if ids, ok := vol.nameTrigramNameTermPostingLimited(piece, fuzzyCandidateCap); ok {
+		return ids
+	}
+	its, _, exactZero, complete := completeSelfNameGramIterators(vol.index, piece)
+	if !complete || exactZero || len(its) == 0 {
+		return nil
+	}
+	recordCount := vol.index.compactRecordCount()
+	out := make([]int, 0, min(budget, 256))
+	it := its[0]
+	for len(out) < budget {
+		block, _, ok := it.nextBlock()
+		if !ok {
+			break
+		}
+		for _, id32 := range block {
+			id := int(id32)
+			if id >= recordCount || !strings.Contains(vol.index.compactLowerNameAt(id), piece) {
+				continue
+			}
+			out = append(out, id)
+			if len(out) >= budget {
+				break
+			}
+		}
+	}
+	return out
+}
+
+// fuzzyBestWindowAt returns the window of nameLower starting at start whose
+// distance to term is smallest, preferring the term's own length on ties.
+func fuzzyBestWindowAt(nameLower, term string, start, tau int) string {
+	name := []rune(nameLower)
+	t := []rune(term)
+	offBy := func(width int) int {
+		if width > len(t) {
+			return width - len(t)
+		}
+		return len(t) - width
+	}
+	best, bestWidth := tau+1, 0
+	for width := max(1, len(t)-tau); width <= len(t)+tau && start+width <= len(name); width++ {
+		d := damerauLevenshteinBounded(name[start:start+width], t, tau)
+		if d < best || (d == best && offBy(width) < offBy(bestWidth)) {
+			best, bestWidth = d, width
+		}
+	}
+	if best > tau || bestWidth == 0 {
+		return ""
+	}
+	return string(name[start : start+bestWidth])
 }
 
 // fuzzyRewriteTrial is one candidate query rewrite: a single term swapped for
@@ -625,8 +812,8 @@ func multiTermFuzzyRewriteTrials(volumes []*serviceVolumeIndex, opts queryOption
 		return nil
 	}
 	const (
-		maxTrials       = 4
-		variantsPerTerm = 2
+		maxTrials       = 6
+		variantsPerTerm = 3
 	)
 	fields := strings.Fields(opts.Query)
 	broken := make([]fuzzyRewriteTrial, 0, 2)

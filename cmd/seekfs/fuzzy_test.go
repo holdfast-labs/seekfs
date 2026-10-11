@@ -367,6 +367,30 @@ func TestTryMultiTermFuzzyRewriteEndToEnd(t *testing.T) {
 	}
 }
 
+func TestTryMultiTermFuzzyRewriteInteriorTypos(t *testing.T) {
+	vol := buildMultiTermFuzzyTestVolume(t)
+	volumes := []*serviceVolumeIndex{vol}
+	// Wrong and missing letters inside "report": no deletion variant of
+	// either typo is a substring of any name.
+	for _, query := range []string{"repirt notes", "reprt notes"} {
+		opts := queryOptions{Query: query, Limit: 10}
+		matches, err := searchServiceVolumes(volumes, opts, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(matches) != 0 {
+			t.Fatalf("%q: exact search unexpectedly matched %v", query, matches)
+		}
+		fuzzied := false
+		if !tryMultiTermFuzzyRewrite(volumes, &opts, &matches, &fuzzied) || !fuzzied {
+			t.Fatalf("%q: expected a rewrite", query)
+		}
+		if len(matches) != 1 || matches[0].Name != "q4-report-notes.pdf" {
+			t.Fatalf("%q: rewrite results = %v, want q4-report-notes.pdf", query, matches)
+		}
+	}
+}
+
 func TestAppendFuzzyServiceMatchesGoldenRanking(t *testing.T) {
 	vol := buildFuzzyTestVolume(t)
 	opts := queryOptions{Query: "tonics~", Limit: 10}
@@ -454,7 +478,8 @@ func TestFuzzyPigeonholePieces(t *testing.T) {
 	}{
 		{"relese", 1, []string{"rel", "ese"}},
 		{"relaase", 1, []string{"rel", "aase"}},
-		{"tonic", 1, []string{"nic"}},
+		{"tonic", 1, []string{"nic", "ton", "oni"}},
+		{"reprt", 1, []string{"prt", "rep", "epr"}},
 		{"render_frame", 2, []string{"rend", "er_f", "rame"}},
 		{"tonicwter", 2, []string{"ton", "icw", "ter"}},
 		{"tonicwat", 2, []string{"toni", "cwat"}},
