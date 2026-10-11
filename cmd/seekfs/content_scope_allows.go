@@ -37,6 +37,11 @@ type contentScopeResolved struct {
 	ExtSet         map[string]struct{}
 	BudgetBytes    int64
 	SystemExcludes bool
+	// Ignore applies git ignore rules inside detected worktrees in place of
+	// the name-based system excludes; IgnoreDigest fingerprints the ignore
+	// files it reads so a sidecar built under other rules is rebuilt.
+	Ignore       *contentGitIgnore
+	IgnoreDigest [32]byte
 }
 
 // resolve computes the effective roots/excludes. repoRoots are the detected git
@@ -117,7 +122,13 @@ func (r contentScopeResolved) allows(path string) (unit, kind string, ok bool) {
 			return "", "", false
 		}
 	}
-	if r.SystemExcludes && contentPathHasExcludedSegment(p, contentSystemExcludeSegments) {
+	if _, inRepo := r.Ignore.repoFor(p); inRepo {
+		// Inside a worktree git decides: tracked "build" or "vendor"
+		// directories are source, while ignored output is skipped.
+		if r.Ignore.ignored(p, false) {
+			return "", "", false
+		}
+	} else if r.SystemExcludes && contentPathHasExcludedSegment(p, contentSystemExcludeSegments) {
 		return "", "", false
 	}
 	for _, repo := range r.Repos {

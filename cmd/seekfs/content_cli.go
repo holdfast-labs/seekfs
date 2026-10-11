@@ -143,7 +143,7 @@ func cmdContentIndex(args []string) error {
 			if scope.disabled() {
 				return errors.New("content-index: content scope is off for this volume")
 			}
-			resolved := scope.resolve(rec.Volume, contentDetectGitRepos(rec))
+			resolved, _ := scope.resolveForIndex(rec.Volume, rec)
 			opts.Scope = &resolved
 		}
 		idx, err = buildContentIndexForIndex(context.Background(), rec, opts)

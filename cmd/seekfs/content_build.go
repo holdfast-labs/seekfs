@@ -117,6 +117,36 @@ func buildContentIndexFromDir(ctx context.Context, root string, opts contentBuil
 	docs := make([]contentBuildDoc, 0, 4096)
 	var scanned int
 	var skipped, truncated, declined int64
+	// Inside a git worktree, git's ignore rules decide what is skipped; the
+	// name-based skips below only apply outside any worktree.
+	absRoot, aerr := filepath.Abs(root)
+	if aerr != nil {
+		absRoot = root
+	}
+	ignore := newContentGitIgnore(nil)
+	for dir := absRoot; ; {
+		if _, serr := os.Lstat(filepath.Join(dir, ".git")); serr == nil {
+			ignore.addRepo(dir)
+			break
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			break
+		}
+		dir = parent
+	}
+	if ignore.ignored(contentNormPath(absRoot), true) {
+		// An explicitly requested root that git ignores (repo\out) is
+		// indexed under the outside-worktree rules, not skipped entirely.
+		ignore = newContentGitIgnore(nil)
+	}
+	absOf := func(path string) string {
+		rel, rerr := filepath.Rel(root, path)
+		if rerr != nil {
+			return contentNormPath(path)
+		}
+		return contentNormPath(filepath.Join(absRoot, rel))
+	}
 	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
 			// A failure on the root itself (a typo'd or inaccessible path) is
@@ -132,7 +162,22 @@ func buildContentIndexFromDir(ctx context.Context, root string, opts contentBuil
 		}
 		if d.IsDir() {
 			name := strings.ToLower(d.Name())
-			if name == ".git" || name == "node_modules" || name == ".opencode" || name == "dist" || name == "vendor" {
+			if name == ".git" {
+				return filepath.SkipDir
+			}
+			abs := absOf(path)
+			if path != root {
+				if _, serr := os.Lstat(filepath.Join(path, ".git")); serr == nil {
+					ignore.addRepo(abs)
+				}
+			}
+			if _, inRepo := ignore.repoFor(abs); inRepo {
+				if path != root && ignore.ignored(abs, true) {
+					return filepath.SkipDir
+				}
+				return nil
+			}
+			if name == "node_modules" || name == ".opencode" || name == "dist" || name == "vendor" {
 				return filepath.SkipDir
 			}
 			return nil
@@ -141,6 +186,9 @@ func buildContentIndexFromDir(ctx context.Context, root string, opts contentBuil
 		// Never feed a content index (its own output, or a previous build) back
 		// into the corpus.
 		if strings.HasSuffix(name, ".gsx") || strings.HasPrefix(name, ".seekfs") {
+			return nil
+		}
+		if abs := absOf(path); ignore.ignored(abs, false) {
 			return nil
 		}
 		if !opts.allows(path) {

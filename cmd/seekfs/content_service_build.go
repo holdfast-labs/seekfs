@@ -164,9 +164,11 @@ func (s *goSearchService) resolvedContentScope(vol *serviceVolumeIndex) (content
 		s.indexMu.RUnlock()
 		return contentScopeResolved{}, false
 	}
-	repos := contentDetectGitRepos(vol.index)
+	repos, ignoreFiles := contentDetectGitLayout(vol.index)
 	s.indexMu.RUnlock()
-	return scope.resolve(vol.volume, repos), true
+	resolved := scope.resolve(vol.volume, repos)
+	resolved.attachGitIgnore(ignoreFiles)
+	return resolved, true
 }
 
 // contentServiceEncodingLabel returns the service's SEEKFS_CONTENT_ENCODING

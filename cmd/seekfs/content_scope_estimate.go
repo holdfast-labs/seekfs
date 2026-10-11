@@ -51,20 +51,36 @@ type contentEstimate struct {
 // entry in the index. A `.git` directory and a `.git` file (worktree/submodule
 // pointer) both mark a repo root; paths are reconstructed only for markers.
 func contentDetectGitRepos(idx *Index) []string {
+	repos, _ := contentDetectGitLayout(idx)
+	return repos
+}
+
+// contentDetectGitLayout returns the worktree roots plus, per root, the
+// .gitignore files the index holds under it (attributed to the deepest
+// root), so the ignore digest needs no filesystem walk.
+func contentDetectGitLayout(idx *Index) ([]string, map[string][]string) {
 	if idx == nil {
-		return nil
+		return nil, nil
 	}
 	count := idx.compactRecordCount()
 	cache := make(map[int]string, 256)
 	seen := make(map[string]struct{})
-	var out []string
+	var out, ignoreFiles []string
 	for id := 0; id < count; id++ {
 		rec := idx.compactRecord(id)
-		if rec.Deleted || rec.FRN == 0 || !contentGitMarkerName(rec.Name) {
+		if rec.Deleted || rec.FRN == 0 {
+			continue
+		}
+		isIgnore := rec.Mode&uint32(os.ModeDir) == 0 && strings.EqualFold(rec.Name, ".gitignore")
+		if !isIgnore && !contentGitMarkerName(rec.Name) {
 			continue
 		}
 		path := idx.reconstructCompactPathCached(id, cache)
 		if path == "" {
+			continue
+		}
+		if isIgnore {
+			ignoreFiles = append(ignoreFiles, path)
 			continue
 		}
 		m := contentNewGitMarker(path, rec.Mode&uint32(os.ModeDir) != 0)
@@ -77,7 +93,37 @@ func contentDetectGitRepos(idx *Index) []string {
 		seen[m.Root] = struct{}{}
 		out = append(out, m.Root)
 	}
-	return out
+	byRepo := make(map[string][]string, len(out))
+	if len(out) > 0 && len(ignoreFiles) > 0 {
+		lookup := newContentGitIgnore(out)
+		for _, path := range ignoreFiles {
+			if root, ok := lookup.repoFor(contentNormPath(path)); ok {
+				byRepo[root] = append(byRepo[root], path)
+			}
+		}
+	}
+	return out, byRepo
+}
+
+// resolveForIndex resolves the scope against the worktrees in idx and
+// attaches their git ignore rules. It also returns every detected worktree,
+// including ones the scope leaves out (git = false).
+func (s contentScope) resolveForIndex(volume string, idx *Index) (contentScopeResolved, []string) {
+	repos, ignoreFiles := contentDetectGitLayout(idx)
+	r := s.resolve(volume, repos)
+	r.attachGitIgnore(ignoreFiles)
+	return r, repos
+}
+
+// attachGitIgnore enables git ignore rules for the resolved worktrees. It
+// stats the ignore files, so callers holding index locks should detect the
+// layout under the lock and attach after releasing it.
+func (r *contentScopeResolved) attachGitIgnore(ignoreFiles map[string][]string) {
+	if len(r.Repos) == 0 {
+		return
+	}
+	r.Ignore = newContentGitIgnore(r.Repos)
+	r.IgnoreDigest = contentIgnoreDigest(r.Repos, ignoreFiles)
 }
 
 // scanContentScope estimates what a scoped build would index. maxFiles mirrors
@@ -90,8 +136,7 @@ func scanContentScope(idx *Index, scope contentScope, volume string, maxFiles in
 	if idx == nil {
 		return est
 	}
-	repos := contentDetectGitRepos(idx)
-	resolved := scope.resolve(volume, repos)
+	resolved, repos := scope.resolveForIndex(volume, idx)
 	est.Repos = repos
 
 	count := idx.compactRecordCount()

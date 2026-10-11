@@ -223,10 +223,12 @@ func TestContentScopeEstimateAndDetect(t *testing.T) {
 	if len(est.Repos) != 1 || est.Repos[0] != contentNormPath(`C:\proj`) {
 		t.Fatalf("repos = %v; want [c:\\proj]", est.Repos)
 	}
-	if est.Files != 2 || est.Bytes != 140 {
-		t.Fatalf("estimate files=%d bytes=%d; want 2/140 (only proj/*.go)", est.Files, est.Bytes)
+	// Inside a worktree git ignore rules replace the name-based excludes;
+	// C:\proj has no ignore files, so node_modules and build are indexed.
+	if est.Files != 4 || est.Bytes != 210 {
+		t.Fatalf("estimate files=%d bytes=%d; want 4/210 (everything under proj)", est.Files, est.Bytes)
 	}
-	if len(est.ByUnit) != 1 || est.ByUnit[0].Kind != "repo" || est.ByUnit[0].Files != 2 {
+	if len(est.ByUnit) != 1 || est.ByUnit[0].Kind != "repo" || est.ByUnit[0].Files != 4 {
 		t.Fatalf("by-unit = %+v", est.ByUnit)
 	}
 	if est.Excluded["exclude"] == 0 || est.Excluded["ext"] != 0 {
@@ -242,8 +244,8 @@ func TestContentScopeEstimateAndDetect(t *testing.T) {
 	}
 	budgeted := defaultContentScope()
 	budgeted.BudgetBytes = 110
-	if capped := scanContentScope(idx, budgeted, "C:", 0); !capped.BudgetHit || capped.Files != 1 || capped.Bytes != 100 {
-		t.Fatalf("budget=110 => files=%d bytes=%d hit=%v; want 1/100/true", capped.Files, capped.Bytes, capped.BudgetHit)
+	if capped := scanContentScope(idx, budgeted, "C:", 0); !capped.BudgetHit || capped.Files != 1 || capped.Bytes != 20 {
+		t.Fatalf("budget=110 => files=%d bytes=%d hit=%v; want 1/20/true (build/out.txt sorts first)", capped.Files, capped.Bytes, capped.BudgetHit)
 	}
 }
 

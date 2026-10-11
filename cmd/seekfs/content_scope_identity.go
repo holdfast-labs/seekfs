@@ -6,6 +6,11 @@ import (
 	"sort"
 )
 
+// contentScopeSelectionVersion changes whenever the rules that pick files
+// for a given scope change, so sidecars selected under old rules rebuild.
+// Version 2: git ignore rules replace name-based excludes inside worktrees.
+const contentScopeSelectionVersion = 2
+
 // fingerprint identifies the effective scope and budget selection policy used
 // to build a sidecar. Old sidecars have a zero hash and must be rebuilt.
 func (r contentScopeResolved) fingerprint() [32]byte {
@@ -24,9 +29,10 @@ func (r contentScopeResolved) fingerprint() [32]byte {
 		Exts             []string
 		BudgetBytes      int64
 		SystemExcludes   bool
-	}{1, r.Mode, sortedContentScopePaths(r.Roots), sortedContentScopePaths(r.Repos),
+		IgnoreDigest     [32]byte
+	}{contentScopeSelectionVersion, r.Mode, sortedContentScopePaths(r.Roots), sortedContentScopePaths(r.Repos),
 		sortedContentScopePaths(r.ExplicitRoots), sortedContentScopePaths(r.Excludes),
-		exts, r.BudgetBytes, r.SystemExcludes}
+		exts, r.BudgetBytes, r.SystemExcludes, r.IgnoreDigest}
 	b, _ := json.Marshal(canonical) // fixed fields of supported JSON scalar types
 	return sha256.Sum256(b)
 }

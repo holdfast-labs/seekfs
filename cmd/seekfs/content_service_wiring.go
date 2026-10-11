@@ -599,18 +599,34 @@ func (s *goSearchService) contentDrainLoop(vol *serviceVolumeIndex) {
 			// A private path cache: the drain must not touch vol.pathCache,
 			// which the search path trims under searchMu (a different lock).
 			pathCache := make(map[int]string, 64)
+			ignoreChanged := false
 			vol.contentCoord.processQueue(func(frn uint64) (string, bool) {
 				path, ok := s.contentResolvePath(vol, frn, pathCache)
 				if !ok {
 					return "", false
 				}
 				if scope != nil {
+					if scope.Ignore != nil && contentIsIgnoreFile(path) {
+						if _, inRepo := scope.Ignore.repoFor(contentNormPath(path)); inRepo {
+							ignoreChanged = true
+						}
+					}
 					if _, _, allowed := scope.allows(path); !allowed {
 						return "", false
 					}
 				}
 				return path, true
 			})
+			if ignoreChanged {
+				// Files the edit newly ignores or un-ignores are not in the
+				// change stream, so only a rebuild under the new rules (and
+				// a re-resolved scope fingerprint) brings the sidecar back in
+				// line.
+				serviceLog("content ignore rules changed volume=%s; rebuilding", vol.volume)
+				scope.Ignore.invalidate()
+				scope = nil
+				s.scheduleContentRebuild(vol)
+			}
 			// M1: after the tick's extractions, fold if the delta has grown
 			// past its bound. A fold failure keeps the delta and backs off.
 			s.maybeFoldContentDelta(vol)
