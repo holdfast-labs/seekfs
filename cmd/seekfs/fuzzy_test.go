@@ -1,6 +1,7 @@
 package main
 
 import (
+	"math/rand"
 	"strings"
 	"testing"
 )
@@ -156,6 +157,7 @@ func buildFuzzyTestVolume(t *testing.T) *serviceVolumeIndex {
 		".", // root record
 		"tonic.txt",
 		"tonicwater.txt",
+		"tonicwater.txtx",
 		"sonic.txt",
 		"ironic.txt",
 		"totally-unrelated.log",
@@ -412,6 +414,59 @@ func TestAppendFuzzyServiceMatchesAutoFiresOnZeroResults(t *testing.T) {
 	}
 }
 
+func TestAppendFuzzyServiceMatchesInteriorSubstitutionAndOmission(t *testing.T) {
+	vol := buildFuzzyTestVolume(t)
+
+	// Neither typo contains a deletion variant that is a substring of
+	// "tonicwater.txt"; only the pigeonhole pieces reach it.
+	// "tonicwaxter.txt" has the same length as "tonicwater.txtx", but the
+	// whole name it mistypes is "tonicwater.txt" (like BUImLD.gn vs BUILD.gni).
+	for _, query := range []string{"tonicwaser.txt", "tonicwter.txt", "tonicwaxter.txt"} {
+		opts := queryOptions{Query: query, Limit: 10}
+		matches, added := appendFuzzyServiceMatches([]*serviceVolumeIndex{vol}, opts, nil)
+		if !added || len(matches) == 0 {
+			t.Fatalf("%q: expected fuzzy results", query)
+		}
+		if matches[0].Name != "tonicwater.txt" {
+			t.Fatalf("%q: top fuzzy result = %q, want tonicwater.txt", query, matches[0].Name)
+		}
+	}
+}
+
+func TestFuzzyLetterMaskMisses(t *testing.T) {
+	term := fuzzyLetterMask("relese")
+	if got := fuzzyLetterMaskMisses(term, fuzzyLetterMask("release.md")); got != 0 {
+		t.Fatalf("release.md misses = %d, want 0", got)
+	}
+	if got := fuzzyLetterMaskMisses(fuzzyLetterMask("relaase"), fuzzyLetterMask("release")); got != 0 {
+		t.Fatalf("release misses for relaase = %d, want 0", got)
+	}
+	if got := fuzzyLetterMaskMisses(fuzzyLetterMask("build.gn"), fuzzyLetterMask("main.cc")); got != 5 {
+		t.Fatalf("main.cc misses for build.gn = %d, want 5", got)
+	}
+}
+
+func TestFuzzyPigeonholePieces(t *testing.T) {
+	cases := []struct {
+		term string
+		tau  int
+		want []string
+	}{
+		{"relese", 1, []string{"rel", "ese"}},
+		{"relaase", 1, []string{"rel", "aase"}},
+		{"tonic", 1, []string{"nic"}},
+		{"render_frame", 2, []string{"rend", "er_f", "rame"}},
+		{"tonicwter", 2, []string{"ton", "icw", "ter"}},
+		{"tonicwat", 2, []string{"toni", "cwat"}},
+	}
+	for _, tc := range cases {
+		got := fuzzyPigeonholePieces(tc.term, tc.tau)
+		if strings.Join(got, "|") != strings.Join(tc.want, "|") {
+			t.Fatalf("fuzzyPigeonholePieces(%q, %d) = %q, want %q", tc.term, tc.tau, got, tc.want)
+		}
+	}
+}
+
 func TestAppendFuzzyServiceMatchesKeepsExactResultsFirst(t *testing.T) {
 	vol := buildFuzzyTestVolume(t)
 
@@ -455,6 +510,64 @@ func TestAppendFuzzyServiceMatchesDeclinesMultiTermAndShortTerms(t *testing.T) {
 	optsCase := queryOptions{Query: "tonics~", CaseSensitive: true, Limit: 10}
 	if _, added := appendFuzzyServiceMatches([]*serviceVolumeIndex{vol}, optsCase, nil); added {
 		t.Fatal("case-sensitive fuzzy queries must be declined")
+	}
+}
+
+// fuzzyNameDistanceWindows is the original per-window implementation, kept
+// as an oracle for the single-pass DP in fuzzyNameDistance.
+func fuzzyNameDistanceWindows(nameLower, term string, tau int) (dist int, prefix bool, windowPos int, ok bool) {
+	nameRunes := []rune(nameLower)
+	termRunes := []rune(term)
+	lt, ln := len(termRunes), len(nameRunes)
+	if ln == 0 {
+		return tau + 1, false, 0, false
+	}
+	best := tau + 1
+	prefixBest := false
+	bestStart := ln
+	end := min(ln-lt+tau, ln)
+	for start := 0; start <= end; start++ {
+		maxWidth := min(lt+tau, ln-start)
+		minWidth := max(lt-tau, 1)
+		for width := minWidth; width <= maxWidth; width++ {
+			d := damerauLevenshteinBounded(nameRunes[start:start+width], termRunes, tau)
+			atPrefix := start == 0
+			if d < best || (d == best && start < bestStart) {
+				if d < best {
+					best = d
+					prefixBest = atPrefix
+				}
+				bestStart = start
+			} else if d == best && atPrefix {
+				prefixBest = true
+			}
+		}
+	}
+	if best > tau {
+		return best, false, bestStart, false
+	}
+	return best, prefixBest, bestStart, true
+}
+
+func TestFuzzyNameDistanceMatchesWindowOracle(t *testing.T) {
+	rng := rand.New(rand.NewSource(1))
+	word := func(n int) string {
+		b := make([]byte, n)
+		for i := range b {
+			b[i] = "abcd."[rng.Intn(5)]
+		}
+		return string(b)
+	}
+	for i := 0; i < 20000; i++ {
+		name := word(1 + rng.Intn(14))
+		term := word(3 + rng.Intn(6))
+		tau := 1 + rng.Intn(2)
+		gd, gp, gw, gok := fuzzyNameDistance(name, term, tau)
+		wd, wp, ww, wok := fuzzyNameDistanceWindows(name, term, tau)
+		if gok != wok || (gok && (gd != wd || gp != wp || gw != ww)) {
+			t.Fatalf("fuzzyNameDistance(%q, %q, %d) = %d/%v/%d/%v, oracle %d/%v/%d/%v",
+				name, term, tau, gd, gp, gw, gok, wd, wp, ww, wok)
+		}
 	}
 }
 

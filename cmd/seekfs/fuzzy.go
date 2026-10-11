@@ -1,6 +1,7 @@
 package main
 
 import (
+	"math/bits"
 	"sort"
 	"strings"
 	"unicode"
@@ -23,6 +24,9 @@ const (
 	// incidental substring hits (e.g. "reprot" inside "coreproto") can also
 	// mask the intended match, so a small threshold catches those too.
 	fuzzyAutoResultThreshold = 10
+	// Terms this long split into pigeonhole pieces of 5+ runes, selective
+	// enough to replace depth-2 deletion variants.
+	fuzzyLongTermRunes = 15
 )
 
 // fuzzyThresholdForTerm picks the allowed Damerau-Levenshtein distance for a
@@ -139,10 +143,68 @@ func fuzzyDeletionVariants(term string, depth int) []string {
 	return out
 }
 
+// fuzzyPigeonholePieces splits term into tau+1 contiguous pieces: a name
+// within tau edits of the term must contain at least one piece verbatim, so
+// piece postings recover substitutions and omissions in the middle of the
+// term, which query-side deletion variants cannot reach ("relese" never
+// appears inside "release"). Pieces shorter than a trigram have no posting
+// and are dropped; when tau+1 pieces would be too short, halves still cover
+// every single-edit typo.
+func fuzzyPigeonholePieces(term string, tau int) []string {
+	runes := []rune(term)
+	parts := tau + 1
+	for parts > 2 && len(runes)/parts < 3 {
+		parts--
+	}
+	out := make([]string, 0, parts)
+	for i := 0; i < parts; i++ {
+		piece := runes[i*len(runes)/parts : (i+1)*len(runes)/parts]
+		if len(piece) >= 3 {
+			out = append(out, string(piece))
+		}
+	}
+	return out
+}
+
+// fuzzyLetterMask records which characters occur in s: a-z, 0-9 and the
+// common filename punctuation get their own bit, everything else shares one.
+func fuzzyLetterMask(s string) uint64 {
+	var mask uint64
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c >= 'a' && c <= 'z':
+			mask |= 1 << (c - 'a')
+		case c >= '0' && c <= '9':
+			mask |= 1 << (26 + c - '0')
+		case c == '.':
+			mask |= 1 << 36
+		case c == '_':
+			mask |= 1 << 37
+		case c == '-':
+			mask |= 1 << 38
+		default:
+			mask |= 1 << 39
+		}
+	}
+	return mask
+}
+
+// fuzzyLetterMaskMisses counts term characters absent from the name. Each
+// edit removes at most one distinct term character, so a name missing more
+// than tau of them cannot be within tau edits of any window and is rejected
+// without running the distance DP.
+func fuzzyLetterMaskMisses(termMask, nameMask uint64) int {
+	return bits.OnesCount64(termMask &^ nameMask)
+}
+
 // foldFuzzyText normalizes text for fuzzy comparison: fullwidth forms fold to
 // their ASCII equivalents and combining marks are stripped so "sodanco"
 // matches "Só Danço". Comparison-side only; index data is untouched.
 func foldFuzzyText(s string) string {
+	if asciiOnlyString(s) {
+		return s // nothing to fold; skips NFD on every candidate name
+	}
 	decomposed := norm.NFD.String(s)
 	var b strings.Builder
 	b.Grow(len(decomposed))
@@ -165,59 +227,73 @@ func foldFuzzyText(s string) string {
 // length is within tau of the term length. prefix reports whether the best
 // alignment starts at the beginning of the name. ok is false when even the
 // best window exceeds tau.
+//
+// It runs one semi-global optimal-string-alignment DP (free start and end in
+// the name) instead of a bounded DP per window, so cost is O(name x term)
+// rather than O(name x term^2) per candidate. Each cell carries the window
+// start of its cheapest path, ties going to the earliest start, so
+// windowPos is the first start among best windows.
 func fuzzyNameDistance(nameLower, term string, tau int) (dist int, prefix bool, windowPos int, ok bool) {
-	nameRunes := []rune(nameLower)
-	termRunes := []rune(term)
-	lt, ln := len(termRunes), len(nameRunes)
+	name := []rune(nameLower)
+	t := []rune(term)
+	ln := len(name)
 	if ln == 0 {
 		return tau + 1, false, 0, false
 	}
-	best := tau + 1
-	prefixBest := false
-	bestStart := ln
-	end := ln - lt + tau
-	if end > ln {
-		end = ln
+	// Row i holds the best cost of aligning t[:i] to a name window ending
+	// at column j; start arrays hold that window's first name index.
+	prev2, prev, cur := make([]int, ln+1), make([]int, ln+1), make([]int, ln+1)
+	prev2S, prevS, curS := make([]int, ln+1), make([]int, ln+1), make([]int, ln+1)
+	for j := 0; j <= ln; j++ {
+		prevS[j] = j
 	}
-	for start := 0; start <= end; start++ {
-		maxWidth := lt + tau
-		if maxWidth > ln-start {
-			maxWidth = ln - start
-		}
-		minWidth := lt - tau
-		if minWidth < 1 {
-			minWidth = 1
-		}
-		for width := minWidth; width <= maxWidth; width++ {
-			d := damerauLevenshteinBounded(nameRunes[start:start+width], termRunes, tau)
-			atPrefix := start == 0
-			if d < best || (d == best && start < bestStart) {
-				if d < best {
-					best = d
-					prefixBest = atPrefix
+	for i := 1; i <= len(t); i++ {
+		cur[0], curS[0] = i, 0
+		rowMin := cur[0]
+		for j := 1; j <= ln; j++ {
+			cost := 1
+			if t[i-1] == name[j-1] {
+				cost = 0
+			}
+			d, s := prev[j-1]+cost, prevS[j-1]
+			if v := prev[j] + 1; v < d || (v == d && prevS[j] < s) {
+				d, s = v, prevS[j]
+			}
+			if v := cur[j-1] + 1; v < d || (v == d && curS[j-1] < s) {
+				d, s = v, curS[j-1]
+			}
+			if i > 1 && j > 1 && t[i-1] == name[j-2] && t[i-2] == name[j-1] {
+				if v := prev2[j-2] + 1; v < d || (v == d && prev2S[j-2] < s) {
+					d, s = v, prev2S[j-2]
 				}
-				bestStart = start
-			} else if d == best && atPrefix {
-				prefixBest = true
 			}
-			if best == 0 {
-				break
+			cur[j], curS[j] = d, s
+			if d < rowMin {
+				rowMin = d
 			}
 		}
-		if best == 0 {
-			break
+		if rowMin > tau {
+			return tau + 1, false, ln, false
+		}
+		prev2, prev, cur = prev, cur, prev2
+		prev2S, prevS, curS = prevS, curS, prev2S
+	}
+	best, bestStart := tau+1, ln
+	for j := 1; j <= ln; j++ {
+		if prev[j] < best || (prev[j] == best && prevS[j] < bestStart) {
+			best, bestStart = prev[j], prevS[j]
 		}
 	}
-	prefix = prefixBest
 	if best > tau {
 		return best, false, bestStart, false
 	}
-	return best, prefix, bestStart, true
+	return best, bestStart == 0, bestStart, true
 }
 
 type fuzzyScoredEntry struct {
 	entry     Entry
 	dist      int
+	wholeDist int
 	prefix    bool
 	windowPos int
 	rank      uint64
@@ -255,11 +331,20 @@ func appendFuzzyServiceMatches(volumes []*serviceVolumeIndex, opts queryOptions,
 	if tau > fuzzyMaxDistance {
 		tau = fuzzyMaxDistance
 	}
-	variants := fuzzyDeletionVariants(term, tau)
+	// Depth-2 variants grow quadratically with term length; once the
+	// pigeonhole pieces are long enough to be selective they cover two-edit
+	// typos on their own, and depth 1 keeps the cheap transposition lookups.
+	variantDepth := tau
+	if tau > 1 && utf8.RuneCountInString(term) >= fuzzyLongTermRunes {
+		variantDepth = 1
+	}
+	variants := fuzzyDeletionVariants(term, variantDepth)
 	// Deterministic order: the candidate collection cap cuts off work, so
 	// iteration order must not change which results users see.
 	sort.Strings(variants)
+	variants = append(variants, fuzzyPigeonholePieces(term, tau)...)
 	termRunes := int64(utf8.RuneCountInString(term))
+	termMask := fuzzyLetterMask(term)
 
 	pqNoTerms := pq
 	pqNoTerms.Terms = nil
@@ -295,13 +380,19 @@ func appendFuzzyServiceMatches(volumes []*serviceVolumeIndex, opts queryOptions,
 				if rec.Deleted {
 					continue
 				}
-				entry := compactEntryFromRecord(vol.index, id, rec, pathCache, true)
-				if _, dupPath := existing[entry.Path]; dupPath {
+				// Score the name before building the entry: path
+				// reconstruction dominates per-candidate cost, and piece
+				// postings bring in many candidates that miss on distance.
+				nameLower := foldFuzzyText(strings.ToLower(rec.Name))
+				if fuzzyLetterMaskMisses(termMask, fuzzyLetterMask(nameLower)) > tau {
 					continue
 				}
-				nameLower := foldFuzzyText(strings.ToLower(entry.Name))
 				dist, prefix, windowPos, okDist := fuzzyNameDistance(nameLower, term, tau)
 				if !okDist || dist == 0 {
+					continue
+				}
+				entry := compactEntryFromRecord(vol.index, id, rec, pathCache, true)
+				if _, dupPath := existing[entry.Path]; dupPath {
 					continue
 				}
 				if !entryMatches(entry, pqNoTerms, pq.MatchPath) {
@@ -315,7 +406,11 @@ func appendFuzzyServiceMatches(volumes []*serviceVolumeIndex, opts queryOptions,
 				if lenDiff < 0 {
 					lenDiff = -lenDiff
 				}
-				out = append(out, fuzzyScoredEntry{entry: entry, dist: dist, prefix: prefix, windowPos: windowPos, rank: rank, path: entry.Path, lenDiff: lenDiff})
+				wholeDist := tau + 1
+				if lenDiff <= tau {
+					wholeDist = damerauLevenshteinBounded([]rune(nameLower), []rune(term), tau)
+				}
+				out = append(out, fuzzyScoredEntry{entry: entry, dist: dist, wholeDist: wholeDist, prefix: prefix, windowPos: windowPos, rank: rank, path: entry.Path, lenDiff: lenDiff})
 			}
 			if len(out) >= enough {
 				break
@@ -331,6 +426,11 @@ func appendFuzzyServiceMatches(volumes []*serviceVolumeIndex, opts queryOptions,
 	sort.Slice(out, func(i, j int) bool {
 		if out[i].dist != out[j].dist {
 			return out[i].dist < out[j].dist
+		}
+		// A typo of a whole filename ("BUImLD.gn") should land on that
+		// name, not on a longer name containing it ("BUILD.gni").
+		if out[i].wholeDist != out[j].wholeDist {
+			return out[i].wholeDist < out[j].wholeDist
 		}
 		if out[i].prefix != out[j].prefix {
 			return out[i].prefix
