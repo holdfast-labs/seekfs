@@ -4,6 +4,7 @@ import (
 	"image"
 	"image/color"
 	"testing"
+	"time"
 
 	"gioui.org/gpu/headless"
 	"gioui.org/io/input"
@@ -533,6 +534,61 @@ func TestHeadlessFluentGlyphs(t *testing.T) {
 	}
 }
 
+func TestHeadlessFrameCost(t *testing.T) {
+	if testing.Short() {
+		t.Skip("frame cost measurement")
+	}
+	u := testUI(t, true)
+	setRows(u, sampleRows(200))
+	r := new(input.Router)
+	mk := func(size image.Point) (layout.Context, *op.Ops) {
+		ops := new(op.Ops)
+		return layout.Context{
+			Ops:    ops,
+			Metric: unit.Metric{PxPerDp: 1, PxPerSp: 1},
+			Constraints: layout.Constraints{
+				Min: size,
+				Max: size,
+			},
+			Source: r.Source(),
+		}, ops
+	}
+	for _, size := range []image.Point{image.Pt(1280, 800), image.Pt(2560, 1440)} {
+		hw, err := headless.NewWindow(size.X, size.Y)
+		if err != nil {
+			t.Skipf("headless unavailable: %v", err)
+		}
+		img := image.NewRGBA(image.Rectangle{Max: size})
+		// Warm up caches (fonts, icons, GPU programs).
+		gtx, _ := mk(size)
+		u.layout(gtx)
+		r.Frame(gtx.Ops)
+		const iters = 30
+		start := time.Now()
+		for i := 0; i < iters; i++ {
+			gtx, _ := mk(size)
+			// Simulate scrolling: advance the list each frame.
+			u.list.Position.First = (i * 7) % 150
+			u.list.Position.Offset = 0
+			u.layout(gtx)
+			r.Frame(gtx.Ops)
+			if err := hw.Frame(gtx.Ops); err != nil {
+				t.Fatalf("frame: %v", err)
+			}
+			if err := hw.Screenshot(img); err != nil {
+				t.Fatalf("screenshot: %v", err)
+			}
+		}
+		hw.Release()
+		elapsed := time.Since(start)
+		avg := float64(elapsed.Microseconds()) / float64(iters) / 1000.0
+		t.Logf("headless render+readback avg=%.2fms over %d frames (%dx%d, scrolled)", avg, iters, size.X, size.Y)
+		if avg > 14 {
+			t.Fatalf("frame cost %.2fms leaves no headroom for 60fps blits", avg)
+		}
+	}
+}
+
 func TestHeadlessBisectFullNoStatus(t *testing.T) {
 	u := testUI(t, true)
 	setRows(u, sampleRows(60))
@@ -560,3 +616,4 @@ func TestHeadlessDarkFill(t *testing.T) {
 		t.Fatalf("dark fill read back as %v, want ~#202020 (sRGB round-trip)", got)
 	}
 }
+

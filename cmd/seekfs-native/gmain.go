@@ -86,8 +86,29 @@ func defaultColW() map[string]float32 {
 func (u *UI) applyScheme() {
 	u.scheme = schemeFor(u.dark, u.accent)
 	restyle(u.th, u.scheme)
-	u.shell.ApplyFrame(u.dark)
+	// SEEKFS_NATIVE_NOMICA=1 disables all DWM frame calls (diagnosing a
+	// white-client issue: Mica/backdrop vs swapchain interaction).
+	if os.Getenv("SEEKFS_NATIVE_NOMICA") == "" {
+		u.shell.ApplyFrame(u.dark)
+	}
 	u.lastDark = u.dark
+}
+
+// useGDI reports whether to present through the GDI fallback (headless GPU
+// render + StretchDIBits) instead of Gio's DXGI swapchain. DXGI presents
+// never composite on some real machines (headless dGPU + capture/virtual
+// displays report DXGI_STATUS_OCCLUDED forever); GDI is universally visible.
+// Default follows SEEKFS_NATIVE_PRESENTER (gdi|dxgi); gdi is the default
+// until DXGI is verified on the target machine.
+func useGDI() bool {
+	switch os.Getenv("SEEKFS_NATIVE_PRESENTER") {
+	case "dxgi":
+		return false
+	case "gdi":
+		return true
+	default:
+		return true
+	}
 }
 
 // runUI creates the window and runs the event loop. It returns when the
@@ -95,8 +116,13 @@ func (u *UI) applyScheme() {
 func runUI(pipe string, limit int) error {
 	w := new(app.Window)
 	w.Option(app.Title("seekfs"))
+	gdi := useGDI()
+	if gdi {
+		w.Option(app.CustomRenderer(true))
+	}
 	u := newUI(pipe, limit, w.Invalidate)
 	u.win = w
+	u.gdiPresent = gdi
 
 	// Restore window size (settings store 96-dpi px; Gio takes dp).
 	ww, hh := u.settings.WindowW, u.settings.WindowH
@@ -134,6 +160,10 @@ func runUI(pipe string, limit int) error {
 		case app.FrameEvent:
 			gtx := app.NewContext(&ops, e)
 			u.layout(gtx)
+			u.maybeSaveShot(gtx)
+			if u.gdiPresent {
+				u.presentGDI(gtx)
+			}
 			e.Frame(gtx.Ops)
 		}
 	}

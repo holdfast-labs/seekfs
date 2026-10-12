@@ -12,6 +12,9 @@ import (
 func (u *UI) onViewEvent(e app.ViewEvent) {
 	if ev, ok := e.(app.Win32ViewEvent); ok {
 		if ev.Valid() {
+			u.mu.Lock()
+			u.hwnd = ev.HWND
+			u.mu.Unlock()
 			u.shell.SetHWND(ev.HWND)
 			u.shell.ApplyFrame(u.dark)
 		}

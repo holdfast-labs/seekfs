@@ -121,6 +121,15 @@ type UI struct {
 
 	// frameCount counts laid-out frames (debug logging).
 	frameCount int
+
+	// gdiPresent selects the GDI fallback presenter.
+	gdiPresent bool
+	// hwnd is the top-level window handle (for GDI presentation).
+	hwnd uintptr
+	// gdiHead is the headless GPU renderer for GDI presentation.
+	gdiHead gdiHeadless
+	// frame times for perf measurement.
+	frameTimes []float64
 }
 
 type sideRow struct {
