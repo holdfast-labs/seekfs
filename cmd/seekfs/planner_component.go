@@ -38,7 +38,7 @@ func (vol *serviceVolumeIndex) componentRootTopCandidates(pq parsedQuery) ([]int
 		len(pq.Globs) > 0 || len(pq.Dirs) > 0 || len(pq.Regexps) > 0 ||
 		len(pq.SizeFilters) > 0 || len(pq.DateFilters) > 0 || len(pq.AttrFilters) > 0 ||
 		len(pq.OrGroups) > 0 || len(pq.NotGroups) > 0 || pq.HasModAfter || pq.Exists ||
-		pq.CWDBias != "" || pq.RootBias != "" || countNonVolumeTerms(pq.Terms) != 1 {
+		pq.CWDBias != "" || pq.RootBias != "" || countNonVolumeTerms(pq.Terms) != 1 || pq.hiddenBlocksTruncation() {
 		return nil, false
 	}
 	term := ""
@@ -155,7 +155,7 @@ func (vol *serviceVolumeIndex) componentDirectTopCandidates(pq parsedQuery) ([]i
 		len(pq.Dirs) > 0 || len(pq.Regexps) > 0 || len(pq.SizeFilters) > 0 ||
 		len(pq.DateFilters) > 0 || len(pq.OrGroups) > 0 || len(pq.NotGroups) > 0 ||
 		pq.HasModAfter || pq.Exists || pq.CWDBias != "" || pq.RootBias != "" ||
-		countNonVolumeTerms(pq.Terms) != 1 {
+		countNonVolumeTerms(pq.Terms) != 1 || pq.hiddenBlocksTruncation() {
 		return nil, false
 	}
 	term := ""
@@ -263,7 +263,7 @@ func (vol *serviceVolumeIndex) componentMultiTermTopCandidates(pq parsedQuery) (
 		len(pq.Dirs) > 0 || len(pq.Regexps) > 0 || len(pq.SizeFilters) > 0 ||
 		len(pq.DateFilters) > 0 || len(pq.OrGroups) > 0 || len(pq.NotGroups) > 0 ||
 		pq.HasModAfter || pq.Exists || pq.CWDBias != "" || pq.RootBias != "" ||
-		countNonVolumeTerms(pq.Terms) < 2 {
+		countNonVolumeTerms(pq.Terms) < 2 || pq.hiddenBlocksTruncation() {
 		return nil, false
 	}
 	var best []int
@@ -447,7 +447,7 @@ func (vol *serviceVolumeIndex) selectiveNamePathTermCandidates(pq parsedQuery) (
 		len(pq.Dirs) > 0 || len(pq.Regexps) > 0 || len(pq.SizeFilters) > 0 ||
 		len(pq.DateFilters) > 0 || len(pq.OrGroups) > 0 || len(pq.NotGroups) > 0 ||
 		pq.HasModAfter || pq.Exists || pq.CWDBias != "" || pq.RootBias != "" ||
-		countNonVolumeTerms(pq.Terms) < 2 {
+		countNonVolumeTerms(pq.Terms) < 2 || pq.hiddenBlocksTruncation() {
 		return nil, false
 	}
 	bestTerm := ""

@@ -163,16 +163,17 @@ func TestMemoLaneSearchParity(t *testing.T) {
 
 func TestMemoLaneEngagesBoundedFallback(t *testing.T) {
 	volumes := memoTestVolumes(t)
-	// Single-term path queries decline the components lane (needs 2+
-	// terms) and land in the bounded fallback, where the memo scan runs.
+	// Filename-mode queries decline the components lane and land in the
+	// bounded fallback, where the memo scan runs. (Path-mode single terms
+	// are served by the components lane with memo-rank-heap instead.)
 	for _, q := range []string{"trainingdata", "nrrd-cache", "zzzz-no-hit-memo"} {
 		trace := &searchTrace{}
-		got, err := searchServiceVolumes(volumes, queryOptions{Query: q, MatchPath: true, Limit: 20, Trace: trace}, false)
+		got, err := searchServiceVolumes(volumes, queryOptions{Query: q, MatchPath: false, Limit: 20, Trace: trace}, false)
 		if err != nil {
 			t.Fatal(err)
 		}
 		memoTraceHasLane(t, trace, "memo-scan")
-		want, err := r5ExhaustivePlannerOracle(volumes, queryOptions{Query: q, MatchPath: true, Limit: 20}, false)
+		want, err := r5ExhaustivePlannerOracle(volumes, queryOptions{Query: q, MatchPath: false, Limit: 20}, false)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -185,14 +186,14 @@ func TestMemoLaneEngagesBoundedFallback(t *testing.T) {
 func TestMemoCountEngages(t *testing.T) {
 	volumes := memoTestVolumes(t)
 	trace := &searchTrace{}
-	n, _, err := countServiceVolumes(volumes, queryOptions{Query: "trainingdata", MatchPath: true, Trace: trace})
+	n, _, err := countServiceVolumes(volumes, queryOptions{Query: "trainingdata", MatchPath: false, Trace: trace})
 	if err != nil {
 		t.Fatal(err)
 	}
 	// The global fallback labels the source; memo engagement is proven
 	// by the additive memo-count marker (one per volume counted).
 	memoTraceHasLane(t, trace, "memo-count")
-	want, err := r5ExhaustivePlannerOracle(volumes, queryOptions{Query: "trainingdata", MatchPath: true}, true)
+	want, err := r5ExhaustivePlannerOracle(volumes, queryOptions{Query: "trainingdata", MatchPath: false}, true)
 	if err != nil {
 		t.Fatal(err)
 	}

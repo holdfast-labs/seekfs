@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -1129,16 +1130,29 @@ func loadConfig(path string) (appConfig, error) {
 		path = findDefaultConfig()
 	}
 	if path == "" {
-		return appConfig{}, nil
+		cfg := appConfig{PluginPath: filepath.Join(filepath.Dir(defaultConfigPath()), "plugin.toml")}
+		var err error
+		cfg.Plugins, err = loadPluginDefinitions(cfg.PluginPath)
+		return cfg, err
 	}
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return appConfig{}, err
 	}
 	cfg := appConfig{}
+	section := ""
 	for _, line := range strings.Split(string(data), "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
+			inner := strings.TrimSpace(line[1 : len(line)-1])
+			if strings.HasPrefix(inner, "features.") {
+				section = inner
+			} else {
+				section = parseContentConfigSection(inner)
+			}
 			continue
 		}
 		parts := strings.SplitN(line, "=", 2)
@@ -1147,6 +1161,18 @@ func loadConfig(path string) (appConfig, error) {
 		}
 		key := strings.TrimSpace(parts[0])
 		value := strings.TrimSpace(parts[1])
+		if section != "" {
+			if strings.HasPrefix(section, "features.") {
+				if err := applyFeatureConfig(&cfg, strings.TrimPrefix(section, "features."), key, value); err != nil {
+					return appConfig{}, err
+				}
+				continue
+			}
+			if section != "ignore" {
+				applyContentScopeConfig(&cfg, section, key, value)
+			}
+			continue
+		}
 		switch key {
 		case "db", "db_path":
 			if s := parseTOMLString(value); s != "" {
@@ -1173,7 +1199,30 @@ func loadConfig(path string) (appConfig, error) {
 			cfg.SeekFSDir = parseTOMLString(value)
 		case "remote_addr":
 			cfg.RemoteAddr = parseTOMLString(value)
+		case "content_scope":
+			cfg.Content.Mode = parseTOMLString(value)
+		case "content_roots":
+			cfg.Content.Roots = append(cfg.Content.Roots, parseTOMLStringArray(value)...)
+		case "content_exclude":
+			cfg.Content.Exclude = append(cfg.Content.Exclude, parseTOMLStringArray(value)...)
+		case "content_budget_bytes":
+			var n int64
+			if _, err := fmt.Sscanf(value, "%d", &n); err == nil {
+				cfg.Content.BudgetBytes = n
+			}
 		}
+	}
+	if err := validateFeatureConfig(cfg.Features); err != nil {
+		return appConfig{}, err
+	}
+	absolute, err := filepath.Abs(path)
+	if err != nil {
+		return appConfig{}, err
+	}
+	cfg.PluginPath = filepath.Join(filepath.Dir(absolute), "plugin.toml")
+	cfg.Plugins, err = loadPluginDefinitions(cfg.PluginPath)
+	if err != nil {
+		return appConfig{}, err
 	}
 	return cfg, nil
 }

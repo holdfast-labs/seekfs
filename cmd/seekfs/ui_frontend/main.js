@@ -1,4 +1,6 @@
-const { normalizeLiveQuery } = window.SeekfsQuery;
+const { normalizeLiveQuery, toContentQuery, contentHighlightTerms, highlightSegments } = window.SeekfsQuery;
+
+const CONTENT_MODE_KEY = "seekfs.contentMode";
 const { debounce, formatSize, formatDate, escapeHtml, sortSupported } = window.SeekfsUtil;
 
 const state = {
@@ -9,6 +11,8 @@ const state = {
   lastClicked: -1,
   sort: "",
   lastQuery: "",
+  contentMode: localStorage.getItem(CONTENT_MODE_KEY) === "1",
+  highlight: [],
 };
 
 const els = {
@@ -24,6 +28,8 @@ const els = {
   health: document.getElementById("health"),
   clear: document.getElementById("clear"),
   count: document.getElementById("count"),
+  contentToggle: document.getElementById("content-toggle"),
+  contentStatus: document.getElementById("content-status"),
 };
 
 function setEmpty(title, sub) {
@@ -276,7 +282,7 @@ function renderRows(rows) {
     tr.setAttribute("aria-selected", "false");
     tr.setAttribute("aria-current", "false");
     tr.innerHTML = `
-      <td>${iconImg(row)}${escapeHtml(row.name || "")}</td>
+      <td>${iconImg(row)}${escapeHtml(row.name || "")}${snippetHtml(row.snippet)}</td>
       <td class="path-cell">${escapeHtml(row.dir || row.path || "")}</td>
       <td class="size-cell">${escapeHtml(formatSize(row))}</td>
       <td class="date-cell">${escapeHtml(formatDate(row.modified))}</td>
@@ -289,6 +295,43 @@ function renderRows(rows) {
   applySelectionClasses();
   els.empty.style.display = rows.length ? "none" : "block";
   updateSelectedFooter();
+}
+
+// snippetHtml renders a content match line under the file name, with the
+// searched terms highlighted.
+function snippetHtml(snippet) {
+  if (!snippet) return "";
+  const parts = highlightSegments(snippet, state.highlight)
+    .map((seg) => (seg.match ? `<mark>${escapeHtml(seg.text)}</mark>` : escapeHtml(seg.text)))
+    .join("");
+  return `<div class="snippet">${parts}</div>`;
+}
+
+function applyContentMode() {
+  if (!els.contentToggle) return;
+  els.contentToggle.setAttribute("aria-pressed", state.contentMode ? "true" : "false");
+  els.query.placeholder = state.contentMode ? "Search inside files" : "Search";
+}
+
+function setContentMode(on) {
+  state.contentMode = on;
+  localStorage.setItem(CONTENT_MODE_KEY, on ? "1" : "0");
+  applyContentMode();
+  if (!on && els.contentStatus) els.contentStatus.textContent = "";
+  searchNow();
+}
+
+// contentStatusText describes the content index behind a content query.
+function contentStatusText(content) {
+  if (!content || !content.state) return "";
+  if (content.state === "indexing") {
+    const pct = content.build_total ? Math.floor((100 * (content.build_done || 0)) / content.build_total) : 0;
+    return `Indexing contents ${pct}%`;
+  }
+  if (content.error) return `Contents: ${content.error}`;
+  if (content.incomplete || content.partial) return "Contents: partial results";
+  if (content.state === "ready") return content.docs ? `${content.docs.toLocaleString()} files indexed` : "";
+  return `Contents ${content.state}`;
 }
 
 function rowFromEvent(event) {
@@ -462,7 +505,7 @@ function onDocumentMouseDown(event) {
   if (event.button !== 0) return;
   const target = event.target;
   if (target && target.closest) {
-    if (target.closest(".searchbar") || target.closest("thead") || target.closest("#menu") || target.closest(".footer")) {
+    if (target.closest(".prompt-wrap") || target.closest(".top") || target.closest("thead") || target.closest("#menu") || target.closest(".footer")) {
       return;
     }
   }
@@ -594,7 +637,9 @@ function buildQueryWithSort(rawQuery) {
 
 async function searchNow() {
   const rawQuery = els.query.value.trim();
-  const query = normalizeLiveQuery(buildQueryWithSort(rawQuery));
+  const typed = state.contentMode ? toContentQuery(rawQuery) : rawQuery;
+  const query = normalizeLiveQuery(buildQueryWithSort(typed));
+  state.highlight = contentHighlightTerms(typed);
   state.lastQuery = rawQuery;
   const seq = ++state.seq;
   hideMenu();
@@ -631,6 +676,7 @@ async function searchNow() {
 function handleSearchResponse(response) {
   if (!response || response.seq !== state.seq) return;
   if ((response.message || "").toLowerCase() === "query superseded") return;
+  if (els.contentStatus) els.contentStatus.textContent = contentStatusText(response.content);
   if (!response.ok) {
     renderRows([]);
     setCount(0);
@@ -1183,6 +1229,21 @@ document.addEventListener("keydown", (event) => {
     return;
   }
 });
+
+if (els.contentToggle) {
+  els.contentToggle.addEventListener("click", () => {
+    setContentMode(!state.contentMode);
+    els.query.focus();
+  });
+}
+document.addEventListener("keydown", (event) => {
+  if (event.ctrlKey && event.shiftKey && (event.key === "F" || event.key === "f")) {
+    event.preventDefault();
+    setContentMode(!state.contentMode);
+    els.query.focus();
+  }
+});
+applyContentMode();
 
 setTimeout(refreshStatus, 150);
 setInterval(refreshStatus, 10000);

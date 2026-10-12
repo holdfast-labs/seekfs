@@ -22,6 +22,7 @@ func countServiceVolumes(volumes []*serviceVolumeIndex, opts queryOptions) (int,
 	if err != nil {
 		return 0, true, err
 	}
+	markCountDivergent(opts, pq)
 	if pq.Impossible {
 		opts.Trace.setPlannerMode("impossible-query")
 		opts.Trace.setSource("impossible-query", 0)
@@ -39,6 +40,53 @@ func countServiceVolumes(volumes []*serviceVolumeIndex, opts queryOptions) (int,
 	}
 	volumes = prioritizeServiceVolumesForPathTerms(volumes, opts)
 	opts.Trace.setEligibleVolumes(volumes)
+	if queryHasAnyContentLeaf(pq) {
+		if contentGlobalLaneEnabled() && queryHasPositiveContentLeaf(pq) {
+			snapshot := newGlobalQuerySnapshot(volumes, opts.Trace)
+			if n, handled, err := countServiceVolumesGlobalContentComponentsSnapshot(snapshot, opts, pq); handled {
+				return n, true, err
+			}
+		}
+		// Content counts run the exact same per-volume candidate + inline
+		// verification path as content searches so count == len(search results)
+		// for every shape that does not require a stat. Unusable volumes degrade
+		// the result; only an all-unusable query is refused. A query still
+		// answerable without content also counts the unusable volume's filename
+		// matches (PF-7b).
+		usable, skipped := contentUsableVolumes(volumes, pq)
+		if len(usable) == 0 && !filenameAnswerable(pq) {
+			return 0, true, contentUnavailableError()
+		}
+		markContentQueryDegraded(opts.Trace, skipped)
+		markContentQueryIncomplete(opts.Trace, usable)
+		total := 0
+		for _, vol := range volumes {
+			if queryCanceled(parsedQuery{DeadlineUnix: opts.DeadlineUnix, Cancel: opts.Cancel}) {
+				return 0, true, errQueryCanceled
+			}
+			var n int
+			var err error
+			if vol != nil && vol.contentUsableForQuery() {
+				n, err = vol.countContentVolume(opts)
+			} else if filenameAnswerable(pq) && vol != nil {
+				n, err = vol.countFilenameOnlyVolume(opts, pq)
+			} else {
+				continue
+			}
+			if err != nil {
+				return 0, true, err
+			}
+			total += n
+		}
+		// A capped candidate superset means the count is not exact. Refuse it
+		// instead of returning a partial number that looks complete.
+		if opts.Trace != nil && opts.Trace.ContentIncomplete {
+			return 0, true, errContentIncomplete
+		}
+		opts.Trace.setPlannerMode("service-content")
+		opts.Trace.setComplete(opts.Trace == nil || (!opts.Trace.ContentPartial && !opts.Trace.ContentIncomplete))
+		return total, true, nil
+	}
 	snapshot := newGlobalQuerySnapshot(volumes, opts.Trace)
 	if count, handled, err := countServiceVolumesGlobalOnlySnapshot(snapshot, opts); handled {
 		if count == 0 && opts.Trace != nil && opts.Trace.PlannerMode == "global-count-name" {
@@ -59,7 +107,7 @@ func countServiceVolumes(volumes []*serviceVolumeIndex, opts queryOptions) (int,
 		return count, true, err
 	}
 	if len(volumes) > 1 {
-		return 0, true, globalMultiVolumePlannerDeclineError(opts)
+		return 0, true, globalMultiVolumePlannerDeclineError(opts, volumes)
 	}
 	if opts.Trace != nil && strings.HasPrefix(opts.Trace.Decline, "global-") {
 		opts.Trace.setFallback("service-count-single-volume")
@@ -79,7 +127,7 @@ func countServiceVolumes(volumes []*serviceVolumeIndex, opts queryOptions) (int,
 			return count, true, nil
 		}
 		pathCache := make(map[int]string)
-		matches, err := searchCompactWithCacheHidden(vol.index, opts, true, pathCache, vol.nameTermCandidates, vol.snapshotHiddenBaseIDs())
+		matches, err := searchCompactWithCacheHidden(vol.index, opts, true, pathCache, vol.nameTermCandidates, vol.snapshotHiddenBaseIDs(), nil)
 		if err != nil {
 			return 0, true, err
 		}
@@ -108,7 +156,7 @@ func countServiceVolumes(volumes []*serviceVolumeIndex, opts queryOptions) (int,
 // than guess, per the R2.6 invariant: any route that can't see the overlay
 // exactly must decline, not answer stale/wrong.
 func (vol *serviceVolumeIndex) overlayAwareFastCount(pq parsedQuery) (int, bool) {
-	if vol == nil || vol.index == nil {
+	if vol == nil || vol.index == nil || queryHasAnyContentLeaf(pq) {
 		return 0, false
 	}
 	snap := vol.snap.Load()
@@ -223,6 +271,11 @@ func (vol *serviceVolumeIndex) fastPostingCount(pq parsedQuery) (int, bool) {
 // exact while an overlay is active instead of being a stale base-only count
 // (review G7 / plan R2.6).
 func (vol *serviceVolumeIndex) fastPostingCountHidden(pq parsedQuery, hidden hiddenBaseIDs) (int, bool) {
+	if queryHasAnyContentLeaf(pq) {
+		// These posting counts never evaluate content; decline so the verified
+		// content path answers.
+		return 0, false
+	}
 	if count, ok := vol.plannedCountHidden(pq, hidden); ok {
 		return count, true
 	}

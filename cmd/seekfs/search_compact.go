@@ -197,7 +197,7 @@ func (idx *Index) appendCompactRecord(rec CompactRecord) int {
 }
 
 func searchCompactWithCache(idx *Index, opts queryOptions, countOnly bool, pathCache map[int]string, candidateFn func(parsedQuery) ([]int, bool)) ([]Entry, error) {
-	return searchCompactWithCacheHidden(idx, opts, countOnly, pathCache, candidateFn, hiddenBaseIDs{})
+	return searchCompactWithCacheHidden(idx, opts, countOnly, pathCache, candidateFn, hiddenBaseIDs{}, nil)
 }
 
 type hiddenBaseIDs struct {
@@ -207,6 +207,14 @@ type hiddenBaseIDs struct {
 
 func (h hiddenBaseIDs) empty() bool {
 	return len(h.tombstone) == 0 && len(h.shadowed) == 0
+}
+
+// hiddenBlocksTruncation reports whether top-N/limited candidate lanes must
+// decline. With overlay-hidden base records, the verify loop drops hidden
+// ids from a truncated set and the page underfills with no way to recover;
+// complete lanes stay exact because every surviving match is still present.
+func (pq parsedQuery) hiddenBlocksTruncation() bool {
+	return !pq.hidden.empty()
 }
 
 func (h hiddenBaseIDs) contains(id int) bool {
@@ -223,7 +231,12 @@ func (h hiddenBaseIDs) contains(id int) bool {
 	return false
 }
 
-func searchCompactWithCacheHidden(idx *Index, opts queryOptions, countOnly bool, pathCache map[int]string, candidateFn func(parsedQuery) ([]int, bool), hidden hiddenBaseIDs) ([]Entry, error) {
+// searchCompactWithCacheHidden verifies candidates from idx. contentVol is
+// non-nil only on the content query path: content semantics are then enforced
+// inline (before a match is appended or counted toward the limit), and the
+// ordinary limit-based collection is restored. A nil contentVol is the
+// unchanged name/scalar path.
+func searchCompactWithCacheHidden(idx *Index, opts queryOptions, countOnly bool, pathCache map[int]string, candidateFn func(parsedQuery) ([]int, bool), hidden hiddenBaseIDs, contentVol *serviceVolumeIndex) ([]Entry, error) {
 	pq, err := parseQuery(opts)
 	if err != nil {
 		return nil, err
@@ -240,6 +253,12 @@ func searchCompactWithCacheHidden(idx *Index, opts queryOptions, countOnly bool,
 	limit := normalizedLimit(opts.Limit, countOnly)
 	pq.Limit = limit
 	pq.CountOnly = countOnly
+	pq.contentCandidateMeta = &contentCandidateMeta{}
+	pq.hidden = hidden
+	var contentMatcher *contentLeafMatcher
+	if contentVol != nil && queryHasAnyContentLeaf(pq) {
+		contentMatcher = newContentLeafMatcher(pq)
+	}
 	order := idx.CompactNameOrder
 	if pq.SortColumn == "size" {
 		order = uint32OrderToInts((&serviceVolumeIndex{index: idx}).sizeOrderForRank())
@@ -276,8 +295,19 @@ func searchCompactWithCacheHidden(idx *Index, opts queryOptions, countOnly bool,
 		pathCache = make(map[int]string)
 	}
 	skipEntryMatches := compactCandidateCanSkipEntryMatches(pq, usedCandidates)
-	if usedCandidates && !countOnly && len(order) >= serviceTrigramParallelVerifyMinIDs {
-		return verifyCompactCandidateOrderParallel(idx, pq, order, pathCache, limit, skipEntryMatches, hidden)
+	// The rank-ordered bounded content scan (used when the posting superset is
+	// capped to the window) already ran the full name+content predicate inline,
+	// so the verify loop below must not repeat it.
+	if contentMatcher != nil && !countOnly && pq.contentCandidateMeta.verified {
+		skipEntryMatches = true
+	}
+	// Content verification is inline and must stop at the limit: the parallel
+	// verifier runs every worker over its full range and only caps the merged
+	// output, so it verifies the whole candidate order. The serial range walk
+	// below stops as soon as the limit is reached, which keeps a broad content
+	// query's work proportional to the window rather than the candidate set.
+	if usedCandidates && !countOnly && contentMatcher == nil && len(order) >= serviceTrigramParallelVerifyMinIDs {
+		return verifyCompactCandidateOrderParallel(idx, pq, order, pathCache, limit, skipEntryMatches, hidden, contentVol, contentMatcher)
 	}
 	for pos := 0; pos < compactOrderLen(order, idx.compactRecordCount()); pos++ {
 		if pos&1023 == 0 && queryCanceled(pq) {
@@ -297,6 +327,9 @@ func searchCompactWithCacheHidden(idx *Index, opts queryOptions, countOnly bool,
 		if queryPathTermPrecheckSafe(pq) && !idx.compactPathContainsAll(recIndex, pq.Terms) {
 			continue
 		}
+		// Bound the path memo: full scans would otherwise retain every
+		// visited path (see boundPathCache).
+		pathCache = boundPathCache(pathCache)
 		if skipEntryMatches {
 			results = append(results, compactEntryFromRecord(idx, recIndex, rec, pathCache, false))
 			if !countOnly && len(results) >= limit {
@@ -304,8 +337,18 @@ func searchCompactWithCacheHidden(idx *Index, opts queryOptions, countOnly bool,
 			}
 			continue
 		}
-		entry := compactEntryFromRecord(idx, recIndex, rec, pathCache, true)
-		if entryMatches(entry, pq, pq.MatchPath) {
+		// Counting mode skips path reconstruction when the query has no path
+		// constraint, and tallies the match instead of retaining an Entry.
+		withPath := true
+		if opts.contentCount != nil {
+			withPath = queryNeedsEntryPath(pq)
+		}
+		entry := compactEntryFromRecordPath(idx, recIndex, rec, pathCache, true, withPath)
+		if entryMatchesWithContentMatcher(contentVol, entry, pq, pq.MatchPath, contentMatcher) {
+			if opts.contentCount != nil {
+				*opts.contentCount++
+				continue
+			}
 			results = append(results, entry)
 			if !countOnly && len(results) >= limit {
 				break
@@ -319,6 +362,11 @@ func compactCandidateCanSkipEntryMatches(pq parsedQuery, usedCandidates bool) bo
 	if !usedCandidates {
 		return false
 	}
+	if queryHasAnyContentLeaf(pq) {
+		// Content verification is inline and needs the materialized entry, so
+		// the name/scalar precheck cannot be skipped.
+		return false
+	}
 	if pq.Under != "" ||
 		pq.Exists ||
 		len(pq.Dirs) > 0 ||
@@ -328,7 +376,8 @@ func compactCandidateCanSkipEntryMatches(pq parsedQuery, usedCandidates bool) bo
 		len(pq.DateFilters) > 0 ||
 		len(pq.AttrFilters) > 0 ||
 		len(pq.OrGroups) > 0 ||
-		len(pq.NotGroups) > 0 {
+		len(pq.NotGroups) > 0 ||
+		len(pq.Features) > 0 {
 		return false
 	}
 	if len(pq.Terms) == 0 {
@@ -349,7 +398,17 @@ func compactCandidateCanSkipEntryMatches(pq parsedQuery, usedCandidates bool) bo
 }
 
 func compactEntryFromRecord(idx *Index, recIndex int, rec CompactRecord, pathCache map[int]string, withLower bool) Entry {
-	path := idx.reconstructCompactPathCached(recIndex, pathCache)
+	return compactEntryFromRecordPath(idx, recIndex, rec, pathCache, withLower, true)
+}
+
+// compactEntryFromRecordPath is compactEntryFromRecord with an explicit path
+// switch. withPath=false skips reconstructing Entry.Path (used by the content
+// count path when the query reads only the record's name/metadata).
+func compactEntryFromRecordPath(idx *Index, recIndex int, rec CompactRecord, pathCache map[int]string, withLower, withPath bool) Entry {
+	path := ""
+	if withPath {
+		path = idx.reconstructCompactPathCached(recIndex, pathCache)
+	}
 	entry := Entry{
 		Path:        path,
 		Name:        rec.Name,
@@ -357,6 +416,7 @@ func compactEntryFromRecord(idx *Index, recIndex int, rec CompactRecord, pathCac
 		Size:        rec.Size,
 		ModUnix:     rec.ModUnix,
 		IndexSource: idx.Source,
+		FRN:         rec.FRN,
 	}
 	if rec.Mode&uint32(os.ModeDir) != 0 && recIndex >= 0 && recIndex < len(idx.Derived.SubtreeBytes) {
 		size := int64(idx.Derived.SubtreeBytes[recIndex])
@@ -375,13 +435,13 @@ func compactEntryFromRecord(idx *Index, recIndex int, rec CompactRecord, pathCac
 	return entry
 }
 
-func verifyCompactCandidateOrderParallel(idx *Index, pq parsedQuery, order []int, pathCache map[int]string, limit int, skipEntryMatches bool, hidden hiddenBaseIDs) ([]Entry, error) {
+func verifyCompactCandidateOrderParallel(idx *Index, pq parsedQuery, order []int, pathCache map[int]string, limit int, skipEntryMatches bool, hidden hiddenBaseIDs, contentVol *serviceVolumeIndex, matcher *contentLeafMatcher) ([]Entry, error) {
 	if len(order) == 0 || limit <= 0 {
 		return nil, nil
 	}
 	workers := min(runtime.GOMAXPROCS(0), max(1, len(order)/serviceTrigramParallelVerifyMinIDs))
 	if workers <= 1 {
-		return verifyCompactCandidateOrderRange(idx, pq, order, pathCache, limit, skipEntryMatches, hidden)
+		return verifyCompactCandidateOrderRange(idx, pq, order, pathCache, limit, skipEntryMatches, hidden, contentVol, matcher)
 	}
 	parts := make([][]Entry, workers)
 	var canceled atomic.Bool
@@ -403,7 +463,8 @@ func verifyCompactCandidateOrderParallel(idx *Index, pq parsedQuery, order []int
 				if hidden.contains(recIndex) {
 					continue
 				}
-				if entry, ok := compactCandidateEntryIfMatch(idx, pq, recIndex, localCache, true, skipEntryMatches); ok {
+				localCache = boundPathCache(localCache)
+				if entry, ok := compactCandidateEntryIfMatchIn(contentVol, idx, pq, recIndex, localCache, true, skipEntryMatches, matcher); ok {
 					local = append(local, entry)
 					if len(local) >= limit {
 						break
@@ -429,7 +490,7 @@ func verifyCompactCandidateOrderParallel(idx *Index, pq parsedQuery, order []int
 	return out, nil
 }
 
-func verifyCompactCandidateOrderRange(idx *Index, pq parsedQuery, order []int, pathCache map[int]string, limit int, skipEntryMatches bool, hidden hiddenBaseIDs) ([]Entry, error) {
+func verifyCompactCandidateOrderRange(idx *Index, pq parsedQuery, order []int, pathCache map[int]string, limit int, skipEntryMatches bool, hidden hiddenBaseIDs, contentVol *serviceVolumeIndex, matcher *contentLeafMatcher) ([]Entry, error) {
 	out := make([]Entry, 0, min(limit, 1024))
 	for pos, recIndex := range order {
 		if pos&1023 == 0 && queryCanceled(pq) {
@@ -438,7 +499,8 @@ func verifyCompactCandidateOrderRange(idx *Index, pq parsedQuery, order []int, p
 		if hidden.contains(recIndex) {
 			continue
 		}
-		if entry, ok := compactCandidateEntryIfMatch(idx, pq, recIndex, pathCache, true, skipEntryMatches); ok {
+		pathCache = boundPathCache(pathCache)
+		if entry, ok := compactCandidateEntryIfMatchIn(contentVol, idx, pq, recIndex, pathCache, true, skipEntryMatches, matcher); ok {
 			out = append(out, entry)
 			if len(out) >= limit {
 				return out, nil
@@ -449,6 +511,14 @@ func verifyCompactCandidateOrderRange(idx *Index, pq parsedQuery, order []int, p
 }
 
 func compactCandidateEntryIfMatch(idx *Index, pq parsedQuery, recIndex int, pathCache map[int]string, usedCandidates bool, skipEntryMatches bool) (Entry, bool) {
+	return compactCandidateEntryIfMatchIn(nil, idx, pq, recIndex, pathCache, usedCandidates, skipEntryMatches, nil)
+}
+
+// compactCandidateEntryIfMatchIn is compactCandidateEntryIfMatch with inline
+// content verification: when vol has content and pq carries a content leaf, the
+// entry must satisfy the joint name+content predicate. Other callers pass nil
+// vol and keep the pure name/scalar behavior.
+func compactCandidateEntryIfMatchIn(vol *serviceVolumeIndex, idx *Index, pq parsedQuery, recIndex int, pathCache map[int]string, usedCandidates bool, skipEntryMatches bool, matcher *contentLeafMatcher) (Entry, bool) {
 	rec := idx.compactRecord(recIndex)
 	if rec.Deleted {
 		return Entry{}, false
@@ -463,10 +533,35 @@ func compactCandidateEntryIfMatch(idx *Index, pq parsedQuery, recIndex int, path
 		return compactEntryFromRecord(idx, recIndex, rec, pathCache, false), true
 	}
 	entry := compactEntryFromRecord(idx, recIndex, rec, pathCache, true)
-	if !entryMatches(entry, pq, pq.MatchPath) {
+	if !entryMatchesWithContentMatcher(vol, entry, pq, pq.MatchPath, matcher) {
 		return Entry{}, false
 	}
 	return entry, true
+}
+
+// scanCandidateMatches reports whether recIndex satisfies the ordered-scan
+// predicate. For a content scan whose query reads no path (a plain content
+// query), it verifies against a path-free Entry: the scan discards the Entry,
+// and the returned candidate reconstructs its path downstream, so building one
+// here would be wasted work. Any query that reads a path keeps the full entry.
+func scanCandidateMatches(vol *serviceVolumeIndex, idx *Index, pq parsedQuery, recIndex int, pathCache map[int]string, matcher *contentLeafMatcher) bool {
+	if matcher != nil && !queryNeedsEntryPath(pq) {
+		rec := idx.compactRecord(recIndex)
+		if rec.Deleted || !compactRecordPrecheck(rec, pq, pq.MatchPath) {
+			return false
+		}
+		entry := Entry{
+			Name:        rec.Name,
+			Mode:        rec.Mode,
+			Size:        rec.Size,
+			ModUnix:     rec.ModUnix,
+			IndexSource: idx.Source,
+			FRN:         rec.FRN,
+		}
+		return entryMatchesWithContentMatcher(vol, entry, pq, pq.MatchPath, matcher)
+	}
+	_, ok := compactCandidateEntryIfMatchIn(vol, idx, pq, recIndex, pathCache, true, false, matcher)
+	return ok
 }
 
 func dropSatisfiedVolumeTerms(pq *parsedQuery, volume string) {
@@ -487,14 +582,33 @@ var errQueryCanceled = errors.New("query superseded")
 
 var errGlobalMultiVolumePlannerDeclined = errors.New("global planner declined multi-volume query")
 
-func globalMultiVolumePlannerDeclineError(opts queryOptions) error {
+func globalMultiVolumePlannerDeclineError(opts queryOptions, volumes []*serviceVolumeIndex) error {
 	if queryCanceled(parsedQuery{DeadlineUnix: opts.DeadlineUnix, Cancel: opts.Cancel}) {
 		return errQueryCanceled
 	}
-	if opts.Trace != nil && opts.Trace.Decline != "" {
-		return fmt.Errorf("%w: %s", errGlobalMultiVolumePlannerDeclined, opts.Trace.Decline)
+	// A bare decline reads as a broken query. Name the scale and how to
+	// narrow it: per-volume fallback was deliberately removed (it cannot
+	// preserve global rank/limit semantics), so the actionable path is a
+	// more selective query, not a retry.
+	names := make([]string, 0, len(volumes))
+	total := 0
+	for _, vol := range volumes {
+		if vol == nil || vol.index == nil {
+			continue
+		}
+		if vol.index.Volume != "" {
+			names = append(names, vol.index.Volume)
+		}
+		total += vol.index.compactRecordCount()
 	}
-	return errGlobalMultiVolumePlannerDeclined
+	scope := ""
+	if len(names) > 0 {
+		scope = fmt.Sprintf(" across %s (%d records)", strings.Join(names, ", "), total)
+	}
+	if opts.Trace != nil && opts.Trace.Decline != "" {
+		return fmt.Errorf("%w%s: %s; narrow with --under <dir>, a volume prefix, or a more selective term", errGlobalMultiVolumePlannerDeclined, scope, opts.Trace.Decline)
+	}
+	return fmt.Errorf("%w%s; narrow with --under <dir>, a volume prefix, or a more selective term", errGlobalMultiVolumePlannerDeclined, scope)
 }
 
 func queryCanceled(pq parsedQuery) bool {
@@ -509,6 +623,11 @@ func queryCanceled(pq parsedQuery) bool {
 // dm:, --recent, and --modified-after would otherwise silently match nothing.
 // Failing loudly is consistent with rejecting unknown filters at parse time.
 func checkQueryCapabilities(pq parsedQuery, idx *Index) error {
+	for _, leaf := range featureAllLeaves(pq) {
+		if leaf.matches == nil {
+			return fmt.Errorf("feature queries require the resident seekfs service")
+		}
+	}
 	needsSize, needsMod := queryNeedsSizeOrMod(pq)
 	if needsSize && !idx.compactHasSize() {
 		return errors.New("size: filters require an index with file sizes; the current index has none (rebuild with a size-capable indexer)")
@@ -605,6 +724,84 @@ func compactRecordPrecheck(rec CompactRecord, pq parsedQuery, matchPath bool) bo
 }
 
 func (vol *serviceVolumeIndex) nameTermCandidates(pq parsedQuery) ([]int, bool) {
+	// Content is a first-class constraint. A content posting superset is
+	// preferred; when none exists (mixed OR, negative-only, an unindexable
+	// gram, or any other decline) the bounded ordered scan is the correct
+	// superset and inline verification narrows it. Returning ok=true even for
+	// an empty set is a real answer, not a fallback.
+	if queryHasAnyContentLeaf(pq) {
+		if queryHasPositiveContentLeaf(pq) {
+			// Bounded candidate materialization (PB8). For a non-count query
+			// that only needs its top window and does not re-rank by relevance
+			// after verification, the result ordering equals the candidate
+			// ordering, so the posting intersection may be capped at the
+			// window. When the cap is hit the set is broad and ordered by
+			// docID, not by rank: using the truncated set would drop a
+			// candidate that verification could still promote into the window.
+			// The rank-ordered bounded scan below is the exact superset-ordered
+			// substitute: it walks the same rank/result order and verifies
+			// inline, stopping at the window.
+			bounded := !pq.contentFullCandidates && !pq.CountOnly && pq.Limit > 0 &&
+				pq.SortColumn != "relevance" && pq.hidden.empty()
+			candidateCap := 0
+			if bounded {
+				// Probe broadness against the completeness window, not the
+				// verify limit: a single-volume default-order query verifies
+				// only its page limit but must still surface a candidate
+				// superset that exceeds the window as incomplete.
+				candidateCap = pq.Limit
+				if pq.contentWindow > candidateCap {
+					candidateCap = pq.contentWindow
+				}
+			}
+			if candidates, ok, capped := vol.contentCandidatesBounded(pq, candidateCap); ok {
+				if capped && bounded && pq.contentWindow > 0 && pq.contentProbe != nil {
+					// The reduced default-order path caps materialization at the
+					// completeness window, so when the posting superset exceeds
+					// it the caller can no longer probe the window with
+					// len(matches) >= window (matches is page-bounded). Record
+					// the cap for the driver; it marks incomplete only if the
+					// page actually filled, i.e. the extra window candidates
+					// could hold more matches.
+					pq.contentProbe.windowCapped = true
+				}
+				if !capped || !bounded {
+					// A fully materialized superset strictly smaller than the
+					// completeness window proves every match fits below it, so
+					// the reduced path is complete without widening.
+					if !capped && bounded && pq.contentWindow > 0 && pq.contentProbe != nil &&
+						len(candidates) < pq.contentWindow {
+						pq.contentProbe.supersetBelowWindow = true
+					}
+					// Single-volume filename parity: the filename path orders
+					// its candidates by rankForQuery(pq) (name rank for the
+					// default order; size/modified/extension/type/path for
+					// explicit sorts), so order the content posting set the same
+					// way. sort:relevance keeps its own post-verify ranking and
+					// is left in candidate (docID) order here.
+					if pq.SortColumn != "relevance" {
+						sortCandidateIDs(candidates, pq, vol.index, vol.rankForQuery(pq))
+					}
+					pq.Trace.setSource("content-candidates", len(candidates))
+					return candidates, true
+				}
+				// Capped and broad: fall through to the rank-ordered bounded
+				// scan, which is a complete superset in result order.
+			}
+		}
+		// The bounded scan is already produced in orderForQuery(pq) order, which
+		// is the same rank sequence for every sort column. It also runs the full
+		// name+content predicate inline, so for a search (not a count) it can
+		// report the candidate set as already verified.
+		if candidates, ok := vol.boundedScanCandidates(pq); ok {
+			pq.Trace.setSource("content-scan", len(candidates))
+			if !pq.CountOnly && pq.contentCandidateMeta != nil {
+				pq.contentCandidateMeta.verified = true
+			}
+			return candidates, true
+		}
+		return nil, false
+	}
 	if !pq.CountOnly && !pq.MatchPath && (len(pq.OrGroups) > 0 || len(pq.NotGroups) > 0) {
 		if candidates, ok := vol.plannedCandidates(pq); ok {
 			pq.Trace.setSource("planned:boolean", len(candidates))
@@ -663,7 +860,9 @@ func (vol *serviceVolumeIndex) nameTermCandidates(pq parsedQuery) ([]int, bool) 
 			return candidates, true
 		}
 		if candidates, ok := vol.nameTrigramCandidates(pq); ok {
-			if compactCandidateCanSkipEntryMatches(pq, true) && pq.Limit > 0 {
+			// See hiddenBlocksTruncation: never truncate before the verify
+			// loop can drop hidden ids.
+			if compactCandidateCanSkipEntryMatches(pq, true) && pq.Limit > 0 && !pq.hiddenBlocksTruncation() {
 				candidates = topCandidateIDsByRank(candidates, pq.Limit, vol.index, vol.rankForQuery(pq))
 			} else {
 				sortCandidateIDs(candidates, pq, vol.index, vol.rankForQuery(pq))
@@ -702,7 +901,11 @@ func (vol *serviceVolumeIndex) nameTermCandidates(pq parsedQuery) ([]int, bool) 
 	}
 	if pq.MatchPath {
 		if candidates, ok := vol.nameTrigramCandidates(pq); ok {
-			if compactCandidateCanSkipEntryMatches(pq, true) && pq.Limit > 0 {
+			// A truncated top-N here would underfill the page once the
+			// verify loop drops hidden ids; keep the complete rank order
+			// instead so later base matches backfill (see
+			// hiddenBlocksTruncation).
+			if compactCandidateCanSkipEntryMatches(pq, true) && pq.Limit > 0 && !pq.hiddenBlocksTruncation() {
 				candidates = topCandidateIDsByRank(candidates, pq.Limit, vol.index, vol.rankForQuery(pq))
 			} else {
 				sortCandidateIDs(candidates, pq, vol.index, vol.rankForQuery(pq))
@@ -803,6 +1006,11 @@ func (vol *serviceVolumeIndex) overlayAwareNameTermCandidates(pq parsedQuery) ([
 		return nil, false
 	}
 	if len(candidates) == 0 {
+		// A content query with no candidate postings is a real empty answer;
+		// only fall back for the name lanes.
+		if queryHasPositiveContentLeaf(pq) {
+			return []int{}, true
+		}
 		return nil, false
 	}
 	return candidates, true

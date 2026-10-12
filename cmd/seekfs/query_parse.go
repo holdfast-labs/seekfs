@@ -78,6 +78,19 @@ func commonPathBareExtensionTerm(term string) bool {
 }
 
 func queryLooksPathScoped(query string) bool {
+	if queryHasFeatureToken(query) {
+		for _, token := range contentTokenizeQuery(query) {
+			for _, part := range featureSplitAlternatives(token) {
+				if strings.HasPrefix(strings.TrimLeft(part, "!-"), "feature:") {
+					continue
+				}
+				if strings.ContainsAny(part, `\/`) {
+					return true
+				}
+			}
+		}
+		return false
+	}
 	for _, field := range strings.Fields(query) {
 		if strings.ContainsAny(field, `\/`) {
 			return true
@@ -143,7 +156,8 @@ func (pq parsedQuery) isEmpty() bool {
 	return len(pq.Terms) == 0 && len(pq.Exts) == 0 && len(pq.Dirs) == 0 &&
 		len(pq.Globs) == 0 && len(pq.Regexps) == 0 && pq.Type == "" &&
 		len(pq.Parents) == 0 && pq.Under == "" && !pq.HasModAfter && len(pq.SizeFilters) == 0 &&
-		len(pq.DateFilters) == 0 && len(pq.AttrFilters) == 0 && len(pq.OrGroups) == 0 && len(pq.NotGroups) == 0
+		len(pq.DateFilters) == 0 && len(pq.AttrFilters) == 0 && len(pq.Content) == 0 && len(pq.Features) == 0 &&
+		len(pq.OrGroups) == 0 && len(pq.NotGroups) == 0
 }
 
 // applyQueryToken parses a single whitespace-delimited token and folds it into
@@ -182,8 +196,8 @@ func applyQueryToken(pq *parsedQuery, raw string) error {
 	// matches the group if it matches any alternative. We only treat '|' as an
 	// operator when it joins token-like alternatives (not inside a regex, which
 	// uses the regex: prefix and is handled before this point).
-	if strings.Contains(raw, "|") && !strings.HasPrefix(raw, "regex:") {
-		parts := strings.Split(raw, "|")
+	if _, isRegexSpan := contentTokenIsRegexSpan(raw); strings.Contains(raw, "|") && len(featureSplitAlternatives(raw)) > 1 && !strings.HasPrefix(raw, "regex:") && !isRegexSpan {
+		parts := featureSplitAlternatives(raw)
 		group := make([]parsedQuery, 0, len(parts))
 		for _, part := range parts {
 			if part == "" {
@@ -210,6 +224,12 @@ func applyQueryToken(pq *parsedQuery, raw string) error {
 	}
 
 	switch {
+	case strings.HasPrefix(raw, "feature:"):
+		leaf, err := parseFeatureLeaf(strings.TrimPrefix(raw, "feature:"))
+		if err != nil {
+			return err
+		}
+		pq.Features = append(pq.Features, leaf)
 	case strings.HasPrefix(raw, "ext:"):
 		ext := strings.TrimPrefix(raw, "ext:")
 		ext = strings.TrimPrefix(ext, ".")
@@ -285,6 +305,14 @@ func applyQueryToken(pq *parsedQuery, raw string) error {
 		switch sortColumn {
 		case "size", "modified", "extension", "type", "path":
 			pq.SortColumn = sortColumn
+		case "relevance":
+			// Content relevance is implemented only by the content pipeline.
+			// A filename-only query keeps the pre-content contract and rejects
+			// it as an unsupported sort, so the flag-off behavior is unchanged.
+			if !queryHasContentToken(pq.Raw) {
+				return fmt.Errorf("unsupported sort %q; supported: sort:size, sort:modified, sort:extension, sort:type, sort:path", raw)
+			}
+			pq.SortColumn = sortColumn
 		default:
 			return fmt.Errorf("unsupported sort %q; supported: sort:size, sort:modified, sort:extension, sort:type, sort:path", raw)
 		}
@@ -294,8 +322,18 @@ func applyQueryToken(pq *parsedQuery, raw string) error {
 		pq.CaseSensitive = false
 	case raw == "type:file" || raw == "type:dir":
 		pq.Type = strings.TrimPrefix(raw, "type:")
+	case strings.HasPrefix(raw, "content:"):
+		leaf, err := parseContentLeaf(strings.TrimPrefix(raw, "content:"))
+		if err != nil {
+			return err
+		}
+		pq.Content = append(pq.Content, leaf)
+		if !contentSearchEnabled() {
+			return contentUnavailableError()
+		}
+		return nil
 	case isUnknownFilterToken(raw):
-		return fmt.Errorf("unsupported filter %q; supported: path: parent: ext: dir: glob: regex: type: case: size: dm: attrib: sort:size sort:modified sort:extension sort:type sort:path (and !term, a|b)", raw)
+		return fmt.Errorf("unsupported filter %q; supported: path: parent: ext: dir: glob: regex: type: case: size: dm: attrib: content: (needs SEEKFS_CONTENT_SEARCH=1) sort:size sort:modified sort:extension sort:type sort:path (and !term, a|b)", raw)
 	case looksLikeImplicitFilenameGlob(raw):
 		pq.Globs = append(pq.Globs, normalizeCase(raw, pq.CaseSensitive))
 	default:
@@ -338,6 +376,8 @@ func mergeSubquery(dst *parsedQuery, src parsedQuery) {
 	dst.SizeFilters = append(dst.SizeFilters, src.SizeFilters...)
 	dst.DateFilters = append(dst.DateFilters, src.DateFilters...)
 	dst.AttrFilters = append(dst.AttrFilters, src.AttrFilters...)
+	dst.Content = append(dst.Content, src.Content...)
+	dst.Features = append(dst.Features, src.Features...)
 	if src.Type != "" {
 		dst.Type = src.Type
 	}
@@ -518,7 +558,16 @@ func isRegexLiteralRune(r rune) bool {
 	return r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '_' || r == '-'
 }
 
-func entryMatches(entry Entry, pq parsedQuery, matchPath bool) bool {
+// entryMatchesScalar evaluates a query's name/path/scalar constraints only. It
+// is the shared body of entryMatches and entryMatchesWithContent; OR/NOT groups
+// recurse in the callers so content-aware verification can apply its own
+// per-alternative (joint) semantics.
+func entryMatchesScalar(entry Entry, pq parsedQuery, matchPath bool) bool {
+	for _, leaf := range pq.Features {
+		if _, ok := leaf.matches[entry.FRN]; !ok {
+			return false
+		}
+	}
 	path := filepath.Clean(entry.Path)
 	name := entry.Name
 	if name == "" {
@@ -607,7 +656,11 @@ func entryMatches(entry Entry, pq parsedQuery, matchPath bool) bool {
 			return false
 		}
 	}
-	if !attrFiltersMatch(entry.Mode, pq.AttrFilters) {
+	return attrFiltersMatch(entry.Mode, pq.AttrFilters)
+}
+
+func entryMatches(entry Entry, pq parsedQuery, matchPath bool) bool {
+	if !entryMatchesScalar(entry, pq, matchPath) {
 		return false
 	}
 	for _, group := range pq.OrGroups {
@@ -623,6 +676,12 @@ func entryMatches(entry Entry, pq parsedQuery, matchPath bool) bool {
 		}
 	}
 	for _, neg := range pq.NotGroups {
+		if queryHasAnyContentLeaf(neg) {
+			// Content exclusion is applied by entryMatchesWithContent, which
+			// knows the per-document results. entryMatches only sees name/scalar
+			// data and must not drop every entry here.
+			continue
+		}
 		if entryMatches(entry, neg, matchPath || neg.MatchPath) {
 			return false
 		}

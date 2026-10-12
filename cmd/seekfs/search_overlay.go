@@ -37,6 +37,7 @@ func (vol *serviceVolumeIndex) overlaySlotEntry(records []CompactRecord, latest 
 		Size:        rec.Size,
 		ModUnix:     rec.ModUnix,
 		IndexSource: vol.index.Source,
+		FRN:         rec.FRN,
 	}, true
 }
 
@@ -77,7 +78,7 @@ func (vol *serviceVolumeIndex) overlayLiveMatchCountCancellable(snap *volumeSnap
 		if !ok {
 			continue
 		}
-		if entryMatches(entry, pq, pq.MatchPath) {
+		if entryMatchesWithContent(vol, entry, pq, pq.MatchPath) {
 			count++
 		}
 	}
@@ -481,6 +482,7 @@ func (vol *serviceVolumeIndex) overlayEntry(records []CompactRecord, latest map[
 		Size:        rec.Size,
 		ModUnix:     rec.ModUnix,
 		IndexSource: vol.index.Source,
+		FRN:         rec.FRN,
 	}, true
 }
 
@@ -682,6 +684,10 @@ func filesystemUnderFallbackSearchLimited(opts queryOptions, countOnly bool, max
 		if entryMatches(entry, pq, pq.MatchPath) {
 			matches = append(matches, entry)
 			if limit > 0 && len(matches) >= limit {
+				// A full top-N page, not a full enumeration: complete stays
+				// as-is (true unless a visit cap tripped). Callers must not
+				// read it as "the whole scope was walked" — counts never
+				// take this path (countOnly returns early above).
 				return filepath.SkipAll
 			}
 		}

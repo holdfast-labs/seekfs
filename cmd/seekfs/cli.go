@@ -68,6 +68,8 @@ func run(args []string) error {
 		return cmdDoctor(args[1:])
 	case "config":
 		return cmdConfig(args[1:])
+	case "plugin", "plugins":
+		return cmdPlugin(args[1:])
 	case "defaults":
 		return cmdDefaults(args[1:])
 	case "uninstall":
@@ -88,6 +90,10 @@ func run(args []string) error {
 		return cmdSearch(args[1:], false)
 	case "count":
 		return cmdSearch(args[1:], true)
+	case "content-index":
+		return cmdContentIndex(args[1:])
+	case "content":
+		return cmdContent(args[1:])
 	case "watch":
 		return runWatch(args[1:])
 	case "version":
@@ -192,6 +198,7 @@ func printUsage(w io.Writer) {
   seekfs loaded [--json]
   seekfs defaults [--json]
   seekfs config path|show|get|set
+  seekfs plugin list|add|remove|enable|disable|config|doctor|reload|path
   seekfs service-index-usn -volume C: -db seekfs.gsi [-pipe \\.\pipe\seekfs-service]
   seekfs bench [-db index.gsi...] [-service] [-count] [--json] [-iterations 100]
   seekfs ui [-pipe \\.\pipe\seekfs-service] [-n 200]
@@ -200,6 +207,8 @@ func printUsage(w io.Writer) {
   seekfs agent
   seekfs search [-db seekfs.db...] [--json] [-n 100] [-path] <query>
   seekfs count [-db seekfs.db...] [--json] [-path] <query>
+  seekfs content-index (-root <dir> | -db <gsi>) [-out content.gsx] [-under <path>] [-ext .go,.md]
+  seekfs content -db content.gsx [-n 100] [--json] <term>
   seekfs watch "<query>" [-interval 2s] [-n 10000] [-under PATH] [-exec CMD] [-pipe \\.\pipe\seekfs-service]
   seekfs version
 
@@ -265,6 +274,10 @@ Query filters:
   case:             Enable case-sensitive matching from the query.
   type:file         Only files.
   type:dir          Only directories.
+  content:foo       Case-insensitive literal substring in file content; not a
+                    whole-word match (foo matches foobar). Needs the
+                    content plugin (seekfs plugin add content); content:/re/ is a regex
+                    match for word boundaries or alternation.
   a|b               OR alternatives within a term, such as ext:png|jpg.
   !term, -term      Exclude a term or filter.
 

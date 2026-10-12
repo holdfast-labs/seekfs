@@ -415,25 +415,129 @@ func (vol *serviceVolumeIndex) boundedScanCandidatesFiltered(pq parsedQuery, fil
 	}
 	order := vol.orderForQuery(pq)
 	limit := pq.Limit
-	canStopAtLimit := !pq.CountOnly && limit > 0 && pq.RootBias == "" && pq.CWDBias == ""
+	contentQuery := queryHasAnyContentLeaf(pq)
+	var contentMatcher *contentLeafMatcher
+	if contentQuery {
+		contentMatcher = newContentLeafMatcher(pq)
+	}
+	// Bias re-ranks the verified candidates: the bias root's subtree moves to
+	// the front, in scan order, and the caller re-applies the same stable bias
+	// to the candidate slice. The scan can therefore still stop once it has the
+	// top of the biased order -- the root's matches first, then the rest -- so
+	// it only needs to defer the non-root matches it has already collected.
+	// A post-verify relevance sort is the one order the caller cannot rebuild
+	// from a prefix, so it keeps the full candidate set. contentFullCandidates
+	// selects the historical full-candidate arm for differential testing, which
+	// must scan before re-ranking. A pending overlay hidden set also disables
+	// the early stop for every query shape: scanCandidateMatches sees the base
+	// record only, so a hidden base match would fill the page and the caller's
+	// verify loop would drop it, under-filling the result with no way to
+	// recover. The guard is the caller's captured hidden set (threaded through
+	// pq), so the scan and the verify loop drop exactly the same records; it is
+	// a cheap length check and is evaluated last, so the common no-overlay path
+	// pays nothing.
+	biased := pq.RootBias != "" || pq.CWDBias != ""
+	canStopAtLimit := !pq.CountOnly && limit > 0 &&
+		(!biased || (!pq.contentFullCandidates && pq.SortColumn != "relevance")) &&
+		pq.hidden.empty()
 	if canStopAtLimit {
+		biasRoot := ""
+		if biased {
+			biasRoot = firstNonEmpty(pq.CWDBias, pq.RootBias)
+		}
 		out := make([]int, 0, min(limit, 1024))
+		var deferred []int
 		cache := make(map[int]string)
+		visited := 0
 		for pos := 0; pos < compactUint32OrderLen(order, recordCount); pos++ {
 			if pos&1023 == 0 && queryCanceled(pq) {
 				return nil, false
+			}
+			// A content scan can walk the whole volume when matches are sparse,
+			// so it is bounded in visited records and in path-cache size. On
+			// reaching the budget, return what was found and say it is
+			// incomplete rather than scan forever. The non-content path is
+			// unchanged (both checks are gated on contentQuery).
+			if contentQuery && visited >= contentScanVisitBudgetOf(pq) {
+				pq.Trace.setContentIncomplete()
+				break
+			}
+			if contentQuery {
+				cache = boundPathCache(cache)
 			}
 			id := compactUint32OrderAt(order, pos)
 			if filter != nil && !filter.contains(id) {
 				continue
 			}
-			if _, ok := compactCandidateEntryIfMatch(vol.index, pq, id, cache, true, false); !ok {
+			if contentQuery {
+				visited++
+			}
+			if !scanCandidateMatches(vol, vol.index, pq, id, cache, contentMatcher) {
+				continue
+			}
+			if biasRoot != "" && !pathUnder(vol.index.reconstructCompactPathCached(id, cache), biasRoot) {
+				// Outside the biased subtree: every root match precedes it, so
+				// hold it until the root's matches are exhausted (or the page
+				// fills without it).
+				if len(deferred) < limit {
+					deferred = append(deferred, id)
+				}
 				continue
 			}
 			out = append(out, id)
 			if len(out) >= limit {
 				return out, true
 			}
+		}
+		if len(out) < limit {
+			out = append(out, deferred...)
+			if len(out) > limit {
+				out = out[:limit]
+			}
+		}
+		return out, true
+	}
+
+	if contentQuery {
+		// A count, or a biased scan whose caller re-ranks after verification,
+		// cannot stop early, and content verification drops candidates, so
+		// materialize the whole matching set up to the memory budget. Past
+		// either budget the superset is incomplete: mark it rather than
+		// silently truncate. A sparse-match scan can visit the whole volume
+		// while producing few matches, so the visited-record budget is enforced
+		// independently of the match budget, and the path memo is reset past a
+		// fixed cap to keep memory O(budget).
+		budget := contentCandidateBudgetOf(pq)
+		visitBudget := contentScanVisitBudgetOf(pq)
+		out := make([]int, 0, min(recordCount, 1024))
+		cache := make(map[int]string)
+		visited := 0
+		incomplete := false
+		for pos := 0; pos < compactUint32OrderLen(order, recordCount); pos++ {
+			if pos&1023 == 0 && queryCanceled(pq) {
+				return nil, false
+			}
+			if visited >= visitBudget {
+				incomplete = true
+				break
+			}
+			id := compactUint32OrderAt(order, pos)
+			if filter != nil && !filter.contains(id) {
+				continue
+			}
+			visited++
+			cache = boundPathCache(cache)
+			if _, ok := compactCandidateEntryIfMatchIn(vol, vol.index, pq, id, cache, true, false, contentMatcher); !ok {
+				continue
+			}
+			if len(out) >= budget {
+				incomplete = true
+				break
+			}
+			out = append(out, id)
+		}
+		if incomplete {
+			pq.Trace.setContentIncomplete()
 		}
 		return out, true
 	}

@@ -36,6 +36,7 @@ func (s *goSearchService) runStandalone() error {
 }
 
 func (s *goSearchService) loadConfiguredIndexes() error {
+	s.initializeFeatures()
 	s.indexMu.Lock()
 	s.loading = true
 	s.loadErr = ""
@@ -58,6 +59,9 @@ func (s *goSearchService) loadConfiguredIndexes() error {
 		return err
 	}
 	s.indexMu.Lock()
+	for _, vol := range volumes {
+		s.prepareFeatureVolume(vol)
+	}
 	s.indexes = indexes
 	s.volumes = volumes
 	s.loadErr = ""
@@ -80,6 +84,9 @@ func (s *goSearchService) loadConfiguredIndexes() error {
 			// backoff until it recovers.
 			go s.staleRecoveryLoop(vol)
 		}
+	}
+	for _, vol := range volumes {
+		s.featuresVolumeReady(vol)
 	}
 	go s.replayStallWatchdog()
 	serviceLog("loaded %d dbs entries=%d elapsed=%s", len(indexes), total, time.Since(start).Round(time.Millisecond))
@@ -307,14 +314,19 @@ func ensureCompactIndexForService(idx *Index) {
 
 func newServiceVolumeIndex(dbPath string, idx *Index) *serviceVolumeIndex {
 	vol := &serviceVolumeIndex{
-		dbPath:      dbPath,
-		index:       idx,
-		volume:      idx.Volume,
-		journalID:   idx.JournalID,
-		checkpoint:  idx.Checkpoint,
-		state:       "ready",
-		pathCache:   make(map[int]string),
-		lastPersist: time.Now(),
+		dbPath:         dbPath,
+		index:          idx,
+		volume:         idx.Volume,
+		journalID:      idx.JournalID,
+		checkpoint:     idx.Checkpoint,
+		baseCheckpoint: idx.Checkpoint,
+		state:          "ready",
+		pathCache:      make(map[int]string),
+		lastPersist:    time.Now(),
+	}
+	if contentSearchEnabled() {
+		vol.content = newContentVolumeState(idx.Volume)
+		vol.contentCoord = newContentCoordinator(vol.content)
 	}
 	if idx.Compact && idx.Source == "usn" {
 		vol.ownedDirFRNs = ownedReplayDirFRNs(idx.Volume)

@@ -17,6 +17,7 @@ func globalExtOnlySupported(pq parsedQuery) bool {
 		len(pq.Regexps) != 0 || len(pq.RegexTerms) != 0 ||
 		len(pq.Parents) != 0 || pq.Under != "" || pq.Exists || pq.HasModAfter || len(pq.SizeFilters) != 0 ||
 		len(pq.DateFilters) != 0 || len(pq.AttrFilters) != 0 || len(pq.OrGroups) != 0 || len(pq.NotGroups) != 0 ||
+		queryHasAnyContentLeaf(pq) ||
 		pq.CaseSensitive {
 		return false
 	}
@@ -178,10 +179,17 @@ func globalComponentQuerySupported(pq parsedQuery, terms []string) bool {
 // regexes keep the components/literal lane so the persisted per-volume regex
 // candidates continue to serve them.
 func globalComponentQuerySupportedMulti(pq parsedQuery, terms []string, multi bool) bool {
-	minTerms := 2
-	if queryHasExplicitPathTerm(pq.Raw) || globalComponentVolumeAnchored(pq) {
-		minTerms = 1
+	if queryHasAnyContentLeaf(pq) {
+		// The components lane verifies only name/path; a content query must
+		// route through the content candidate + post-filter path.
+		return false
 	}
+	// Single plain terms are admitted: the probe estimate (capped, never
+	// materializing past the scan cap) and the iterator's own budgeted
+	// expansion decline broad terms, so selectivity — not term count —
+	// decides. Previously minTerms was 2 here, forcing every selective
+	// single-term path query into a full scan.
+	minTerms := 1
 	if len(pq.OrGroups) != 0 || len(pq.NotGroups) != 0 {
 		minTerms = 1
 	}
@@ -368,7 +376,7 @@ func compareGlobalVerifiedEntries(a, b globalRankedEntry, pq parsedQuery, global
 // the requested top-N entries. Boolean branches stay lazy: OR sources merge
 // their posting iterators and NOT advances the exclusion iterator with
 // SeekGE, while this verifier owns the only bounded result heap.
-func collectGlobalVerifiedTopN(it globalIDIterator, volumes []*serviceVolumeIndex, snapshots []*volumeSnapshot, pq parsedQuery, limit int) ([]globalRankedEntry, int, error) {
+func collectGlobalVerifiedTopN(it globalIDIterator, volumes []*serviceVolumeIndex, snapshots []*volumeSnapshot, pq parsedQuery, limit int, matcher *contentLeafMatcher) ([]globalRankedEntry, int, error) {
 	if it == nil || limit <= 0 {
 		return nil, 0, nil
 	}
@@ -403,11 +411,11 @@ func collectGlobalVerifiedTopN(it globalIDIterator, volumes []*serviceVolumeInde
 			dropSatisfiedVolumeTerms(&volumePQs[i], vol.index.Volume)
 		}
 	}
-	if out, verified, ok, err := collectGlobalMemoTopN(ids, volumes, snapshots, volumePQs, rankers, ranksComplete, pq, limit); ok {
+	if out, verified, ok, err := collectGlobalMemoTopN(ids, volumes, snapshots, volumePQs, rankers, ranksComplete, pq, limit, matcher); ok {
 		return out, verified, err
 	}
 	if len(ids) < 2*serviceTrigramParallelVerifyMinIDs {
-		out, verified, canceled := collectGlobalVerifiedTopNRange(ids, volumes, snapshots, volumePQs, rankers, pq, limit, global, nil)
+		out, verified, canceled := collectGlobalVerifiedTopNRange(ids, volumes, snapshots, volumePQs, rankers, pq, limit, global, nil, matcher)
 		if canceled {
 			return nil, verified, errQueryCanceled
 		}
@@ -415,7 +423,7 @@ func collectGlobalVerifiedTopN(it globalIDIterator, volumes []*serviceVolumeInde
 	}
 	workers := min(runtime.GOMAXPROCS(0), max(1, len(ids)/serviceTrigramParallelVerifyMinIDs))
 	if workers <= 1 {
-		out, verified, canceled := collectGlobalVerifiedTopNRange(ids, volumes, snapshots, volumePQs, rankers, pq, limit, global, nil)
+		out, verified, canceled := collectGlobalVerifiedTopNRange(ids, volumes, snapshots, volumePQs, rankers, pq, limit, global, nil, matcher)
 		if canceled {
 			return nil, verified, errQueryCanceled
 		}
@@ -434,7 +442,7 @@ func collectGlobalVerifiedTopN(it globalIDIterator, volumes []*serviceVolumeInde
 		wg.Add(1)
 		go func(w, start, end int) {
 			defer wg.Done()
-			items, verified, canceled := collectGlobalVerifiedTopNRange(ids[start:end], volumes, snapshots, volumePQs, rankers, pq, limit, global, &stopped)
+			items, verified, canceled := collectGlobalVerifiedTopNRange(ids[start:end], volumes, snapshots, volumePQs, rankers, pq, limit, global, &stopped, matcher)
 			results[w].items = items
 			results[w].verified = verified
 			if canceled {
@@ -478,8 +486,9 @@ func collectGlobalVerifiedTopN(it globalIDIterator, volumes []*serviceVolumeInde
 // collectGlobalVerifiedTopNRange verifies one slice of candidate IDs with
 // worker-local path caches and a bounded heap. It is the serial whole-slice
 // path as well as the per-worker parallel path; stopped, when non-nil, is
-// shared across workers for prompt cancellation.
-func collectGlobalVerifiedTopNRange(ids []globalRecordID, volumes []*serviceVolumeIndex, snapshots []*volumeSnapshot, volumePQs []parsedQuery, rankers []func(int) int, pq parsedQuery, limit int, global bool, stopped *atomic.Bool) ([]globalRankedEntry, int, bool) {
+// shared across workers for prompt cancellation. The matcher threads through
+// to content-aware verification (nil keeps the pure name/scalar behavior).
+func collectGlobalVerifiedTopNRange(ids []globalRecordID, volumes []*serviceVolumeIndex, snapshots []*volumeSnapshot, volumePQs []parsedQuery, rankers []func(int) int, pq parsedQuery, limit int, global bool, stopped *atomic.Bool, matcher *contentLeafMatcher) ([]globalRankedEntry, int, bool) {
 	h := &globalVerifiedTopHeap{pq: pq, global: global}
 	heap.Init(h)
 	pathCaches := make([]map[int]string, len(volumes))
@@ -508,7 +517,8 @@ func collectGlobalVerifiedTopNRange(ids []globalRecordID, volumes []*serviceVolu
 		if pathCaches[id.volume] == nil {
 			pathCaches[id.volume] = make(map[int]string)
 		}
-		entry, ok := compactCandidateEntryIfMatch(vol.index, volumePQs[id.volume], id.local, pathCaches[id.volume], true, false)
+		pathCaches[id.volume] = boundPathCache(pathCaches[id.volume])
+		entry, ok := compactCandidateEntryIfMatchIn(vol, vol.index, volumePQs[id.volume], id.local, pathCaches[id.volume], true, false, matcher)
 		verified++
 		if !ok {
 			continue
@@ -528,7 +538,7 @@ func collectGlobalVerifiedTopNRange(ids []globalRecordID, volumes []*serviceVolu
 	return out, verified, false
 }
 
-func countGlobalVerifiedIterator(it globalIDIterator, volumes []*serviceVolumeIndex, snapshots []*volumeSnapshot, pq parsedQuery) (int, int, error) {
+func countGlobalVerifiedIterator(it globalIDIterator, volumes []*serviceVolumeIndex, snapshots []*volumeSnapshot, pq parsedQuery, matcher *contentLeafMatcher) (int, int, error) {
 	if it == nil {
 		return 0, 0, nil
 	}
@@ -545,7 +555,7 @@ func countGlobalVerifiedIterator(it globalIDIterator, volumes []*serviceVolumeIn
 		}
 	}
 	if len(ids) < 2*serviceTrigramParallelVerifyMinIDs {
-		count, verified, canceled := countGlobalVerifiedRange(ids, volumes, snapshots, volumePQs, pq, nil)
+		count, verified, canceled := countGlobalVerifiedRange(ids, volumes, snapshots, volumePQs, pq, nil, matcher)
 		if canceled {
 			return 0, verified, errQueryCanceled
 		}
@@ -553,7 +563,7 @@ func countGlobalVerifiedIterator(it globalIDIterator, volumes []*serviceVolumeIn
 	}
 	workers := min(runtime.GOMAXPROCS(0), max(1, len(ids)/serviceTrigramParallelVerifyMinIDs))
 	if workers <= 1 {
-		count, verified, canceled := countGlobalVerifiedRange(ids, volumes, snapshots, volumePQs, pq, nil)
+		count, verified, canceled := countGlobalVerifiedRange(ids, volumes, snapshots, volumePQs, pq, nil, matcher)
 		if canceled {
 			return 0, verified, errQueryCanceled
 		}
@@ -572,7 +582,7 @@ func countGlobalVerifiedIterator(it globalIDIterator, volumes []*serviceVolumeIn
 		wg.Add(1)
 		go func(w, start, end int) {
 			defer wg.Done()
-			count, verified, canceled := countGlobalVerifiedRange(ids[start:end], volumes, snapshots, volumePQs, pq, &stopped)
+			count, verified, canceled := countGlobalVerifiedRange(ids[start:end], volumes, snapshots, volumePQs, pq, &stopped, matcher)
 			results[w].count = count
 			results[w].verified = verified
 			if canceled {
@@ -594,8 +604,9 @@ func countGlobalVerifiedIterator(it globalIDIterator, volumes []*serviceVolumeIn
 
 // countGlobalVerifiedRange counts one slice of candidate IDs with
 // worker-local path caches. It is the serial whole-slice path as well as
-// the per-worker parallel path.
-func countGlobalVerifiedRange(ids []globalRecordID, volumes []*serviceVolumeIndex, snapshots []*volumeSnapshot, volumePQs []parsedQuery, pq parsedQuery, stopped *atomic.Bool) (int, int, bool) {
+// the per-worker parallel path. The matcher threads through to content-aware
+// verification (nil keeps the pure name/scalar behavior).
+func countGlobalVerifiedRange(ids []globalRecordID, volumes []*serviceVolumeIndex, snapshots []*volumeSnapshot, volumePQs []parsedQuery, pq parsedQuery, stopped *atomic.Bool, matcher *contentLeafMatcher) (int, int, bool) {
 	pathCaches := make([]map[int]string, len(volumes))
 	count, verified := 0, 0
 	for _, id := range ids {
@@ -615,7 +626,8 @@ func countGlobalVerifiedRange(ids []globalRecordID, volumes []*serviceVolumeInde
 		if pathCaches[id.volume] == nil {
 			pathCaches[id.volume] = make(map[int]string)
 		}
-		_, ok := compactCandidateEntryIfMatch(vol.index, volumePQs[id.volume], id.local, pathCaches[id.volume], true, false)
+		pathCaches[id.volume] = boundPathCache(pathCaches[id.volume])
+		_, ok := compactCandidateEntryIfMatchIn(vol, vol.index, volumePQs[id.volume], id.local, pathCaches[id.volume], true, false, matcher)
 		verified++
 		if ok {
 			count++

@@ -63,6 +63,35 @@ type UISearchResponse struct {
 	ElapsedMS int64      `json:"elapsed_ms"`
 	Results   []UIResult `json:"results"`
 	Message   string     `json:"message,omitempty"`
+	// Content summarizes the content index for a query that searched file
+	// contents, so the UI can say whether results are complete.
+	Content *UIContentStatus `json:"content,omitempty"`
+}
+
+// UIContentStatus is the part of the service's content health the UI shows.
+type UIContentStatus struct {
+	State      string `json:"state,omitempty"`
+	Docs       int    `json:"docs,omitempty"`
+	BuildDone  int    `json:"build_done,omitempty"`
+	BuildTotal int    `json:"build_total,omitempty"`
+	Partial    bool   `json:"partial,omitempty"`
+	Incomplete bool   `json:"incomplete,omitempty"`
+	Error      string `json:"error,omitempty"`
+}
+
+func uiContentStatusFrom(h *contentHealth) *UIContentStatus {
+	if h == nil {
+		return nil
+	}
+	return &UIContentStatus{
+		State:      h.State,
+		Docs:       h.Docs,
+		BuildDone:  h.BuildDone,
+		BuildTotal: h.BuildTotal,
+		Partial:    h.Partial,
+		Incomplete: h.Incomplete,
+		Error:      firstNonEmpty(h.BuildError, h.FoldError),
+	}
 }
 
 type UIResult struct {
@@ -73,6 +102,8 @@ type UIResult struct {
 	Size     int64  `json:"size,omitempty"`
 	Modified string `json:"modified,omitempty"`
 	Exists   bool   `json:"exists"`
+	// Snippet is the matching line of a content query, when there is one.
+	Snippet string `json:"snippet,omitempty"`
 }
 
 type UIStatus struct {
@@ -228,7 +259,7 @@ func (a *UIApp) search(req UISearchRequest, seq int64) UISearchResponse {
 		return UISearchResponse{OK: false, Seq: seq, Query: query, ElapsedMS: elapsed, Message: err.Error()}
 	}
 	if !resp.OK {
-		return UISearchResponse{OK: false, Seq: seq, Query: query, ElapsedMS: elapsed, Message: resp.Message}
+		return UISearchResponse{OK: false, Seq: seq, Query: query, ElapsedMS: elapsed, Message: resp.Message, Content: uiContentStatusFrom(resp.Content)}
 	}
 	results := uiResultsFromServiceResponse(resp)
 	message := ""
@@ -243,6 +274,7 @@ func (a *UIApp) search(req UISearchRequest, seq int64) UISearchResponse {
 		ElapsedMS: elapsed,
 		Message:   message,
 		Results:   results,
+		Content:   uiContentStatusFrom(resp.Content),
 	}
 }
 
@@ -577,6 +609,7 @@ func uiResultFromJSON(row jsonResult) UIResult {
 		IsDir:    row.IsDir,
 		Modified: row.Modified,
 		Exists:   true,
+		Snippet:  row.Snippet,
 	}
 	if result.Name == "" {
 		result.Name = filepath.Base(row.Path)

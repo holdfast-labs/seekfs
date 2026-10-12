@@ -56,10 +56,10 @@ func TestGlobalVerifiedIteratorPropagatesCancellationAfterDrain(t *testing.T) {
 				return &cancelAtEOFGlobalIterator{ids: ids, canceled: &canceled}
 			}
 
-			if _, _, err := collectGlobalVerifiedTopN(newIterator(), nil, nil, pq, 1); !errors.Is(err, errQueryCanceled) {
+			if _, _, err := collectGlobalVerifiedTopN(newIterator(), nil, nil, pq, 1, nil); !errors.Is(err, errQueryCanceled) {
 				t.Fatalf("top-N cancellation error = %v, want %v", err, errQueryCanceled)
 			}
-			if _, _, err := countGlobalVerifiedIterator(newIterator(), nil, nil, pq); !errors.Is(err, errQueryCanceled) {
+			if _, _, err := countGlobalVerifiedIterator(newIterator(), nil, nil, pq, nil); !errors.Is(err, errQueryCanceled) {
 				t.Fatalf("count cancellation error = %v, want %v", err, errQueryCanceled)
 			}
 		})

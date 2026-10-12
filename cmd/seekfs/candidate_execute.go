@@ -68,7 +68,7 @@ func (plan candidatePlan) executeTop(pq parsedQuery) ([]int, int, bool) {
 	if plan.vol == nil || plan.vol.index == nil || pq.CountOnly || pq.Limit <= 0 ||
 		len(plan.sources) != 1 || len(plan.sources[0].union) == 0 ||
 		len(plan.vol.recentIDs) != 0 || plan.underPathFallback != "" ||
-		pq.RootBias != "" || pq.CWDBias != "" {
+		pq.RootBias != "" || pq.CWDBias != "" || pq.hiddenBlocksTruncation() {
 		return nil, 0, false
 	}
 	parts := plan.sources[0].union

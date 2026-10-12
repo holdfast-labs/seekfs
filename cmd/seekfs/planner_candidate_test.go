@@ -396,6 +396,33 @@ func TestPathModeDottedExtensionNarrowsSubstringSemantics(t *testing.T) {
 	}
 }
 
+// TestCompactScanPathCacheBounded pins the path-memo bound on the compact
+// scan loop: past contentScanPathCacheCap visited paths the memo resets
+// instead of growing with the record count, while results stay complete.
+func TestCompactScanPathCacheBounded(t *testing.T) {
+	const files = contentScanPathCacheCap + 1000
+	records := []CompactRecord{{FRN: 1, ParentFRN: 1, Parent: -1, Name: ".", Mode: uint32(os.ModeDir)}}
+	for i := 0; i < files; i++ {
+		records = append(records, CompactRecord{
+			FRN: uint64(2 + i), ParentFRN: 1, Parent: 0,
+			Name: fmt.Sprintf("file-%05d.txt", i),
+		})
+	}
+	idx := &Index{Source: "usn", Volume: "F:", Compact: true, Records: records}
+	buildOrders(idx)
+	pathCache := make(map[int]string)
+	got, err := searchCompactWithCacheHidden(idx, queryOptions{Query: "type:file", Limit: files}, false, pathCache, nil, hiddenBaseIDs{}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != files {
+		t.Fatalf("results = %d, want %d complete matches", len(got), files)
+	}
+	if len(pathCache) > contentScanPathCacheCap {
+		t.Fatalf("path memo = %d entries, want bounded by %d", len(pathCache), contentScanPathCacheCap)
+	}
+}
+
 func TestSinglePathTermCandidateCanSkipEntryMatches(t *testing.T) {
 	pq := mustParseQuery(t, queryOptions{Query: "path:.opencode", Limit: 20})
 	pq.Limit = normalizedLimit(20, false)
@@ -414,6 +441,63 @@ func TestSinglePathTermCandidateCanSkipEntryMatches(t *testing.T) {
 	multiTerm.Limit = normalizedLimit(20, false)
 	if compactCandidateCanSkipEntryMatches(multiTerm, true) {
 		t.Fatal("multi-term path query skipped entryMatches")
+	}
+	withFeature := mustParseQuery(t, queryOptions{Query: "path:.opencode", Limit: 20})
+	withFeature.Limit = normalizedLimit(20, false)
+	withFeature.Features = append(withFeature.Features, featureLeaf{Name: "companion", Text: "needle"})
+	if compactCandidateCanSkipEntryMatches(withFeature, true) {
+		t.Fatal("candidate query with feature leaf skipped entryMatches")
+	}
+}
+
+// TestCaseSensitivePathQueryStaysExact pins the S2 routing invariant: no
+// candidate lane may serve an unverified case-insensitive superset to a
+// case-sensitive query (compactPathContainsTerm folds case, and the skip
+// path would then admit wrong-case hits). Every such lane declines today,
+// leaving the fully-verifying bounded scan; this test fails if any future
+// lane serves sensitive queries from insensitive postings.
+func TestCaseSensitivePathQueryStaysExact(t *testing.T) {
+	records := []CompactRecord{
+		{FRN: 1, ParentFRN: 1, Parent: -1, Name: ".", Mode: uint32(os.ModeDir)},
+		{FRN: 2, ParentFRN: 1, Parent: 0, Name: "Run_Me.txt", Mode: modeFromAttrs(fileAttributeArchive)},
+		{FRN: 3, ParentFRN: 1, Parent: 0, Name: "run_me.txt", Mode: modeFromAttrs(fileAttributeArchive)},
+		{FRN: 4, ParentFRN: 1, Parent: 0, Name: "RUN_ME.txt", Mode: modeFromAttrs(fileAttributeArchive)},
+	}
+	idx := &Index{Source: "usn", Volume: "F:", Roots: []string{`F:\`}, Compact: true, Records: records}
+	buildOrders(idx)
+	vol := newServiceVolumeIndex("case-sensitive-pin.gsi", idx)
+	volumes := []*serviceVolumeIndex{vol}
+	for _, tc := range []struct {
+		name      string
+		query     string
+		path      bool
+		want      []string
+		skipCount bool
+	}{
+		// Count declines case-sensitive queries entirely (no count lane
+		// serves them; pre-existing gap shared with sub-3-char path
+		// counts) — search correctness is what this test pins.
+		{name: "name", query: "case:true Run_Me", want: []string{`F:\Run_Me.txt`}, skipCount: true},
+		{name: "path", query: "case:true Run_Me", want: []string{`F:\Run_Me.txt`}, skipCount: true},
+		{name: "insensitive control", query: "run_me", want: []string{`F:\Run_Me.txt`, `F:\run_me.txt`, `F:\RUN_ME.txt`}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			matchPath := tc.name == "path"
+			got, err := searchServiceVolumes(volumes, queryOptions{Query: tc.query, MatchPath: matchPath, Limit: 20}, false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if paths := pathsOf(got); !slices.Equal(paths, tc.want) {
+				t.Fatalf("paths = %v, want %v", paths, tc.want)
+			}
+			if tc.skipCount {
+				return
+			}
+			n, ok, err := countServiceVolumes(volumes, queryOptions{Query: tc.query, MatchPath: matchPath})
+			if err != nil || !ok || n != len(tc.want) {
+				t.Fatalf("count = %d ok=%v err=%v, want %d true nil", n, ok, err, len(tc.want))
+			}
+		})
 	}
 }
 

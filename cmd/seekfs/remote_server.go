@@ -102,27 +102,40 @@ type remoteDBSummary struct {
 // here are ever sent to a remote caller; everything else in the internal
 // serviceResponse is private by default.
 type remoteResponse struct {
-	OK              bool                `json:"ok"`
-	Message         string              `json:"message,omitempty"`
-	Count           int                 `json:"count,omitempty"`
-	SearchMS        float64             `json:"search_ms,omitempty"`
-	Source          string              `json:"source,omitempty"`
-	EligibleVolumes []string            `json:"eligible_volumes,omitempty"`
-	Health          string              `json:"health,omitempty"`
-	HealthMessage   string              `json:"health_message,omitempty"`
-	Version         string              `json:"version,omitempty"`
-	Commit          string              `json:"commit,omitempty"`
-	Date            string              `json:"date,omitempty"`
-	BuildFlavor     string              `json:"build_flavor,omitempty"`
-	Entries         int                 `json:"entries,omitempty"`
-	Loading         bool                `json:"loading,omitempty"`
-	Fuzzy           bool                `json:"fuzzy,omitempty"`
-	Complete        *bool               `json:"complete,omitempty"`
-	Results         []string            `json:"results,omitempty"`
-	Rows            []remoteResultRow   `json:"rows,omitempty"`
-	DBs             []remoteDBSummary   `json:"dbs,omitempty"`
-	WatchVolumes    []watchVolumeCursor `json:"watch_volumes,omitempty"`
-	WatchEvents     []watchDeltaEvent   `json:"watch_events,omitempty"`
+	OK              bool                 `json:"ok"`
+	Message         string               `json:"message,omitempty"`
+	Count           int                  `json:"count,omitempty"`
+	SearchMS        float64              `json:"search_ms,omitempty"`
+	Source          string               `json:"source,omitempty"`
+	EligibleVolumes []string             `json:"eligible_volumes,omitempty"`
+	Health          string               `json:"health,omitempty"`
+	HealthMessage   string               `json:"health_message,omitempty"`
+	Version         string               `json:"version,omitempty"`
+	Commit          string               `json:"commit,omitempty"`
+	Date            string               `json:"date,omitempty"`
+	BuildFlavor     string               `json:"build_flavor,omitempty"`
+	Entries         int                  `json:"entries,omitempty"`
+	Loading         bool                 `json:"loading,omitempty"`
+	Fuzzy           bool                 `json:"fuzzy,omitempty"`
+	Complete        *bool                `json:"complete,omitempty"`
+	Content         *remoteContentHealth `json:"content,omitempty"`
+	Results         []string             `json:"results,omitempty"`
+	Rows            []remoteResultRow    `json:"rows,omitempty"`
+	DBs             []remoteDBSummary    `json:"dbs,omitempty"`
+	WatchVolumes    []watchVolumeCursor  `json:"watch_volumes,omitempty"`
+	WatchEvents     []watchDeltaEvent    `json:"watch_events,omitempty"`
+}
+
+// remoteContentHealth is the coarse, public projection of content query health.
+// Internal detail (build/fold error text, counts, sidecar sizes) stays private;
+// a remote caller gets only the trust-relevant flags, so a degraded or
+// divergent content answer is visible off-box instead of only inside Complete.
+type remoteContentHealth struct {
+	State           string   `json:"state,omitempty"`
+	Partial         bool     `json:"partial,omitempty"`
+	Incomplete      bool     `json:"incomplete,omitempty"`
+	CountDivergent  bool     `json:"count_divergent,omitempty"`
+	DegradedVolumes []string `json:"degraded_volumes,omitempty"`
 }
 
 // remoteResultRow is the public projection of a jsonResult row.  It carries the
@@ -596,6 +609,15 @@ func remoteResponseFromService(resp serviceResponse, countOnly bool) remoteRespo
 		Fuzzy:       resp.Fuzzy,
 		Complete:    resp.Complete,
 		Results:     resp.Results,
+	}
+	if resp.Content != nil {
+		out.Content = &remoteContentHealth{
+			State:           resp.Content.State,
+			Partial:         resp.Content.Partial,
+			Incomplete:      resp.Content.Incomplete,
+			CountDivergent:  resp.Content.CountDivergent,
+			DegradedVolumes: resp.Content.DegradedVolumes,
+		}
 	}
 	// EligibleVolumes are public volume labels (C:, F:), safe to expose.
 	out.EligibleVolumes = resp.EligibleVolumes

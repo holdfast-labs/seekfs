@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -181,6 +182,7 @@ func entryToJSON(entry Entry) jsonResult {
 		Volume:      filepath.VolumeName(entry.Path),
 		IsDir:       entry.Mode&uint32(os.ModeDir) != 0,
 		IndexSource: entry.IndexSource,
+		Snippet:     entry.Snippet,
 	}
 	if result.Name == "" {
 		result.Name = filepath.Base(result.Path)
@@ -194,6 +196,15 @@ func entryToJSON(entry Entry) jsonResult {
 }
 
 func searchAll(indexes []*Index, opts queryOptions, countOnly bool) ([]Entry, error) {
+	if pq, err := parseQuery(opts); err == nil && queryHasFeatureLeaf(pq) {
+		return nil, fmt.Errorf("feature queries require the resident seekfs service")
+	}
+	if pq, err := parseQuery(opts); err == nil && queryHasAnyContentLeaf(pq) {
+		// Content is only queryable through the service's FRN-keyed volumes;
+		// a direct-index search has no content resolver. Refuse rather than
+		// silently ignore the content leaf.
+		return nil, contentUnavailableError()
+	}
 	if len(indexes) == 1 {
 		matches, err := search(indexes[0], opts, countOnly)
 		if err != nil {
@@ -359,6 +370,12 @@ func searchServiceVolumes(volumes []*serviceVolumeIndex, opts queryOptions, coun
 	if err != nil {
 		return nil, err
 	}
+	if countOnly {
+		markCountDivergent(opts, pq)
+	}
+	if queryHasFeatureLeaf(pq) {
+		return nil, fmt.Errorf("feature queries require the service feature dispatcher")
+	}
 	if pq.Impossible {
 		opts.Trace.setPlannerMode("impossible-query")
 		opts.Trace.setSource("impossible-query", 0)
@@ -376,6 +393,27 @@ func searchServiceVolumes(volumes []*serviceVolumeIndex, opts queryOptions, coun
 	}
 	volumes = prioritizeServiceVolumesForPathTerms(volumes, opts)
 	opts.Trace.setEligibleVolumes(volumes)
+	if contentGlobalLaneEnabled() && queryHasPositiveContentLeaf(pq) {
+		snapshot := newGlobalQuerySnapshot(volumes, opts.Trace)
+		if matches, handled, err := searchServiceVolumesGlobalContentComponentsSnapshot(snapshot, opts, countOnly, pq); handled {
+			return matches, err
+		}
+	}
+	if queryHasAnyContentLeaf(pq) {
+		// Content has its own candidate + post-filter path. It runs on every
+		// content-usable volume; an unusable volume degrades the result rather
+		// than bricking the whole service, but if none is usable the query is
+		// refused instead of reported as no matches. A query that remains
+		// answerable without content still gets the unusable volume's filename
+		// matches (PF-7b); an unanswerable one skips it.
+		usable, skipped := contentUsableVolumes(volumes, pq)
+		if len(usable) == 0 && !filenameAnswerable(pq) {
+			return nil, contentUnavailableError()
+		}
+		markContentQueryDegraded(opts.Trace, skipped)
+		markContentQueryIncomplete(opts.Trace, usable)
+		return searchContentServiceVolumes(volumes, opts, countOnly, pq)
+	}
 	snapshot := newGlobalQuerySnapshot(volumes, opts.Trace)
 	if matches, handled, err := searchServiceVolumesGlobalExtOnlySnapshot(snapshot, opts, countOnly); handled {
 		return matches, err
@@ -393,7 +431,7 @@ func searchServiceVolumes(volumes []*serviceVolumeIndex, opts queryOptions, coun
 		return matches, err
 	}
 	if len(volumes) > 1 {
-		return nil, globalMultiVolumePlannerDeclineError(opts)
+		return nil, globalMultiVolumePlannerDeclineError(opts, volumes)
 	}
 	if len(volumes) == 1 {
 		if opts.Trace != nil && strings.HasPrefix(opts.Trace.Decline, "global-") {
@@ -408,12 +446,11 @@ func searchServiceVolumes(volumes []*serviceVolumeIndex, opts queryOptions, coun
 		pathCache := make(map[int]string)
 		hidden := vol.snapshotHiddenBaseIDs()
 		candidateFn := vol.nameTermCandidates
+		// Top-N/limited lanes decline via hiddenBlocksTruncation when hidden
+		// is non-empty, so the candidate set stays complete and the verify
+		// loop cannot underfill the page. No lane needs a nil bypass anymore.
 		if vol.hasActiveOverlay() && !countOnly {
-			if hidden.empty() {
-				candidateFn = vol.overlayAwareNameTermCandidates
-			} else {
-				candidateFn = nil
-			}
+			candidateFn = vol.overlayAwareNameTermCandidates
 		}
 		baseOpts := opts
 		if vol.hasActiveOverlay() && !countOnly {
@@ -438,7 +475,7 @@ func searchServiceVolumes(volumes []*serviceVolumeIndex, opts queryOptions, coun
 				opts.Trace.OverlayBaseWindow = baseOpts.Limit
 			}
 		}
-		matches, err := searchCompactWithCacheHidden(vol.index, baseOpts, countOnly, pathCache, candidateFn, hidden)
+		matches, err := searchCompactWithCacheHidden(vol.index, baseOpts, countOnly, pathCache, candidateFn, hidden, nil)
 		matches = vol.mergeOverlayMatches(matches, opts, countOnly, pathCache)
 		vol.trimSearchCachesLocked()
 		if locked {
@@ -471,6 +508,12 @@ func (vol *serviceVolumeIndex) mergeOverlayMatches(base []Entry, opts queryOptio
 	if vol == nil {
 		return base
 	}
+	if opts.contentCount != nil {
+		// Count mode: the compact scan tallied base matches in place and
+		// countContentVolume adds the overlay count (where cancellation is
+		// surfaced). Materializing entries here would defeat that.
+		return base
+	}
 	snap := vol.snap.Load()
 	if snap == nil || len(snap.records) == 0 {
 		return base
@@ -480,6 +523,12 @@ func (vol *serviceVolumeIndex) mergeOverlayMatches(base []Entry, opts queryOptio
 		return base
 	}
 	limit := normalizedLimit(opts.Limit, countOnly)
+	if queryHasAnyContentLeaf(pq) {
+		// Inline content verification owns the per-volume limit already;
+		// truncating the merged set here would drop a true match that the
+		// caller's post-merge limit has not yet considered.
+		limit = 0
+	}
 	overlay := vol.overlayRankedMatches(snap, pq, pathCache)
 	if !countOnly {
 		merged := make([]Entry, 0, len(base)+len(overlay))
@@ -513,13 +562,17 @@ func (vol *serviceVolumeIndex) overlayRankedMatches(snap *volumeSnapshot, pq par
 		return nil
 	}
 	latest := latestOverlaySlotsByFRN(records)
+	var contentMatcher *contentLeafMatcher
+	if queryHasAnyContentLeaf(pq) {
+		contentMatcher = newContentLeafMatcher(pq)
+	}
 	overlay := make([]rankedOverlayEntry, 0, len(records))
 	for slot := 0; slot < len(records); slot++ {
 		entry, ok := vol.overlayEntry(records, latest, slot, map[int32]struct{}{}, pathCache)
 		if !ok {
 			continue
 		}
-		if entryMatches(entry, pq, pq.MatchPath) {
+		if entryMatchesWithContentMatcher(vol, entry, pq, pq.MatchPath, contentMatcher) {
 			overlay = append(overlay, rankedOverlayEntry{entry: entry, rank: vol.overlayEntryRank(entry, pq)})
 		}
 	}

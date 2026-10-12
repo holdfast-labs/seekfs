@@ -17,6 +17,10 @@ import (
 )
 
 type serviceResponse struct {
+	PluginAPI                int                 `json:"plugin_api,omitempty"`
+	PluginConfig             string              `json:"plugin_config,omitempty"`
+	Plugins                  []pluginStatus      `json:"plugins,omitempty"`
+	Features                 []featureHealth     `json:"features,omitempty"`
 	OK                       bool                `json:"ok"`
 	Message                  string              `json:"message,omitempty"`
 	Fuzzy                    bool                `json:"fuzzy,omitempty"`
@@ -70,6 +74,19 @@ type serviceResponse struct {
 	Runtime                  *runtimeMemoryInfo  `json:"runtime,omitempty"`
 	Health                   string              `json:"health,omitempty"`
 	HealthMessage            string              `json:"health_message,omitempty"`
+	Content                  *contentHealth      `json:"content,omitempty"`
+}
+
+// redactContentText clears local-only matched content text (snippets) from the
+// response rows. A non-local transport calls this at the command boundary so a
+// future projection cannot leak document text even if it forgets to strip it.
+func (r *serviceResponse) redactContentText() {
+	if r == nil {
+		return
+	}
+	for i := range r.Rows {
+		r.Rows[i].Snippet = ""
+	}
 }
 
 // servicePrincipal describes the caller of a service command and the
@@ -406,6 +423,29 @@ type goSearchService struct {
 	// empty (disabled) by default.
 	remoteAddr string
 	remoteSrv  *remoteLoopbackServer
+	// contentLocks holds the advisory `.gsx.lock` locks this service owns for
+	// the volumes it has attached or built, keyed by the `.gsx` path. They are
+	// held for the volume's lifetime so a concurrent `content-index -db` fails
+	// fast rather than clobbering the service's sidecar (M10). Bounded by the
+	// distinct sidecar paths; released at process exit.
+	contentLocksMu sync.Mutex
+	contentLocks   map[string]*contentVolumeLock
+	// contentLockWarned marks sidecar paths whose lock acquisition failed and
+	// has not yet succeeded, so the bounded retry (drain tick) logs once instead
+	// of flooding while another process holds the lock.
+	contentLockWarned map[string]bool
+	// contentCfg is the resolved seekfs.toml, used to derive the per-volume
+	// content scope for the service-owned build.
+	contentCfg     appConfig
+	featuresOnce   sync.Once
+	features       atomic.Pointer[serviceFeatures]
+	pluginSettings atomic.Pointer[pluginSettings]
+	pluginUpdateMu sync.Mutex
+	pluginQueueMu  sync.Mutex
+	pluginPending  map[string]pluginDefinition
+	pluginApplying atomic.Bool
+	pluginErrorMu  sync.Mutex
+	pluginError    string
 }
 
 // signalServiceStop closes the stop channel exactly once.  It is safe to call
@@ -427,6 +467,29 @@ type serviceVolumeIndex struct {
 	checkpoint  int64
 	state       string
 	staleReason string
+	// baseCheckpoint is the USN watermark of the persisted record index:
+	// the checkpoint the base record set is complete through. It trails
+	// `checkpoint` while an unfolded overlay is pending, so a service-owned
+	// content build (PF-3) can stamp a sidecar that matches exactly the
+	// records it walked; restart catch-up then replays the overlay changes.
+	baseCheckpoint int64
+	// content is the per-volume content-search state and coordinator. Both are
+	// nil unless content search is enabled by config or environment.
+	content           *contentVolumeState
+	contentCoord      *contentCoordinator
+	featureFeed       *featureChangeFeed
+	contentActivation atomic.Pointer[contentActivation]
+	contentTasksMu    sync.Mutex
+	contentTasks      int
+	contentTasksDone  chan struct{}
+	// contentBuildBusy serializes service-owned content builds: at most one
+	// runs per volume at a time, and it is left set for the whole build.
+	contentBuildBusy atomic.Bool
+	// contentBuildAttempts counts consecutive generation-change retries of a
+	// service-owned content build. An external ensureContentBuild resets it; the
+	// retry path increments it so a volume whose generation never settles gives
+	// up (degraded + BuildError) instead of spinning builds forever.
+	contentBuildAttempts atomic.Int32
 	// ownedDirFRNs holds the NTFS file references of directories that hold
 	// seekfs's own artifacts (the seekfs dir and the name-gram spool dir) for
 	// this volume.  USN changes whose ParentFRN is in this set are consumed

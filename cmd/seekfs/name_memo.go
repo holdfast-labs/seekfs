@@ -441,6 +441,11 @@ func memoSupported(pq parsedQuery) bool {
 	if pq.CaseSensitive || pq.Fuzzy {
 		return false
 	}
+	if queryHasAnyContentLeaf(pq) {
+		// The memo only decides name/scalar fields; content leaves need the
+		// content-aware verifier, so decline and let that path answer.
+		return false
+	}
 	// Only satisfied volume terms may be removed by the caller. A remaining
 	// volume term is a real constraint, which a name identity cannot decide.
 	for _, term := range pq.Terms {

@@ -163,6 +163,13 @@ type Entry struct {
 	Mode        uint32
 	ModUnix     int64
 	IndexSource string
+	// FRN is the NTFS file reference. Content search keys documents on it, so
+	// entries built from a compact record or an overlay record carry it for
+	// inline content verification. Zero for records that have no FRN.
+	FRN uint64
+	// Snippet is a short window of matched content text, populated only for
+	// content-query results (and only on the local path). Empty otherwise.
+	Snippet string
 }
 
 type jsonError struct {
@@ -178,6 +185,7 @@ type jsonResult struct {
 	Size        *int64 `json:"size,omitempty"`
 	Modified    string `json:"modified,omitempty"`
 	IndexSource string `json:"index_source,omitempty"`
+	Snippet     string `json:"snippet,omitempty"`
 	Exists      *bool  `json:"exists,omitempty"`
 }
 
@@ -221,6 +229,7 @@ type jsonSearchResponse struct {
 	Declines                 []traceDecline `json:"declines,omitempty"`
 	Fallback                 string         `json:"fallback,omitempty"`
 	Complete                 *bool          `json:"complete,omitempty"`
+	Content                  *contentHealth `json:"content,omitempty"`
 	Results                  []jsonResult   `json:"results,omitempty"`
 }
 
@@ -443,6 +452,13 @@ type appConfig struct {
 	OutputFormat string
 	SeekFSDir    string
 	RemoteAddr   string
+	// Content scope. Content holds global [content] / top-level content_* keys;
+	// ContentByVolume holds [content."<volume>"] overrides keyed by volume name.
+	Content         contentScopeConfig
+	ContentByVolume map[string]contentScopeConfig
+	Features        map[string]featureConfig
+	PluginPath      string
+	Plugins         map[string]pluginDefinition
 }
 
 type queryOptions struct {
@@ -461,6 +477,46 @@ type queryOptions struct {
 	RequestSeq    int64        `json:"request_seq,omitempty"`
 	Cancel        func() bool  `json:"-"`
 	Trace         *searchTrace `json:"-"`
+	// Per-query content budgets. Zero means "use the default"; they are never
+	// globals, so concurrent queries cannot race on each other's limits.
+	ContentCandidateBudget int `json:"content_candidate_budget,omitempty"`
+	ContentScanVisitBudget int `json:"content_scan_visit_budget,omitempty"`
+	// contentCount, when non-nil, makes the content compact scan count matches
+	// in place instead of materializing and retaining []Entry. Local-only.
+	contentCount *int `json:"-"`
+	// parsedOverride, when non-nil, makes parseQuery return this tree instead of
+	// re-parsing Query. PF-7b: the filename-only evaluation of a volume whose
+	// content index is unusable needs a stripped query that cannot be expressed
+	// as a Query string. Local-only; nil on every normal request.
+	parsedOverride *parsedQuery `json:"-"`
+	// contentFullCandidates disables the bounded content-candidate fast path
+	// (bounded posting materialization + broad rank-ordered scan) so a
+	// differential test can compare it against the historical full-budget
+	// candidate logic. Local-only; false on every normal request.
+	contentFullCandidates bool `json:"-"`
+	// contentWindow is the enlarged content window the completeness signal is
+	// measured against when the verify limit itself is smaller (a single-volume
+	// default-order query verifies only its page limit but must still report
+	// incompleteness when the candidate superset exceeds the window).
+	// Local-only; 0 on every normal request.
+	contentWindow int `json:"-"`
+	// contentProbe, when non-nil, is the per-volume channel the reduced content
+	// path uses to report whether it truncated the posting superset at the
+	// completeness window or proved the superset below it. The driver creates a
+	// fresh probe per volume search so the signal is never shared across
+	// queries. Local-only; nil on every normal request.
+	contentProbe *contentCompletenessProbe `json:"-"`
+}
+
+// contentCompletenessProbe carries the reduced default-order path's
+// completeness evidence from the candidate source back to the volume driver.
+// windowCapped means the posting superset exceeded the window and was truncated
+// there (so the driver must decide from the page); supersetBelowWindow means the
+// whole superset was materialized and is strictly smaller than the window (so
+// every match fits below it and the result is complete).
+type contentCompletenessProbe struct {
+	windowCapped        bool
+	supersetBelowWindow bool
 }
 
 type parsedQuery struct {
@@ -485,6 +541,8 @@ type parsedQuery struct {
 	SizeFilters       []sizeFilter
 	DateFilters       []dateFilter
 	AttrFilters       []uint32
+	Content           []contentLeaf
+	Features          []featureLeaf
 	SortColumn        string
 	OrGroups          [][]parsedQuery
 	NotGroups         []parsedQuery
@@ -495,6 +553,32 @@ type parsedQuery struct {
 	DeadlineUnix      int64
 	Cancel            func() bool
 	Trace             *searchTrace
+	// Per-query content budgets copied from queryOptions; 0 means use default.
+	ContentCandidateBudget int
+	ContentScanVisitBudget int
+	// contentFullCandidates mirrors queryOptions.contentFullCandidates so
+	// nameTermCandidates can bypass the bounded content-candidate fast path.
+	contentFullCandidates bool
+	// contentWindow mirrors queryOptions.contentWindow: the completeness window
+	// when the verify limit is smaller than it.
+	contentWindow int
+	// contentProbe mirrors queryOptions.contentProbe: the per-volume channel a
+	// reduced content search reports its completeness evidence through.
+	contentProbe *contentCompletenessProbe
+	// contentCandidateMeta carries a candidate source's self-report back to
+	// searchCompact for the current search call (never shared across queries).
+	contentCandidateMeta *contentCandidateMeta
+	// hidden is the overlay hidden-base-ID set captured once for this search
+	// call and threaded into the bounded candidate scan, so the scan's
+	// early-stop guard drops exactly the records the caller's verify loop drops
+	// instead of re-reading the volume snapshot and racing a republish.
+	hidden hiddenBaseIDs
+}
+
+// contentCandidateMeta is the per-search-call channel a candidate source uses to
+// tell searchCompact that it already ran the full inline content predicate.
+type contentCandidateMeta struct {
+	verified bool
 }
 
 type searchTrace struct {
@@ -527,6 +611,28 @@ type searchTrace struct {
 	PostingPrefetchRanges    int    `json:"posting_prefetch_ranges,omitempty"`
 	PostingPrefetchPages     int    `json:"posting_prefetch_pages,omitempty"`
 	Complete                 *bool
+	// ContentPartial is set when a content query answered from only a subset of
+	// the eligible volumes; ContentSkippedVolumes names the volumes left out.
+	ContentPartial        bool
+	ContentSkippedVolumes []string
+	// ContentIncomplete is set when a content query could not evaluate the full
+	// candidate superset within the memory budget. The result is a visible
+	// degradation, never a silent truncation; a count refuses outright.
+	ContentIncomplete bool
+	// ContentCountDivergent is set on a content count for the `under:`/Exists
+	// shapes: a count never stats, so it can exceed the search result set. The
+	// count is still returned; this only makes the divergence visible.
+	ContentCountDivergent bool
+	// CountDivergent is the non-content twin of ContentCountDivergent: search
+	// stat-filters stale entries under --under/Exists while counts do not, so
+	// a count may exceed a matching search after deletions. Set on potential,
+	// like its twin, not on proven divergence.
+	CountDivergent bool
+	// ContentCandidatesVerified records that the content candidate source
+	// already ran the full inline content predicate (the rank-ordered bounded
+	// content scan), so the downstream verify loop can skip re-evaluating it.
+	// Local-only plumbing; never serialized.
+	ContentCandidatesVerified bool `json:"-"`
 }
 
 type traceTerm struct {
@@ -553,6 +659,18 @@ func (t *searchTrace) setSource(source string, candidates int) {
 	}
 	t.Source = source
 	t.Candidates = candidates
+}
+
+// markCountDivergent flags Under/Exists counts whose totals may exceed a
+// matching search (search stat-filters stale entries while counts do not).
+// Content queries set their own twin flag instead, so they are excluded.
+func markCountDivergent(opts queryOptions, pq parsedQuery) {
+	if opts.Trace == nil || queryHasAnyContentLeaf(pq) {
+		return
+	}
+	if opts.Under != "" || opts.Exists {
+		opts.Trace.CountDivergent = true
+	}
 }
 
 func (t *searchTrace) setDecline(reason string) {
@@ -629,6 +747,12 @@ func (t *searchTrace) setFallback(route string) {
 		return
 	}
 	t.Fallback = route
+}
+
+func (t *searchTrace) setContentIncomplete() {
+	if t != nil {
+		t.ContentIncomplete = true
+	}
 }
 
 func (t *searchTrace) setComplete(complete bool) {

@@ -223,6 +223,10 @@ func (s *goSearchService) rebuildVolumeInPlace(vol *serviceVolumeIndex) error {
 	s.startBackgroundNameTrigramBuilds([]*serviceVolumeIndex{vol})
 	s.startBackgroundNameIdentityBuilds([]*serviceVolumeIndex{vol})
 	serviceLog("rebuilt stale index volume=%s db=%s entries=%d", rebuilt.volume, rebuilt.dbPath, rebuilt.index.entryCount())
+	// WP1e/PB4: content must self-heal after a filename rebuild (a journal
+	// reset invalidated the FRN-keyed content index). Re-attach a still-valid
+	// sidecar, or schedule the background content rebuild.
+	s.featuresVolumeReady(vol)
 	return nil
 }
 
@@ -339,6 +343,14 @@ func (vol *serviceVolumeIndex) applyUSNChanges(changes []usnChange) {
 			lastChange[change.FRN] = i
 		}
 	}
+	// Changes that actually apply to the indexed set: own-artifact churn is
+	// consumed below and must not reach the content coordinator either, or the
+	// content store would feed its own writes back. Built only when content is
+	// enabled so the default replay path pays nothing.
+	var applied []usnChange
+	if vol.contentCoord != nil || vol.featureFeed != nil {
+		applied = make([]usnChange, 0, len(changes))
+	}
 	for i, change := range changes {
 		if change.FRN == 0 {
 			continue
@@ -358,6 +370,9 @@ func (vol *serviceVolumeIndex) applyUSNChanges(changes []usnChange) {
 			continue
 		}
 		vol.recordOverlayChange(change, i == lastChange[change.FRN] && change.Reason&usnReasonNeedsInfoRefresh != 0)
+		if vol.contentCoord != nil || vol.featureFeed != nil {
+			applied = append(applied, change)
+		}
 		if change.USN > vol.checkpoint {
 			vol.checkpoint = change.USN
 		}
@@ -366,6 +381,10 @@ func (vol *serviceVolumeIndex) applyUSNChanges(changes []usnChange) {
 	vol.dirty = true
 	vol.publishDirSizeDelta()
 	vol.publishSnapshot()
+	// Content search consumes the same applied change stream as the record
+	// overlay (own-artifact churn already excluded). Nil unless the feature is
+	// enabled, so the default path is untouched.
+	vol.observeFeatureChanges(applied)
 }
 
 // filterOwnedReplayChanges drops changes that fall inside directories holding

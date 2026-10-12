@@ -166,8 +166,11 @@ func TestPlainTermPrefilterNoHitSkipsScan(t *testing.T) {
 	if len(got) != 0 {
 		t.Fatalf("got %d results, want none", len(got))
 	}
-	if trace.Source != "global:bounded-scan" {
-		t.Fatalf("source = %q, want global:bounded-scan", trace.Source)
+	// Selective single-term path queries are served by the global components
+	// lane (trigram bridge with exact-zero short-circuit), not the bounded
+	// scan; either way no scan work may happen for a no-hit term.
+	if trace.Source != "global:components" {
+		t.Fatalf("source = %q, want global:components", trace.Source)
 	}
 	if trace.Candidates != 0 {
 		t.Fatalf("candidates = %d, want 0 (scan skipped)", trace.Candidates)

@@ -396,7 +396,7 @@ tbody tr.focused td {
 
 .footer {
   display: grid;
-  grid-template-columns: auto 1fr auto;
+  grid-template-columns: auto 1fr auto auto;
   align-items: center;
   gap: 12px;
   padding: 0 20px;
@@ -509,4 +509,54 @@ tbody tr.focused td {
   border-radius: 5px;
   outline: none;
   font: inherit;
+}
+
+/* ---- Contents toggle: quiet prompt control, accent when engaged ---- */
+
+.prompt-toggle {
+  flex: none;
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--faint);
+  background: transparent;
+  border: 1px solid var(--rule);
+  border-radius: 5px;
+  padding: 1px 6px;
+  cursor: pointer;
+  user-select: none;
+}
+
+.prompt-toggle:hover {
+  color: var(--text);
+  border-color: #3a3a44;
+}
+
+.prompt-toggle[aria-pressed="true"] {
+  color: var(--text);
+  background: var(--selection);
+  border-color: var(--selection-border);
+}
+
+/* ---- Content snippet under the file name, with match highlights ---- */
+
+.snippet {
+  margin-top: 1px;
+  overflow: hidden;
+  color: var(--dim);
+  font-size: 0.92em;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.snippet mark {
+  color: var(--text);
+  background: rgba(90, 169, 255, 0.35);
+  border-radius: 2px;
+}
+
+.content-status {
+  color: var(--faint);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
