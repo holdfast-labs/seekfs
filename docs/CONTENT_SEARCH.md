@@ -697,12 +697,12 @@ rebuild rather than attaching an empty index.
   8,192-file edit took 1m43s (all shards), each peaking near 1 GB.
 - **Reshard on fold.** A single-file base that grows past twice the target
   through folds is split into shards by the fold that crosses the line.
-- **Parallel extraction.** Builds extract up to `contentBuildWorkers` files
-  concurrently (half the CPUs, at most 4) through `contentPrefetchExtract`,
-  which returns results in item order. Selection, budget and abort behaviour
-  are therefore unchanged. On Chromium (16k files, 128 MB of text, warm cache),
-  the build dropped from 2m16s to 28 s, with extraction fully hidden behind
-  tokenizing.
+- **Parallel extraction.** Builds extract on `contentBuildWorkers` files
+  concurrently (`NumCPU`, capped at 16; 1 while the user queries or the
+  machine is on battery) through `contentPrefetchExtract`, which returns
+  results in item order. Selection, budget and abort behaviour are therefore
+  unchanged. See §6l for the current throughput work (single-read slurp,
+  text fast path, parallel tokenize/sort/shards, adaptive IO priority).
 - **Not yet:** shards are not rebalanced between rebuilds. The offline
   `content-index` CLI still writes a single file, but it now spools extracted
   text to disk during the walk and streams the save like the service paths.
@@ -824,6 +824,76 @@ through the service and ~0.5 s cold through the offline `content -db` path
 delete→unfindable 4.7 s end to end (dominated by the ~5.5 s full filename
 rewalk the pre-existing watcher performs on this tree); converged
 steady-state reconciles are silent and queue nothing.
+
+## 6l. Build throughput (done)
+
+The §6k 19-minute blink build was profiled per stage (warm and cold, CPU +
+block profiles, `zz_buildperf_profile_test.go`, since removed) and rebuilt
+for throughput. Output is byte-identical to the old builder on the same
+inputs — proven by unit tests per fast path and by a full-corpus
+old-vs-new sidecar comparison (177,311 docs, 7 shards: doc tables, stored
+text, and every shard's text/terms/grams sections identical). Recall,
+memory bounds (~250 MB per 64 MiB shard) and the per-section CRCs are
+unchanged.
+
+**Profile (2,000 Chromium files, per-file means).** Cold: `open` 7.5 ms
+(first-touch MFT + Defender, 93% of per-file cost), everything else <0.4 ms
+combined. Warm: grams 0.32 ms, terms 0.07 ms, open 0.04 ms, the two reads +
+decode + hash + fold ~0.15 ms. Assembly (20k files / 151 MB text): 24.4 s
+old, dominated by the serial spill-run sorts (~50%), the posting merge and
+single-threaded tokenize.
+
+**What changed (all in the build path; query paths untouched):**
+
+- **Workers scale to the hardware.** `contentBuildWorkers` is `NumCPU`
+  (capped at 16), not half the CPUs capped at 4. The adaptive throttle is
+  unchanged: 1 worker while the user queries or the machine is on battery,
+  and the tokenize / run-sort / shard stages reuse the same adaptive count.
+- **One read per file.** `contentSlurpNoRecall` opens with `OPEN_NO_RECALL`,
+  stats, and reads the whole (capped) file once; the extractor aliases the
+  slurped bytes instead of reading twice (head + body) and copying. Over-cap
+  files keep the streaming handle path.
+- **No per-file goroutine/timer for text.** `contentExtractSafely` runs the
+  plain-text extractor inline with panic isolation (it is a bounded read +
+  decode and cannot hang); container parsers keep the full
+  goroutine + deadline supervision, and the hang/spin/panic drain tests still
+  pass.
+- **Cheaper normalize.** The assembler aliases already-decoded stored text
+  (`contentStoredText`, exact on BOM/UTF-16-NUL edges by construction),
+  folds ASCII in one pass (`contentFoldText`), skips the redundant per-word
+  lower (`contentTermsOfFolded`), and keys grams as `uint32`
+  (`contentGramsOfU32`, rendered only for distinct grams).
+- **Parallel tokenize.** `assembleContentIndexStreamed` pulls a bounded
+  read-ahead batch (64 docs / 64 MiB, vars for tests) and normalizes,
+  hashes and tokenizes it on the worker pool, emitting in docID order. Each
+  doc's bytes are copied at pull time because a source may reuse its backing
+  buffer (`TestContentAssembleStreamConsumesSourceBuffer` pins this).
+- **Parallel run sort.** Spill runs sort by MSD radix partition on the first
+  key byte: 3-byte gram buffers take a comparison-free stable counting path
+  (input docID order is ascending per key, so stability is the tiebreak);
+  term buffers sort each group independently across workers with no
+  cross-group merge. Runs are byte-identical at any worker count.
+- **Parallel section finish and shard assembly.** Term and gram
+  `FinishFile` run concurrently; sharded builds assemble up to
+  `contentShardBuildConcurrency` (2) shards at once, each in a private
+  scratch directory (the streamer names its term/gram files with fixed
+  names — sharing one directory corrupted a shard, caught by the attach
+  checksum gate and fixed).
+- **IO priority is adaptive.** The Low disk-priority hint now applies only
+  while the user is active or on battery (`SEEKFS_CONTENT_IOPRIORITY`
+  forces it); an idle build keeps normal priority.
+
+**Measured (same 20k-file / 151 MB benchmark, GOMAXPROCS=16):** extraction
+warm 16-worker 0.032 → 0.015 ms/file; assembly 24.4 s → 6.5 s (3.75×).
+Service build of blink (178,595 files → 177,311 docs, 7 shards, warm cache,
+loaded box): extraction ~75 s, assembly + save + attach ~40 s, **ready in
+~2 min** vs the §6k 19 min cold baseline; cold-cache full pass on the same
+box took ~16 min (first-touch opens dominate: 468k × ~7.5 ms / 16 workers).
+`content:PaintLayer` still answers in ~40 ms through the service.
+
+Not yet: the posting merge (`mergeInto`) is still serial per section (few
+runs per shard keep it small); shards are not rebalanced between rebuilds;
+the offline `content-index` CLI still writes a single file.
 
 ## 7. Carried debt / known gaps
 

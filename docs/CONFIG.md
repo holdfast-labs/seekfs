@@ -129,6 +129,19 @@ exist for low-memory or unusual environments; the defaults are fine otherwise.
 | `SEEKFS_GRAM_MERGE_WORKERS` | Parallel merge workers | `GOMAXPROCS`, capped at 8 |
 | `SEEKFS_GRAM_MERGE_FANIN` | Maximum runs merged per pass (minimum 2) | `32` |
 
+## Build tuning (content)
+
+Content builds scale with the machine when idle and yield when it is not:
+extraction runs on `NumCPU` workers (capped at 16), dropping to 1 while the
+user is actively querying or the machine is on battery; tokenize, run-sort
+and shard assembly parallelize under the same adaptive count. These
+environment variables exist for unusual environments; the defaults are fine
+otherwise.
+
+| Variable | Meaning | Default |
+| --- | --- | --- |
+| `SEEKFS_CONTENT_IOPRIORITY` | `low` always opens content files with the Low disk-priority hint; any other value never does; unset means adaptive (Low only while the user is active or on battery, normal priority for an idle build) | adaptive |
+
 ## Runtime tuning (service)
 
 These knobs tune the resident service and query engine. Leave them unset unless

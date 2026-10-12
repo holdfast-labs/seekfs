@@ -488,7 +488,12 @@ func TestGlobalNameUnderUsesNameFirstFilter(t *testing.T) {
 // the full bounded scan.
 func cheapPredicateTestVolumes(t *testing.T) []*serviceVolumeIndex {
 	t.Helper()
-	now := time.Now().Add(-time.Hour).UnixNano()
+	// Pin the clock to midday so "now - 1h" is always the same calendar day
+	// as the dm:today filter the test issues; with a live clock a run in the
+	// first hour after midnight puts the record on "yesterday" and the
+	// dm:today subtest flakes.
+	fixedNow := time.Date(time.Now().Year(), time.Now().Month(), time.Now().Day(), 12, 0, 0, 0, time.Local)
+	now := fixedNow.Add(-time.Hour).UnixNano()
 	old := time.Date(2020, time.January, 1, 0, 0, 0, 0, time.UTC).UnixNano()
 	records := []CompactRecord{
 		{FRN: 1, ParentFRN: 1, Parent: -1, Name: ".", Mode: modeFromAttrs(fileAttributeDir)},
@@ -517,6 +522,10 @@ func cheapPredicateTestVolumes(t *testing.T) []*serviceVolumeIndex {
 }
 
 func TestGlobalNameCheapPredicatesUseNameFirst(t *testing.T) {
+	restoreNow := queryNowFunc
+	fixedNow := time.Date(time.Now().Year(), time.Now().Month(), time.Now().Day(), 12, 0, 0, 0, time.Local)
+	queryNowFunc = func() time.Time { return fixedNow }
+	defer func() { queryNowFunc = restoreNow }()
 	volumes := cheapPredicateTestVolumes(t)
 
 	tests := []struct {

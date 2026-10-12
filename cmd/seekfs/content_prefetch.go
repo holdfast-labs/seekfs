@@ -2,21 +2,28 @@ package main
 
 import (
 	"context"
+	"os"
 	"runtime"
+	"strings"
 	"time"
 )
 
 // contentBuildWorkers is how many files a build extracts concurrently.
-// Extraction (open, read, decode) dominated a serial Chromium build at about
-// 8 ms per file; results are still consumed in order, so selection, budget
-// and abort behaviour are unchanged. A var so tests can pin it.
+// Extraction is IO-bound on small files (open, read, decode), so an idle
+// build scales with the machine: NumCPU workers (capped), not a fixed small
+// number. Results are still consumed in order, so selection, budget and abort
+// behaviour are unchanged. The service build drops to 1 worker while the user
+// is actively querying or the machine is on battery
+// (contentBuildWorkerCount); the offline CLI keeps the static cap because it
+// is a foreground command the user explicitly started. A var so tests can pin
+// it.
 var contentBuildWorkers = func() int {
-	n := runtime.NumCPU() / 2
+	n := runtime.NumCPU()
 	if n < 1 {
 		n = 1
 	}
-	if n > 4 {
-		n = 4
+	if n > 16 {
+		n = 16
 	}
 	return n
 }()
@@ -38,12 +45,27 @@ var (
 	contentOnBatteryNow = contentSystemOnBattery
 )
 
+// contentLowerIOPriorityNow reports whether newly opened content handles
+// should take the Low disk-priority hint: only while the user is actively
+// querying or the machine is on battery. An idle build keeps normal priority:
+// the Low hint measurably throttles reads even when the disk would otherwise
+// be idle, and there is nothing to yield to. SEEKFS_CONTENT_IOPRIORITY forces
+// the policy ("low" always lowers, anything else never does). The Windows
+// opener consults it; other platforms open plainly.
+func contentLowerIOPriorityNow() bool {
+	if v := strings.TrimSpace(os.Getenv("SEEKFS_CONTENT_IOPRIORITY")); v != "" {
+		return strings.EqualFold(v, "low")
+	}
+	return contentUserActiveNow() || contentOnBatteryNow()
+}
+
 // contentBuildWorkerCount is the adaptive extraction concurrency for the
 // service-owned background build: the static cap, dropped to 1 while the user
 // is actively querying or the machine is on battery. The offline CLI keeps
 // the static cap: it is a foreground command the user explicitly started.
 // Ordering, budget and abort semantics are unchanged at any count because the
-// prefetch stream is consumed in item order.
+// prefetch stream is consumed in item order. The streaming assembler reuses
+// the same count for its tokenize stage.
 func contentBuildWorkerCount() int {
 	if contentBuildWorkers <= 1 {
 		return contentBuildWorkers

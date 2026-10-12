@@ -60,6 +60,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -79,6 +80,14 @@ var contentBuildRun = func(fn func()) { go fn() }
 // once. One build is already serial and paced; this keeps several volumes from
 // saturating the disk together.
 const contentBuildMaxConcurrent = 1
+
+// contentShardBuildConcurrency bounds how many shards assemble concurrently
+// in one service build. Shards are independent (own posting builders, own
+// section files, spool reads via concurrent ReadAt), so assembling several at
+// once uses idle CPUs while extraction is done. The per-shard memory bound is
+// unchanged; concurrency multiplies the transient peak, so this stays small.
+// A var so tests and tight-memory machines can pin it to 1 (sequential).
+var contentShardBuildConcurrency = 2
 
 // contentBuildGate is the process-wide build concurrency limiter.
 var contentBuildGate = make(chan struct{}, contentBuildMaxConcurrent)
@@ -500,7 +509,9 @@ func (s *goSearchService) snapshotContentBuildItems(vol *serviceVolumeIndex, opt
 
 // contentBuildDocSafe extracts one file into a build doc. It recovers from an
 // extractor panic so one pathological document cannot kill the service, and
-// returns ok=false for missing/oversized/binary/skipped files.
+// returns ok=false for missing/oversized/binary/skipped files. The file is
+// opened with OPEN_NO_RECALL and read exactly once (contentSlurpNoRecall);
+// the extractor reuses the slurped bytes in place.
 func contentBuildDocSafe(ctx context.Context, item contentBuildItem) (doc contentBuildDoc, res contentExtractResult, ok bool) {
 	defer func() {
 		if recover() != nil {
@@ -509,18 +520,13 @@ func contentBuildDocSafe(ctx context.Context, item contentBuildItem) (doc conten
 			ok = false
 		}
 	}()
-	f, err := contentOpenNoRecall(item.path)
+	settings := contentExtractSettingsFromContext(ctx)
+	s, err := contentSlurpNoRecall(item.path, settings.maxRaw)
 	if err != nil {
 		return contentBuildDoc{}, contentExtractResult{}, false
 	}
-	defer f.Close()
-	info, err := f.Stat()
-	if err != nil || info.IsDir() {
-		return contentBuildDoc{}, contentExtractResult{}, false
-	}
-	size := info.Size()
-	head, _ := contentReadBounded(f, size, 512)
-	e := contentExtractorForPath(item.path, head)
+	defer s.close()
+	e := contentExtractorForPath(item.path, s.headBytes())
 	if e == nil {
 		// No extractor claimed the head: binary (NUL in the sniff window),
 		// counted apart from skipped/declined.
@@ -529,11 +535,11 @@ func contentBuildDocSafe(ctx context.Context, item contentBuildItem) (doc conten
 	// Bound one document's extraction so a hang cannot stall the serial build;
 	// contentExtractSafely nests the deadline inside the build's stop/cancel
 	// context and isolates a parser panic.
-	res, err = contentExtractSafely(ctx, e, f, size)
+	res, err = contentExtractSafely(ctx, e, s.reader(), s.size)
 	if err != nil || res.Skipped || len(res.Text) == 0 {
 		return contentBuildDoc{}, res, false
 	}
-	return contentBuildDoc{path: item.path, frn: item.frn, text: res.Text, modUnix: info.ModTime().Unix(), class: res.Class, version: e.Version(), fileSize: size, fileModNano: info.ModTime().UnixNano()}, res, true
+	return contentBuildDoc{path: item.path, frn: item.frn, text: res.Text, modUnix: s.modUnix, class: res.Class, version: e.Version(), fileSize: s.size, fileModNano: s.modNano}, res, true
 }
 
 // contentBuildCurrent reports whether a build may still publish: the per-volume
@@ -804,16 +810,25 @@ func (s *goSearchService) runContentBuild(vol *serviceVolumeIndex, reuseSidecar 
 		return selected[i].item.path < selected[j].item.path
 	})
 	// sourceOf streams the selected docs at the given positions (ascending
-	// FRN) back out of the spool.
+	// FRN) back out of the spool. Each sourceOf call owns its cursor, but
+	// concurrent shard assembles share the abort latch, so it is mutex-held.
+	var abortMu sync.Mutex
 	sourceOf := func(order []int) contentBuildSource {
 		next := 0
+		setAbort := func(reason string, retry bool) {
+			abortMu.Lock()
+			defer abortMu.Unlock()
+			if abortReason == "" {
+				abortReason, abortRetry = reason, retry
+			}
+		}
 		return func() (contentBuildDoc, bool, error) {
 			if vol.replayGen.Load() != gen || next%contentBuildBatchSize == 0 && !s.contentBuildCurrent(vol, gen, journalID) {
-				abortReason, abortRetry = "journal generation changed during assembly", true
+				setAbort("journal generation changed during assembly", true)
 				return contentBuildDoc{}, false, errContentBuildAborted
 			}
 			if s.contentStopped(vol) {
-				abortReason = "service stopping"
+				setAbort("service stopping", false)
 				return contentBuildDoc{}, false, errContentBuildAborted
 			}
 			if next == len(order) {
@@ -861,8 +876,18 @@ func (s *goSearchService) runContentBuild(vol *serviceVolumeIndex, reuseSidecar 
 	// doc table and sidecar identity for the streaming save. The spooled
 	// section files, not a heap index, are what gets saved; attach reloads
 	// the sidecar through the mmap loader.
+	//
+	// Each assemble call gets a private scratch directory: the streaming
+	// assembler names its term/gram section files with fixed names, so
+	// concurrent shard assembles must not share one directory. Sequential
+	// callers could share, but a private directory is equally correct and
+	// keeps one code path. Everything under tmpDir is removed with it.
 	assemble := func(order []int) (*contentStreamedBuild, *contentIndex, error) {
-		built, err := assembleContentIndexStreamed(sourceOf(order), tmpDir)
+		shardTmp, err := os.MkdirTemp(tmpDir, "shard-*")
+		if err != nil {
+			return nil, nil, err
+		}
+		built, err := assembleContentIndexStreamed(sourceOf(order), shardTmp)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -899,16 +924,55 @@ func (s *goSearchService) runContentBuild(vol *serviceVolumeIndex, reuseSidecar 
 			return err
 		}
 		infos := make([]contentShardInfo, 0, len(groups))
-		for _, g := range groups {
-			built, shard, err := assemble(g.docs)
-			if err != nil {
-				return err
+		if len(groups) == 1 || contentShardBuildConcurrency < 2 {
+			for _, g := range groups {
+				built, shard, err := assemble(g.docs)
+				if err != nil {
+					return err
+				}
+				info, err := contentSaveShard(dir, shard, contentBuildFiles(built), g.prefixes)
+				if err != nil {
+					return err
+				}
+				infos = append(infos, info)
 			}
-			info, err := contentSaveShard(dir, shard, contentBuildFiles(built), g.prefixes)
-			if err != nil {
-				return err
+		} else {
+			// Shards assemble concurrently, bounded by
+			// contentShardBuildConcurrency. Manifest order follows groups, so
+			// the published layout is identical to the sequential build's.
+			par := make([]contentShardInfo, len(groups))
+			sem := make(chan struct{}, contentShardBuildConcurrency)
+			var wg sync.WaitGroup
+			var mu sync.Mutex
+			var firstErr error
+			for gi := range groups {
+				wg.Add(1)
+				go func(gi int) {
+					defer wg.Done()
+					sem <- struct{}{}
+					defer func() { <-sem }()
+					built, shard, err := assemble(groups[gi].docs)
+					if err == nil {
+						var info contentShardInfo
+						info, err = contentSaveShard(dir, shard, contentBuildFiles(built), groups[gi].prefixes)
+						if err == nil {
+							par[gi] = info
+						}
+					}
+					if err != nil {
+						mu.Lock()
+						if firstErr == nil {
+							firstErr = err
+						}
+						mu.Unlock()
+					}
+				}(gi)
 			}
-			infos = append(infos, info)
+			wg.Wait()
+			if firstErr != nil {
+				return firstErr
+			}
+			infos = append(infos, par...)
 		}
 		if !s.contentBuildCurrent(vol, gen, journalID) {
 			return errContentBuildStale

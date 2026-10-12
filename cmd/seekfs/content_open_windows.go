@@ -38,11 +38,16 @@ func contentOpenNoRecall(path string) (*os.File, error) {
 	if err != nil {
 		return nil, &os.PathError{Op: "open", Path: path, Err: err}
 	}
-	// Lower this handle's disk priority so background extraction (service
-	// builds, USN delta) is a good citizen next to interactive I/O. The hint
-	// is per-handle, so other openers of the file are unaffected; a failure
-	// here must not fail the open (e.g. a filesystem that rejects the class).
-	contentLowerHandleIOPriority(h)
+	// Lower this handle's disk priority while foreground activity exists, so
+	// background extraction (service builds, USN delta) is a good citizen
+	// next to interactive I/O. An idle build keeps normal priority: the Low
+	// hint measurably throttles reads even when the disk would otherwise be
+	// idle, and there is nothing to yield to. The hint is per-handle, so
+	// other openers of the file are unaffected; a failure here must not fail
+	// the open (e.g. a filesystem that rejects the class).
+	if contentLowerIOPriorityNow() {
+		contentLowerHandleIOPriority(h)
+	}
 	return os.NewFile(uintptr(h), path), nil
 }
 

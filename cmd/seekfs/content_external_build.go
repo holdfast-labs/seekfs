@@ -27,6 +27,7 @@ import (
 	"io"
 	"os"
 	"sort"
+	"sync"
 )
 
 // contentSectionFileBufSize is the buffered-I/O size for spilling a finished
@@ -54,6 +55,9 @@ type contentExternalSectionBuilder struct {
 	records    int
 	err        error
 	closed     bool
+	// scratch is the radix-partition workspace, reused across spills so a
+	// large spill does not allocate a second buffer every time.
+	scratch []contentExternalRecord
 }
 
 func newContentExternalSectionBuilder(tmpDir string, arenaBytes int) (*contentExternalSectionBuilder, error) {
@@ -83,17 +87,256 @@ func (b *contentExternalSectionBuilder) Add(key string, docID uint32, tf uint32)
 	}
 }
 
+// contentExternalRecordSlice sorts records by (key, docID) without
+// reflection (sort.Slice's func adapter costs ~2x here on millions of
+// records).
+type contentExternalRecordSlice []contentExternalRecord
+
+func (s contentExternalRecordSlice) Len() int { return len(s) }
+func (s contentExternalRecordSlice) Less(i, j int) bool {
+	if s[i].key != s[j].key {
+		return s[i].key < s[j].key
+	}
+	return s[i].docID < s[j].docID
+}
+func (s contentExternalRecordSlice) Swap(i, j int) { s[i], s[j] = s[j], s[i] }
+
+// contentExternalSortWorkers sizes the spill-run parallel sort. Small buffers
+// sort faster serially; the assembler reuses the adaptive build count so an
+// active user or a battery still gets the serial sort.
+func contentExternalSortWorkers(n int) int {
+	if n < 1<<18 {
+		return 1
+	}
+	w := contentBuildWorkerCount()
+	if w < 1 {
+		w = 1
+	}
+	if w > n/(1<<16) {
+		w = n / (1 << 16)
+		if w < 1 {
+			w = 1
+		}
+	}
+	return w
+}
+
 // spill sorts the pending buffer and writes it to a fresh run file.
 func (b *contentExternalSectionBuilder) spill() error {
 	if len(b.buf) == 0 {
 		return nil
 	}
-	sort.Slice(b.buf, func(i, j int) bool {
-		if b.buf[i].key != b.buf[j].key {
-			return b.buf[i].key < b.buf[j].key
+	if contentExternalSortWorkers(len(b.buf)) < 2 {
+		sort.Sort(contentExternalRecordSlice(b.buf))
+		return b.spillSorted()
+	}
+	return b.spillRadix()
+}
+
+// spillRadix sorts a large pending buffer with one MSD radix step on the
+// first key byte: records are stable-partitioned into 256 first-byte groups,
+// each group is ordered independently on a worker pool, and groups stream
+// into the run file in byte order. First-byte groups are key-disjoint ranges,
+// so concatenation is exactly the fully-sorted order — no cross-group merge
+// and ~8 fewer comparisons per record than a whole-buffer sort.
+//
+// A buffer of all 3-byte keys (the gram builder) takes the counting path:
+// each group is counting-sorted on its last two bytes with no comparisons at
+// all. Stability preserves the input's ascending-docID order within equal
+// keys (documents arrive in docID order and contribute each key once), so the
+// (key, docID) contract holds without an explicit tiebreak.
+func (b *contentExternalSectionBuilder) spillRadix() error {
+	buf := b.buf
+	if cap(b.scratch) < len(buf) {
+		b.scratch = make([]contentExternalRecord, len(buf))
+	}
+	scratch := b.scratch[:len(buf)]
+	var counts [256]int
+	all3 := true
+	for i := range buf {
+		k := buf[i].key
+		counts[k[0]]++
+		if len(k) != 3 {
+			all3 = false
 		}
-		return b.buf[i].docID < b.buf[j].docID
-	})
+	}
+	// Stable partition buf -> scratch by first key byte.
+	var off [256]int
+	for c := 1; c < 256; c++ {
+		off[c] = off[c-1] + counts[c-1]
+	}
+	pos := off
+	for i := range buf {
+		c := buf[i].key[0]
+		scratch[pos[c]] = buf[i]
+		pos[c]++
+	}
+	rw, err := createRunFileWriter(b.tmpDir)
+	if err != nil {
+		return err
+	}
+	if all3 {
+		// Counting path: per-group counting sort on the 2-byte suffix,
+		// stable so equal keys keep ascending docIDs. Groups stream into
+		// the run file in first-byte order.
+		var c2 [65536]int
+		var start [65536]int
+		for c := 0; c < 256; c++ {
+			lo := off[c]
+			g := scratch[lo : lo+counts[c]]
+			if len(g) == 0 {
+				continue
+			}
+			for i := range g {
+				k := g[i].key
+				c2[int(k[1])<<8|int(k[2])]++
+			}
+			s := 0
+			for v := 0; v < 65536; v++ {
+				start[v] = s
+				s += c2[v]
+			}
+			dst := buf[lo : lo+len(g)]
+			for i := range g {
+				k := g[i].key
+				v := int(k[1])<<8 | int(k[2])
+				dst[start[v]] = g[i]
+				start[v]++
+			}
+			for i := range g {
+				k := g[i].key
+				c2[int(k[1])<<8|int(k[2])] = 0
+			}
+			if err := rw.writeRecords(dst); err != nil {
+				return rw.abort(err)
+			}
+		}
+	} else {
+		// MSD path: sort each first-byte group independently across the
+		// worker pool, then stream groups in byte order.
+		w := contentBuildWorkerCount()
+		if w < 1 {
+			w = 1
+		}
+		if w > 256 {
+			w = 256
+		}
+		if w > 1 {
+			var wg sync.WaitGroup
+			next := 0
+			var mu sync.Mutex
+			for i := 0; i < w; i++ {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					for {
+						mu.Lock()
+						c := next
+						next++
+						mu.Unlock()
+						if c >= 256 {
+							return
+						}
+						g := scratch[off[c] : off[c]+counts[c]]
+						sort.Sort(contentExternalRecordSlice(g))
+					}
+				}()
+			}
+			wg.Wait()
+		} else {
+			for c := 0; c < 256; c++ {
+				g := scratch[off[c] : off[c]+counts[c]]
+				sort.Sort(contentExternalRecordSlice(g))
+			}
+		}
+		for c := 0; c < 256; c++ {
+			if counts[c] == 0 {
+				continue
+			}
+			if err := rw.writeRecords(scratch[off[c] : off[c]+counts[c]]); err != nil {
+				return rw.abort(err)
+			}
+		}
+	}
+	path, err := rw.commit()
+	if err != nil {
+		return err
+	}
+	b.runs = append(b.runs, path)
+	b.buf = b.buf[:0]
+	b.bufBytes = 0
+	return nil
+}
+
+// runFileWriter streams sorted records into one run file with the exact
+// historical encoding (uvarint keyLen, key bytes, uvarint docID, uvarint tf).
+type runFileWriter struct {
+	f       *os.File
+	bw      *bufio.Writer
+	path    string
+	scratch [binary.MaxVarintLen64]byte
+}
+
+func createRunFileWriter(tmpDir string) (*runFileWriter, error) {
+	f, err := os.CreateTemp(tmpDir, "cxext-*.run")
+	if err != nil {
+		return nil, err
+	}
+	return &runFileWriter{f: f, bw: bufio.NewWriterSize(f, 1<<16), path: f.Name()}, nil
+}
+
+func (w *runFileWriter) writeOne(r *contentExternalRecord) error {
+	n := binary.PutUvarint(w.scratch[:], uint64(len(r.key)))
+	if _, err := w.bw.Write(w.scratch[:n]); err != nil {
+		return err
+	}
+	if _, err := w.bw.WriteString(r.key); err != nil {
+		return err
+	}
+	n = binary.PutUvarint(w.scratch[:], uint64(r.docID))
+	if _, err := w.bw.Write(w.scratch[:n]); err != nil {
+		return err
+	}
+	n = binary.PutUvarint(w.scratch[:], uint64(r.tf))
+	if _, err := w.bw.Write(w.scratch[:n]); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (w *runFileWriter) writeRecords(recs []contentExternalRecord) error {
+	for i := range recs {
+		if err := w.writeOne(&recs[i]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// commit flushes, closes and keeps the run file, returning its path.
+func (w *runFileWriter) commit() (string, error) {
+	if err := w.bw.Flush(); err != nil {
+		_ = w.f.Close()
+		_ = os.Remove(w.path)
+		return "", err
+	}
+	if err := w.f.Close(); err != nil {
+		_ = os.Remove(w.path)
+		return "", err
+	}
+	return w.path, nil
+}
+
+// abort discards the partial run file.
+func (w *runFileWriter) abort(err error) error {
+	_ = w.bw.Flush()
+	_ = w.f.Close()
+	_ = os.Remove(w.path)
+	return err
+}
+
+// spillSorted writes the (already sorted) pending buffer to a fresh run file.
+func (b *contentExternalSectionBuilder) spillSorted() error {
 	f, err := os.CreateTemp(b.tmpDir, "cxext-*.run")
 	if err != nil {
 		return err
@@ -173,6 +416,7 @@ func (b *contentExternalSectionBuilder) Close() error {
 	}
 	b.closed = true
 	b.buf = nil
+	b.scratch = nil
 	return b.removeRuns()
 }
 

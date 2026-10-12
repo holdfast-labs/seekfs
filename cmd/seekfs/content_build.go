@@ -19,6 +19,8 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
+	"unicode/utf8"
 )
 
 // contentBuildOptions bounds and scopes a build. MaxFiles caps files scanned;
@@ -264,23 +266,20 @@ func buildContentIndexFromDir(ctx context.Context, root string, opts contentBuil
 		if opts.MaxFiles > 0 && scanned > opts.MaxFiles {
 			return filepath.SkipAll
 		}
-		f, ferr := os.Open(path)
-		if ferr != nil {
+		// Single-read open without recalling cloud placeholders (the §4
+		// invariant); the extractor reuses the slurped bytes in place.
+		s, serr := contentSlurpNoRecall(path, settings.maxRaw)
+		if serr != nil {
 			return nil
 		}
-		info, serr := f.Stat()
-		if serr != nil || info.IsDir() {
-			f.Close()
-			return nil
-		}
-		size := info.Size()
-		head, _ := contentReadBounded(f, size, 512)
+		head := s.headBytes()
 		e := contentExtractorForPath(path, head)
 		if e == nil {
 			// No extractor claimed the head: binary (NUL in the sniff
 			// window), tallied apart from declined so the counters reconcile
 			// as indexed == eligible - declined - skipped - binary.
 			binary++
+			s.close()
 			return nil
 		}
 		// The extractor applies the raw/text policy: an over-cap container is
@@ -288,8 +287,9 @@ func buildContentIndexFromDir(ctx context.Context, root string, opts contentBuil
 		// Truncated prefix. Both are tallied into the policy section. The call
 		// is panic-isolated and deadline-bounded (contentExtractSafely), so one
 		// hostile file cannot crash or wedge the CLI build.
-		res, eerr := contentExtractSafely(ctx, e, f, size)
-		f.Close()
+		res, eerr := contentExtractSafely(ctx, e, s.reader(), s.size)
+		size, modUnix, modNano := s.size, s.modUnix, s.modNano
+		s.close()
 		if eerr != nil {
 			skipped++
 			return nil
@@ -327,11 +327,11 @@ func buildContentIndexFromDir(ctx context.Context, root string, opts contentBuil
 			item:        contentBuildItem{frn: contentPathKey(rel), path: rel},
 			offset:      offset,
 			length:      len(res.Text),
-			modUnix:     info.ModTime().Unix(),
+			modUnix:     modUnix,
 			class:       res.Class,
 			version:     e.Version(),
 			fileSize:    size,
-			fileModNano: info.ModTime().UnixNano(),
+			fileModNano: modNano,
 		})
 		return nil
 	})
@@ -370,8 +370,9 @@ func assembleContentIndexFromSpool(spool *os.File, spooled []contentWalkDoc, ord
 // it fills, sorted runs spill to disk and merge. The counted bytes understate
 // the resident records (string headers and slice growth), so the arena is sized
 // well below the per-shard heap budget: a 64 MiB shard must assemble under
-// ~250 MB of heap (see the shard-scale harness).
-const contentBuildArenaBytes = 12 << 20
+// ~250 MB of heap (see the shard-scale harness). A var so benchmarks can
+// explore the run-count tradeoff without changing the production bound.
+var contentBuildArenaBytes = 12 << 20
 
 // contentBuildSource yields extracted documents one at a time for
 // assembleContentIndexStream. It must return docs in ascending (frn, path)
@@ -380,8 +381,10 @@ const contentBuildArenaBytes = 12 << 20
 type contentBuildSource func() (doc contentBuildDoc, ok bool, err error)
 
 // contentAssembleStreamHook runs after each document has been normalized and
-// its postings added, before the next one is pulled from the source. Tests use
-// it to prove the assembler processes docs one at a time instead of buffering.
+// its postings added, before the next batch is pulled from the source, in
+// docID order. Tests use it to prove the assembler streams instead of
+// buffering the whole source: at most one read-ahead batch
+// (contentAssembleBatchDocs/Bytes) may be pulled ahead of the hook.
 var contentAssembleStreamHook = func(docID int) {}
 
 // assembleContentIndexStream is the streaming core of assembleContentIndex. It
@@ -446,6 +449,55 @@ type contentStreamedBuild struct {
 	gramPath string
 }
 
+// contentAssembleBatchDocs and contentAssembleBatchBytes bound the streaming
+// assembler's tokenize read-ahead: at most this many documents or bytes are
+// pulled from the source before earlier docs are emitted in order. The bound
+// keeps the "never retain the corpus" streaming guarantee (peak is one batch
+// of raw text plus its token maps) while letting the CPU-bound normalize /
+// hash / tokenize stage run on contentBuildWorkerCount workers. Vars so tests
+// can pin the batching.
+var (
+	contentAssembleBatchDocs  = 64
+	contentAssembleBatchBytes = int64(64 << 20)
+)
+
+// contentTokenizedDoc is one document after the parallel normalize stage:
+// case-preserving stored bytes, the folded length for the doc table, the
+// content hash, and the precomputed term/gram sets the serial emit stage
+// merges into the posting builders in docID order.
+type contentTokenizedDoc struct {
+	stored []byte
+	docLen uint32
+	hash   [contentHashLen]byte
+	terms  map[string]uint32
+	grams  map[uint32]struct{}
+}
+
+// contentTokenizeDocForBuild normalizes one extracted document exactly the
+// way the historical serial assembler did (repair, fold, hash, terms, grams),
+// so parallel assembly produces byte-identical output.
+func contentTokenizeDocForBuild(text []byte) contentTokenizedDoc {
+	stored := contentStoredText(text)
+	folded := contentFoldText(stored)
+	return contentTokenizedDoc{
+		stored: stored,
+		docLen: uint32(len(folded)),
+		hash:   sha256Of(stored),
+		terms:  contentTermsOfFolded(folded),
+		grams:  contentGramsOfU32(folded),
+	}
+}
+
+// contentGramU32String renders a trigram key back to its 3-byte string form
+// for the posting builder.
+func contentGramU32String(g uint32) string {
+	var b [3]byte
+	b[0] = byte(g >> 16)
+	b[1] = byte(g >> 8)
+	b[2] = byte(g)
+	return string(b[:])
+}
+
 // assembleContentIndexStreamed consumes documents like assembleContentIndexStream
 // but never retains the corpus: the text store is spooled to a temp file as
 // docs arrive and the posting sections merge straight into section files, so
@@ -487,50 +539,102 @@ func assembleContentIndexStreamed(source contentBuildSource, tmpDir string) (*co
 	var docs []contentDoc
 	var paths []string
 	asmErr := func() error {
+		workers := contentBuildWorkerCount()
+		if workers < 1 {
+			workers = 1
+		}
 		for {
-			d, ok, err := source()
-			if err != nil {
-				return err
+			// Bounded read-ahead: pull the next batch, then emit it in
+			// order. The source is still consumed strictly front-to-back,
+			// so DocID assignment and the text-store order are unchanged.
+			// Each doc's bytes are copied at pull time: a source may reuse
+			// its backing buffer on the next call, so retaining the slice
+			// across pulls would alias overwritten bytes.
+			var raws []contentBuildDoc
+			var rawBytes int64
+			for len(raws) < contentAssembleBatchDocs && rawBytes < contentAssembleBatchBytes {
+				d, ok, err := source()
+				if err != nil {
+					return err
+				}
+				if !ok {
+					break
+				}
+				d.text = bytes.Clone(d.text)
+				rawBytes += int64(len(d.text))
+				raws = append(raws, d)
+				// A single huge document must still make progress when the
+				// byte cap is already met by it alone.
+				if len(raws) == 1 && rawBytes >= contentAssembleBatchBytes {
+					break
+				}
 			}
-			if !ok {
+			if len(raws) == 0 {
 				break
 			}
-			docID := uint32(len(docs))
-			paths = append(paths, d.path)
-			// Store case-preserving repaired text (PF-6a): a case-sensitive query
-			// verifies against these exact bytes, and snippets show the real case.
-			// The index (terms and grams) is built from a case-folded copy, so the
-			// case-insensitive prefilter stays a superset of every case-sensitive
-			// match (tgrep's merged-case index, case-aware verify).
-			stored := contentRepairText(d.text)
-			folded := contentFoldText(stored)
-			if _, err := textW.Write(stored); err != nil {
-				return err
+			toks := make([]contentTokenizedDoc, len(raws))
+			if len(raws) == 1 || workers == 1 {
+				for i := range raws {
+					toks[i] = contentTokenizeDocForBuild(raws[i].text)
+				}
+			} else {
+				n := workers
+				if n > len(raws) {
+					n = len(raws)
+				}
+				var wg sync.WaitGroup
+				for w := 0; w < n; w++ {
+					wg.Add(1)
+					go func(w int) {
+						defer wg.Done()
+						for i := w; i < len(raws); i += n {
+							toks[i] = contentTokenizeDocForBuild(raws[i].text)
+						}
+					}(w)
+				}
+				wg.Wait()
 			}
-			docs = append(docs, contentDoc{
-				DocID:            docID,
-				FRN:              d.frn,
-				ContentType:      d.class,
-				ExtractorVersion: d.version,
-				DocLen:           uint32(len(folded)),
-				RawSize:          int64(len(stored)),
-				ModUnix:          d.modUnix,
-				ContentHash:      sha256Of(stored),
-				TextOff:          textSize,
-				TextLen:          uint32(len(stored)),
-				FileSize:         d.fileSize,
-				FileModNano:      d.fileModNano,
-			})
-			textSize += uint64(len(stored))
-			// Documents arrive in ascending docID order, so each key's Adds arrive
-			// in ascending docID order as the builder requires.
-			for term, tf := range contentTermsOf(folded) {
-				termBuilder.Add(term, docID, tf)
+			for i := range raws {
+				d := &raws[i]
+				t := &toks[i]
+				docID := uint32(len(docs))
+				paths = append(paths, d.path)
+				// Store case-preserving repaired text (PF-6a): a case-sensitive query
+				// verifies against these exact bytes, and snippets show the real case.
+				// The index (terms and grams) is built from a case-folded copy, so the
+				// case-insensitive prefilter stays a superset of every case-sensitive
+				// match (tgrep's merged-case index, case-aware verify).
+				if _, err := textW.Write(t.stored); err != nil {
+					return err
+				}
+				docs = append(docs, contentDoc{
+					DocID:            docID,
+					FRN:              d.frn,
+					ContentType:      d.class,
+					ExtractorVersion: d.version,
+					DocLen:           t.docLen,
+					RawSize:          int64(len(t.stored)),
+					ModUnix:          d.modUnix,
+					ContentHash:      t.hash,
+					TextOff:          textSize,
+					TextLen:          uint32(len(t.stored)),
+					FileSize:         d.fileSize,
+					FileModNano:      d.fileModNano,
+				})
+				textSize += uint64(len(t.stored))
+				// Documents arrive in ascending docID order, so each key's Adds arrive
+				// in ascending docID order as the builder requires. The per-doc
+				// (term -> tf) multiset is identical to the serial path's, and
+				// the builder sorts on spill, so Add order within a doc cannot
+				// change the encoded bytes.
+				for term, tf := range t.terms {
+					termBuilder.Add(term, docID, tf)
+				}
+				for gram := range t.grams {
+					gramBuilder.Add(contentGramU32String(gram), docID, 1)
+				}
+				contentAssembleStreamHook(int(docID))
 			}
-			for gram := range contentGramsOf(folded) {
-				gramBuilder.Add(gram, docID, 1)
-			}
-			contentAssembleStreamHook(int(docID))
 		}
 		return nil
 	}()
@@ -545,15 +649,24 @@ func assembleContentIndexStreamed(source contentBuildSource, tmpDir string) (*co
 		return nil, err
 	}
 	termPath := filepath.Join(tmpDir, "cxterm.sec")
-	if err := termBuilder.FinishFile(termPath); err != nil {
-		_ = os.Remove(textPath)
-		return nil, err
-	}
 	gramPath := filepath.Join(tmpDir, "cxgram.sec")
-	if err := gramBuilder.FinishFile(gramPath); err != nil {
+	// The term and gram sections are independent files; merging and writing
+	// them concurrently uses a second core for the historically serial
+	// FinishFile phase. The bytes of each file are unaffected.
+	var finishWG sync.WaitGroup
+	var termErr, gramErr error
+	finishWG.Add(2)
+	go func() { defer finishWG.Done(); termErr = termBuilder.FinishFile(termPath) }()
+	go func() { defer finishWG.Done(); gramErr = gramBuilder.FinishFile(gramPath) }()
+	finishWG.Wait()
+	if termErr != nil {
+		_ = os.Remove(textPath)
+		return nil, termErr
+	}
+	if gramErr != nil {
 		_ = os.Remove(textPath)
 		_ = os.Remove(termPath)
-		return nil, err
+		return nil, gramErr
 	}
 	built.docs = docs
 	built.paths = paths
@@ -701,6 +814,24 @@ func buildContentIndexForIndex(ctx context.Context, idx *Index, opts contentBuil
 	return cidx, nil
 }
 
+// contentStoredText is the zero-copy form of contentRepairText for bytes an
+// extractor already decoded: decoded text is always valid UTF-8, and repair
+// is the identity on valid UTF-8 that carries no BOM and no BOM-less UTF-16
+// NUL pattern, so such input is returned as-is with no copy. Anything else
+// (a leading UTF-8 BOM, which repair strips and a legacy-decoded span can
+// re-emit; valid UTF-8 whose NUL pattern repair would reinterpret as UTF-16;
+// a never-in-practice invalid buffer) takes the exact repair path. Either way
+// the bytes are exactly what contentRepairText would have produced.
+func contentStoredText(decoded []byte) []byte {
+	if len(decoded) >= 3 && decoded[0] == 0xEF && decoded[1] == 0xBB && decoded[2] == 0xBF {
+		return contentRepairText(decoded)
+	}
+	if utf8.Valid(decoded) && contentSniffUTF16BOMless(decoded) == "" {
+		return decoded
+	}
+	return contentRepairText(decoded)
+}
+
 // contentRepairText is the repair half of the old contentNormalizeText: it
 // decodes under the auto (legacy-aware) policy and PRESERVES CASE. This is the
 // one repair every builder, the delta extractor, and a later search must share,
@@ -724,7 +855,28 @@ func contentRepairText(decoded []byte) []byte {
 // case-insensitive query folds both sides with the same rule and never loses a
 // case-sensitive candidate. The input is the repaired, case-preserving stored
 // text; a query leaf is folded directly.
+//
+// The ASCII fast path folds in a single pass into a single fresh buffer.
+// strings.ToLower on the same bytes would copy three times (string + lower +
+// []byte); the bytes are identical because ASCII case mapping is trivial.
 func contentFoldText(repaired []byte) []byte {
+	ascii := true
+	for i := 0; i < len(repaired); i++ {
+		if repaired[i] >= 0x80 {
+			ascii = false
+			break
+		}
+	}
+	if ascii {
+		out := make([]byte, len(repaired))
+		for i, b := range repaired {
+			if b >= 'A' && b <= 'Z' {
+				b += 'a' - 'A'
+			}
+			out[i] = b
+		}
+		return out
+	}
 	return []byte(strings.ToLower(string(repaired)))
 }
 
@@ -761,6 +913,34 @@ func contentTokenMapHint(n int) int {
 	return n
 }
 
+// contentTermsOfFolded tokenizes already-folded text into words with term
+// frequencies. It is contentTermsOf without the per-word strings.ToLower:
+// folding is idempotent, so lowering an already-folded word is the identity
+// and skipping it produces the identical map with one fewer allocation per
+// word. The word rule matches contentTermsOf exactly.
+func contentTermsOfFolded(folded []byte) map[string]uint32 {
+	out := make(map[string]uint32, contentTokenMapHint(len(folded)/8+1))
+	start := -1
+	for i := 0; i <= len(folded); i++ {
+		var isWord bool
+		if i < len(folded) {
+			b := folded[i]
+			isWord = (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9') || b == '_' || b >= 0x80
+		}
+		if isWord {
+			if start < 0 {
+				start = i
+			}
+			continue
+		}
+		if start >= 0 {
+			out[string(folded[start:i])]++
+			start = -1
+		}
+	}
+	return out
+}
+
 // contentTermsOf tokenizes text into lowercase words with term frequencies.
 // Word bytes are ASCII alphanumerics, underscore, and any byte >= 0x80 (so a
 // UTF-8 word stays one term).
@@ -784,6 +964,23 @@ func contentTermsOf(text []byte) map[string]uint32 {
 			out[term]++
 			start = -1
 		}
+	}
+	return out
+}
+
+// contentGramsOfU32 returns the distinct 3-byte trigrams of text as uint32
+// keys, skipping grams that contain a control byte. It is contentGramsOf
+// without the per-position 3-byte string allocation: the key set is identical
+// (a trigram is a bijection with its uint32), and the assembler renders keys
+// only for distinct grams via contentGramU32String.
+func contentGramsOfU32(text []byte) map[uint32]struct{} {
+	out := make(map[uint32]struct{}, contentTokenMapHint(len(text)/4))
+	for i := 0; i+3 <= len(text); i++ {
+		a, b, c := text[i], text[i+1], text[i+2]
+		if a < 32 || b < 32 || c < 32 {
+			continue
+		}
+		out[uint32(a)<<16|uint32(b)<<8|uint32(c)] = struct{}{}
 	}
 	return out
 }
