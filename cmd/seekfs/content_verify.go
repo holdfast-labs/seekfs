@@ -15,6 +15,7 @@ package main
 import (
 	"bytes"
 	"errors"
+	"os"
 	"regexp"
 	"sort"
 	"unicode/utf8"
@@ -66,6 +67,12 @@ func boundPathCache(cache map[int]string) map[int]string {
 	}
 	return cache
 }
+
+// contentStatExists stats a path for the `exists:` predicate. It is a var so
+// tests can substitute a fake filesystem: the differential lane tests keep
+// every record path inside a deleted temp dir, which must still read as
+// existing for the exists: shape to have a non-empty set on both arms.
+var contentStatExists = os.Stat
 
 // errContentIncomplete refuses a count whose candidate superset was capped: a
 // partial number would look exact.

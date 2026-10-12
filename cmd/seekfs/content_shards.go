@@ -214,7 +214,13 @@ func (r *contentReader) shardedCandidateStream(term string, mask []bool) func() 
 // shardMaskUnder returns which shards can hold documents under the normalized
 // folder under, or nil when every shard can (an unsharded reader, or no
 // scope). A shard qualifies if it owns a prefix inside under, or owns the
-// longest prefix containing under (the folder's own owner).
+// longest prefix containing under (the folder's own owner). The mask is a
+// pure prefilter: doc paths are matched against the same normalized folder
+// tree the planner assigns shards from, so a mask that is too narrow would
+// drop true matches. In particular the under root is cleaned but never
+// absolutized: callers pass the query's under: value verbatim, and an
+// under: that names no indexed folder still selects its would-be owner's
+// shard (whose docs then fail verification), never an empty set.
 func (r *contentReader) shardMaskUnder(under string) []bool {
 	if r == nil || r.idx == nil || len(r.idx.shards) == 0 {
 		return nil
@@ -228,7 +234,14 @@ func (r *contentReader) shardMaskUnder(under string) []bool {
 	mask[assign.dir(under)] = true
 	for i, sh := range r.idx.shards {
 		for _, p := range sh.info.Prefixes {
-			if p != "" && contentPathUnder(p, under) {
+			// A prefix inside under qualifies its shard. Equality counts
+			// as inside here (not just a strict descendant): the folder's
+			// own files are assigned to the shard owning the folder's
+			// longest matching prefix, which may be exactly this prefix,
+			// so a shard that owns `under` itself must be read. (The
+			// owner's shard is already set above; this covers the case
+			// where the owner comes from a longer prefix of a parent.)
+			if p != "" && (p == under || contentPathUnder(p, under)) {
 				mask[i] = true
 				break
 			}

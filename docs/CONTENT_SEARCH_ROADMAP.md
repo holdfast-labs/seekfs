@@ -213,8 +213,8 @@ Streaming postings (M6) and optional mmap of `.gsx` are the easy tails.
   **filename-driven + content-verified**: drive the existing global filename
   iterator (ext/under/dir/name) and verify the content leaves inline, which
   avoids materializing the content candidate superset for a common content term.
-  In `cmd/seekfs/content_global_lane.go`, off by default behind
-  `SEEKFS_CONTENT_GLOBAL_LANE`:
+  In `cmd/seekfs/content_global_lane.go`, **on by default**
+  (`SEEKFS_CONTENT_GLOBAL_LANE=0` is the kill switch):
   - **Phase 0** (`a7e11a0`): an optional `*contentLeafMatcher` is threaded through
     the global verification primitives (`collectGlobalVerifiedTopN`,
     `countGlobalVerifiedIterator`, `rankedEntriesFromGlobalIDs`,
@@ -235,17 +235,46 @@ Streaming postings (M6) and optional mmap of `.gsx` are the easy tails.
     (per-volume rank with record-id ties, the shared comparator only when the
     verified set spans volumes), so tied basenames are neither dropped nor
     misordered at a limit.
-  Each phase is reviewed and differential-tested against the per-volume content
   path (single and multi volume).
-  **Remaining:** (4b) handle overlays/hidden lane-natively instead of declining;
-  (4c) `under:`/`exists:` lane-natively plus differential coverage of the
-  remaining component roots (regex/attrib/parent); (5) the biased-early-stop
-  budget and the multi-volume lane (single-volume is provably parity, but the
-  content path's per-volume pre-truncation before the shared comparator is not
-  mirrorable, so multi-volume declines); (6) reconcile the lane's `Complete`/
-  `ContentIncomplete` signal with the content path's conservative window probe
-  (the lane's set is exact, so it reports complete where the content path marks
-  incomplete), then flip the default (drop `SEEKFS_CONTENT_GLOBAL_LANE`).
+  - **Phase 4b**: overlays/hidden lane-natively — hidden base IDs are skipped
+    during the drive and live overlay records merge with content verification,
+    mirroring `mergeOverlayMatches` including its merged re-sort whenever
+    overlay records exist (a dedicated merge, not `mergeGlobalOverlayEntries`,
+    whose rank re-sort would destroy the bias partition).
+  - **Phase 4c**: `under:`/`exists:` lane-natively — `under:` narrows the drive
+    to the under-root subtree iterator (the same narrowing
+    `candidate_build.go` applies) and is enforced by inline verification plus
+    the implicit-under re-check; `exists:` is enforced by the same inline
+    verification with the `ContentCountDivergent` flag on counts. The sharded
+    differential caught and fixed a real slow-path bug here: `shardMaskUnder`
+    excluded the shard owning `under` itself (see §6i of CONTENT_SEARCH.md).
+  - **Phase 4d**: biased order on pristine volumes (stable root-first partition
+    mirroring `biasOrderCompact`); bias with overlay activity declines, since
+    the content path's merged re-sort cannot be mirrored from a biased page
+    (differential work also fixed two lane-side ordering bugs: a reversed
+    intra-partition rank key, and a rank re-sort in the overlay merge).
+  - **Phase 5 (selectivity gate)**: the lane verifies every filename candidate,
+    so it engages only when that side is small — estimated drive at most
+    max(1024, 4×limit), where the estimate is a min-over-dimensions upper bound
+    (ext/under/dir/parent; OR-unions and unboundable shapes decline). Measured
+    on 50k docs (`BenchmarkContentGlobalLane`): selective ext + broad content
+    ~143× faster at a fifth of the memory; broad sides stay on the slow path
+    at identical results (no regression); under: + content at limit 5000 ~3.5×
+    faster at under half the memory.
+  - **Phase 6 (default on)**: the lane is the default route
+    (`SEEKFS_CONTENT_GLOBAL_LANE=0` kills it); the completeness flag stays more
+    accurate by design (the lane's set is exact, so it reports complete where
+    the content path's window probe is conservative).
+  **Still declines (exact fallback, each differential-tested):** `sort:relevance`
+  on search (counts stay eligible — order is irrelevant); content under OR/NOT
+  groups; case-sensitive filename parts (lowercase-keyed postings); filename
+  OR-unions; bare non-path terms, regex-only, attrib-only, `type:`-only and
+  other filename shapes with no supported or boundable root; a filename side
+  over the selectivity budget; multi-usable-volume (per-volume pre-truncation
+  before the shared comparator is not mirrorable); truncated catch-up
+  (`healthIncomplete`); missing overlay snapshot; bias with overlay activity.
+  Counts refuse nothing the slow path would refuse except through the shared
+  `healthIncomplete` decline.
 
 ### WP8 — Resource hardening (M1, M2, M5, M9, M10)
 - **Method:** bounded delta + eviction between folds (M1), per-document

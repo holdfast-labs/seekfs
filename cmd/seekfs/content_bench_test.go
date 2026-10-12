@@ -282,6 +282,133 @@ func BenchmarkContentCountVsFilename(b *testing.B) {
 	}
 }
 
+// contentLaneBenchVolume builds a single 50k-doc volume with real directory
+// hierarchy (8 top-level dirs) for the compound-lane benchmark. Names carry a
+// broad term ("nrrd", every record) and a selective token ("quasar", a
+// handful); bodies carry a broad term ("download", every doc) and a selective
+// term ("pelican", a few).
+func contentLaneBenchVolume(b *testing.B) *serviceVolumeIndex {
+	b.Helper()
+	const (
+		n            = 50_000
+		dirs         = 8
+		selectiveEvery = 6_250 // ~8 of 50k
+		pelicanEvery   = 3_125 // ~16 of 50k
+	)
+	recs := make([]contentVolRecord, 0, n+dirs)
+	for d := 0; d < dirs; d++ {
+		recs = append(recs, contentVolRecord{
+			frn: uint64(100 + d), parent: -1, parentFRN: 1,
+			name: fmt.Sprintf("dir%d", d), mode: uint32(os.ModeDir),
+			path: fmt.Sprintf(`C:\dir%d`, d),
+		})
+	}
+	for i := 0; i < n; i++ {
+		d := i % dirs
+		name := fmt.Sprintf("scan-%06d.nrrd", i)
+		if i%selectiveEvery == 0 {
+			// Selective extension AND name token: an 8-doc filename
+			// side against the 50k-doc content side.
+			name = fmt.Sprintf("quasar-scan-%06d.qzr", i)
+		}
+		var body strings.Builder
+		for r := 0; r <= i%7; r++ {
+			body.WriteString("the archive worker syncs the download cache to the remote volume every interval ")
+		}
+		if i%pelicanEvery == 0 {
+			body.WriteString("pelican ")
+		}
+		recs = append(recs, contentVolRecord{
+			frn:       uint64(1000 + i),
+			parent:    int32(d),
+			parentFRN: uint64(100 + d),
+			name:      name,
+			size:      int64(100 + i%900),
+			modUnix:   int64(1_600_000_000 + i),
+			path:      fmt.Sprintf(`C:\dir%d\%s`, d, name),
+			content:   body.String(),
+		})
+	}
+	vol := newContentRecordVolume(b, "C:", recs)
+	vol.rebuildNameTrigramsLocked()
+	return vol
+}
+
+// BenchmarkContentGlobalLane compares the compound content lane (default on)
+// against the per-volume content path (SEEKFS_CONTENT_GLOBAL_LANE=0) on the
+// 50k-doc hierarchical corpus, for three representative compound shapes:
+// selective name + broad content, broad name + rare content, and under: +
+// content. A warm call asserts identical result sets before timing; each arm
+// reports ns/op and allocations.
+func BenchmarkContentGlobalLane(b *testing.B) {
+	vol := contentLaneBenchVolume(b)
+	vols := []*serviceVolumeIndex{vol}
+	cases := []struct {
+		name  string
+		query string
+		under string
+		limit int
+		// engage reports whether the lane must take this shape: selective
+		// sides engage (and should win); broad sides must decline to the
+		// slow path (fallback parity, never a regression).
+		engage bool
+	}{
+		{"selective-name-broad-content", "ext:qzr content:download", "", 20, true},
+		{"broad-name-rare-content", "ext:nrrd content:pelican", "", 20, false},
+		// Large limit: the 6.25k-doc under subtree fits the scaled
+		// budget (4x5000) where the slow path's window machinery gets
+		// expensive, and the lane stays exact.
+		{"under-content", "content:download", `C:\dir3`, 5000, true},
+	}
+	for _, tc := range cases {
+		// Warm/verify: both arms must agree exactly before timing. When the
+		// lane is expected, it must actually engage (planner mode), or the
+		// comparison would time the slow path twice.
+		opts := queryOptions{Query: tc.query, Limit: tc.limit, Under: tc.under, Trace: &searchTrace{}}
+		os.Setenv("SEEKFS_CONTENT_GLOBAL_LANE", "1")
+		want, err := searchServiceVolumes(vols, opts, false)
+		if err != nil {
+			b.Fatalf("lane warm %q: %v", tc.name, err)
+		}
+		if didEngage := opts.Trace.PlannerMode == "global-content-components"; didEngage != tc.engage {
+			b.Fatalf("lane engaged=%v want %v %q (planner=%q source=%q)", didEngage, tc.engage, tc.name, opts.Trace.PlannerMode, opts.Trace.Source)
+		}
+		os.Setenv("SEEKFS_CONTENT_GLOBAL_LANE", "0")
+		got, err := searchServiceVolumes(vols, opts, false)
+		if err != nil {
+			b.Fatalf("no-lane warm %q: %v", tc.name, err)
+		}
+		if len(want) != len(got) {
+			b.Fatalf("%s: lane=%d no-lane=%d results differ", tc.name, len(want), len(got))
+		}
+		for i := range want {
+			if want[i].Path != got[i].Path {
+				b.Fatalf("%s: element %d differs lane=%q no-lane=%q", tc.name, i, want[i].Path, got[i].Path)
+			}
+		}
+		b.ReportMetric(float64(len(want)), "results")
+		for _, arm := range []struct {
+			label string
+			value string
+		}{
+			{"lane", "1"},
+			{"no-lane", "0"},
+		} {
+			b.Run(tc.name+"/"+arm.label, func(b *testing.B) {
+				os.Setenv("SEEKFS_CONTENT_GLOBAL_LANE", arm.value)
+				defer os.Setenv("SEEKFS_CONTENT_GLOBAL_LANE", "1")
+				b.ReportAllocs()
+				b.ResetTimer()
+				for i := 0; i < b.N; i++ {
+					if _, err := searchServiceVolumes(vols, opts, false); err != nil {
+						b.Fatalf("searchServiceVolumes(%q): %v", tc.query, err)
+					}
+				}
+			})
+		}
+	}
+	os.Setenv("SEEKFS_CONTENT_GLOBAL_LANE", "1")
+}
 // contentBenchMeasureAllocBytes returns the total bytes allocated per call of fn,
 // measured with runtime.MemStats so the regression gate is framework-free and
 // deterministic.

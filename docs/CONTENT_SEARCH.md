@@ -15,13 +15,23 @@ volume. PB8 landed bounded content-candidate materialization, the rank-ordered
 bounded scan fallback, and the biased/overlay early-stop fix (see §6h). WP11
 landed the HTML/EML/mbox/RTF/MSG/PDF extractors (with per-parser fuzz targets),
 and WP8 landed the M1 replay-bounded delta, M9 count/remote health, and the M1
-delta observability. The optional PB8 items 4–7 (global-lane integration) is now
-**partly landed**: a compound content + selective-filename lane
-(`cmd/seekfs/content_global_lane.go`) drives the filename iterator and verifies
-content inline, single and multi volume, but is **off by default** behind
-`SEEKFS_CONTENT_GLOBAL_LANE` and still declines overlays/hidden, `under:`/
-`exists:`, relevance, and biased order (see the WP7 section of the roadmap). The
-documented §7 residuals remain. `.gsx` is format **v5** (sharded manifests; see §6i). P4 document-extraction
+delta observability. The PB8 items 4–7 (global-lane integration) has now landed:
+a compound content + selective-filename lane (`cmd/seekfs/content_global_lane.go`)
+drives the filename iterator and verifies content inline. It is **on by default**
+(`SEEKFS_CONTENT_GLOBAL_LANE=0` is the kill switch back to the per-volume
+content path) and engages single-volume compound queries whose filename side is
+small (estimated drive at most max(1024, 4×limit)). It handles `under:`
+(under-root narrowing on the filename side, shard-mask pruning on sharded
+bases), `exists:`, overlay hidden-base filtering with the live-slot merge, and
+biased order on pristine volumes — every newly in-scope shape proven by
+randomized differentials against the slow path (identical sets, order, counts
+and snippets). It still declines `sort:relevance` on search, content under
+OR/NOT groups, case-sensitive filename parts, filename OR-unions, bare
+non-path terms and other unsupported filename roots, multi-usable-volume
+queries, truncated catch-up (`healthIncomplete`), a missing overlay snapshot,
+and biased queries while the volume carries overlay activity (see the WP7
+section of the roadmap for the precise list and rationale). The documented §7
+residuals remain. `.gsx` is format **v5** (sharded manifests; see §6i). P4 document-extraction
 quality remains deferred (see §7). Content search is off by default; with
 `[features.content] enabled = true` or `SEEKFS_CONTENT_SEARCH=1`, `content:`
 queries work through the service once the
@@ -559,11 +569,16 @@ whole posting superset. It also carries the count-parity, remote-content-health
 
 Residual / known limitations (all explicit deferrals):
 
-- **Content bypasses the global planner lanes (PB8 items 4–7).** A compound
-  content + selective-filename query (`content:<common> ext:.go under:<dir>`)
-  does not lane-intersect: the content path runs per-volume and the cost is
-  driven by the content candidates. Deferred/optional; if pursued, prototype the
-  `globalRecordID` ↔ content-docID join first.
+- **Content bypasses the global planner lanes for broad filename sides (PB8
+  items 4–7).** The compound lane (see intro) engages only when the filename
+  side is small (at most max(1024, 4×limit) estimated candidates): driving the
+  filename iterator and verifying every candidate inline is only cheaper than
+  the bounded content scan below that line (measured: an 8-doc ext side against
+  a 50k-doc broad term answers ~143× faster; a 50k-doc side would cost ~640×
+  more than the 16-candidate slow path, so it stays on the content path, at
+  identical results). The old "prototype the `globalRecordID` ↔ content-docID
+  join" note is obsolete: no join was needed, since `contentCandidatesBounded`
+  already maps to local record IDs and the lane drives the other direction.
 - **OR-alternative candidate union.** `contentAltCandidateDocs` still
   materializes each alternative's doc set (`budget=0`); a k-way streamed union is
   an optimization tail.
@@ -650,7 +665,10 @@ an empty index.
   later sweep.
 - **`under:`.** `shardMaskUnder` limits content candidates to the shards that
   can hold docs under the folder: the folder's owner plus any shard owning a
-  prefix inside it.
+  prefix inside it, including a shard that owns `under` itself (equality
+  counts: the folder's own files live in its owner's shard, so excluding it
+  dropped true matches — caught by the compound-lane differential on a sharded
+  corpus).
 - **Measured (Chromium, 62k files / 508 MB text):** with a single file, every
   fold re-assembled everything in about 2m13s with a 3.4 GB heap peak. With 64
   MiB shards (10 shards, 6% larger on disk), a 100-file edit in one folder took
