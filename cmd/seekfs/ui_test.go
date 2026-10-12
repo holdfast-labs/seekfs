@@ -538,6 +538,18 @@ func TestUIResultCarriesContentSnippet(t *testing.T) {
 	}
 }
 
+func TestUIFuzzyMessageNamesCorrection(t *testing.T) {
+	if got := uiFuzzyMessage(serviceResponse{FuzzyCorrection: "receive"}); got != "Showing results for receive" {
+		t.Fatalf("message = %q", got)
+	}
+	if got := uiFuzzyMessage(serviceResponse{Fuzzy: true}); got != "showing close matches" {
+		t.Fatalf("message = %q", got)
+	}
+	if got := uiFuzzyMessage(serviceResponse{}); got != "" {
+		t.Fatalf("message = %q; want empty", got)
+	}
+}
+
 func TestUIContentStatusFromHealth(t *testing.T) {
 	if uiContentStatusFrom(nil) != nil {
 		t.Fatal("no content health must yield no UI content status")

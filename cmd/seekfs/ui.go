@@ -66,6 +66,10 @@ type UISearchResponse struct {
 	// Content summarizes the content index for a query that searched file
 	// contents, so the UI can say whether results are complete.
 	Content *UIContentStatus `json:"content,omitempty"`
+	// FuzzyCorrection names the corrected content word(s) when a zero-result
+	// `content:` query was retried with typo-tolerant corrections, so the UI
+	// can say "Showing results for receive".
+	FuzzyCorrection string `json:"fuzzy_correction,omitempty"`
 }
 
 // UIContentStatus is the part of the service's content health the UI shows.
@@ -77,6 +81,19 @@ type UIContentStatus struct {
 	Partial    bool   `json:"partial,omitempty"`
 	Incomplete bool   `json:"incomplete,omitempty"`
 	Error      string `json:"error,omitempty"`
+}
+
+// uiFuzzyMessage summarizes a fuzzy result for the UI summary bar. A content
+// typo correction names the corrected word(s); a filename close match keeps
+// the historical text.
+func uiFuzzyMessage(resp serviceResponse) string {
+	if resp.FuzzyCorrection != "" {
+		return "Showing results for " + resp.FuzzyCorrection
+	}
+	if resp.Fuzzy {
+		return "showing close matches"
+	}
+	return ""
 }
 
 func uiContentStatusFrom(h *contentHealth) *UIContentStatus {
@@ -262,19 +279,17 @@ func (a *UIApp) search(req UISearchRequest, seq int64) UISearchResponse {
 		return UISearchResponse{OK: false, Seq: seq, Query: query, ElapsedMS: elapsed, Message: resp.Message, Content: uiContentStatusFrom(resp.Content)}
 	}
 	results := uiResultsFromServiceResponse(resp)
-	message := ""
-	if resp.Fuzzy {
-		message = "showing close matches"
-	}
+	message := uiFuzzyMessage(resp)
 	return UISearchResponse{
-		OK:        true,
-		Seq:       seq,
-		Query:     query,
-		Count:     len(results),
-		ElapsedMS: elapsed,
-		Message:   message,
-		Results:   results,
-		Content:   uiContentStatusFrom(resp.Content),
+		OK:              true,
+		Seq:             seq,
+		Query:           query,
+		Count:           len(results),
+		ElapsedMS:       elapsed,
+		Message:         message,
+		Results:         results,
+		Content:         uiContentStatusFrom(resp.Content),
+		FuzzyCorrection: resp.FuzzyCorrection,
 	}
 }
 
