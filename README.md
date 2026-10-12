@@ -68,6 +68,27 @@ For a small CLI-only trial without a full-volume index:
 .\seekfs.exe count -db .\docs.gsi report
 ```
 
+## Native desktop app (preview)
+
+`seekfs-native.exe` is a native, GPU-rendered desktop window (built with Gio)
+that talks to the resident service, like `seekfs-ui.exe`, but with a
+Finder/Explorer-style layout: a sidebar of favorites, volumes and saved
+searches; Details, Icons and grouped views; a preview pane; the Explorer
+context menu; drag-out; rename; and Recycle Bin delete. It follows the system
+light/dark theme and accent color, and the Contents toggle searches inside
+files with highlighted snippets.
+
+```powershell
+go build -ldflags=-H=windowsgui -o seekfs-native.exe ./cmd/seekfs-native
+.\seekfs-native.exe                 # uses the default service pipe
+.\seekfs-native.exe -pipe \.\pipe\<name>
+```
+
+`SEEKFS_NATIVE_PRESENTER=dxgi` switches from the default GDI presentation path
+(GPU render, then a GDI copy, which works on every display setup) to Gio's
+swapchain. Settings live in `%APPDATA%\seekfs
+ative.json`.
+
 ## Search your way
 
 | Find… | Command |
