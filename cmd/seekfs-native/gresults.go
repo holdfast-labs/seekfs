@@ -520,7 +520,9 @@ func (u *UI) layoutRow(gtx layout.Context, rows []ResultRow, i int) layout.Dimen
 				effName, _ := u.effWidths()
 				gtx.Constraints.Min.X = gtx.Dp(Dp(effName))
 				gtx.Constraints.Max.X = gtx.Dp(Dp(effName))
-				return layout.Inset{Left: Dp(6), Right: Dp(4)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+				// Same vertical inset as every other cell so all baselines
+				// match (a bare label centers differently).
+				return layout.Inset{Left: Dp(6), Right: Dp(4), Top: Dp(5), Bottom: Dp(5)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
 					return label(u.th, Sp(13), r.Name, u.scheme.Text).Layout(gtx)
 				})
 			}),

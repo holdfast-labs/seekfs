@@ -589,6 +589,50 @@ func TestHeadlessFrameCost(t *testing.T) {
 	}
 }
 
+func TestHeadlessRowBaselines(t *testing.T) {
+	u := testUI(t, true)
+	setRows(u, []ResultRow{{
+		Path: `C:\proj\active_tab_chrome_pages.go`, Name: "active_tab_chrome_pages.go",
+		Dir: `C:\proj\api_test\tab_capture`, Size: 900, HasSize: true,
+		Modified: time.Now(), HasMod: true, Type: "go", Exists: true,
+	}})
+	u.ensureRowState(1)
+	img := renderHeadless(t, 1200, 120, func(gtx layout.Context) layout.Dimensions {
+		u.paintBG(gtx)
+		return u.layoutRow(gtx, u.rows, 0)
+	})
+	// Text centroid per column band (name 0-260, folder 280-500, size, date).
+	centroid := func(x0, x1 int) float64 {
+		sum, n := 0.0, 0
+		for y := 0; y < 120; y++ {
+			for x := x0; x < x1; x++ {
+				c := img.RGBAAt(x, y)
+				if (int(c.R)+int(c.G)+int(c.B))/3 > 120 {
+					sum += float64(y)
+					n++
+				}
+			}
+		}
+		if n == 0 {
+			return -1
+		}
+		return sum / float64(n)
+	}
+	nameY := centroid(30, 260)
+	folderY := centroid(280, 500)
+	sizeY := centroid(510, 610)
+	dateY := centroid(620, 790)
+	t.Logf("centroids name=%.1f folder=%.1f size=%.1f date=%.1f", nameY, folderY, sizeY, dateY)
+	for col, y := range map[string]float64{"folder": folderY, "size": sizeY, "date": dateY} {
+		if y < 0 || nameY < 0 {
+			t.Fatalf("missing text in name or %s column", col)
+		}
+		if d := y - nameY; d < -1.5 || d > 1.5 {
+			t.Fatalf("%s baseline off by %.1fpx from name", col, d)
+		}
+	}
+}
+
 func TestHeadlessBisectFullNoStatus(t *testing.T) {
 	u := testUI(t, true)
 	setRows(u, sampleRows(60))
