@@ -18,6 +18,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"fmt"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -1221,6 +1222,12 @@ type contentCoordinator struct {
 	// drains. Bounded in memory (an FRN per change, not its text).
 	deferred     map[uint64]struct{}
 	drainEnabled bool
+	// declined, when non-nil, receives keys whose extraction deterministically
+	// produced no indexable text (skipped/empty input, no error) with the
+	// stat at attempt time. The walk drain sets it around processQueue to
+	// feed the unindexable skip-set; it stays nil everywhere else (the USN
+	// journal never re-reports a declined file, so USN needs no memory).
+	declined func(frn uint64, size, modNano int64)
 	// observedUSN is the highest change USN handed to observeChanges. It is a
 	// contiguous persistence bound only when no observed-but-unextracted work
 	// remains and catch-up is complete, which foldSnapshot enforces before a
@@ -1658,6 +1665,14 @@ func (c *contentCoordinator) processQueue(resolvePath func(frn uint64) (string, 
 			// must not delete acknowledged content.
 			if !havePrior && c.state.hasContentForFRN(frn) {
 				delta.delete(frn)
+			} else if !havePrior && c.declined != nil {
+				// A never-indexed file declined deterministically: remember
+				// its current fingerprint so the caller stops retrying it
+				// until it changes. (A stat race here only costs one extra
+				// attempt: any later change re-arms it.)
+				if st, serr := os.Stat(path); serr == nil {
+					c.declined(frn, st.Size(), st.ModTime().UnixNano())
+				}
 			}
 			continue
 		}

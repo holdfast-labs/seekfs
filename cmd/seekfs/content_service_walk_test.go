@@ -52,14 +52,17 @@ func newContentWalkTestVolume(t *testing.T, dir string) (*serviceVolumeIndex, st
 // the drain loop does.
 func contentWalkDrainTick(t *testing.T, s *goSearchService, vol *serviceVolumeIndex) {
 	t.Helper()
-	enqueued := s.contentReconcileWalkVolume(vol, true)
+	s.contentReconcileWalkVolume(vol, true)
+	vol.contentCoord.declined = func(key uint64, size, modNano int64) {
+		vol.content.walkDeclinedNote(key, contentWalkPrint{size: size, mod: modNano})
+	}
+	defer func() { vol.contentCoord.declined = nil }()
 	s.indexMu.RLock()
 	defer s.indexMu.RUnlock()
 	cache := make(map[int]string, 64)
 	vol.contentCoord.processQueue(func(key uint64) (string, bool) {
 		return s.contentResolveWalkPath(vol, key, cache)
 	})
-	s.contentNoteWalkDeclined(vol, enqueued)
 }
 
 // contentWalkSearch is contentServiceSearch that fails the test on error.

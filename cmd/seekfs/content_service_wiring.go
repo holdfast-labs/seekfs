@@ -658,9 +658,15 @@ func (s *goSearchService) contentDrainLoop(vol *serviceVolumeIndex) {
 			s.indexMu.RLock()
 			isWalkDrain := vol.contentWalkOriginAttached()
 			s.indexMu.RUnlock()
-			var walkEnqueued map[uint64]contentWalkPrint
 			if isWalkDrain {
-				walkEnqueued = s.contentReconcileWalkVolume(vol, false)
+				s.contentReconcileWalkVolume(vol, false)
+				// Feed deterministic declines into the walk skip-set, so
+				// unindexable files are not retried every reconcile. The
+				// coordinator is per-volume, so no other volume's drain
+				// can observe this.
+				vol.contentCoord.declined = func(key uint64, size, modNano int64) {
+					vol.content.walkDeclinedNote(key, contentWalkPrint{size: size, mod: modNano})
+				}
 			}
 			vol.contentCoord.promoteAll()
 			// A private path cache: the drain must not touch vol.pathCache,
@@ -704,11 +710,7 @@ func (s *goSearchService) contentDrainLoop(vol *serviceVolumeIndex) {
 				scope = nil
 				s.scheduleContentRebuild(vol)
 			}
-			if isWalkDrain {
-				// Remember keys that extracted to nothing, so the next
-				// reconcile does not retry them at the same fingerprint.
-				s.contentNoteWalkDeclined(vol, walkEnqueued)
-			}
+			vol.contentCoord.declined = nil
 			// M1: after the tick's extractions, fold if the delta has grown
 			// past its bound. A fold failure keeps the delta and backs off.
 			s.maybeFoldContentDelta(vol)

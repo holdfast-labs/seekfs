@@ -199,22 +199,19 @@ func (s *goSearchService) contentResolveWalkPath(vol *serviceVolumeIndex, key ui
 // hash-verifies before upserting, so an mtime-only touch never churns text.
 //
 // force reconciles even when the filename generation has not moved (attach,
-// periodic safety net). Otherwise only a new generation is diffed. It
-// returns the enqueued keys with their enqueue-time fingerprints so the
-// drain can record which of them produced no indexable text (the
-// unindexable skip-set).
-func (s *goSearchService) contentReconcileWalkVolume(vol *serviceVolumeIndex, force bool) map[uint64]contentWalkPrint {
+// periodic safety net). Otherwise only a new generation is diffed.
+func (s *goSearchService) contentReconcileWalkVolume(vol *serviceVolumeIndex, force bool) {
 	if s == nil || vol == nil || vol.content == nil || vol.contentCoord == nil {
-		return nil
+		return
 	}
 	if !contentSearchEnabled() {
-		return nil
+		return
 	}
 	if contentScopeForVolume(s.contentConfig(), vol.volume).disabled() {
-		return nil
+		return
 	}
 	if !s.beginContentTask(vol) {
-		return nil
+		return
 	}
 	defer endContentTask(vol)
 
@@ -227,34 +224,34 @@ func (s *goSearchService) contentReconcileWalkVolume(vol *serviceVolumeIndex, fo
 		sameGen := vol.replayGen.Load() == lastGen
 		s.indexMu.RUnlock()
 		if sameGen {
-			return nil
+			return
 		}
 	}
 	// Scope resolution takes indexMu itself, so it runs outside the scan's
 	// read lock (nesting RLocks deadlocks once a writer waits).
 	scope, ok := s.resolvedContentScope(vol)
 	if !ok {
-		return nil
+		return
 	}
 	s.indexMu.RLock()
 	if vol.index == nil || vol.index.Source != "walk" || vol.state != "ready" {
 		s.indexMu.RUnlock()
-		return nil
+		return
 	}
 	reader, resolver := vol.content.readerResolverView()
 	if reader == nil || reader.idx == nil || resolver == nil {
 		s.indexMu.RUnlock()
-		return nil
+		return
 	}
 	if reader.idx.Origin != contentOriginWalk {
 		s.indexMu.RUnlock()
-		return nil
+		return
 	}
 	gen := vol.replayGen.Load()
 	keys, ids, ok := s.contentWalkKeys(vol)
 	if !ok {
 		s.indexMu.RUnlock()
-		return nil
+		return
 	}
 	// Index-side fingerprint: key -> (size, modNano) for every live file.
 	live := make(map[uint64]contentWalkPrint, len(keys))
@@ -373,36 +370,5 @@ func (s *goSearchService) contentReconcileWalkVolume(vol *serviceVolumeIndex, fo
 	vol.content.walkReconcileDone(gen)
 	if len(changed) > 0 || len(seen) > 0 {
 		serviceLog("content walk reconcile volume=%s changed=%d dropped=%d", vol.volume, len(changed), len(seen))
-	}
-	return changed
-}
-
-// contentNoteWalkDeclined records enqueued keys that extraction left
-// unindexed, so the next reconcile does not retry them at the same
-// fingerprint. A key that did land (live delta or base doc at the
-// enqueue-time fingerprint) is left alone; a fingerprint change re-arms it
-// in the reconcile. Call after the drain's processQueue.
-func (s *goSearchService) contentNoteWalkDeclined(vol *serviceVolumeIndex, enqueued map[uint64]contentWalkPrint) {
-	if vol == nil || vol.content == nil || len(enqueued) == 0 {
-		return
-	}
-	reader, resolver := vol.content.readerResolverView()
-	delta := vol.content.deltaView()
-	for key, want := range enqueued {
-		if delta != nil {
-			if doc, ok := delta.docFor(key); ok && !doc.Deleted &&
-				doc.FileSize == want.size && doc.FileModNano == want.mod {
-				continue
-			}
-		}
-		if reader != nil && reader.idx != nil && resolver != nil {
-			if di, ok := resolver.docForFRN(key); ok && di < len(reader.idx.Docs) {
-				d := &reader.idx.Docs[di]
-				if d.FileSize == want.size && d.FileModNano == want.mod {
-					continue
-				}
-			}
-		}
-		vol.content.walkDeclinedNote(key, want)
 	}
 }
