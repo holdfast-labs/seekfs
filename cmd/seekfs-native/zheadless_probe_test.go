@@ -472,6 +472,39 @@ func TestHeadlessCellHeights(t *testing.T) {
 	t.Logf("namecell=%v iconcell=%v", dName.Size, dIcon.Size)
 }
 
+func TestFitColumnsShrink(t *testing.T) {
+	u := testUI(t, true)
+	u.mu.Lock()
+	u.colW["name"] = 280
+	u.colW["folder"] = 260
+	u.colW["size"] = 110
+	u.colW["modified"] = 170
+	u.colW["type"] = 140
+	u.mu.Unlock()
+	// Wide: everything fits.
+	u.fitColumns(1200)
+	if !u.showTypeNow() || !u.showMatchNow() {
+		t.Fatal("wide window must show all columns")
+	}
+	// Narrow: type+match hide, essentials shrink to fit.
+	u.fitColumns(700)
+	if u.showTypeNow() || u.showMatchNow() {
+		t.Fatal("narrow window must hide type+match")
+	}
+	effName, effFolder := u.effWidths()
+	// Fixed: size 110 + modified 170 + chrome 48 = 328; avail 700 leaves
+	// 372 for name+folder (from 540) — folder yields first.
+	if effName+effFolder > 372+1 {
+		t.Fatalf("name+folder = %v+%v, want <= 372", effName, effFolder)
+	}
+	if effFolder != 80 && effName != 280 {
+		t.Logf("shrink distribution: name=%v folder=%v", effName, effFolder)
+	}
+	if effFolder < 80 || effName < 120 {
+		t.Fatalf("below minimums: name=%v folder=%v", effName, effFolder)
+	}
+}
+
 func TestHeadlessBisectFullNoStatus(t *testing.T) {
 	u := testUI(t, true)
 	setRows(u, sampleRows(60))

@@ -98,8 +98,8 @@ func (u *UI) layoutResults(gtx layout.Context) layout.Dimensions {
 func (u *UI) hoverTipRow() int {
 	u.mu.Lock()
 	rows := u.rows
-	folderW := u.colW["folder"]
 	u.mu.Unlock()
+	_, folderW := u.effWidths()
 	for i := range rows {
 		if i < len(u.rowClicks) && u.rowClicks[i].Hovered() && folderTruncated(rows[i].Dir, folderW) {
 			return i
@@ -125,14 +125,50 @@ func (u *UI) layoutTipCard(gtx layout.Context, dir string) layout.Dimensions {
 	return layout.Dimensions{Size: sz}
 }
 
-// fitColumns sets showType/showMatch from the available width in dp.
-// Essential columns (Name, Folder, Size, Date) always show.
+// fitColumns sets showType/showMatch from the available width in dp and
+// shrinks Name/Folder to fit when even the essentials overflow (stale wide
+// persisted widths on a narrow window). Size/Date keep fixed widths so
+// dates never truncate; the region is hard-clipped as a backstop.
 func (u *UI) fitColumns(avail float32) {
 	u.mu.Lock()
 	defer u.mu.Unlock()
 	essentials := u.colW["name"] + u.colW["folder"] + u.colW["size"] + u.colW["modified"] + 48
 	u.showType = avail >= essentials+u.colW["type"]
 	u.showMatch = avail >= essentials+u.colW["type"]+140
+	effName, effFolder := u.colW["name"], u.colW["folder"]
+	if over := essentials - avail; over > 0 {
+		// Folder yields first (min 80), then Name (min 120).
+		take := over
+		if effFolder-80 < take {
+			take = effFolder - 80
+		}
+		if take < 0 {
+			take = 0
+		}
+		effFolder -= take
+		over -= take
+		if over > 0 {
+			take = over
+			if effName-120 < take {
+				take = effName - 120
+			}
+			if take < 0 {
+				take = 0
+			}
+			effName -= take
+		}
+	}
+	u.effName, u.effFolder = effName, effFolder
+}
+
+// effWidths returns the frame's effective Name/Folder widths.
+func (u *UI) effWidths() (float32, float32) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	if u.effName <= 0 {
+		return u.colW["name"], u.colW["folder"]
+	}
+	return u.effName, u.effFolder
 }
 
 func (u *UI) showTypeNow() bool {
@@ -219,10 +255,21 @@ func (u *UI) headerCells(th *material.Theme, s Scheme, key SortKey, asc bool) []
 		}
 		cols = append(cols, colDef{i, c.key, c.title})
 	}
+	effName, effFolder := u.effWidths()
+	colWidth := func(k SortKey) float32 {
+		switch k {
+		case SortName:
+			return effName
+		case SortFolder:
+			return effFolder
+		default:
+			return u.colW[k.String()]
+		}
+	}
 	var out []layout.FlexChild
 	for ci, c := range cols {
 		c := c
-		w := u.colW[c.key.String()]
+		w := colWidth(c.key)
 		title := c.title
 		if c.key != SortSnippet && key == c.key {
 			if asc {
@@ -470,14 +517,16 @@ func (u *UI) layoutRow(gtx layout.Context, rows []ResultRow, i int) layout.Dimen
 				return u.cellIcon(gtx, r, Dp(16))
 			}),
 			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-				gtx.Constraints.Min.X = gtx.Dp(Dp(u.colW["name"]))
-				gtx.Constraints.Max.X = gtx.Dp(Dp(u.colW["name"]))
+				effName, _ := u.effWidths()
+				gtx.Constraints.Min.X = gtx.Dp(Dp(effName))
+				gtx.Constraints.Max.X = gtx.Dp(Dp(effName))
 				return layout.Inset{Left: Dp(6), Right: Dp(4)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
 					return label(u.th, Sp(13), r.Name, u.scheme.Text).Layout(gtx)
 				})
 			}),
 			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-				return u.cellText(gtx, folderText(r.Dir, u.colW["folder"]), u.colW["folder"])
+				_, effFolder := u.effWidths()
+				return u.cellText(gtx, folderText(r.Dir, effFolder), effFolder)
 			}),
 			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 				return u.cellTextRight(gtx, sizeText(r), u.colW["size"])

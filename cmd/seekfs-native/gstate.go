@@ -91,6 +91,9 @@ type UI struct {
 	// Column visibility for the current frame (priority-hide when narrow).
 	showType  bool
 	showMatch bool
+	// Effective Name/Folder widths after shrink-to-fit.
+	effName   float32
+	effFolder float32
 	// Preview splitter drag state.
 	splitTag splitDrag
 
