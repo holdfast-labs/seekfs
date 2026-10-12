@@ -144,6 +144,10 @@ type contentHealth struct {
 	// fold publishes a base re-extracted at the current versions.
 	ExtractorRefresh   bool `json:"extractor_refresh,omitempty"`
 	StaleExtractorDocs int  `json:"stale_extractor_docs,omitempty"`
+	// IntegrityError records why the attached base failed its post-attach
+	// checksum pass. The base is dropped (stale) and a rebuild scheduled, so
+	// the field names the corruption instead of serving wrong results.
+	IntegrityError string `json:"integrity_error,omitempty"`
 }
 
 // contentDeltaDoc is an extracted document for a file changed since the base,
@@ -384,6 +388,12 @@ type contentVolumeState struct {
 	// clears when a fold republishes the base at the current versions.
 	refreshActive  bool
 	refreshPending int
+	// integrityFailures counts consecutive checksum failures of the attached
+	// base. It resets when a base passes the post-attach integrity pass and
+	// caps the rebuilds one failure streak schedules, so a disk that corrupts
+	// every write leaves the volume stale instead of spinning rebuilds. It
+	// survives setReady (attach happens before the pass runs) and markStale.
+	integrityFailures int
 }
 
 func newContentVolumeState(volume string) *contentVolumeState {
@@ -689,6 +699,62 @@ func (s *contentVolumeState) rebuildResolver(baseFRNs []uint64, baseIDs []uint32
 		return
 	}
 	s.resolver = buildContentResolver(s.idx.Docs, baseFRNs, baseIDs)
+}
+
+// markIntegrityFailed drops a checksum-failed base so it is never served and
+// records the reason. It acts only when expect is still the attached base in
+// a serving state (ready/degraded); a newer base, or a volume already owned
+// by a build/rebuild, is left alone. It reports whether the caller should
+// schedule a rebuild: only the first detector of a given base does, so one
+// corrupt base schedules exactly one rebuild.
+func (s *contentVolumeState) markIntegrityFailed(expect *contentIndex, reason string) bool {
+	if s == nil {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.idx != expect || expect == nil {
+		return false
+	}
+	if s.state != contentStateReady && s.state != contentStateDegraded {
+		return false
+	}
+	s.integrityFailures++
+	s.health.IntegrityError = reason
+	s.state = contentStateStale
+	s.health.State = contentStateStale
+	s.reader = nil
+	s.resolver = nil
+	s.delta = newContentDelta()
+	s.catchUpPending = false
+	s.catchUpFailed = false
+	s.refreshActive = false
+	s.refreshPending = 0
+	s.health.ExtractorRefresh = false
+	s.health.StaleExtractorDocs = 0
+	return true
+}
+
+// markIntegrityVerified resets the integrity failure streak once a base passes
+// the post-attach checksum pass.
+func (s *contentVolumeState) markIntegrityVerified() {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.integrityFailures = 0
+	s.health.IntegrityError = ""
+}
+
+// integrityFailureCount returns the current integrity failure streak.
+func (s *contentVolumeState) integrityFailureCount() int {
+	if s == nil {
+		return 0
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.integrityFailures
 }
 
 // markStale is the journal-reset / index-rebuild invalidation: the decoded
