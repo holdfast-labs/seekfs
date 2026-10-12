@@ -425,7 +425,54 @@ func cmdServiceInfo(args []string) error {
 	for _, db := range resp.DBs {
 		fmt.Printf("%s entries=%d source=%s volume=%s built_at=%s checkpoint=%d\n", db.Path, db.Entries, db.Source, db.Volume, db.BuiltAt, db.Checkpoint)
 	}
+	if resp.Content != nil {
+		fmt.Printf("content: %s\n", contentHealthSummary(resp.Content))
+	}
 	return nil
+}
+
+// contentHealthSummary renders one content-health line for `loaded`: the
+// state, and — when the scope budget truncated the corpus — the exact dropped
+// files and the enforced budget with the operator action.
+func contentHealthSummary(h *contentHealth) string {
+	if h == nil {
+		return "state=off"
+	}
+	var b strings.Builder
+	b.WriteString("state=" + h.State)
+	if h.Docs > 0 {
+		fmt.Fprintf(&b, " docs=%d", h.Docs)
+	}
+	if h.ScopeDropped > 0 {
+		fmt.Fprintf(&b, " scope_dropped_files=%d scope_dropped_bytes=%d budget=%s (raise [features.content] budget_bytes)",
+			h.ScopeDropped, h.ScopeDroppedBytes, contentBudgetLabel(h.BudgetBytes))
+	}
+	if h.BuildError != "" {
+		fmt.Fprintf(&b, " build_error=%s", h.BuildError)
+	}
+	if h.FoldError != "" {
+		fmt.Fprintf(&b, " fold_error=%s", h.FoldError)
+	}
+	return b.String()
+}
+
+// contentBudgetLabel renders a byte budget as "2 GiB" (or "unknown" when
+// unset) for the loaded/status and UI surfaces.
+func contentBudgetLabel(n int64) string {
+	if n <= 0 {
+		return "unknown"
+	}
+	units := []string{"B", "KiB", "MiB", "GiB", "TiB"}
+	v := float64(n)
+	u := 0
+	for v >= 1024 && u < len(units)-1 {
+		v /= 1024
+		u++
+	}
+	if v == float64(int64(v)) {
+		return fmt.Sprintf("%d %s", int64(v), units[u])
+	}
+	return fmt.Sprintf("%.1f %s", v, units[u])
 }
 
 func cmdDoctor(args []string) error {

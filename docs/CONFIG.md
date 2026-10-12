@@ -65,6 +65,42 @@ See [FEATURES.md](FEATURES.md) for configuration,
 query syntax, limits and the companion protocol. `seekfs loaded --json` reports
 feature health independently of filename-search health.
 
+## Content scope
+
+The service-owned content build indexes detected Git worktrees plus
+configured roots (never the whole volume). These `[content]` keys tune it
+(`[content."E:"]` overrides one volume):
+
+```toml
+[content]
+mode = "auto"            # auto | explicit | off
+roots = ["E:\\work"]
+exclude = ["E:\\work\\scratch"]
+exts = [".go", ".md"]    # optional verbatim allowlist; unset means sniff
+git = true               # follow worktree .gitignore rules
+system_excludes = true
+budget_bytes = 8589934592  # explicit extracted-text budget
+```
+
+File selection is ripgrep-style by default: every file the scope admits is
+opened and its head sniffed (NUL in the first 8 KiB means binary, like
+ripgrep; BOM/UTF-16 text is still indexed). Only known-binary extensions
+(images, archives, media, objects, fonts, legacy OLE documents) are rejected
+without opening. Set `exts` to opt back into a verbatim extension allowlist.
+Files that sniff binary are tallied as `binary` in the `.gsx` policy and in
+`loaded --json` — expected rejections, never drops.
+
+`budget_bytes` defaults to a tenth of the index volume's free space (floored
+at 2 GiB, ceiling 32 GiB), so a Chromium-size repo indexes completely; only
+an explicit value joins the sidecar identity. Large corpora build as folder
+shards (past 64 MiB of text), each capped at the 4 GiB per-file sidecar cap,
+so a total budget past 4 GiB stays memory-bounded and safe. Environment
+overrides are `SEEKFS_CONTENT_SCOPE`, `SEEKFS_CONTENT_ROOTS`,
+`SEEKFS_CONTENT_EXCLUDE`, and `SEEKFS_CONTENT_BUDGET_BYTES`. When the budget
+truncates a build, health reports the exact dropped files/bytes and the
+enforced budget (`scope_dropped`, `scope_dropped_bytes`, `budget_bytes` in
+`loaded --json`); raise `budget_bytes` to index the rest.
+
 ## Editing Config
 
 Use `seekfs config` so agents and users do not need to locate the file manually:

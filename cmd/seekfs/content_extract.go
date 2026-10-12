@@ -117,7 +117,12 @@ type contentExtractResult struct {
 	// (raw over the policy cap, or text cut at the text cap) rather than the
 	// whole document. It is surfaced in health/policy counts, never silent.
 	Truncated bool
-	Reason    string
+	// Binary is true when the file sniffed as binary (NUL in the head window):
+	// a distinct, expected outcome counted separately from Skipped, never a
+	// silent drop. A nil extractor (contentExtractorForPath claimed nothing)
+	// also means binary; callers map that to Binary.
+	Binary bool
+	Reason string
 }
 
 // contentExtractor turns file bytes into text. Implementations live in their own
@@ -163,6 +168,26 @@ func contentExtractorVersionForClass(class uint16) (uint16, bool) {
 		}
 	}
 	return 0, false
+}
+
+// contentRegistryClaimsExt reports whether a registered (rich) extractor
+// claims ext: PDF, OOXML, HTML, email and friends. The plain-text fallback
+// claims nothing by extension; unknown extensions are sniffed at build time.
+func contentRegistryClaimsExt(ext string) bool {
+	if ext == "" {
+		return false
+	}
+	for _, e := range contentExtractors {
+		if e.Name() == "text" {
+			continue
+		}
+		for _, want := range e.Extensions() {
+			if want == ext {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // contentExtractorForPath selects an extractor for a path. Extension match

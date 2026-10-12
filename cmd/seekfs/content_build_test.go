@@ -49,6 +49,37 @@ func TestContentBuildExcludesIndexFiles(t *testing.T) {
 	}
 }
 
+func TestContentWalkBuildTalliesBinary(t *testing.T) {
+	t.Setenv("SEEKFS_CONTENT_SEARCH", "1")
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "a.txt"), []byte("alpha needle"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "b.bin"), []byte("bin\x00ary"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "OWNERS"), []byte("owner needle"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	idx, err := buildContentIndexFromDir(context.Background(), dir, defaultContentBuildOptions())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(idx.Docs) != 2 {
+		t.Fatalf("built %d docs; want 2 (a.txt, OWNERS)", len(idx.Docs))
+	}
+	if idx.Policy.Binary != 1 {
+		t.Fatalf("policy binary = %d; want 1 (b.bin)", idx.Policy.Binary)
+	}
+	r, err := openContentReader(idx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hits := r.search("needle", 0); len(hits) != 2 {
+		t.Fatalf("search = %v; want both text files", contentPathsOf(hits))
+	}
+}
+
 // A root that cannot be read (a typo'd or inaccessible path) must fail rather
 // than silently publish an empty index.
 func TestContentBuildMissingRootErrors(t *testing.T) {

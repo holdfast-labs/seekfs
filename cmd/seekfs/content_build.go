@@ -159,13 +159,18 @@ func buildContentIndexFromDir(ctx context.Context, root string, opts contentBuil
 	defer spool.Close()
 	var spooled []contentWalkDoc
 	var scanned int
-	var skipped, truncated, declined int64
+	var skipped, truncated, declined, binary int64
 	// Inside a git worktree, git's ignore rules decide what is skipped; the
 	// name-based skips below only apply outside any worktree.
-	absRoot, aerr := filepath.Abs(root)
+	absRootOrig, aerr := filepath.Abs(root)
 	if aerr != nil {
-		absRoot = root
+		absRootOrig = root
 	}
+	// absRoot is the folded form for worktree registration and lookup (the
+	// filesystem is case-insensitive); ignore-pattern matching always runs on
+	// original-case absolute paths via absOfOrig, because patterns match
+	// case-sensitively like git and ripgrep.
+	absRoot := contentNormPath(absRootOrig)
 	ignore := newContentGitIgnore(nil)
 	for dir := absRoot; ; {
 		if _, serr := os.Lstat(filepath.Join(dir, ".git")); serr == nil {
@@ -178,7 +183,7 @@ func buildContentIndexFromDir(ctx context.Context, root string, opts contentBuil
 		}
 		dir = parent
 	}
-	if ignore.ignored(contentNormPath(absRoot), true) {
+	if ignore.ignored(absRootOrig, true) {
 		// An explicitly requested root that git ignores (repo\out) is
 		// indexed under the outside-worktree rules, not skipped entirely.
 		ignore = newContentGitIgnore(nil)
@@ -189,6 +194,13 @@ func buildContentIndexFromDir(ctx context.Context, root string, opts contentBuil
 			return contentNormPath(path)
 		}
 		return contentNormPath(filepath.Join(absRoot, rel))
+	}
+	absOfOrig := func(path string) string {
+		rel, rerr := filepath.Rel(root, path)
+		if rerr != nil {
+			return path
+		}
+		return filepath.Join(absRootOrig, rel)
 	}
 	walkErr := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
@@ -215,7 +227,7 @@ func buildContentIndexFromDir(ctx context.Context, root string, opts contentBuil
 				}
 			}
 			if _, inRepo := ignore.repoFor(abs); inRepo {
-				if path != root && ignore.ignored(abs, true) {
+				if path != root && ignore.ignored(absOfOrig(path), true) {
 					return filepath.SkipDir
 				}
 				return nil
@@ -231,7 +243,7 @@ func buildContentIndexFromDir(ctx context.Context, root string, opts contentBuil
 		if strings.HasSuffix(name, ".gsx") || strings.HasPrefix(name, ".seekfs") {
 			return nil
 		}
-		if abs := absOf(path); ignore.ignored(abs, false) {
+		if ignore.ignored(absOfOrig(path), false) {
 			return nil
 		}
 		if !opts.allows(path) {
@@ -254,9 +266,10 @@ func buildContentIndexFromDir(ctx context.Context, root string, opts contentBuil
 		head, _ := contentReadBounded(f, size, 512)
 		e := contentExtractorForPath(path, head)
 		if e == nil {
-			// No extractor: a binary/unsupported file, or an empty one the
-			// sniffer declined. Tallied so the counters reconcile.
-			declined++
+			// No extractor claimed the head: binary (NUL in the sniff
+			// window), tallied apart from declined so the counters reconcile
+			// as indexed == eligible - declined - skipped - binary.
+			binary++
 			return nil
 		}
 		// The extractor applies the raw/text policy: an over-cap container is
@@ -268,6 +281,10 @@ func buildContentIndexFromDir(ctx context.Context, root string, opts contentBuil
 		f.Close()
 		if eerr != nil {
 			skipped++
+			return nil
+		}
+		if res.Binary {
+			binary++
 			return nil
 		}
 		if res.Skipped {
@@ -322,7 +339,7 @@ func buildContentIndexFromDir(ctx context.Context, root string, opts contentBuil
 	if err != nil {
 		return nil, err
 	}
-	idx.Policy = contentBuildPolicy{MaxRaw: settings.maxRaw, MaxText: settings.maxText, Skipped: skipped, Truncated: truncated}
+	idx.Policy = contentBuildPolicy{MaxRaw: settings.maxRaw, MaxText: settings.maxText, Skipped: skipped, Truncated: truncated, Binary: binary}
 	idx.Scanned = int64(scanned)
 	idx.Declined = declined
 	return idx, nil
@@ -579,7 +596,7 @@ func buildContentIndexForIndex(ctx context.Context, idx *Index, opts contentBuil
 	}
 	defer spool.Close()
 	var spooled []contentWalkDoc
-	var skipped, truncated int64
+	var skipped, truncated, binary int64
 	var scopeBytes int64
 	count := idx.compactRecordCount()
 	var items []contentBuildItem
@@ -633,6 +650,10 @@ func buildContentIndexForIndex(ctx context.Context, idx *Index, opts contentBuil
 			})
 			continue
 		}
+		if res.Binary {
+			binary++
+			continue
+		}
 		if res.Skipped {
 			skipped++
 		}
@@ -652,7 +673,7 @@ func buildContentIndexForIndex(ctx context.Context, idx *Index, opts contentBuil
 		return nil, err
 	}
 	cidx.Origin = contentOriginUSN
-	cidx.Policy = contentBuildPolicy{MaxRaw: settings.maxRaw, MaxText: settings.maxText, Skipped: skipped, Truncated: truncated}
+	cidx.Policy = contentBuildPolicy{MaxRaw: settings.maxRaw, MaxText: settings.maxText, Skipped: skipped, Truncated: truncated, Binary: binary}
 	// Stamp the content USN checkpoint from the record index metadata: the
 	// base is complete as of the .gsi checkpoint, so restart catch-up resumes
 	// from here rather than re-reading the whole journal (WP0/PB3).

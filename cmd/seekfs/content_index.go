@@ -137,16 +137,23 @@ const (
 // contentBuildPolicy is the extraction policy a `.gsx` was built with and the
 // build's skip/truncation counts, stored in the CXPL section. It makes the
 // size/encoding policy visible to the service's content health instead of a
-// silent drop.
+// silent drop. ScopeDropped/ScopeDroppedBytes are the exact files and
+// extracted-text bytes the scope byte budget excluded; BudgetBytes is the
+// budget that was enforced, so health can name it in the operator action.
 type contentBuildPolicy struct {
-	MaxRaw       int64
-	MaxText      int64
-	Skipped      int64
-	Truncated    int64
-	ScopeDropped int64
+	MaxRaw            int64
+	MaxText           int64
+	Skipped           int64
+	Truncated         int64
+	ScopeDropped      int64
+	ScopeDroppedBytes int64
+	BudgetBytes       int64
+	// Binary counts files that sniffed as binary (NUL in the head window):
+	// expected, ripgrep-agreeing rejections, tallied apart from Skipped.
+	Binary int64
 }
 
-const contentPolicySize = 40
+const contentPolicySize = 64
 
 func (p contentBuildPolicy) encode() []byte {
 	b := make([]byte, contentPolicySize)
@@ -155,6 +162,9 @@ func (p contentBuildPolicy) encode() []byte {
 	binary.LittleEndian.PutUint64(b[16:], uint64(p.Skipped))
 	binary.LittleEndian.PutUint64(b[24:], uint64(p.Truncated))
 	binary.LittleEndian.PutUint64(b[32:], uint64(p.ScopeDropped))
+	binary.LittleEndian.PutUint64(b[40:], uint64(p.ScopeDroppedBytes))
+	binary.LittleEndian.PutUint64(b[48:], uint64(p.BudgetBytes))
+	binary.LittleEndian.PutUint64(b[56:], uint64(p.Binary))
 	return b
 }
 
@@ -168,8 +178,15 @@ func decodeContentPolicy(data []byte) (contentBuildPolicy, bool) {
 		Skipped:   int64(binary.LittleEndian.Uint64(data[16:])),
 		Truncated: int64(binary.LittleEndian.Uint64(data[24:])),
 	}
-	if len(data) >= contentPolicySize {
+	if len(data) >= 40 {
 		p.ScopeDropped = int64(binary.LittleEndian.Uint64(data[32:]))
+	}
+	if len(data) >= 56 {
+		p.ScopeDroppedBytes = int64(binary.LittleEndian.Uint64(data[40:]))
+		p.BudgetBytes = int64(binary.LittleEndian.Uint64(data[48:]))
+	}
+	if len(data) >= contentPolicySize {
+		p.Binary = int64(binary.LittleEndian.Uint64(data[56:]))
 	}
 	return p, true
 }
@@ -709,28 +726,14 @@ func contentPlanStaleExtractorRefresh(idx *contentIndex, resolvePath func(uint64
 	return plan
 }
 
-// contentPathExtractableByRegistry reports whether a path's extension is claimed
-// by a registered extractor or is in the service's curated text allowlist. It is
-// the extension gate for refreshing an old class==0 doc: a doc whose extension
-// nothing would extract now cannot be re-extracted, so the volume rebuilds.
+// contentPathExtractableByRegistry reports whether a path could be extracted
+// without opening it: anything but a known-binary extension (which the sniff
+// would reject) is a text candidate, including extensionless files. It is the
+// extension gate for refreshing an old class==0 doc and for catch-up byte
+// budgeting: a doc nothing could extract now forces a rebuild instead of a
+// targeted refresh.
 func contentPathExtractableByRegistry(path string) bool {
-	ext := contentPathExtension(path)
-	if ext == "" {
-		return false
-	}
-	for _, e := range contentExtractors {
-		for _, want := range e.Extensions() {
-			if want == ext {
-				return true
-			}
-		}
-	}
-	for _, want := range contentDefaultTextExtensions {
-		if want == ext {
-			return true
-		}
-	}
-	return false
+	return !contentBinaryExtension(contentPathExtension(path))
 }
 
 // contentStaleExtractorDocCount counts the docs in an attached base whose

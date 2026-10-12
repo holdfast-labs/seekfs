@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"runtime"
+	"time"
 )
 
 // contentBuildWorkers is how many files a build extracts concurrently.
@@ -19,6 +20,39 @@ var contentBuildWorkers = func() int {
 	}
 	return n
 }()
+
+// contentBuildQueryQuietWindow is how recently a query must have run for the
+// service build to consider the user active and drop to one worker.
+var contentBuildQueryQuietWindow = 30 * time.Second
+
+// contentUserActiveNow and contentOnBatteryNow are the adaptive-policy probes.
+// They are vars so tests can inject activity and power states deterministically.
+var (
+	contentUserActiveNow = func() bool {
+		last := serviceLastQueryUnixNano.Load()
+		if last == 0 {
+			return false
+		}
+		return time.Since(time.Unix(0, last)) < contentBuildQueryQuietWindow
+	}
+	contentOnBatteryNow = contentSystemOnBattery
+)
+
+// contentBuildWorkerCount is the adaptive extraction concurrency for the
+// service-owned background build: the static cap, dropped to 1 while the user
+// is actively querying or the machine is on battery. The offline CLI keeps
+// the static cap: it is a foreground command the user explicitly started.
+// Ordering, budget and abort semantics are unchanged at any count because the
+// prefetch stream is consumed in item order.
+func contentBuildWorkerCount() int {
+	if contentBuildWorkers <= 1 {
+		return contentBuildWorkers
+	}
+	if contentUserActiveNow() || contentOnBatteryNow() {
+		return 1
+	}
+	return contentBuildWorkers
+}
 
 // contentExtracted is one prefetched extraction.
 type contentExtracted struct {
