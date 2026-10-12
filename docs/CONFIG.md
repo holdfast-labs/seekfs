@@ -140,6 +140,7 @@ for `SEEKFS_SUBTREE_INTERVALS` and `SEEKFS_NAME_ORDER` flip off, while
 | `SEEKFS_NAME_TRIGRAM_MAX_RECORDS` | Record cap above which name trigrams are not built at startup; ignored in low-memory mode or when `SEEKFS_NAME_TRIGRAMS` is set explicitly | `20000000` |
 | `SEEKFS_SELF_NAME_GRAMS` | Selective/complete name gram sections for filename queries | on |
 | `SEEKFS_GLOBAL_PLANNER` | Force the global multi-volume planner | off (the `ui` launcher sets `1`) |
+| `SEEKFS_CONTENT_GLOBAL_LANE` | Compound content + selective-filename lane (`content:` plus `ext:`/`dir:`/`under:` and friends): drives the filename side and verifies content inline instead of materializing the content candidate superset | on (`0` forces the per-volume content path) |
 
 ### Persistence diagnostics
 

@@ -26,7 +26,7 @@ type contentVolRecord struct {
 // newContentRecordVolume builds a service volume from explicit records (with
 // parent links, so directory-qualified duplicate basenames are possible) and a
 // matching FRN-keyed content index. Records with empty content get no doc.
-func newContentRecordVolume(t *testing.T, volume string, recs []contentVolRecord) *serviceVolumeIndex {
+func newContentRecordVolume(t testing.TB, volume string, recs []contentVolRecord) *serviceVolumeIndex {
 	t.Helper()
 	t.Setenv("SEEKFS_CONTENT_SEARCH", "1")
 	idx := &Index{Source: "usn", Volume: volume, Compact: true}
