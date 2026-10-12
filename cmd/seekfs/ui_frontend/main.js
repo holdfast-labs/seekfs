@@ -687,7 +687,9 @@ function handleSearchResponse(response) {
   renderRows(response.results || []);
   const count = response.count || (response.results || []).length;
   setCount(count);
-  els.summary.textContent = `${count.toLocaleString()} items  |  ${response.elapsed_ms} ms`;
+  let summary = `${count.toLocaleString()} items  |  ${response.elapsed_ms} ms`;
+  if (response.fuzzy_correction) summary += `  |  Showing results for ${response.fuzzy_correction}`;
+  els.summary.textContent = summary;
   setEmpty("No matches", "");
 }
 

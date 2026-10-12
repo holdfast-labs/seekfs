@@ -122,6 +122,21 @@ unless `case:true` is set. The fold is the same on both sides because the
 builder folds documents and the query folds the leaf with the one shared
 `contentFoldText`.
 
+**Typo tolerance.** A `content:` query that matches zero documents is retried
+with per-word corrections from the term dictionary (the folded CXTR words):
+each correctable word (4+ runes) of every positive term/phrase leaf is replaced
+by the dictionary term within edit distance 1 (2 for 8+ rune words) with the
+best document frequency, and the first retry that returns results wins (at most
+a few trials: single-word rewrites, then the combined rewrite). Exact results
+are never altered — fuzzy only fires on a total miss — and `case:true` queries,
+regex leaves, and NOT leaves are never corrected. Sharded indexes merge
+candidates across shards, and the resident delta vocabulary covers unflushed
+changes. The response sets `fuzzy` plus `fuzzy_correction` (the corrected
+words), so the UI summary says "Showing results for receive" and counts agree
+with searches. Measured on the Chromium content sample (62k docs, 500 random
+5+ letter words, one random edit each): 98.4% top-1 at p50 ~24 ms / p99
+~40 ms per corrected term (`content_fuzzy.go`, `content_fuzzy_test.go`).
+
 **Per-format scope.** Matching is against *extracted* text, not raw bytes. Plain
 text/code is indexed as text. HTML indexes the visible page text only — tags,
 entities, `<script>`/`<style>`/`<textarea>` and comments are excluded (verified:
@@ -153,6 +168,7 @@ when none is usable the query errors rather than returning empty.
 | `content_read.go` | `contentReader`: decode sections, trigram-intersection candidates, substring verification, `contentHit{Path,DocID,Offset}`. |
 | `content_resolver.go` | `contentResolver`: merges FRN-sorted docs against the base FRN column → `docID -> recordID` (`contentNoRecordID` = dropped). |
 | `content_query.go` | `contentLeaf`, `contentSearchEnabled`, `contentUnavailableError`, `parseContentLeaf`, `queryHasPositiveContentLeaf`, deterministic `contentAssignLeafIDs`. |
+| `content_fuzzy.go` | Typo tolerance for zero-result `content:` queries: dictionary correction per word (pigeonhole/bitmap prefilters + bounded Damerau-Levenshtein, reusing `fuzzy.go`), merged across shards and the delta vocabulary, retried through the exact search/count paths; `fuzzy_correction` surfaces the corrected words. |
 | `content_tokenize.go` | Quote- and regex-span-aware query tokenizer (`content:/a b/` survives whitespace and `|`). |
 | `content_service.go` | `contentVolumeState` (idx/reader/resolver/delta/state/health), `contentDelta`, `contentCoordinator` (dirty/promote/drain/invalidate), `contentExtractDeltaDoc`, `processQueue`, `contentEligibleForExtraction`, `contentHealth`, `sha256Of`. |
 | `content_service_wiring.go` | Service glue: `contentIndexPathForDB`, `contentBaseFRNColumns`, `attachContentForVolume`, `contentDrainLoop`, `contentResolvePath`, `rebindContentAfterBaseSwap`, `contentLookupFRNColumn`. |

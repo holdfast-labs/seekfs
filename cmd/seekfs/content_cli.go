@@ -174,12 +174,15 @@ func cmdContentIndex(args []string) error {
 // contentCLIResponse is the additive JSON shape for the offline `content`
 // command: `results` stays an array of path strings (the original shape) and
 // `snippets` is a parallel array of matched-text windows, aligned to `results`.
-// Consumers that only know the old shape are unaffected.
+// Consumers that only know the old shape are unaffected. When a zero-result
+// query was retried with typo-tolerant corrections, FuzzyCorrection names the
+// corrected words ("Showing results for receive").
 type contentCLIResponse struct {
-	OK       bool     `json:"ok"`
-	Count    int      `json:"count"`
-	Results  []string `json:"results"`
-	Snippets []string `json:"snippets"`
+	OK              bool     `json:"ok"`
+	Count           int      `json:"count"`
+	Results         []string `json:"results"`
+	Snippets        []string `json:"snippets"`
+	FuzzyCorrection string   `json:"fuzzy_correction,omitempty"`
 }
 
 func cmdContent(args []string) error {
@@ -219,13 +222,22 @@ func cmdContent(args []string) error {
 		return err
 	}
 	hits := r.search(term, *n)
+	fuzzy := ""
+	if len(hits) == 0 {
+		if corrected, show, ok := contentFuzzyCorrectOfflineText(r, term); ok {
+			if retry := r.search(corrected, *n); len(retry) > 0 {
+				hits, fuzzy = retry, show
+			}
+		}
+	}
 
 	if *asJSON {
 		resp := contentCLIResponse{
-			OK:       true,
-			Count:    len(hits),
-			Results:  make([]string, 0, len(hits)),
-			Snippets: make([]string, 0, len(hits)),
+			OK:              true,
+			Count:           len(hits),
+			Results:         make([]string, 0, len(hits)),
+			Snippets:        make([]string, 0, len(hits)),
+			FuzzyCorrection: fuzzy,
 		}
 		for _, h := range hits {
 			resp.Results = append(resp.Results, h.Path)
@@ -233,6 +245,9 @@ func cmdContent(args []string) error {
 		}
 		enc := json.NewEncoder(os.Stdout)
 		return enc.Encode(resp)
+	}
+	if fuzzy != "" {
+		fmt.Fprintf(os.Stdout, "(showing results for %q)\n", fuzzy)
 	}
 	for _, h := range hits {
 		if *withSnippet && h.Snippet != "" {

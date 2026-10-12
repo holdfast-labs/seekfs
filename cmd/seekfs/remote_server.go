@@ -117,6 +117,7 @@ type remoteResponse struct {
 	Entries         int                  `json:"entries,omitempty"`
 	Loading         bool                 `json:"loading,omitempty"`
 	Fuzzy           bool                 `json:"fuzzy,omitempty"`
+	FuzzyCorrection string               `json:"fuzzy_correction,omitempty"`
 	Complete        *bool                `json:"complete,omitempty"`
 	Content         *remoteContentHealth `json:"content,omitempty"`
 	Results         []string             `json:"results,omitempty"`
@@ -594,21 +595,22 @@ func readRemoteFramePayload(r *bufio.Reader) ([]byte, error) {
 // reasons) stay private by default.
 func remoteResponseFromService(resp serviceResponse, countOnly bool) remoteResponse {
 	out := remoteResponse{
-		OK:          resp.OK,
-		Message:     genericRemoteMessage(resp.Message),
-		Count:       resp.Count,
-		SearchMS:    resp.SearchMS,
-		Source:      remoteSearchSource(resp.Source, countOnly),
-		Health:      resp.Health,
-		Version:     resp.Version,
-		Commit:      resp.Commit,
-		Date:        resp.Date,
-		BuildFlavor: resp.BuildFlavor,
-		Entries:     resp.Entries,
-		Loading:     resp.Loading,
-		Fuzzy:       resp.Fuzzy,
-		Complete:    resp.Complete,
-		Results:     resp.Results,
+		OK:              resp.OK,
+		Message:         genericRemoteMessage(resp.Message),
+		Count:           resp.Count,
+		SearchMS:        resp.SearchMS,
+		Source:          remoteSearchSource(resp.Source, countOnly),
+		Health:          resp.Health,
+		Version:         resp.Version,
+		Commit:          resp.Commit,
+		Date:            resp.Date,
+		BuildFlavor:     resp.BuildFlavor,
+		Entries:         resp.Entries,
+		Loading:         resp.Loading,
+		Fuzzy:           resp.Fuzzy,
+		FuzzyCorrection: resp.FuzzyCorrection,
+		Complete:        resp.Complete,
+		Results:         resp.Results,
 	}
 	if resp.Content != nil {
 		out.Content = &remoteContentHealth{
