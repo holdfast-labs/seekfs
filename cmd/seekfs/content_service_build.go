@@ -678,6 +678,8 @@ func (s *goSearchService) runContentBuild(vol *serviceVolumeIndex, reuseSidecar 
 	var used, skipped, truncated int64
 	abortReason := ""
 	abortRetry := false
+	nextExtracted, stopPrefetch := contentPrefetchExtract(ctx, items, contentBuildWorkers, contentBuildDocSafe)
+	defer stopPrefetch()
 	for done < total {
 		// The atomic generation covers the common abort (a rebuild/journal
 		// reset bumps replayGen); the full journal-id check runs per batch
@@ -692,7 +694,12 @@ func (s *goSearchService) runContentBuild(vol *serviceVolumeIndex, reuseSidecar 
 		}
 		item := items[done]
 		done++
-		doc, res, ok := contentBuildDocSafe(ctx, item)
+		got, live := nextExtracted()
+		if !live {
+			abortReason = "service stopping"
+			break
+		}
+		doc, res, ok := got.doc, got.res, got.ok
 		if ok && res.Truncated {
 			truncated++
 		}

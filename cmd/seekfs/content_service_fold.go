@@ -200,7 +200,19 @@ func (s *goSearchService) runContentFold(vol *serviceVolumeIndex) {
 			return
 		}
 		rewritten = len(cidx.Docs)
-		saveErr = contentFoldSave(gsx, cidx)
+		if int64(len(cidx.Sections[contentSectionText])) > 2*contentShardTargetBytes {
+			// Grown well past one shard through folds: split it now rather
+			// than keep rewriting one ever-larger file.
+			var shards int
+			shards, saveErr = contentReshardAndSave(gsx, cidx, header, tmpDir)
+			if saveErr == nil {
+				serviceLog("content fold resharded volume=%s shards=%d", vol.volume, shards)
+			} else {
+				contentSweepShards(gsx)
+			}
+		} else {
+			saveErr = contentFoldSave(gsx, cidx)
+		}
 	} else {
 		// Sharded: rewrite only the shards the delta touches; the others are
 		// named unchanged by the new manifest.
@@ -262,9 +274,7 @@ func (s *goSearchService) runContentFold(vol *serviceVolumeIndex) {
 	}
 	vol.contentCoord.commitFold(snap)
 	vol.contentCoord.foldSucceeded()
-	if base.shards != nil {
-		contentSweepShards(gsx)
-	}
+	contentSweepShards(gsx)
 	serviceLog("content fold volume=%s rewritten_docs=%d checkpoint=%d", vol.volume, rewritten, checkpoint)
 }
 

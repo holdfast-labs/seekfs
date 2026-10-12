@@ -402,10 +402,8 @@ func buildContentIndexForIndex(ctx context.Context, idx *Index, opts contentBuil
 	var skipped, truncated int64
 	var scopeBytes int64
 	count := idx.compactRecordCount()
+	var items []contentBuildItem
 	for id := 0; id < count; id++ {
-		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
 		rec := idx.compactRecord(id)
 		if rec.Deleted || rec.Mode&uint32(os.ModeDir) != 0 || rec.FRN == 0 {
 			continue
@@ -414,7 +412,19 @@ func buildContentIndexForIndex(ctx context.Context, idx *Index, opts contentBuil
 		if path == "" || !opts.allows(path) {
 			continue
 		}
-		doc, res, ok := contentBuildDocSafe(ctx, contentBuildItem{frn: rec.FRN, path: path})
+		items = append(items, contentBuildItem{frn: rec.FRN, path: path})
+	}
+	next, stop := contentPrefetchExtract(ctx, items, contentBuildWorkers, contentBuildDocSafe)
+	defer stop()
+	for range items {
+		got, live := next()
+		if err := ctx.Err(); err != nil || !live {
+			if err == nil {
+				err = context.Canceled
+			}
+			return nil, err
+		}
+		doc, res, ok := got.doc, got.res, got.ok
 		if res.Truncated {
 			truncated++
 		}

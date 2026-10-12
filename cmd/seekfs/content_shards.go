@@ -529,3 +529,47 @@ func contentShardFoldSource(sh *contentShard, incoming []contentDeltaDoc, drop m
 		}
 	}
 }
+
+// contentReshardAndSave splits an assembled single-file index into folder
+// shards and publishes them with a manifest at gsx. A fold uses it when an
+// unsharded base has grown well past the shard target, so a volume that
+// started small does not stay one ever-larger file.
+func contentReshardAndSave(gsx string, whole *contentIndex, header *contentIndex, tmpDir string) (int, error) {
+	reader, err := openContentReader(whole)
+	if err != nil {
+		return 0, err
+	}
+	paths := make([]string, len(whole.Docs))
+	sizes := make([]int64, len(whole.Docs))
+	for i, d := range whole.Docs {
+		paths[i], sizes[i] = reader.docPath(d.DocID), int64(d.TextLen)
+	}
+	groups := contentGroupByShard(contentPlanShards(paths, sizes, contentShardTargetBytes), paths)
+	dir := contentShardDir(gsx)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return 0, err
+	}
+	infos := make([]contentShardInfo, 0, len(groups))
+	for _, g := range groups {
+		k := 0
+		cidx, err := assembleContentIndexStream(func() (contentBuildDoc, bool, error) {
+			if k == len(g.docs) {
+				return contentBuildDoc{}, false, nil
+			}
+			d := whole.Docs[g.docs[k]]
+			k++
+			return contentBuildDoc{frn: d.FRN, path: paths[d.DocID], text: reader.docText(d.DocID), modUnix: d.ModUnix, class: d.ContentType, version: d.ExtractorVersion}, true, nil
+		}, tmpDir)
+		if err != nil {
+			return 0, err
+		}
+		cidx.Origin, cidx.JournalID, cidx.CheckpointUSN = header.Origin, header.JournalID, header.CheckpointUSN
+		cidx.Policy, cidx.ScopeHash = header.Policy, header.ScopeHash
+		info, err := contentSaveShard(dir, cidx, g.prefixes)
+		if err != nil {
+			return 0, err
+		}
+		infos = append(infos, info)
+	}
+	return len(infos), contentSaveManifest(gsx, header, infos)
+}

@@ -592,9 +592,16 @@ an empty index.
   MiB shards (10 shards, 6% larger on disk), a 100-file edit in one folder took
   13 s, a clustered 8,192-file edit took 15 s (2 shards), and a spread
   8,192-file edit took 1m43s (all shards), each peaking near 1 GB.
-- **Not yet:** an unsharded base that grows past the target through folds stays
-  one file until the next full rebuild, and shards are not rebalanced between
-  rebuilds. The offline `content-index` CLI still writes a single file.
+- **Reshard on fold.** A single-file base that grows past twice the target
+  through folds is split into shards by the fold that crosses the line.
+- **Parallel extraction.** Builds extract up to `contentBuildWorkers` files
+  concurrently (half the CPUs, at most 4) through `contentPrefetchExtract`,
+  which returns results in item order. Selection, budget and abort behaviour
+  are therefore unchanged. On Chromium (16k files, 128 MB of text, warm cache),
+  the build dropped from 2m16s to 28 s, with extraction fully hidden behind
+  tokenizing.
+- **Not yet:** shards are not rebalanced between rebuilds. The offline
+  `content-index` CLI still writes a single file and holds all text in memory.
 
 ## 7. Carried debt / known gaps
 

@@ -287,3 +287,28 @@ func TestContentShardedFoldMovesRenamedDocBetweenShards(t *testing.T) {
 		t.Fatal("moved doc is not in the shard owning its new folder")
 	}
 }
+
+func TestContentFoldReshardsGrownSingleFileBase(t *testing.T) {
+	f := newContentFoldFixture(t, []contentFixtureFile{
+		{10, "alpha.txt", "alphaold base"},
+		{20, "beta.txt", "betaneedle base"},
+	})
+	if f.vol.content.readerView().idx.shards != nil {
+		t.Fatal("precondition: fixture base should be a single file")
+	}
+	restore := contentShardTargetBytes
+	contentShardTargetBytes = 5
+	t.Cleanup(func() { contentShardTargetBytes = restore })
+	f.churn(t, 10, 105, "gammanew needlegamma")
+	f.s.runContentFold(f.vol)
+	reader := f.vol.content.readerView()
+	if reader == nil || reader.idx.shards == nil {
+		t.Fatal("a fold over twice the shard target must publish a sharded base")
+	}
+	if hits, _ := contentServiceSearch(t, f.vol, "content:needlegamma", false); len(hits) != 1 {
+		t.Fatalf("edit not findable after reshard: %v", hits)
+	}
+	if hits, _ := contentServiceSearch(t, f.vol, "content:betaneedle", false); len(hits) != 1 {
+		t.Fatalf("untouched doc lost by reshard: %v", hits)
+	}
+}
