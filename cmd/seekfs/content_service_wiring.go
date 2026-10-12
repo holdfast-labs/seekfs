@@ -658,8 +658,9 @@ func (s *goSearchService) contentDrainLoop(vol *serviceVolumeIndex) {
 			s.indexMu.RLock()
 			isWalkDrain := vol.contentWalkOriginAttached()
 			s.indexMu.RUnlock()
+			var walkEnqueued map[uint64]contentWalkPrint
 			if isWalkDrain {
-				s.contentReconcileWalkVolume(vol, false)
+				walkEnqueued = s.contentReconcileWalkVolume(vol, false)
 			}
 			vol.contentCoord.promoteAll()
 			// A private path cache: the drain must not touch vol.pathCache,
@@ -702,6 +703,11 @@ func (s *goSearchService) contentDrainLoop(vol *serviceVolumeIndex) {
 				scope.Ignore.invalidate()
 				scope = nil
 				s.scheduleContentRebuild(vol)
+			}
+			if isWalkDrain {
+				// Remember keys that extracted to nothing, so the next
+				// reconcile does not retry them at the same fingerprint.
+				s.contentNoteWalkDeclined(vol, walkEnqueued)
 			}
 			// M1: after the tick's extractions, fold if the delta has grown
 			// past its bound. A fold failure keeps the delta and backs off.

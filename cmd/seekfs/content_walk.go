@@ -47,6 +47,13 @@ import (
 // the delay.
 var contentWalkReconcilePeriod = 60 * time.Second
 
+// contentWalkPrint is the (size, nanosecond mtime) fingerprint a walk
+// reconcile diffs. Named so the delta skip-set and the live/base maps share it.
+type contentWalkPrint struct {
+	size int64
+	mod  int64
+}
+
 // contentWalkKey returns the stable content key for an absolute file path:
 // the FNV-1a hash of its cleaned, slash-normalized form. Every walk content
 // path (build, delta, resolver join, query) must derive the key through this
@@ -192,19 +199,22 @@ func (s *goSearchService) contentResolveWalkPath(vol *serviceVolumeIndex, key ui
 // hash-verifies before upserting, so an mtime-only touch never churns text.
 //
 // force reconciles even when the filename generation has not moved (attach,
-// periodic safety net). Otherwise only a new generation is diffed.
-func (s *goSearchService) contentReconcileWalkVolume(vol *serviceVolumeIndex, force bool) {
+// periodic safety net). Otherwise only a new generation is diffed. It
+// returns the enqueued keys with their enqueue-time fingerprints so the
+// drain can record which of them produced no indexable text (the
+// unindexable skip-set).
+func (s *goSearchService) contentReconcileWalkVolume(vol *serviceVolumeIndex, force bool) map[uint64]contentWalkPrint {
 	if s == nil || vol == nil || vol.content == nil || vol.contentCoord == nil {
-		return
+		return nil
 	}
 	if !contentSearchEnabled() {
-		return
+		return nil
 	}
 	if contentScopeForVolume(s.contentConfig(), vol.volume).disabled() {
-		return
+		return nil
 	}
 	if !s.beginContentTask(vol) {
-		return
+		return nil
 	}
 	defer endContentTask(vol)
 
@@ -217,43 +227,40 @@ func (s *goSearchService) contentReconcileWalkVolume(vol *serviceVolumeIndex, fo
 		sameGen := vol.replayGen.Load() == lastGen
 		s.indexMu.RUnlock()
 		if sameGen {
-			return
+			return nil
 		}
 	}
 	// Scope resolution takes indexMu itself, so it runs outside the scan's
 	// read lock (nesting RLocks deadlocks once a writer waits).
 	scope, ok := s.resolvedContentScope(vol)
 	if !ok {
-		return
+		return nil
 	}
 	s.indexMu.RLock()
 	if vol.index == nil || vol.index.Source != "walk" || vol.state != "ready" {
 		s.indexMu.RUnlock()
-		return
+		return nil
 	}
 	reader, resolver := vol.content.readerResolverView()
 	if reader == nil || reader.idx == nil || resolver == nil {
 		s.indexMu.RUnlock()
-		return
+		return nil
 	}
 	if reader.idx.Origin != contentOriginWalk {
 		s.indexMu.RUnlock()
-		return
+		return nil
 	}
 	gen := vol.replayGen.Load()
 	keys, ids, ok := s.contentWalkKeys(vol)
 	if !ok {
 		s.indexMu.RUnlock()
-		return
+		return nil
 	}
 	// Index-side fingerprint: key -> (size, modNano) for every live file.
-	type filePrint struct {
-		size int64
-		mod  int64
-	}
-	live := make(map[uint64]filePrint, len(keys))
+	live := make(map[uint64]contentWalkPrint, len(keys))
+	changed := make(map[uint64]contentWalkPrint)
 	pathCache := make(map[int]string, 1024)
-	var changed, scoped []uint64
+	var scoped []uint64
 	for n, key := range keys {
 		id := int(ids[n])
 		if id < 0 || id >= vol.index.compactRecordCount() {
@@ -271,17 +278,18 @@ func (s *goSearchService) contentReconcileWalkVolume(vol *serviceVolumeIndex, fo
 			pathCache = make(map[int]string, 1024)
 		}
 		if _, _, allowed := scope.allows(path); !allowed {
-			scoped = append(scoped, key)
+			// Out of scope and never indexed: skip silently. Tombstoning
+			// it would plant a phantom entry the folds reprocess forever.
 			continue
 		}
-		live[key] = filePrint{size: rec.Size, mod: rec.ModUnix}
+		live[key] = contentWalkPrint{size: rec.Size, mod: rec.ModUnix}
 	}
 	// Base-side fingerprint from the attached doc table.
-	base := make(map[uint64]filePrint, len(reader.idx.Docs))
+	base := make(map[uint64]contentWalkPrint, len(reader.idx.Docs))
 	for i := range reader.idx.Docs {
 		d := &reader.idx.Docs[i]
 		if d.FRN != 0 {
-			base[d.FRN] = filePrint{size: d.FileSize, mod: d.FileModNano}
+			base[d.FRN] = contentWalkPrint{size: d.FileSize, mod: d.FileModNano}
 		}
 	}
 	delta := vol.content.deltaView()
@@ -291,26 +299,46 @@ func (s *goSearchService) contentReconcileWalkVolume(vol *serviceVolumeIndex, fo
 	// entry already matches the index fingerprint keeps it (its extraction
 	// is queued or done at the current values); a delta entry that predates
 	// the change must re-extract — skipping it would serve the stale text
-	// forever, since nothing else would queue the key again.
+	// forever, since nothing else would queue the key again. A key the
+	// skip-set remembers at these exact values extracted to nothing last
+	// time and is not retried until it changes.
 	for key, want := range live {
 		if delta != nil {
+			// Exact fingerprint match (empty files included: size 0 is a
+			// legitimate value, not a missing one).
 			if doc, ok := delta.docFor(key); ok && !doc.Deleted &&
-				doc.FileSize == want.size && doc.FileModNano == want.mod &&
-				(doc.FileSize != 0 || doc.FileModNano != 0) {
+				doc.FileSize == want.size && doc.FileModNano == want.mod {
 				continue
 			}
 		}
+		if vol.content.walkDeclinedSkipped(key, want) {
+			continue
+		}
 		got, inBase := base[key]
-		if !inBase || got.size != want.size || got.mod != want.mod {
-			changed = append(changed, key)
+		if !inBase && want.size == 0 {
+			// An empty file was never indexed and never will be (every
+			// extractor declines text-free input); enqueueing it would
+			// fast-fail extraction on every reconcile forever. A
+			// truncation to empty of an indexed file still flows below
+			// (inBase), where the declining extraction tombstones it.
+			continue
+		}
+		if !inBase || got != want {
+			changed[key] = want
 		}
 	}
-	// Vanished or newly-scoped-out files tombstone so the fold drops them.
-	// Anything the index no longer lists under its key is gone: a rename is
-	// exactly this (old key tombstoned) plus a new-key enqueue above.
-	for key := range base {
-		if _, ok := live[key]; !ok {
+	// Vanished files tombstone so the fold drops them; a rename is exactly
+	// this (old key tombstoned) plus a new-key enqueue above. A file back at
+	// its base fingerprint has its pre-fold tombstone rescinded instead, so
+	// restoring a file before the fold cannot drop live content.
+	for key, want := range base {
+		got, ok := live[key]
+		if !ok {
 			scoped = append(scoped, key)
+			continue
+		}
+		if got == want && delta != nil {
+			delta.rescind(key)
 		}
 	}
 	if delta != nil {
@@ -336,10 +364,45 @@ func (s *goSearchService) contentReconcileWalkVolume(vol *serviceVolumeIndex, fo
 		}
 	}
 	if len(changed) > 0 {
-		vol.contentCoord.enqueueFRNs(changed)
+		list := make([]uint64, 0, len(changed))
+		for key := range changed {
+			list = append(list, key)
+		}
+		vol.contentCoord.enqueueFRNs(list)
 	}
 	vol.content.walkReconcileDone(gen)
 	if len(changed) > 0 || len(seen) > 0 {
 		serviceLog("content walk reconcile volume=%s changed=%d dropped=%d", vol.volume, len(changed), len(seen))
+	}
+	return changed
+}
+
+// contentNoteWalkDeclined records enqueued keys that extraction left
+// unindexed, so the next reconcile does not retry them at the same
+// fingerprint. A key that did land (live delta or base doc at the
+// enqueue-time fingerprint) is left alone; a fingerprint change re-arms it
+// in the reconcile. Call after the drain's processQueue.
+func (s *goSearchService) contentNoteWalkDeclined(vol *serviceVolumeIndex, enqueued map[uint64]contentWalkPrint) {
+	if vol == nil || vol.content == nil || len(enqueued) == 0 {
+		return
+	}
+	reader, resolver := vol.content.readerResolverView()
+	delta := vol.content.deltaView()
+	for key, want := range enqueued {
+		if delta != nil {
+			if doc, ok := delta.docFor(key); ok && !doc.Deleted &&
+				doc.FileSize == want.size && doc.FileModNano == want.mod {
+				continue
+			}
+		}
+		if reader != nil && reader.idx != nil && resolver != nil {
+			if di, ok := resolver.docForFRN(key); ok && di < len(reader.idx.Docs) {
+				d := &reader.idx.Docs[di]
+				if d.FileSize == want.size && d.FileModNano == want.mod {
+					continue
+				}
+			}
+		}
+		vol.content.walkDeclinedNote(key, want)
 	}
 }

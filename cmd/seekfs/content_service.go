@@ -253,6 +253,25 @@ func (d *contentDelta) textFor(frn uint64) (text []byte, found, deleted bool) {
 	return doc.Text, true, false
 }
 
+// rescind drops a tombstone for frn: the file it pronounced deleted is live
+// again with content matching the base (restored before the fold), so the
+// fold must keep the base doc. A live entry is never touched. Reports
+// whether a tombstone was dropped.
+func (d *contentDelta) rescind(frn uint64) bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	i, ok := d.byFRN[frn]
+	if !ok || !d.docs[i].Deleted {
+		return false
+	}
+	d.docs = append(d.docs[:i], d.docs[i+1:]...)
+	d.byFRN = make(map[uint64]int, len(d.docs))
+	for j := range d.docs {
+		d.byFRN[d.docs[j].FRN] = j
+	}
+	return true
+}
+
 // docFor returns a copy of the delta doc for the key, if any (live or
 // tombstoned). The walk reconcile uses its fingerprint to tell a current
 // entry from a stale one.
@@ -407,6 +426,40 @@ type contentVolumeState struct {
 	// not re-diff a large tree every 2 s.
 	walkReconcileGen uint64
 	walkReconcileAt  time.Time
+	// walkUnindexable remembers keys whose last extraction attempt produced
+	// no indexable text (empty or text-free files), qualified by the
+	// fingerprint attempted, so a reconcile does not re-enqueue them every
+	// pass forever. A fingerprint change drops the memory and retries, so a
+	// file that gains content is still picked up. In-memory only: a restart
+	// re-learns it in one fast-fail round. This is the walk equivalent of
+	// the USN stream never re-reporting a declined file.
+	walkUnindexable map[uint64]contentWalkPrint
+}
+
+// walkDeclinedNote records that key extracted to nothing at print. A later
+// change re-arms it via the fingerprint mismatch in walkDeclinedSkipped.
+func (s *contentVolumeState) walkDeclinedNote(key uint64, print contentWalkPrint) {
+	if s == nil || key == 0 {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.walkUnindexable == nil {
+		s.walkUnindexable = make(map[uint64]contentWalkPrint)
+	}
+	s.walkUnindexable[key] = print
+}
+
+// walkDeclinedSkipped reports whether key was already attempted at print
+// without indexable text. A fingerprint change returns false (retry).
+func (s *contentVolumeState) walkDeclinedSkipped(key uint64, print contentWalkPrint) bool {
+	if s == nil || key == 0 {
+		return false
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	got, ok := s.walkUnindexable[key]
+	return ok && got == print
 }
 
 // walkReconcileMark returns the generation and time of the last walk

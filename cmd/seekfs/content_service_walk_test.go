@@ -47,17 +47,19 @@ func newContentWalkTestVolume(t *testing.T, dir string) (*serviceVolumeIndex, st
 }
 
 // contentWalkDrainTick runs one walk drain pass: reconcile the filename index
-// against the content base (forced, metadata-only), then extract the queue
-// through the key->path resolver, exactly as the drain loop does.
+// against the content base (forced, metadata-only), extract the queue
+// through the key->path resolver, and record unindexable keys, exactly as
+// the drain loop does.
 func contentWalkDrainTick(t *testing.T, s *goSearchService, vol *serviceVolumeIndex) {
 	t.Helper()
-	s.contentReconcileWalkVolume(vol, true)
+	enqueued := s.contentReconcileWalkVolume(vol, true)
 	s.indexMu.RLock()
 	defer s.indexMu.RUnlock()
 	cache := make(map[int]string, 64)
 	vol.contentCoord.processQueue(func(key uint64) (string, bool) {
 		return s.contentResolveWalkPath(vol, key, cache)
 	})
+	s.contentNoteWalkDeclined(vol, enqueued)
 }
 
 // contentWalkSearch is contentServiceSearch that fails the test on error.
@@ -221,6 +223,151 @@ func TestContentWalkZeroJoinStaysStale(t *testing.T) {
 	}
 	if vol.content.usableForQuery() {
 		t.Fatal("zero-join walk base must not be usable")
+	}
+}
+
+// A reconcile with no changes must be a no-op: nothing enqueued, no
+// tombstones. In particular, out-of-scope files (never indexed) must not
+// plant phantom tombstones that every fold reprocesses, and empty files
+// (unindexable) must not re-enqueue forever.
+func TestContentWalkReconcileSteadyState(t *testing.T) {
+	stubContentBuildSync(t)
+	stubContentCatchUpSync(t)
+	dir := t.TempDir()
+	root := filepath.Join(dir, "root")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "a.txt"), []byte("steadymarker text here"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "empty.txt"), []byte{}, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "blob.bin"), []byte{0, 1, 2, 3, 4}, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	vol, _ := newContentWalkTestVolume(t, root)
+	s := contentTestService(t)
+	s.volumes = []*serviceVolumeIndex{vol}
+	s.indexes = []*Index{vol.index}
+	s.ensureContentBuild(vol)
+	if got := vol.content.stateOf(); got != contentStateReady {
+		t.Fatalf("precondition state = %q; want ready", got)
+	}
+	s.contentReconcileWalkVolume(vol, true)
+	if n := vol.contentCoord.queued(); n != 0 {
+		t.Fatalf("steady-state reconcile queued %d keys; want 0", n)
+	}
+	if n := vol.content.deltaView().len(); n != 0 {
+		t.Fatalf("steady-state reconcile left %d delta entries; want 0 (no phantoms)", n)
+	}
+	// And again: idempotent.
+	s.contentReconcileWalkVolume(vol, true)
+	if n := vol.contentCoord.queued(); n != 0 {
+		t.Fatalf("second steady-state reconcile queued %d keys; want 0", n)
+	}
+	if n := vol.content.deltaView().len(); n != 0 {
+		t.Fatalf("second steady-state reconcile left %d delta entries; want 0", n)
+	}
+}
+
+// A nonzero-size file with no indexable text (binary-sniffed) must converge
+// too: the first reconcile enqueues it, extraction declines, and later
+// reconciles remember it instead of retrying forever. A file that gains
+// text afterwards is still picked up via its new fingerprint.
+func TestContentWalkReconcileUnindexableConverges(t *testing.T) {
+	stubContentBuildSync(t)
+	stubContentCatchUpSync(t)
+	dir := t.TempDir()
+	root := filepath.Join(dir, "root")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	binPath := filepath.Join(root, "data.txt")
+	blob := make([]byte, 0, 300)
+	for i := 0; i < 300; i++ {
+		blob = append(blob, byte(i%251), 0)
+	}
+	if err := os.WriteFile(binPath, blob, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	vol, _ := newContentWalkTestVolume(t, root)
+	s := contentTestService(t)
+	s.volumes = []*serviceVolumeIndex{vol}
+	s.indexes = []*Index{vol.index}
+	s.ensureContentBuild(vol)
+	if got := vol.content.stateOf(); got != contentStateReady {
+		t.Fatalf("precondition state = %q; want ready", got)
+	}
+	// First pass: enqueued, extraction declines, remembered.
+	contentWalkDrainTick(t, s, vol)
+	if n := vol.content.deltaView().len(); n != 0 {
+		t.Fatalf("declined file left %d delta entries; want 0", n)
+	}
+	// Second pass: remembered, not re-enqueued.
+	s.contentReconcileWalkVolume(vol, true)
+	if n := vol.contentCoord.queued(); n != 0 {
+		t.Fatalf("remembered unindexable file re-queued (%d); want 0", n)
+	}
+	// The file gains real text (and size): the new fingerprint re-arms it.
+	if err := os.WriteFile(binPath, []byte("nowindexable marker with plenty of text"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.rebuildWalkVolumeInPlace(vol, "test"); err != nil {
+		t.Fatal(err)
+	}
+	contentWalkDrainTick(t, s, vol)
+	if got := contentWalkNames(contentWalkSearch(t, vol, "content:nowindexable")); len(got) != 1 || got[0] != "data.txt" {
+		t.Fatalf("re-armed content = %v; want [data.txt]", got)
+	}
+}
+
+// Deleting a file tombstones it; restoring the identical content before the
+// fold must rescind the tombstone, or the fold would drop live content.
+func TestContentWalkRestoreBeforeFoldKeepsDoc(t *testing.T) {
+	stubContentBuildSync(t)
+	stubContentCatchUpSync(t)
+	dir := t.TempDir()
+	root := filepath.Join(dir, "root")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(root, "fragile.txt")
+	text := []byte("fragilemarker durable text content here")
+	if err := os.WriteFile(path, text, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	vol, _ := newContentWalkTestVolume(t, root)
+	s := contentTestService(t)
+	s.volumes = []*serviceVolumeIndex{vol}
+	s.indexes = []*Index{vol.index}
+	s.ensureContentBuild(vol)
+	if got := vol.content.stateOf(); got != contentStateReady {
+		t.Fatalf("precondition state = %q; want ready", got)
+	}
+
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.rebuildWalkVolumeInPlace(vol, "test"); err != nil {
+		t.Fatal(err)
+	}
+	contentWalkDrainTick(t, s, vol)
+	if got := contentWalkSearch(t, vol, "content:fragilemarker"); len(got) != 0 {
+		t.Fatalf("deleted content still findable: %v", contentWalkNames(got))
+	}
+
+	if err := os.WriteFile(path, text, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.rebuildWalkVolumeInPlace(vol, "test"); err != nil {
+		t.Fatal(err)
+	}
+	contentWalkDrainTick(t, s, vol)
+	s.runContentFold(vol)
+	if got := contentWalkNames(contentWalkSearch(t, vol, "content:fragilemarker")); len(got) != 1 || got[0] != "fragile.txt" {
+		t.Fatalf("restored content after fold = %v; want [fragile.txt]", got)
 	}
 }
 
