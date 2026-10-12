@@ -96,7 +96,7 @@ func cmdContentIndex(args []string) error {
 			return enc.Encode(est)
 		}
 		fmt.Fprintf(os.Stdout, "content scope estimate for %s (mode=%s):\n", rec.Volume, scope.Mode)
-		fmt.Fprintf(os.Stdout, "  files=%d bytes=%d projected_gsx=%d max_files_hit=%v budget_hit=%v\n", est.Files, est.Bytes, est.ProjectedGSXBytes, est.MaxFilesHit, est.BudgetHit)
+		fmt.Fprintf(os.Stdout, "  files=%d bytes=%d projected_gsx=%d max_files_hit=%v budget_hit=%v budget=%d eligible_files=%d eligible_bytes=%d\n", est.Files, est.Bytes, est.ProjectedGSXBytes, est.MaxFilesHit, est.BudgetHit, est.BudgetBytes, est.EligibleFiles, est.EligibleBytes)
 		for _, r := range est.Repos {
 			fmt.Fprintf(os.Stdout, "  repo: %s\n", r)
 		}
@@ -161,7 +161,7 @@ func cmdContentIndex(args []string) error {
 	}
 	fmt.Fprintf(os.Stdout, "indexed %d documents into %s\n", len(idx.Docs), outPath)
 	if p := idx.Policy; p != (contentBuildPolicy{}) {
-		fmt.Fprintf(os.Stdout, "policy: max_raw=%d max_text=%d skipped=%d truncated=%d\n", p.MaxRaw, p.MaxText, p.Skipped, p.Truncated)
+		fmt.Fprintf(os.Stdout, "policy: max_raw=%d max_text=%d skipped=%d truncated=%d scope_dropped=%d scope_dropped_bytes=%d budget=%d\n", p.MaxRaw, p.MaxText, p.Skipped, p.Truncated, p.ScopeDropped, p.ScopeDroppedBytes, p.BudgetBytes)
 	}
 	if idx.Scanned > 0 || idx.Declined > 0 {
 		// Reconcile: indexed == eligible - declined - skipped (truncated files

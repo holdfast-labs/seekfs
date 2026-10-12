@@ -65,6 +65,32 @@ See [FEATURES.md](FEATURES.md) for configuration,
 query syntax, limits and the companion protocol. `seekfs loaded --json` reports
 feature health independently of filename-search health.
 
+## Content scope
+
+The service-owned content build indexes detected Git worktrees plus
+configured roots (never the whole volume). These `[content]` keys tune it
+(`[content."E:"]` overrides one volume):
+
+```toml
+[content]
+mode = "auto"            # auto | explicit | off
+roots = ["E:\\work"]
+exclude = ["E:\\work\\scratch"]
+exts = [".go", ".md"]
+git = true               # follow worktree .gitignore rules
+system_excludes = true
+budget_bytes = 4294967296  # explicit extracted-text budget
+```
+
+`budget_bytes` defaults to a tenth of the index volume's free space (floored
+at 2 GiB, capped at the 4 GiB sidecar cap), so a Chromium-size repo indexes
+completely; only an explicit value joins the sidecar identity. Environment
+overrides are `SEEKFS_CONTENT_SCOPE`, `SEEKFS_CONTENT_ROOTS`,
+`SEEKFS_CONTENT_EXCLUDE`, and `SEEKFS_CONTENT_BUDGET_BYTES`. When the budget
+truncates a build, health reports the exact dropped files/bytes and the
+enforced budget (`scope_dropped`, `scope_dropped_bytes`, `budget_bytes` in
+`loaded --json`); raise `budget_bytes` to index the rest.
+
 ## Editing Config
 
 Use `seekfs config` so agents and users do not need to locate the file manually:

@@ -304,9 +304,27 @@ function contentStatusText(content) {
     return `Indexing contents ${pct}%`;
   }
   if (content.error) return `Contents: ${content.error}`;
+  if (content.scope_dropped) {
+    return `${content.scope_dropped.toLocaleString()} files not indexed (budget ${formatBudgetBytes(content.budget_bytes)}) — raise [features.content] budget_bytes`;
+  }
   if (content.incomplete || content.partial) return "Contents: partial results";
   if (content.state === "ready") return content.docs ? `${content.docs.toLocaleString()} files indexed` : "";
   return `Contents ${content.state}`;
+}
+
+// formatBudgetBytes renders a byte budget as "2 GiB" (unknown when unset), so
+// the scope-dropped footer names the exact enforced budget.
+function formatBudgetBytes(n) {
+  if (!n) return "unknown";
+  const units = ["B", "KiB", "MiB", "GiB", "TiB"];
+  let v = n;
+  let u = 0;
+  while (v >= 1024 && u < units.length - 1) {
+    v /= 1024;
+    u += 1;
+  }
+  const text = Number.isInteger(v) ? v.toString() : v.toFixed(1);
+  return `${text} ${units[u]}`;
 }
 
 function rowFromEvent(event) {

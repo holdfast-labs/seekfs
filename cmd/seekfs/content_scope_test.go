@@ -36,8 +36,16 @@ func TestContentScopeForVolumeDefaults(t *testing.T) {
 	if s.Mode != contentScopeAuto || !s.IncludeGit || !s.SystemExcludes {
 		t.Fatalf("defaults = %+v; want auto/git/system", s)
 	}
-	if want := int64(float64(contentGSXMaxBytes) * contentScopeBudgetFraction); s.BudgetBytes != want {
-		t.Fatalf("default budget = %d; want %d", s.BudgetBytes, want)
+	// Without config the budget derives from the volume's free space (floored
+	// and capped), and is not explicit, so it stays out of the fingerprint.
+	if want := defaultContentScopeBudget(contentScopeBudgetAnchor("C:")); s.BudgetBytes != want {
+		t.Fatalf("default budget = %d; want derived %d", s.BudgetBytes, want)
+	}
+	if s.BudgetBytes < contentScopeBudgetFloorBytes || s.BudgetBytes > contentScopeBudgetCeilBytes {
+		t.Fatalf("default budget = %d; want within [%d, %d]", s.BudgetBytes, contentScopeBudgetFloorBytes, contentScopeBudgetCeilBytes)
+	}
+	if s.BudgetExplicit {
+		t.Fatal("derived default budget must not be explicit")
 	}
 }
 
@@ -88,8 +96,8 @@ func TestContentScopeInvalidFallsBack(t *testing.T) {
 	if s.Mode != contentScopeAuto {
 		t.Fatalf("invalid mode = %q; want auto", s.Mode)
 	}
-	if s.BudgetBytes != defaultContentScope().BudgetBytes {
-		t.Fatalf("invalid budget = %d; want default", s.BudgetBytes)
+	if want := defaultContentScopeBudget(contentScopeBudgetAnchor("C:")); s.BudgetBytes != want {
+		t.Fatalf("invalid budget = %d; want derived default %d", s.BudgetBytes, want)
 	}
 }
 
@@ -246,6 +254,66 @@ func TestContentScopeEstimateAndDetect(t *testing.T) {
 	budgeted.BudgetBytes = 110
 	if capped := scanContentScope(idx, budgeted, "C:", 0); !capped.BudgetHit || capped.Files != 1 || capped.Bytes != 20 {
 		t.Fatalf("budget=110 => files=%d bytes=%d hit=%v; want 1/20/true (build/out.txt sorts first)", capped.Files, capped.Bytes, capped.BudgetHit)
+	} else if capped.BudgetBytes != 110 || capped.EligibleFiles != 4 || capped.EligibleBytes != 210 {
+		t.Fatalf("budget=110 => budget=%d eligible=%d/%d; want 110, 4 files, 210 bytes", capped.BudgetBytes, capped.EligibleFiles, capped.EligibleBytes)
+	}
+}
+
+func TestDefaultContentScopeBudgetDerived(t *testing.T) {
+	// No anchor: the legacy fixed default.
+	if want := int64(float64(contentGSXMaxBytes) * contentScopeBudgetFraction); defaultContentScopeBudget("") != want {
+		t.Fatalf("anchorless budget = %d; want legacy %d", defaultContentScopeBudget(""), want)
+	}
+	// A real anchor: a tenth of free space within the floor/ceiling.
+	got := defaultContentScopeBudget(t.TempDir())
+	if got < contentScopeBudgetFloorBytes || got > contentScopeBudgetCeilBytes {
+		t.Fatalf("derived budget = %d; want within [%d, %d]", got, contentScopeBudgetFloorBytes, contentScopeBudgetCeilBytes)
+	}
+	// Anchors: bare volumes anchor at the root, absolute paths at themselves,
+	// anything else anchors nowhere.
+	if a := contentScopeBudgetAnchor("E:"); a == "" {
+		t.Fatal("bare volume must anchor")
+	}
+	if a := contentScopeBudgetAnchor(""); a != "" {
+		t.Fatalf("empty volume anchored at %q", a)
+	}
+	if a := contentScopeBudgetAnchor("relative"); a != "" {
+		t.Fatalf("relative volume anchored at %q", a)
+	}
+}
+
+func TestContentScopeFingerprintBudgetProvenance(t *testing.T) {
+	t.Setenv("SEEKFS_CONTENT_SCOPE", "")
+	t.Setenv("SEEKFS_CONTENT_ROOTS", "")
+	t.Setenv("SEEKFS_CONTENT_EXCLUDE", "")
+	t.Setenv("SEEKFS_CONTENT_BUDGET_BYTES", "")
+	base := defaultContentScope()
+	a := base.resolve("C:", nil)
+	// The derived default is stable and budgets nothing into the identity.
+	if a.fingerprint() != base.resolve("C:", nil).fingerprint() {
+		t.Fatal("derived-budget fingerprint must be stable")
+	}
+	// The same numeric budget, made explicit, joins the identity...
+	exp := base
+	exp.BudgetBytes = a.BudgetBytes
+	exp.BudgetExplicit = true
+	if exp.resolve("C:", nil).fingerprint() == a.fingerprint() {
+		t.Fatal("an explicit budget must join the scope fingerprint")
+	}
+	// ...and distinct explicit budgets differ.
+	exp2 := exp
+	exp2.BudgetBytes++
+	if exp.resolve("C:", nil).fingerprint() == exp2.resolve("C:", nil).fingerprint() {
+		t.Fatal("distinct explicit budgets must fingerprint differently")
+	}
+	// contentScopeForVolume marks config and env budgets explicit.
+	cfg := appConfig{Content: contentScopeConfig{BudgetBytes: 1234}}
+	if s := contentScopeForVolume(cfg, "C:"); !s.BudgetExplicit || s.BudgetBytes != 1234 {
+		t.Fatalf("config budget = %+v; want explicit 1234", s)
+	}
+	t.Setenv("SEEKFS_CONTENT_BUDGET_BYTES", "5678")
+	if s := contentScopeForVolume(appConfig{}, "C:"); !s.BudgetExplicit || s.BudgetBytes != 5678 {
+		t.Fatalf("env budget = %+v; want explicit 5678", s)
 	}
 }
 

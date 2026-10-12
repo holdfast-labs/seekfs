@@ -36,15 +36,22 @@ type contentScopeUnit struct {
 
 // contentEstimate is the pre-flight estimate for a scoped build.
 type contentEstimate struct {
-	Files             int64              `json:"files"`
-	Bytes             int64              `json:"bytes"` // Σ min(size, contentExtractMaxTextBytes)
-	ByExt             map[string]int64   `json:"by_ext,omitempty"`
-	ByUnit            []contentScopeUnit `json:"by_unit,omitempty"`
-	Repos             []string           `json:"repos,omitempty"`
-	Excluded          map[string]int64   `json:"excluded,omitempty"` // reason -> files
-	MaxFilesHit       bool               `json:"max_files_hit,omitempty"`
-	BudgetHit         bool               `json:"budget_hit,omitempty"`
-	ProjectedGSXBytes int64              `json:"projected_gsx_bytes"`
+	Files       int64              `json:"files"`
+	Bytes       int64              `json:"bytes"` // Σ min(size, contentExtractMaxTextBytes)
+	ByExt       map[string]int64   `json:"by_ext,omitempty"`
+	ByUnit      []contentScopeUnit `json:"by_unit,omitempty"`
+	Repos       []string           `json:"repos,omitempty"`
+	Excluded    map[string]int64   `json:"excluded,omitempty"` // reason -> files
+	MaxFilesHit bool               `json:"max_files_hit,omitempty"`
+	BudgetHit   bool               `json:"budget_hit,omitempty"`
+	BudgetBytes int64              `json:"budget_bytes"`
+	// EligibleFiles/EligibleBytes are the pre-budget totals over the whole
+	// candidate set, so a budget_hit names exactly what was cut: eligible
+	// files were considered, files fit. (When MaxFilesHit, both are over the
+	// priority-truncated set, like Files/Bytes.)
+	EligibleFiles     int64 `json:"eligible_files"`
+	EligibleBytes     int64 `json:"eligible_bytes"`
+	ProjectedGSXBytes int64 `json:"projected_gsx_bytes"`
 }
 
 // contentDetectGitRepos returns the normalized worktree roots of every `.git`
@@ -117,13 +124,14 @@ func (s contentScope) resolveForIndex(volume string, idx *Index) (contentScopeRe
 
 // attachGitIgnore enables git ignore rules for the resolved worktrees. It
 // stats the ignore files, so callers holding index locks should detect the
-// layout under the lock and attach after releasing it.
+// layout under the lock and attach after releasing it. The global excludes
+// paths are resolved per repo here so the digest covers them.
 func (r *contentScopeResolved) attachGitIgnore(ignoreFiles map[string][]string) {
 	if len(r.Repos) == 0 {
 		return
 	}
 	r.Ignore = newContentGitIgnore(r.Repos)
-	r.IgnoreDigest = contentIgnoreDigest(r.Repos, ignoreFiles)
+	r.IgnoreDigest = contentIgnoreDigest(r.Repos, ignoreFiles, r.Ignore.resolveGlobals())
 }
 
 // scanContentScope estimates what a scoped build would index. maxFiles mirrors
@@ -190,6 +198,11 @@ func scanContentScope(idx *Index, scope contentScope, volume string, maxFiles in
 		return contentBuildItemLess(candidates[i].item, candidates[j].item)
 	})
 	unitIndex := make(map[string]int)
+	est.BudgetBytes = resolved.BudgetBytes
+	for _, c := range candidates {
+		est.EligibleFiles++
+		est.EligibleBytes += c.bytes
+	}
 	for _, c := range candidates {
 		if est.Bytes+c.bytes > resolved.BudgetBytes {
 			est.BudgetHit = true

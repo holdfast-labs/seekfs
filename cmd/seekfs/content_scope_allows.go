@@ -29,13 +29,16 @@ var contentSystemExcludeVolumeDirs = []string{
 // contentScopeResolved is a scope with its effective roots and excludes for one
 // volume plus the detected git worktrees.
 type contentScopeResolved struct {
-	Mode           contentScopeMode
-	Roots          []string // effective include roots (normalized)
-	Repos          []string // detected git worktree roots (normalized)
-	ExplicitRoots  []string // configured roots, before known folders are added
-	Excludes       []string // normalized exclude prefixes
-	ExtSet         map[string]struct{}
-	BudgetBytes    int64
+	Mode          contentScopeMode
+	Roots         []string // effective include roots (normalized)
+	Repos         []string // detected git worktree roots (normalized)
+	ExplicitRoots []string // configured roots, before known folders are added
+	Excludes      []string // normalized exclude prefixes
+	ExtSet        map[string]struct{}
+	BudgetBytes   int64
+	// BudgetExplicit mirrors contentScope.BudgetExplicit: only an explicit
+	// budget joins the scope fingerprint (see contentScopeSelectionVersion).
+	BudgetExplicit bool
 	SystemExcludes bool
 	// Ignore applies git ignore rules inside detected worktrees in place of
 	// the name-based system excludes; IgnoreDigest fingerprints the ignore
@@ -47,7 +50,7 @@ type contentScopeResolved struct {
 // resolve computes the effective roots/excludes. repoRoots are the detected git
 // worktree roots (contentDetectGitRepos).
 func (s contentScope) resolve(volume string, repoRoots []string) contentScopeResolved {
-	r := contentScopeResolved{Mode: s.Mode, BudgetBytes: s.BudgetBytes, SystemExcludes: s.SystemExcludes}
+	r := contentScopeResolved{Mode: s.Mode, BudgetBytes: s.BudgetBytes, BudgetExplicit: s.BudgetExplicit, SystemExcludes: s.SystemExcludes}
 	if s.Exts != nil {
 		r.ExtSet = s.Exts
 	} else {

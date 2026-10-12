@@ -894,6 +894,60 @@ func TestContentServiceBuildBudgetUsesExtractedTextAndPriority(t *testing.T) {
 	if len(built.Docs) != 1 || built.Docs[0].FRN != 4 || built.Policy.ScopeDropped != 1 {
 		t.Fatalf("priority index docs=%+v dropped=%d; want only repo file", built.Docs, built.Policy.ScopeDropped)
 	}
+	// The enforced budget is recorded for health.
+	if built.Policy.BudgetBytes != 8 {
+		t.Fatalf("priority index policy = %+v; want budget=8", built.Policy)
+	}
+}
+
+// A biting byte budget records EXACT dropped files and extracted-text bytes:
+// the ordered stream is consumed to the end, tallying each excluded file's
+// real extracted size instead of the remaining-item estimate.
+func TestContentServiceBuildBudgetDropsExactFilesAndBytes(t *testing.T) {
+	t.Setenv("SEEKFS_CONTENT_SEARCH", "1")
+	stubContentCatchUpSync(t)
+	stubContentBuildSync(t)
+	dir := t.TempDir()
+	bodies := map[string]string{
+		"a.txt": "alpha",
+		"b.txt": "bravo!",
+		"c.txt": "charlie?",
+	}
+	for name, body := range bodies {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	const journal = uint64(93)
+	const cp = int64(101)
+	stubContentCatchUpJournal(t, usnJournalDataV0{UsnJournalID: journal, FirstUsn: 1, LowestValidUsn: 1, NextUsn: cp})
+	vol, gsx := contentBuildTestVolume(t, dir, journal, uint64(cp), []CompactRecord{
+		{FRN: 1, Parent: -1, Name: "a.txt", Size: 5},
+		{FRN: 2, Parent: -1, Name: "b.txt", Size: 6},
+		{FRN: 3, Parent: -1, Name: "c.txt", Size: 8},
+	})
+	s := contentTestService(t)
+	// Fits a.txt + b.txt (5+6=11), drops c.txt (8 bytes of extracted text).
+	s.contentCfg.Content.BudgetBytes = 11
+	s.ensureContentBuild(vol)
+	built, err := contentLoadFile(gsx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	releaseContentIndexOnCleanup(t, built)
+	if len(built.Docs) != 2 || built.Policy.ScopeDropped != 1 {
+		t.Fatalf("budgeted index docs=%d dropped=%d; want 2 docs, 1 dropped", len(built.Docs), built.Policy.ScopeDropped)
+	}
+	if built.Policy.ScopeDroppedBytes != int64(len("charlie?")) || built.Policy.BudgetBytes != 11 {
+		t.Fatalf("budgeted index policy = %+v; want dropped_bytes=%d budget=11", built.Policy, len("charlie?"))
+	}
+	h := vol.content.healthSnapshot(0)
+	if h.ScopeDropped != 1 || h.ScopeDroppedBytes != int64(len("charlie?")) || h.BudgetBytes != 11 {
+		t.Fatalf("budget health = %+v; want exact dropped files/bytes/budget", h)
+	}
+	if !h.Incomplete {
+		t.Fatal("budget-truncated sidecar must report incomplete")
+	}
 }
 
 // A volume whose generation keeps changing must not spin builds forever: after

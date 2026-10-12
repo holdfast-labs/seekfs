@@ -617,6 +617,12 @@ func (s *goSearchService) contentDrainLoop(vol *serviceVolumeIndex) {
 				}
 				return path, true
 			})
+			if scope != nil && scope.Ignore != nil && scope.Ignore.globalChanged() {
+				// The global excludes file lives outside the volume, so the
+				// USN stream never reports its edits; poll its stat instead.
+				// Same rebuild as an edited in-volume ignore file.
+				ignoreChanged = true
+			}
 			if ignoreChanged {
 				// Files the edit newly ignores or un-ignores are not in the
 				// change stream, so only a rebuild under the new rules (and

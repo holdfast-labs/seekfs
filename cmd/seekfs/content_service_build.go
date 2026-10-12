@@ -29,9 +29,11 @@ package main
 // it never retains the raw corpus in memory. Peak transient heap is one
 // document's text plus posting arenas, assembled text, and capped metadata.
 //
-// IO governor. Extraction is serial and paused every batch so filename search
-// and USN replay keep the disk; the loop is cancelable through s.stop and the
-// per-volume build generation.
+// IO governor. Extraction runs on contentBuildWorkerCount workers (dropped to
+// one while the user queries or the machine is on battery) with per-handle
+// low disk priority (contentOpenNoRecall), and pauses every batch so filename
+// search and USN replay keep the disk; the loop is cancelable through s.stop
+// and the per-volume build generation.
 //
 // Build vs catch-up. A base build extracts the base corpus while restart
 // catch-up and the drain loop may extract changed files into the in-memory
@@ -528,7 +530,7 @@ func (s *goSearchService) runContentBuild(vol *serviceVolumeIndex, reuseSidecar 
 		return
 	}
 	retry := false
-	var scopeDropped int64
+	var scopeDropped, scopeDroppedBytes int64
 	select {
 	case contentBuildGate <- struct{}{}:
 	case <-contentActivationDone(vol):
@@ -676,9 +678,11 @@ func (s *goSearchService) runContentBuild(vol *serviceVolumeIndex, reuseSidecar 
 	total := len(items)
 	done := 0
 	var used, skipped, truncated int64
+	// overBudget latches once the scope byte budget bites; see the tally below.
+	overBudget := false
 	abortReason := ""
 	abortRetry := false
-	nextExtracted, stopPrefetch := contentPrefetchExtract(ctx, items, contentBuildWorkers, contentBuildDocSafe)
+	nextExtracted, stopPrefetch := contentPrefetchExtract(ctx, items, contentBuildWorkerCount(), contentBuildDocSafe)
 	defer stopPrefetch()
 	for done < total {
 		// The atomic generation covers the common abort (a rebuild/journal
@@ -730,9 +734,17 @@ func (s *goSearchService) runContentBuild(vol *serviceVolumeIndex, reuseSidecar 
 			continue
 		}
 		n := int64(len(doc.text))
-		if opts.Scope != nil && opts.Scope.BudgetBytes > 0 && n > opts.Scope.BudgetBytes-used {
-			scopeDropped += int64(total - done + 1)
-			break
+		// Once the byte budget bites, extraction keeps consuming the ordered
+		// stream to the end (abort and pacing checks above are unchanged) so
+		// the dropped files and bytes are exact: every remaining file is
+		// still extracted, its text tallied and released instead of spooled.
+		// Selection order is unchanged; this only costs extraction work on a
+		// build that was already going to publish incomplete.
+		if overBudget || opts.Scope != nil && opts.Scope.BudgetBytes > 0 && n > opts.Scope.BudgetBytes-used {
+			overBudget = true
+			scopeDropped++
+			scopeDroppedBytes += n
+			continue
 		}
 		offset, err := spool.Seek(0, io.SeekCurrent)
 		if err != nil {
@@ -782,11 +794,15 @@ func (s *goSearchService) runContentBuild(vol *serviceVolumeIndex, reuseSidecar 
 			return contentBuildDoc{path: s.item.path, frn: s.item.frn, text: text, modUnix: s.modUnix, class: s.class, version: s.version}, true, nil
 		}
 	}
+	var budgetBytes int64
+	if opts.Scope != nil {
+		budgetBytes = opts.Scope.BudgetBytes
+	}
 	header := &contentIndex{
 		Origin:        contentOriginUSN,
 		JournalID:     journalID,
 		CheckpointUSN: uint64(checkpoint),
-		Policy:        contentBuildPolicy{MaxRaw: settings.maxRaw, MaxText: settings.maxText, Skipped: skipped, Truncated: truncated, ScopeDropped: scopeDropped},
+		Policy:        contentBuildPolicy{MaxRaw: settings.maxRaw, MaxText: settings.maxText, Skipped: skipped, Truncated: truncated, ScopeDropped: scopeDropped, ScopeDroppedBytes: scopeDroppedBytes, BudgetBytes: budgetBytes},
 	}
 	if opts.Scope != nil {
 		header.ScopeHash = opts.Scope.fingerprint()

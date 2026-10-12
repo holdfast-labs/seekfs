@@ -97,10 +97,33 @@ are `SEEKFS_CONTENT_SCOPE`, `SEEKFS_CONTENT_ROOTS`, and
 the service rebuilds an older sidecar or one whose scope changed before serving
 its stored content.
 
+Inside a detected worktree the scope follows git's ignore rules with git's
+precedence: `.gitignore` files, then `.git/info/exclude`, then the global
+excludes file (`core.excludesFile` from the repo's `.git/config` or the
+user's `~/.gitconfig`, else `%USERPROFILE%\.config\git\ignore` /
+`$XDG_CONFIG_HOME/git/ignore`). The global file joins the scope digest, and
+the drain loop polls its stat (it lives outside the volume, so the USN
+stream never reports it), so edits rebuild under the new rules.
+
 The service selects Git repositories before configured roots, then known
 folders. It spools accepted extracted text to temporary disk before assembling
 the FRN-sorted sidecar, so a large scoped build needs temporary disk space up
 to its extracted-text budget.
+
+The extracted-text budget (`budget_bytes`) defaults to a tenth of the index
+volume's free space (floored at 2 GiB, capped at the 4 GiB sidecar cap), so a
+Chromium-size repo indexes completely; sharding bounds build and fold memory
+per 64 MiB shard, so the budget is really disk space. Set `[content]`
+`budget_bytes` (or `[content."E:"]` per volume, or
+`SEEKFS_CONTENT_BUDGET_BYTES`) to pin an explicit budget. Only an explicit
+budget joins the sidecar identity: the derived default tracks free space, and
+fingerprinting it would rebuild on every drift. When a budget does bite, the
+build still extracts the excluded files and tallies their exact sizes, so the
+`.gsx` policy records exact `scope_dropped` files and `scope_dropped_bytes`
+plus the enforced `budget_bytes`; content health (`loaded --json`,
+`scope_dropped`/`scope_dropped_bytes`/`budget_bytes`) and the UI footer
+surface them as e.g. "12,345 files not indexed (budget 2 GiB) — raise
+[features.content] budget_bytes" instead of a vague "partial results".
 
 ### 2b. Content matching semantics
 

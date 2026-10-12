@@ -53,7 +53,7 @@ func contentTestState() *contentVolumeState {
 func TestContentHealthSurfacesBuildPolicy(t *testing.T) {
 	t.Setenv("SEEKFS_CONTENT_SEARCH", "1")
 	idx := newContentIndex()
-	idx.Policy = contentBuildPolicy{MaxRaw: 8, MaxText: 4, Skipped: 2, Truncated: 1, ScopeDropped: 1}
+	idx.Policy = contentBuildPolicy{MaxRaw: 8, MaxText: 4, Skipped: 2, Truncated: 1, ScopeDropped: 3, ScopeDroppedBytes: 44, BudgetBytes: 100}
 	r, err := openContentReader(idx)
 	if err != nil {
 		t.Fatal(err)
@@ -64,8 +64,44 @@ func TestContentHealthSurfacesBuildPolicy(t *testing.T) {
 	if h.MaxRaw != 8 || h.MaxText != 4 || h.Skipped != 2 || h.Truncated != 1 {
 		t.Fatalf("health policy not surfaced: %+v", h)
 	}
+	if h.ScopeDropped != 3 || h.ScopeDroppedBytes != 44 || h.BudgetBytes != 100 {
+		t.Fatalf("health budget drop not surfaced: %+v", h)
+	}
 	if !h.Incomplete || h.State != contentStateDegraded {
 		t.Fatalf("budget-limited sidecar not marked incomplete: %+v", h)
+	}
+}
+
+func TestContentBudgetLabel(t *testing.T) {
+	cases := map[int64]string{
+		0:       "unknown",
+		-5:      "unknown",
+		512:     "512 B",
+		1536:    "1.5 KiB",
+		1 << 20: "1 MiB",
+		2 << 30: "2 GiB",
+		3 << 30: "3 GiB",
+		5 << 40: "5 TiB",
+	}
+	for n, want := range cases {
+		if got := contentBudgetLabel(n); got != want {
+			t.Errorf("contentBudgetLabel(%d) = %q; want %q", n, got, want)
+		}
+	}
+}
+
+func TestContentHealthSummary(t *testing.T) {
+	if got := contentHealthSummary(nil); got != "state=off" {
+		t.Fatalf("nil summary = %q", got)
+	}
+	plain := contentHealthSummary(&contentHealth{State: contentStateReady, Docs: 10})
+	if plain != "state=ready docs=10" {
+		t.Fatalf("plain summary = %q", plain)
+	}
+	dropped := contentHealthSummary(&contentHealth{State: contentStateDegraded, Docs: 7, ScopeDropped: 12345, ScopeDroppedBytes: 6789, BudgetBytes: 2 << 30})
+	want := "state=degraded docs=7 scope_dropped_files=12345 scope_dropped_bytes=6789 budget=2 GiB (raise [features.content] budget_bytes)"
+	if dropped != want {
+		t.Fatalf("dropped summary = %q; want %q", dropped, want)
 	}
 }
 

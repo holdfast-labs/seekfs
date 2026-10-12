@@ -546,4 +546,8 @@ func TestUIContentStatusFromHealth(t *testing.T) {
 	if got.State != contentStateIndexing || got.BuildDone != 5 || got.BuildTotal != 10 || got.Error != "disk full" {
 		t.Fatalf("uiContentStatusFrom = %+v", got)
 	}
+	dropped := uiContentStatusFrom(&contentHealth{State: contentStateDegraded, ScopeDropped: 12345, ScopeDroppedBytes: 6789, BudgetBytes: 2 << 30})
+	if dropped.ScopeDropped != 12345 || dropped.ScopeDroppedBytes != 6789 || dropped.BudgetBytes != 2<<30 {
+		t.Fatalf("uiContentStatusFrom dropped = %+v", dropped)
+	}
 }
