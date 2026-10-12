@@ -91,10 +91,14 @@ E:\bench\seekfs-native.exe -pipe \\.\pipe\seekfs-native-dev
 ```
 
 Flags: `-pipe` (service pipe, default `\\.\pipe\seekfs-service`), `-n`
-(result limit). Environment: `SEEKFS_NATIVE_QUERY` runs one search at
-startup (deterministic screenshots), `SEEKFS_NATIVE_DPISCALE=1.5` scales all
-layout for scaling tests, `SEEKFS_NATIVE_DEBUGLOG=<file>` logs search
-delivery and frames, `SEEKFS_NATIVE_SETTINGS` overrides the settings path
+(result limit). Headless snapshots (deterministic, no window needed):
+`-snapshot out.png -theme dark|light -scale 1|1.5 -size 1280x800
+-query chrome -view details|icons|grouped -contents -preview`.
+Environment: `SEEKFS_NATIVE_QUERY` runs one search at startup,
+`SEEKFS_NATIVE_THEME=dark|light` overrides the OS theme,
+`SEEKFS_NATIVE_DPISCALE=1.5` scales all layout for scaling tests,
+`SEEKFS_NATIVE_DEBUGLOG=<file>` logs search delivery and frames,
+`SEEKFS_NATIVE_SETTINGS` overrides the settings path
 (`%APPDATA%\seekfs\native.json` by default).
 
 Features: instant debounced search, Contents toggle (`content:` rewrite with

@@ -505,6 +505,34 @@ func TestFitColumnsShrink(t *testing.T) {
 	}
 }
 
+func TestHeadlessFluentGlyphs(t *testing.T) {
+	u := testUI(t, true)
+	for name, g := range map[string]string{
+		"back": iconBack, "forward": iconForward, "search": iconSearch,
+		"clear": iconClear, "list": iconList, "grid": iconGrid,
+		"group": iconGroup, "contents": iconContents, "saved": iconSaved,
+		"add": iconAdd,
+	} {
+		img := renderHeadless(t, 60, 60, func(gtx layout.Context) layout.Dimensions {
+			u.paintBG(gtx)
+			return ficon(u.th, Sp(24), g, u.scheme.Text).Layout(gtx)
+		})
+		n := 0
+		for y := 0; y < 60; y++ {
+			for x := 0; x < 60; x++ {
+				c := img.RGBAAt(x, y)
+				if (int(c.R)+int(c.G)+int(c.B))/3 > 120 {
+					n++
+				}
+			}
+		}
+		t.Logf("glyph %s bright=%d", name, n)
+		if n < 5 {
+			t.Errorf("fluent glyph %s (%q) rendered blank", name, g)
+		}
+	}
+}
+
 func TestHeadlessBisectFullNoStatus(t *testing.T) {
 	u := testUI(t, true)
 	setRows(u, sampleRows(60))
