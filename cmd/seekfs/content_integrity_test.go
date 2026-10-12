@@ -10,7 +10,9 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
+	"time"
 )
 
 // contentCorruptSection rewrites path with one byte flipped inside the payload
@@ -186,6 +188,70 @@ func stubContentVerifySync(t *testing.T) {
 	restore := contentVerifyAsync
 	contentVerifyAsync = func(fn func()) { fn() }
 	t.Cleanup(func() { contentVerifyAsync = restore })
+}
+
+// TestContentVerifyPassReleaseMidHash proves the mapping lifetime, not a
+// probe, protects the pass: with the pass paused mid-hash, releasing the
+// index blocks until the pass drops its pin (no fault), and the pass then
+// reports the release cleanly instead of hashing a gone mapping.
+func TestContentVerifyPassReleaseMidHash(t *testing.T) {
+	path, loaded := contentIntegrityTestFile(t)
+	// The fixture registers a cleanup Release; this test also releases
+	// mid-pass, which is safe because Release is once-only.
+
+	// Pause the pass on the first checksummed section it hashes.
+	entered := make(chan struct{})
+	releaseGate := make(chan struct{})
+	var once sync.Once
+	restoreHook := contentVerifySectionHook
+	contentVerifySectionHook = func(tag uint32) {
+		once.Do(func() { close(entered) })
+		<-releaseGate
+	}
+	t.Cleanup(func() { contentVerifySectionHook = restoreHook })
+
+	passDone := make(chan error, 1)
+	go func() { passDone <- verifyContentSectionCRCs(loaded) }()
+
+	<-entered
+	released := make(chan struct{})
+	go func() {
+		loaded.Release()
+		close(released)
+	}()
+
+	// The Release must wait for the pinned pass: it cannot complete while the
+	// pass is still parked inside the hook.
+	select {
+	case <-released:
+		t.Fatal("Release completed while the verify pass still held its pin")
+	case <-time.After(time.Second):
+	}
+	close(releaseGate)
+	select {
+	case <-released:
+	case <-time.After(10 * time.Second):
+		t.Fatal("Release never completed after the pass dropped its pin")
+	}
+
+	// The pass stopped early on the release instead of faulting on an
+	// unmapped view.
+	select {
+	case err := <-passDone:
+		if err == nil {
+			t.Fatal("pass over a released index must not report success")
+		}
+		t.Logf("pass stopped early: %v", err)
+	case <-time.After(10 * time.Second):
+		t.Fatal("pass never returned after release")
+	}
+
+	// The mapping is really gone: the file is writable again on Windows.
+	f, err := os.OpenFile(path, os.O_WRONLY, 0o644)
+	if err != nil {
+		t.Fatalf("released mapping still holds the file: %v", err)
+	}
+	_ = f.Close()
 }
 
 // TestContentIntegrityFailureMarksStaleAndRebuilds attaches a base with one

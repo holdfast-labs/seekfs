@@ -639,8 +639,12 @@ legacy (pre-checksum) section that loads and is upgraded with checksums on
 the next save. Decode verifies the small sections (doc table, paths, policy,
 scope, manifest) immediately, so a corrupt small section fails the load; the
 large text/term/gram sections are verified by a background pass after attach
-(`verifyContentAfterAttach`), so startup does not page in gigabytes. A
-mismatch drops the base (stale — queries are refused, never served from
+(`verifyContentAfterAttach`), so startup does not page in gigabytes. The pass
+hashes each index (and each shard index) under its read pin, and `Release`
+refuses new pins and waits for pinned reads before unmapping, so the unmap
+can never race an in-flight section read even outside `indexMu` (a mapping
+torn down mid-pass stops the pass early with an error instead of faulting).
+A mismatch drops the base (stale — queries are refused, never served from
 corrupt bytes) and schedules a full rebuild (v1 has no per-shard rebuild),
 capped at `contentIntegrityMaxRebuilds` per failure streak so a disk that
 corrupts every write leaves the volume visibly stale with `integrity_error`

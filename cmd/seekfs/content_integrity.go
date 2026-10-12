@@ -21,28 +21,38 @@ import (
 	"fmt"
 )
 
+// contentVerifySectionHook runs before each section is hashed. Tests use it
+// to pause the pass mid-hash (proving a concurrent Release waits the pin out)
+// or to observe the pass's progress.
+var contentVerifySectionHook = func(tag uint32) {}
+
 // verifyContentSectionCRCs checks every checksummed section of idx against its
 // table checksum and returns the first mismatch. Legacy sections (no flag)
 // are skipped. It recurses into a composite manifest's shards, so one call
 // covers a whole sharded sidecar.
 //
-// Safety: section payloads may alias a memory-mapped file that a concurrent
-// base swap unmaps (Windows faults on touching an unmapped view). The service
-// only calls this with the attached base reachable (the local reference keeps
-// the finalizer from running, and swaps happen under indexMu while the pass
-// holds a content task), and every section is probed readable before it is
-// hashed, so a torn-down mapping fails the pass instead of faulting.
+// Lifetime: section payloads may alias a memory-mapped file, and on Windows
+// touching an unmapped view faults instead of panicking. Each index (and each
+// shard index) is therefore hashed under its read pin: Release takes the
+// write side, so the unmap waits for every in-flight section read. When the
+// index was already released the pass stops early with an error instead of
+// hashing a gone mapping.
 func verifyContentSectionCRCs(idx *contentIndex) error {
 	if idx == nil {
 		return fmt.Errorf("nil content index")
 	}
+	if !idx.pinRead() {
+		return fmt.Errorf("content index was released before verification")
+	}
+	defer idx.pinDone()
 	for tag, payload := range idx.Sections {
 		want, ok := idx.SectionCRC[tag]
 		if !ok {
 			continue
 		}
-		if !contentSectionReadable(payload) {
-			return fmt.Errorf("content section %s is no longer readable", contentSectionTagName(tag))
+		contentVerifySectionHook(tag)
+		if idx.released() {
+			return fmt.Errorf("content index was released during verification")
 		}
 		if got := contentSectionCRC(payload); got != want {
 			return &contentSectionCRCError{tag: tag, want: want, got: got}

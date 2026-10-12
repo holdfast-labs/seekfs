@@ -238,12 +238,21 @@ type contentIndex struct {
 	// release unmaps the file backing Sections when the index was loaded from a
 	// memory-mapped `.gsx` (contentLoadFileMapped); nil for a heap-decoded
 	// index. Only Sections (and the reader's text/posting views derived from
-	// them) alias the mapping; Docs and Policy are decoded copies. Release is
-	// once-only, and attachRelease also arms a finalizer, so an index whose
-	// owner merely drops it is still unmapped once no query references it. The
-	// GC only finalizes an unreachable index, which is what makes the unmap
-	// safe: a query holding the reader keeps the index reachable.
-	release     func()
+	// them) alias the mapping; Docs and Policy are decoded copies.
+	release func()
+	// pin guards the mapping's lifetime against readers that run outside
+	// indexMu (the background integrity pass): a reader holds one pin
+	// reference while touching Sections, and Release waits for every
+	// reference to drop before unmapping. pinMu serializes pinRefuse against
+	// pin acquisition only; pins themselves are a WaitGroup so a pinned
+	// reader never blocks another pinned reader. Release is once-only
+	// (releaseOnce), and attachRelease also arms a finalizer, so an index
+	// whose owner merely drops it is still unmapped once no query references
+	// it and no pin is held. The finalizer runs only on an unreachable index,
+	// but reachability alone does not stop an explicit Release — the pin does.
+	pin         sync.WaitGroup
+	pinMu       sync.RWMutex
+	pinRefuse   bool
 	releaseOnce sync.Once
 	// shards is set on a composite index loaded from a manifest (see
 	// content_shards.go); Docs then spans every shard and Sections holds only
@@ -277,6 +286,8 @@ func fireContentMappingReleaseHook() {
 // attachRelease records how to unmap this index's backing file and arms a
 // finalizer so the mapping is released even when the owner only drops the
 // index. Only the mmap load path calls it; a heap index leaves release nil.
+// The finalizer calls Release, which takes the pin's write side, so it waits
+// out any in-flight pinned section read before unmapping.
 func (idx *contentIndex) attachRelease(release func()) {
 	if idx == nil || release == nil {
 		return
@@ -285,12 +296,53 @@ func (idx *contentIndex) attachRelease(release func()) {
 	runtime.SetFinalizer(idx, (*contentIndex).Release)
 }
 
-// Release unmaps the index's backing file exactly once. It is a no-op on a
-// heap-decoded index. Explicit Release is only called by the service while it
-// holds indexMu for writing (no query can be reading the sections then); the
-// finalizer backstops every other drop, running only once the index is
-// unreachable from all goroutines, so an unmap can never race an in-flight
-// read.
+// pinRead holds a read pin on the index's mapping while the caller touches
+// Sections. It reports false when the index is already released: the caller
+// must stop without reading. A composite pins only its manifest mapping here;
+// shards are pinned individually through their own indexes.
+// Every pinRead must be paired with pinDone, promptly: Release blocks until
+// the last pin drops.
+func (idx *contentIndex) pinRead() bool {
+	if idx == nil {
+		return false
+	}
+	idx.pinMu.RLock()
+	defer idx.pinMu.RUnlock()
+	if idx.pinRefuse {
+		return false
+	}
+	idx.pin.Add(1)
+	return true
+}
+
+// pinDone releases one pinRead hold.
+func (idx *contentIndex) pinDone() {
+	if idx == nil {
+		return
+	}
+	idx.pin.Done()
+}
+
+// released reports whether Release has run. Readers outside indexMu (the
+// background integrity pass) check it up front so they stop early instead of
+// hashing a mapping that is already gone.
+func (idx *contentIndex) released() bool {
+	if idx == nil {
+		return true
+	}
+	idx.pinMu.RLock()
+	defer idx.pinMu.RUnlock()
+	return idx.pinRefuse
+}
+
+// Release unmaps the index's backing file exactly once. It refuses new pins
+// and waits for every out-of-lock section reader (a background integrity pass
+// holding a pin), so the unmap can never race an in-flight section read even
+// when the releaser does not hold indexMu. Shard mappings are released
+// through the shard indexes, which carry their own pins. It is a no-op on a
+// heap-decoded index. The finalizer backstops a dropped index the same way:
+// it runs only once the index is unreachable, then pins-out and unmaps like
+// any Release.
 func (idx *contentIndex) Release() {
 	if idx == nil {
 		return
@@ -299,9 +351,18 @@ func (idx *contentIndex) Release() {
 		for _, sh := range idx.shards {
 			sh.idx.Release()
 		}
-		if idx.release != nil {
-			idx.release()
-			idx.release = nil
+		idx.pinMu.Lock()
+		idx.pinRefuse = true
+		release := idx.release
+		idx.release = nil
+		idx.pinMu.Unlock()
+		// Wait out every pinned section read before unmapping: a background
+		// integrity pass parked mid-hash holds a pin, so the unmap cannot
+		// race its reads. A heap index has no mapping; the wait is still
+		// harmless (no pin is ever held without a mapping behind it).
+		idx.pin.Wait()
+		if release != nil {
+			release()
 		}
 	})
 }
