@@ -13,6 +13,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"os"
 	"strings"
 )
 
@@ -258,6 +259,15 @@ var contentExtractPanicError = errors.New("content extractor panic")
 // for *os.File (its ReadAt/Close are concurrency-safe) but not for a
 // non-close-safe library ReaderAt; P4's hard kill removes the sharing.
 func contentExtractSafely(ctx context.Context, e contentExtractor, r io.ReaderAt, size int64) (contentExtractResult, error) {
+	// Fast path: the plain-text extractor is bounded (contentReadBounded caps
+	// the read) and never blocks, so it needs neither the per-file goroutine
+	// nor the per-file deadline timer — both cost more than the extraction on
+	// a small file. Panic isolation is preserved inline. Byte-identical to the
+	// supervised path: the same Extract call on the same bytes. Container
+	// parsers (OOXML/PDF/HTML/...) keep the full supervision below.
+	if _, ok := e.(contentTextExtractor); ok {
+		return contentExtractTextDirectly(ctx, e, r, size)
+	}
 	type outcome struct {
 		res contentExtractResult
 		err error
@@ -280,6 +290,20 @@ func contentExtractSafely(ctx context.Context, e contentExtractor, r io.ReaderAt
 	case <-ectx.Done():
 		return contentExtractResult{Skipped: true, Reason: "extraction timeout"}, ectx.Err()
 	}
+}
+
+// contentExtractTextDirectly runs the plain-text extractor inline with panic
+// isolation but no goroutine and no deadline timer. See contentExtractSafely:
+// text extraction is a bounded read plus a decode, so it cannot hang; the
+// supervision would only add per-file overhead.
+func contentExtractTextDirectly(ctx context.Context, e contentExtractor, r io.ReaderAt, size int64) (res contentExtractResult, err error) {
+	defer func() {
+		if recover() != nil {
+			res = contentExtractResult{Skipped: true, Reason: "extractor panic"}
+			err = contentExtractPanicError
+		}
+	}()
+	return e.Extract(ctx, r, size)
 }
 
 // contentHasBOM reports whether b starts with a UTF-8/UTF-16 BOM. A BOM-marked
@@ -314,10 +338,132 @@ func contentLooksBinary(head []byte) bool {
 	return false
 }
 
-// contentReadBounded reads up to max bytes from r at offset 0.
+// contentSliceReader is an io.ReaderAt over already-slurped file bytes. It
+// lets the single-read build path hand the extractor the bytes it already
+// read, instead of reading the file twice (once for the 512 B sniff head,
+// once for the body). contentReadBounded aliases these bytes without copying.
+type contentSliceReader struct{ b []byte }
+
+func (r *contentSliceReader) ReadAt(p []byte, off int64) (int, error) {
+	if r == nil || off >= int64(len(r.b)) {
+		return 0, io.EOF
+	}
+	n := copy(p, r.b[off:])
+	if n < len(p) {
+		return n, io.EOF
+	}
+	return n, nil
+}
+
+// contentSlurpedFile is one file opened with OPEN_NO_RECALL, statted, and
+// read in a single syscall when it fits the raw cap. Small files — the whole
+// corpus in practice — cost one open + one stat + one read instead of open +
+// stat + head read + body read. The extractor reuses the bytes in place (see
+// contentReadBounded), so there is no second copy either.
+type contentSlurpedFile struct {
+	// data holds the whole file when size <= maxRaw; reader() serves it.
+	data []byte
+	// file is the still-open handle for an over-cap file; reader() serves
+	// it and head holds the already-read sniff prefix.
+	file *os.File
+	head []byte
+	size int64
+	// modUnix/modNano are the stat()'d mtime in seconds and nanoseconds.
+	modUnix int64
+	modNano int64
+}
+
+// contentSlurpNoRecall opens path without recalling cloud placeholders,
+// stats it, and reads it once. Files at or below maxRaw are fully buffered;
+// larger files keep the open handle (plus their 512 B head) for the
+// extractor to stream under its own cap. A missing file, a directory, or a
+// stat failure is an error; the caller maps that to a skip.
+func contentSlurpNoRecall(path string, maxRaw int64) (*contentSlurpedFile, error) {
+	if maxRaw <= 0 {
+		maxRaw = contentExtractMaxRawBytes
+	}
+	f, err := contentOpenNoRecall(path)
+	if err != nil {
+		return nil, err
+	}
+	info, err := f.Stat()
+	if err != nil || info.IsDir() {
+		_ = f.Close()
+		if err == nil {
+			err = errors.New("content slurp: is a directory")
+		}
+		return nil, err
+	}
+	size := info.Size()
+	if size < 0 {
+		_ = f.Close()
+		return nil, errors.New("negative content size")
+	}
+	mtime := info.ModTime()
+	s := &contentSlurpedFile{size: size, modUnix: mtime.Unix(), modNano: mtime.UnixNano()}
+	if size > maxRaw {
+		head, herr := contentReadBounded(f, size, 512)
+		if herr != nil {
+			_ = f.Close()
+			return nil, herr
+		}
+		s.file = f
+		s.head = head
+		return s, nil
+	}
+	buf := make([]byte, size)
+	n, rerr := f.ReadAt(buf, 0)
+	_ = f.Close()
+	if rerr != nil && !errors.Is(rerr, io.EOF) {
+		return nil, rerr
+	}
+	s.data = buf[:n]
+	return s, nil
+}
+
+// headBytes returns the sniff prefix: the first 512 B of the file.
+func (s *contentSlurpedFile) headBytes() []byte {
+	if s == nil {
+		return nil
+	}
+	if s.data != nil {
+		if len(s.data) > 512 {
+			return s.data[:512]
+		}
+		return s.data
+	}
+	return s.head
+}
+
+// reader returns the extractor's ReaderAt: the buffered bytes, or the open
+// handle for an over-cap file.
+func (s *contentSlurpedFile) reader() io.ReaderAt {
+	if s.data != nil {
+		return &contentSliceReader{b: s.data}
+	}
+	return s.file
+}
+
+// close releases the over-cap handle, if any. Buffered bytes need no release:
+// the extractor already copied what it kept (decoded text), and the raw
+// buffer drops with the slurp.
+func (s *contentSlurpedFile) close() {
+	if s != nil && s.file != nil {
+		_ = s.file.Close()
+		s.file = nil
+	}
+}
+
+// contentReadBounded reads up to max bytes from r at offset 0. When r serves
+// an already-slurped file whose buffered length exactly matches size, the
+// bytes are aliased without copying; every other ReaderAt keeps the
+// historical single-ReadAt copy. Callers must treat the result as read-only.
 func contentReadBounded(r io.ReaderAt, size int64, max int) ([]byte, error) {
 	if size < 0 {
 		return nil, errors.New("negative content size")
+	}
+	if sr, ok := r.(*contentSliceReader); ok && sr != nil && size == int64(len(sr.b)) && size <= int64(max) {
+		return sr.b, nil
 	}
 	if size > int64(max) {
 		size = int64(max)

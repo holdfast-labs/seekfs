@@ -750,12 +750,21 @@ func TestContentAssembleStreamConsumesSourceBuffer(t *testing.T) {
 	}
 }
 
-// The assembler must pull and process one document at a time, not buffer the
-// whole source: when the source is asked for doc k, docs < k must already be
+// The assembler must stream, not buffer the whole source: when the source is
+// asked for doc k, docs before k minus one read-ahead batch must already be
 // normalized and indexed.
 func TestContentAssembleStreamProcessesAsItPulls(t *testing.T) {
 	restore := contentAssembleStreamHook
 	defer func() { contentAssembleStreamHook = restore }()
+	restoreDocs := contentAssembleBatchDocs
+	restoreBytes := contentAssembleBatchBytes
+	contentAssembleBatchDocs = 3
+	contentAssembleBatchBytes = 1 << 20
+	defer func() { contentAssembleBatchDocs = restoreDocs; contentAssembleBatchBytes = restoreBytes }()
+	// Single tokenize worker so the hook order is deterministic.
+	restoreWorkers := contentBuildWorkers
+	contentBuildWorkers = 1
+	defer func() { contentBuildWorkers = restoreWorkers }()
 	processed := -1
 	contentAssembleStreamHook = func(docID int) { processed = docID }
 
@@ -765,8 +774,8 @@ func TestContentAssembleStreamProcessesAsItPulls(t *testing.T) {
 		if pulled >= n {
 			return contentBuildDoc{}, false, nil
 		}
-		if processed != pulled-1 {
-			t.Errorf("pulled doc %d but only processed through %d; assembler is buffering the source", pulled, processed)
+		if pulled-processed-1 > contentAssembleBatchDocs {
+			t.Errorf("pulled doc %d but only processed through %d; assembler buffered more than one batch", pulled, processed)
 		}
 		doc := contentBuildDoc{
 			frn:  uint64(pulled + 1),

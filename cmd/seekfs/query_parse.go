@@ -827,6 +827,11 @@ func parseAttribFilter(spec string) (uint32, error) {
 	return mask, nil
 }
 
+// queryNowFunc is the clock parseDateFilter reads for relative specs
+// (today/yesterday/thisweek/durations). A var so tests can pin "now"
+// deterministically instead of flaking across midnight.
+var queryNowFunc = time.Now
+
 // parseDateFilter parses an Everything-style dm: constraint. Supported specs:
 // "today", "yesterday", "thisweek", "lastweek", a relative duration like "24h"
 // or "7d", or an absolute date (YYYY-MM-DD) / RFC3339 timestamp meaning
@@ -836,7 +841,7 @@ func parseDateFilter(spec string) (dateFilter, error) {
 	if spec == "" {
 		return dateFilter{}, errors.New("empty dm: filter")
 	}
-	now := time.Now()
+	now := queryNowFunc()
 	startOfDay := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
 	switch spec {
 	case "today":

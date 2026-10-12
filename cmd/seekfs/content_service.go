@@ -1656,21 +1656,6 @@ func contentExtractDeltaDocContext(baseCtx context.Context, frn uint64, path str
 	if baseCtx != nil && baseCtx.Err() != nil {
 		return contentDeltaDoc{}, false, baseCtx.Err()
 	}
-	f, err := contentOpenNoRecall(path)
-	if err != nil {
-		return contentDeltaDoc{}, false, err
-	}
-	defer f.Close()
-	info, err := f.Stat()
-	if err != nil || info.IsDir() {
-		return contentDeltaDoc{}, false, err
-	}
-	size := info.Size()
-	head, _ := contentReadBounded(f, size, 512)
-	e := contentExtractorForPath(path, head)
-	if e == nil {
-		return contentDeltaDoc{}, false, nil
-	}
 	// The settings context carries the service's encoding/cap policy. The
 	// call goes through contentExtractSafely so the drain shares the build's
 	// isolation: a parser panic is a skip, and a ctx-ignoring parser is cut off
@@ -1679,16 +1664,29 @@ func contentExtractDeltaDocContext(baseCtx context.Context, frn uint64, path str
 		baseCtx = context.Background()
 	}
 	ctx := contentWithExtractSettings(baseCtx, contentServiceExtractSettings())
-	res, err := contentExtractSafely(ctx, e, f, size)
+	settings := contentExtractSettingsFromContext(ctx)
+	// Single-read open without recalling cloud placeholders; the extractor
+	// reuses the slurped bytes in place.
+	s, err := contentSlurpNoRecall(path, settings.maxRaw)
+	if err != nil {
+		return contentDeltaDoc{}, false, err
+	}
+	defer s.close()
+	size := s.size
+	e := contentExtractorForPath(path, s.headBytes())
+	if e == nil {
+		return contentDeltaDoc{}, false, nil
+	}
+	res, err := contentExtractSafely(ctx, e, s.reader(), size)
 	if err != nil || res.Skipped || len(res.Text) == 0 {
 		return contentDeltaDoc{}, false, err
 	}
-	stored := contentRepairText(res.Text)
+	stored := contentStoredText(res.Text)
 	h := sha256Of(stored)
 	if havePrior && h == prior {
 		return contentDeltaDoc{}, false, nil
 	}
-	return contentDeltaDoc{FRN: frn, Path: path, Text: stored, Hash: h, ContentType: res.Class, ExtractorVersion: e.Version(), FileSize: size, FileModNano: info.ModTime().UnixNano()}, true, nil
+	return contentDeltaDoc{FRN: frn, Path: path, Text: stored, Hash: h, ContentType: res.Class, ExtractorVersion: e.Version(), FileSize: size, FileModNano: s.modNano}, true, nil
 }
 
 // sha256Of is the shared content hash: sha256 truncated to contentHashLen bytes
