@@ -791,17 +791,24 @@ func (s *goSearchService) runContentBuild(vol *serviceVolumeIndex, reuseSidecar 
 	if opts.Scope != nil {
 		header.ScopeHash = opts.Scope.fingerprint()
 	}
-	stamp := func(cidx *contentIndex) {
-		cidx.Origin = header.Origin
-		cidx.JournalID = header.JournalID
-		cidx.CheckpointUSN = header.CheckpointUSN
-		cidx.Policy = header.Policy
-		cidx.ScopeHash = header.ScopeHash
-	}
 	gsx := contentIndexPathForDB(vol.dbPath)
 	if gsx == "" {
 		vol.content.markBuildFailed("no content sidecar path")
 		return
+	}
+	// assemble runs the streaming assembler over the selected docs at the given
+	// positions and returns the spooled shard plus a header index carrying the
+	// doc table and sidecar identity for the streaming save. The spooled
+	// section files, not a heap index, are what gets saved; attach reloads
+	// the sidecar through the mmap loader.
+	assemble := func(order []int) (*contentStreamedBuild, *contentIndex, error) {
+		built, err := assembleContentIndexStreamed(sourceOf(order), tmpDir)
+		if err != nil {
+			return nil, nil, err
+		}
+		shard := contentShardHeader(header, built)
+		shard.Sections = map[uint32][]byte{contentSectionPaths: encodeContentPaths(built.paths)}
+		return built, shard, nil
 	}
 	// save assembles and writes the sidecar: one file for a corpus within a
 	// shard, otherwise folder shards plus a manifest. Shards are assembled one
@@ -812,15 +819,14 @@ func (s *goSearchService) runContentBuild(vol *serviceVolumeIndex, reuseSidecar 
 			for i := range all {
 				all[i] = i
 			}
-			cidx, err := assembleContentIndexStream(sourceOf(all), tmpDir)
+			built, shard, err := assemble(all)
 			if err != nil {
 				return err
 			}
-			stamp(cidx)
 			if !s.contentBuildCurrent(vol, gen, journalID) {
 				return errContentBuildStale
 			}
-			return contentSaveFile(gsx, cidx)
+			return contentSaveAssembled(gsx, shard, contentBuildFiles(built))
 		}
 		paths := make([]string, len(selected))
 		sizes := make([]int64, len(selected))
@@ -834,12 +840,11 @@ func (s *goSearchService) runContentBuild(vol *serviceVolumeIndex, reuseSidecar 
 		}
 		infos := make([]contentShardInfo, 0, len(groups))
 		for _, g := range groups {
-			cidx, err := assembleContentIndexStream(sourceOf(g.docs), tmpDir)
+			built, shard, err := assemble(g.docs)
 			if err != nil {
 				return err
 			}
-			stamp(cidx)
-			info, err := contentSaveShard(dir, cidx, g.prefixes)
+			info, err := contentSaveShard(dir, shard, contentBuildFiles(built), g.prefixes)
 			if err != nil {
 				return err
 			}

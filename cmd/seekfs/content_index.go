@@ -7,10 +7,13 @@ package main
 // trigram, text-store, rank and delta sections over the same container.
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"hash/crc32"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -18,6 +21,63 @@ import (
 	"sync"
 	"time"
 )
+
+// contentSectionFlagCRC marks a section-table entry whose trailing word holds
+// a CRC32C (Castagnoli) of the section payload. The flag rides the entry's
+// 4-byte flags field and the CRC its 4-byte padding word, so the format version
+// stays 4: older binaries ignore both words and keep loading, while a new
+// binary treats a missing flag as a legacy (pre-checksum) section that loads
+// and is upgraded on the next build.
+const contentSectionFlagCRC uint32 = 1
+
+// contentSectionCRCModel is the Castagnoli polynomial: hardware-accelerated on
+// modern CPUs via hash/crc32.
+var contentSectionCRCModel = crc32.MakeTable(crc32.Castagnoli)
+
+// contentSectionCRC returns the integrity checksum of one section payload.
+func contentSectionCRC(data []byte) uint32 {
+	return crc32.Checksum(data, contentSectionCRCModel)
+}
+
+// contentSectionCRCError reports a section payload whose bytes do not match
+// the checksum in the section table: a flipped bit (or a torn write the
+// atomic rename did not prevent) rather than a structural fault.
+type contentSectionCRCError struct {
+	tag  uint32
+	want uint32
+	got  uint32
+}
+
+func (e *contentSectionCRCError) Error() string {
+	return fmt.Sprintf("content section %s checksum mismatch (want %08x, got %08x)", contentSectionTagName(e.tag), e.want, e.got)
+}
+
+// contentSectionTagName renders a section tag for diagnostics.
+func contentSectionTagName(tag uint32) string {
+	var b [4]byte
+	binary.BigEndian.PutUint32(b[:], tag)
+	for i := range b {
+		if b[i] < 32 || b[i] > 126 {
+			return fmt.Sprintf("%08x", tag)
+		}
+	}
+	return string(b[:])
+}
+
+// contentSectionEagerVerify reports whether a section's checksum is verified
+// immediately on load. Small sections (doc table, paths, policy, scope,
+// manifest) are hashed at decode; the large text/term/gram sections are
+// verified by a background pass after attach so startup does not page in
+// gigabytes. Any other checksummed section is small by construction and
+// verifies eagerly.
+func contentSectionEagerVerify(tag uint32) bool {
+	switch tag {
+	case contentSectionText, contentSectionTerms, contentSectionGrams:
+		return false
+	default:
+		return true
+	}
+}
 
 // contentIndexMagic identifies a `.gsx` file. The trailing digits are the
 // format version encoded in the magic as well as the header, matching the v9
@@ -170,6 +230,11 @@ type contentIndex struct {
 	// the counters reconcile against the file count.
 	Scanned  int64
 	Declined int64
+	// SectionCRC holds the expected CRC32C per section tag for sections whose
+	// table entry carries contentSectionFlagCRC. Sections absent from the map
+	// are legacy (pre-checksum) and load without verification; the next build
+	// rewrites them with checksums.
+	SectionCRC map[uint32]uint32
 	// release unmaps the file backing Sections when the index was loaded from a
 	// memory-mapped `.gsx` (contentLoadFileMapped); nil for a heap-decoded
 	// index. Only Sections (and the reader's text/posting views derived from
@@ -337,7 +402,7 @@ func contentIndexEncode(idx *contentIndex) []byte {
 	off := uint64(headerSize)
 	for _, tag := range tags {
 		data := idx.Sections[tag]
-		entries = append(entries, contentSectionEntry{tag: tag, offset: off, length: uint64(len(data))})
+		entries = append(entries, contentSectionEntry{tag: tag, offset: off, length: uint64(len(data)), flags: contentSectionFlagCRC, crc: contentSectionCRC(data), hasCRC: true})
 		off += uint64(len(data))
 	}
 	for i, e := range entries {
@@ -346,6 +411,7 @@ func contentIndexEncode(idx *contentIndex) []byte {
 		binary.LittleEndian.PutUint64(table[p+4:], e.offset)
 		binary.LittleEndian.PutUint64(table[p+12:], e.length)
 		binary.LittleEndian.PutUint32(table[p+20:], e.flags)
+		binary.LittleEndian.PutUint32(table[p+24:], e.crc)
 	}
 	body.Write(table)
 
@@ -360,6 +426,10 @@ type contentSectionEntry struct {
 	offset uint64
 	length uint64
 	flags  uint32
+	// crc/hasCRC carry the section-table checksum: crc is the entry's trailing
+	// word and hasCRC whether contentSectionFlagCRC was set.
+	crc    uint32
+	hasCRC bool
 }
 
 const contentSectionEntrySize = 28 // tag(4)+offset(8)+length(8)+flags(4)+pad(4)
@@ -433,10 +503,24 @@ func contentIndexDecode(data []byte) (*contentIndex, error) {
 		tag := binary.LittleEndian.Uint32(data[p:])
 		off := binary.LittleEndian.Uint64(data[p+4:])
 		length := binary.LittleEndian.Uint64(data[p+12:])
+		flags := binary.LittleEndian.Uint32(data[p+20:])
+		crc := binary.LittleEndian.Uint32(data[p+24:])
 		if length > contentIndexMaxSection || off+length > uint64(len(data)) {
 			return nil, fmt.Errorf("content section %08x out of range", tag)
 		}
-		idx.Sections[tag] = data[off : off+length]
+		payload := data[off : off+length]
+		idx.Sections[tag] = payload
+		if flags&contentSectionFlagCRC != 0 {
+			if idx.SectionCRC == nil {
+				idx.SectionCRC = make(map[uint32]uint32, sectionCount)
+			}
+			idx.SectionCRC[tag] = crc
+			if contentSectionEagerVerify(tag) {
+				if got := contentSectionCRC(payload); got != crc {
+					return nil, &contentSectionCRCError{tag: tag, want: crc, got: got}
+				}
+			}
+		}
 	}
 	if sec, ok := idx.Sections[contentSectionPolicy]; ok {
 		if p, ok := decodeContentPolicy(sec); ok {
@@ -618,6 +702,181 @@ func contentLookupFRN(docs []contentDoc, frn uint64) (int, bool) {
 		return i, true
 	}
 	return 0, false
+}
+
+// contentSectionPayload is one section headed for a `.gsx`: either resident
+// bytes or a temp file holding the exact section bytes (text store and posting
+// sections spooled during assembly).
+type contentSectionPayload struct {
+	tag  uint32
+	data []byte
+	file string
+	size uint64
+}
+
+// contentCollectPayloads gathers the sections contentIndexEncode and
+// contentSaveAssembled both write: the doc table, policy and scope derived
+// from idx exactly as the encoder derives them, the resident small sections,
+// and the file-backed large sections. Both writers share it so the streaming
+// save is byte-identical to the in-memory encode for the same input.
+func contentCollectPayloads(idx *contentIndex, files map[uint32]string) []contentSectionPayload {
+	sections := make(map[uint32][]byte, len(idx.Sections)+3)
+	for tag, data := range idx.Sections {
+		if tag == contentSectionDocTable {
+			continue
+		}
+		sections[tag] = data
+	}
+	sections[contentSectionDocTable] = contentDocTableBytes(idx.Docs)
+	if idx.Policy != (contentBuildPolicy{}) {
+		sections[contentSectionPolicy] = idx.Policy.encode()
+	}
+	if idx.ScopeHash != ([32]byte{}) {
+		sections[contentSectionScope] = idx.ScopeHash[:]
+	}
+	out := make([]contentSectionPayload, 0, len(sections)+len(files))
+	for tag, data := range sections {
+		if path, ok := files[tag]; ok {
+			if st, err := os.Stat(path); err == nil {
+				out = append(out, contentSectionPayload{tag: tag, file: path, size: uint64(st.Size())})
+				continue
+			}
+		}
+		out = append(out, contentSectionPayload{tag: tag, data: data, size: uint64(len(data))})
+	}
+	for tag, path := range files {
+		known := false
+		for _, p := range out {
+			if p.tag == tag {
+				known = true
+				break
+			}
+		}
+		if known {
+			continue
+		}
+		if st, err := os.Stat(path); err == nil && st.Size() > 0 {
+			out = append(out, contentSectionPayload{tag: tag, file: path, size: uint64(st.Size())})
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].tag < out[j].tag })
+	return out
+}
+
+// contentPayloadSize totals a payload set's encoded size: header + payloads +
+// the section table. Both the cap check and the header's table offset derive
+// from it, so an over-cap save is refused before anything is written and the
+// table offset is exact.
+func contentPayloadSize(payloads []contentSectionPayload) int64 {
+	total := int64(contentHeaderSize()) + 4 + int64(len(payloads))*contentSectionEntrySize
+	for _, p := range payloads {
+		total += int64(p.size)
+	}
+	return total
+}
+
+// contentWritePayload copies one payload to w while accumulating its CRC32C.
+// Exactly one of p.data/p.file carries the bytes; a missing file reads as
+// empty (a section FinishFile declined to create). h is an extra sink (the
+// caller's own hasher, or io.Discard).
+func contentWritePayload(w io.Writer, h io.Writer, p contentSectionPayload) (uint32, error) {
+	crc := crc32.New(contentSectionCRCModel)
+	mw := io.MultiWriter(w, h, crc)
+	if p.file != "" {
+		f, err := os.Open(p.file)
+		if err != nil {
+			if os.IsNotExist(err) {
+				return crc.Sum32(), nil
+			}
+			return 0, err
+		}
+		_, err = io.CopyBuffer(mw, f, make([]byte, contentSectionFileBufSize))
+		cerr := f.Close()
+		if err != nil {
+			return 0, err
+		}
+		if cerr != nil {
+			return 0, cerr
+		}
+		return crc.Sum32(), nil
+	}
+	if _, err := mw.Write(p.data); err != nil {
+		return 0, err
+	}
+	return crc.Sum32(), nil
+}
+
+// contentSaveAssembled streams one shard to path: the header placeholder, each
+// section payload from memory or its spool file (hashing the CRC32C as it
+// goes), then the section table with checksums, then the patched header. The
+// temp-then-rename atomicity, the contentGSXSizeError cap (checked before
+// anything is written), the deterministic section order and the byte-identical
+// output for the same input all match contentSaveFile.
+func contentSaveAssembled(path string, idx *contentIndex, files map[uint32]string) error {
+	payloads := contentCollectPayloads(idx, files)
+	if size := contentPayloadSize(payloads); contentGSXMaxBytes > 0 && size > contentGSXMaxBytes {
+		return &contentGSXSizeError{size: size, cap: contentGSXMaxBytes}
+	}
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(dir, filepath.Base(path)+".*.tmp")
+	if err != nil {
+		return err
+	}
+	name := tmp.Name()
+	bw := bufio.NewWriterSize(tmp, contentSectionFileBufSize)
+	fail := func(err error) error {
+		_ = bw.Flush()
+		_ = tmp.Close()
+		_ = os.Remove(name)
+		return err
+	}
+	if _, err := bw.Write(make([]byte, contentHeaderSize())); err != nil {
+		return fail(err)
+	}
+	entries := make([]contentSectionEntry, 0, len(payloads))
+	off := uint64(contentHeaderSize())
+	for _, p := range payloads {
+		crc, err := contentWritePayload(bw, io.Discard, p)
+		if err != nil {
+			return fail(err)
+		}
+		entries = append(entries, contentSectionEntry{tag: p.tag, offset: off, length: p.size, flags: contentSectionFlagCRC, crc: crc, hasCRC: true})
+		off += p.size
+	}
+	tableOffset := off
+	table := make([]byte, 4+len(entries)*contentSectionEntrySize)
+	binary.LittleEndian.PutUint32(table[:4], uint32(len(entries)))
+	for i, e := range entries {
+		q := 4 + i*contentSectionEntrySize
+		binary.LittleEndian.PutUint32(table[q:], e.tag)
+		binary.LittleEndian.PutUint64(table[q+4:], e.offset)
+		binary.LittleEndian.PutUint64(table[q+12:], e.length)
+		binary.LittleEndian.PutUint32(table[q+20:], e.flags)
+		binary.LittleEndian.PutUint32(table[q+24:], e.crc)
+	}
+	if _, err := bw.Write(table); err != nil {
+		return fail(err)
+	}
+	if err := bw.Flush(); err != nil {
+		return fail(err)
+	}
+	header := make([]byte, contentHeaderSize())
+	contentWriteHeader(header, idx, tableOffset, len(entries))
+	if _, err := tmp.WriteAt(header, 0); err != nil {
+		return fail(err)
+	}
+	if err := tmp.Sync(); err != nil {
+		return fail(err)
+	}
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(name)
+		return err
+	}
+	idx.EncodedSize = int64(tableOffset) + int64(len(table))
+	return os.Rename(name, path)
 }
 
 // contentSaveFile writes the index to path atomically (temp + fsync + rename),

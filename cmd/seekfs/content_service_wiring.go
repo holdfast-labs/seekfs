@@ -234,6 +234,13 @@ func (s *goSearchService) attachContentForVolume(vol *serviceVolumeIndex) {
 			contentCatchUpAsync(func() { defer endContentTask(vol); s.contentCatchUpAfterAttach(vol, idx) })
 		}
 	}
+	// Verify the large sections in the background: the small ones were checked
+	// at load, and hashing gigabytes synchronously would stall startup. A
+	// mismatch drops the base and schedules a rebuild, so corrupt bytes are
+	// never served.
+	if s.beginContentTask(vol) {
+		contentVerifyAsync(func() { defer endContentTask(vol); s.verifyContentAfterAttach(vol, idx) })
+	}
 	serviceLog("content index loaded for volume %s docs=%d", vol.volume, len(idx.Docs))
 }
 

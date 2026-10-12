@@ -208,6 +208,12 @@ func cmdContent(args []string) error {
 	// A one-shot CLI query owns the mapping only for its own duration; release
 	// it on return. The hits are copied strings, so nothing outlives it.
 	defer idx.Release()
+	// Small sections were verified at load; check the large ones before
+	// serving results, so a flipped byte fails the query instead of answering
+	// from corrupt bytes.
+	if err := verifyContentSectionCRCs(idx); err != nil {
+		return fmt.Errorf("content: %s failed integrity check: %w", *db, err)
+	}
 	r, err := openContentReader(idx)
 	if err != nil {
 		return err

@@ -100,7 +100,11 @@ its stored content.
 The service selects Git repositories before configured roots, then known
 folders. It spools accepted extracted text to temporary disk before assembling
 the FRN-sorted sidecar, so a large scoped build needs temporary disk space up
-to its extracted-text budget.
+to its extracted-text budget. Assembly itself is fully streamed: the text
+store is spooled to a temp file as docs arrive, the term/gram posting sections
+merge straight into section files, and the `.gsx` is written by streaming
+those payloads with a running section table (see §6j). A 64 MiB shard builds
+or folds under ~250 MB of heap.
 
 ### 2b. Content matching semantics
 
@@ -137,7 +141,8 @@ when none is usable the query errors rather than returning empty.
 | File | Role |
 | --- | --- |
 | `content_encoding.go` | tgrep-ported text decoding: BOM sniff (UTF-8/16LE/16BE), lossy repair with maximal-subsequence semantics, and `contentLossyFixups` mapping repaired offsets back to source bytes. |
-| `content_index.go` | `.gsx` container: magic/version, `Origin`, section table, 64-byte `contentDoc` records, encode/decode, atomic save, FRN bisection. |
+| `content_index.go` | `.gsx` container: magic/version, `Origin`, section table (with per-section CRC32C), 64-byte `contentDoc` records, encode/decode, atomic save (in-memory and streaming), FRN bisection. |
+| `content_integrity.go` | Post-attach checksum verification, stale-marking and rebuild scheduling for corrupt sidecars. |
 | `content_postings.go` | Shared CXTR/CXGR block codec: `key -> []contentDocFreq{docID,tf}`, delta-varint docID + uvarint tf, 1024-doc blocks, dictionary + block meta, bounded lookup. |
 | `content_external_build.go` | Bounded external spill/merge builder (`contentExternalSectionBuilder`) producing bytes identical to the in-memory encoder. |
 | `content_extract.go` | `contentExtractor` interface, registry, `contentExtractorForPath` (extension → format sniffers → text fallback), binary sniff, size caps. |
@@ -601,7 +606,52 @@ an empty index.
   the build dropped from 2m16s to 28 s, with extraction fully hidden behind
   tokenizing.
 - **Not yet:** shards are not rebalanced between rebuilds. The offline
-  `content-index` CLI still writes a single file and holds all text in memory.
+  `content-index` CLI still writes a single file, but it now spools extracted
+  text to disk during the walk and streams the save like the service paths.
+
+## 6j. Streaming build/save + per-section integrity (done)
+
+**Streaming.** `assembleContentIndexStreamed` (`content_build.go`) consumes
+documents exactly like the in-memory assembler but never retains the corpus:
+each doc's repaired text is appended to a temp text-store file as it arrives,
+and the term/gram builders merge straight into section files
+(`FinishFile` in `content_external_build.go`) instead of returning whole
+`[]byte`. `contentSaveAssembled` (`content_index.go`) streams those payloads
+into the `.gsx` with a running section table and patches the header, computing
+each section's CRC32C as it goes. The temp-then-rename atomicity, the
+`contentGSXSizeError` cap (checked from the payload sizes before anything is
+written), the deterministic section order and the byte-identical output for
+the same input all match the in-memory save (a test builds the same corpus
+both ways and compares bytes). Callers that need the index after a build
+(attach, fold publish) reload the saved file through the mmap loader instead
+of keeping heap copies. The in-memory API stays for tests and small corpora.
+Peak transient heap per shard is one document's text plus the two posting
+arenas (now 12 MiB each) plus O(docs) metadata and the posting entry/block
+tables; the per-document tokenizer map hints are capped so one huge document
+cannot preallocate gigabytes of empty buckets (hints are allocation-only and
+do not change the output).
+
+**Integrity.** Every section-table entry carries a CRC32C (Castagnoli,
+hardware-accelerated via `hash/crc32`) of its payload in the entry's trailing
+word, flagged by `contentSectionFlagCRC`. The format version stays 4: older
+binaries ignore both words and keep loading, and a file without the flag is a
+legacy (pre-checksum) section that loads and is upgraded with checksums on
+the next save. Decode verifies the small sections (doc table, paths, policy,
+scope, manifest) immediately, so a corrupt small section fails the load; the
+large text/term/gram sections are verified by a background pass after attach
+(`verifyContentAfterAttach`), so startup does not page in gigabytes. A
+mismatch drops the base (stale — queries are refused, never served from
+corrupt bytes) and schedules a full rebuild (v1 has no per-shard rebuild),
+capped at `contentIntegrityMaxRebuilds` per failure streak so a disk that
+corrupts every write leaves the volume visibly stale with `integrity_error`
+in health instead of spinning rebuilds. The offline `content` command
+verifies the whole file synchronously before searching.
+
+**Residual:** a fold that reads a base corrupted after its attach-time pass
+re-encodes the corrupt bytes with fresh (valid) checksums, so the corruption
+persists until the next rebuild rather than tripping the pass. Closing it
+needs per-document checksums or a pre-fold verify (which pages the base);
+deferred.
 
 ## 7. Carried debt / known gaps
 
@@ -735,8 +785,10 @@ real in-cap PDFs measured mean recall **0.933 → 0.980** and perfect files
   — or whose extractor produced no text, e.g. empty), so `indexed == eligible -
   declined - skipped`. Not persisted to the `.gsx` (the policy section is a fixed
   size), so the service health view does not carry it yet.
-- **`.gsx` has no integrity checksum.** Payload/text byte flips are undetected
-  (structural damage is caught); fuzzing found no panic. Accepted.
+- **Fold-after-corruption window (see §6j).** A base corrupted after its
+  attach-time checksum pass is re-encoded by a fold with fresh checksums, so
+  the corruption persists until a rebuild. Per-document checksums or a
+  pre-fold verify would close it; deferred.
 - Confirmed clean: encrypted/image-only PDFs → `skipped` with no false hits;
   OOXML oracle parity 13/13 under the 32 MiB cap; RTF/EML/mbox/MSG end-to-end
   synthetic parity (only `\fldrslt`, non-allowlisted headers and encoded blobs

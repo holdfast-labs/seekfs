@@ -442,7 +442,7 @@ func TestContentFoldFailureKeepsDelta(t *testing.T) {
 	f.churn(t, 10, 105, "gammanew needlegamma")
 
 	restore := contentFoldSave
-	contentFoldSave = func(string, *contentIndex) error { return errors.New("injected save failure") }
+	contentFoldSave = func(string, *contentIndex, map[uint32]string) error { return errors.New("injected save failure") }
 	t.Cleanup(func() { contentFoldSave = restore })
 
 	f.s.runContentFold(f.vol)
@@ -498,7 +498,7 @@ func TestContentFoldNonCapFailureBoundsAndReplays(t *testing.T) {
 	contentDeltaHardMaxDocs = 3
 	t.Cleanup(func() { contentDeltaHardMaxDocs = restoreHard })
 	restoreSave := contentFoldSave
-	contentFoldSave = func(string, *contentIndex) error { return errors.New("injected save failure") }
+	contentFoldSave = func(string, *contentIndex, map[uint32]string) error { return errors.New("injected save failure") }
 	t.Cleanup(func() { contentFoldSave = restoreSave })
 
 	for i := 0; i < n; i++ {

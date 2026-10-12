@@ -29,6 +29,10 @@ import (
 	"sort"
 )
 
+// contentSectionFileBufSize is the buffered-I/O size for spilling a finished
+// posting section to disk and for streaming it back into a `.gsx`.
+const contentSectionFileBufSize = 1 << 20
+
 const contentExternalRecordOverhead = 10 // keyLen(2)+docID(4)+tf(4)
 
 // contentExternalRunBufSize bounds each open run's read buffer. The merge holds
@@ -269,6 +273,74 @@ func (h *contentMergeHeap) Pop() any {
 // merge k-way merges the runs and assembles the section. Run files are left in
 // place so a failed merge can still be cleaned up by Close.
 func (b *contentExternalSectionBuilder) merge() ([]byte, error) {
+	asm, cleanup, err := b.mergeInto(newContentMemoryBlobSink(), newContentMemoryBlobSink())
+	if cleanup != nil {
+		defer cleanup()
+	}
+	if err != nil {
+		return nil, err
+	}
+	if asm == nil {
+		return nil, nil
+	}
+	return asm.bytes(), nil
+}
+
+// FinishFile spills the tail and k-way merges the runs straight into the
+// section file at path, without ever assembling the section in memory. The
+// file holds byte-identical bytes to what Finish would return. When the
+// builder saw no records, no file is created and nil is returned, mirroring
+// Finish's nil section. Run files are removed on success; a failure leaves
+// them for Close.
+func (b *contentExternalSectionBuilder) FinishFile(path string) error {
+	if b.err != nil {
+		return b.err
+	}
+	if b.closed {
+		return errors.New("content external builder closed")
+	}
+	if err := b.spill(); err != nil {
+		return err
+	}
+	if len(b.runs) == 0 {
+		_ = os.Remove(path)
+		return nil
+	}
+	keys, err := newContentFileBlobSink(b.tmpDir)
+	if err != nil {
+		return err
+	}
+	blocks, err := newContentFileBlobSink(b.tmpDir)
+	if err != nil {
+		keys.abort()
+		return err
+	}
+	asm, cleanup, err := b.mergeInto(keys, blocks)
+	if cleanup != nil {
+		defer cleanup()
+	}
+	if err != nil {
+		return err
+	}
+	if asm == nil {
+		return nil
+	}
+	if err := asm.writeFile(path); err != nil {
+		return err
+	}
+	b.removeRuns()
+	return nil
+}
+
+// mergeInto k-way merges the runs into an assembler whose key/block blobs
+// stream to the given sinks. It returns (nil, nil, nil) when every run is
+// empty. Callers must run cleanup (which releases the sinks' temp resources)
+// and must not use the assembler afterwards.
+func (b *contentExternalSectionBuilder) mergeInto(keys, blocks contentBlobSink) (*contentExternalAssembler, func(), error) {
+	cleanup := func() {
+		keys.abort()
+		blocks.abort()
+	}
 	readers := make([]*contentRunReader, 0, len(b.runs))
 	for _, path := range b.runs {
 		r, err := newContentRunReader(path)
@@ -276,7 +348,7 @@ func (b *contentExternalSectionBuilder) merge() ([]byte, error) {
 			for _, open := range readers {
 				open.f.Close()
 			}
-			return nil, err
+			return nil, cleanup, err
 		}
 		if r.done {
 			r.f.Close()
@@ -285,7 +357,7 @@ func (b *contentExternalSectionBuilder) merge() ([]byte, error) {
 		readers = append(readers, r)
 	}
 	if len(readers) == 0 {
-		return nil, nil
+		return nil, cleanup, nil
 	}
 	h := contentMergeHeap(readers)
 	heap.Init(&h)
@@ -297,7 +369,9 @@ func (b *contentExternalSectionBuilder) merge() ([]byte, error) {
 		}
 	}()
 
-	asm := newContentExternalAssembler(b.records)
+	asm := newContentExternalAssembler(b.records, keys, blocks)
+	// The assembler owns the sinks from here; success or merge error both run
+	// the sinks' abort through cleanup, which is a no-op after finalize.
 	for h.Len() > 0 {
 		r := h[0]
 		if !asm.hasKey || !bytes.Equal(asm.curKey, r.key) {
@@ -307,7 +381,7 @@ func (b *contentExternalSectionBuilder) merge() ([]byte, error) {
 		asm.addPosting(r.docID, r.tf)
 
 		if err := r.advance(); err != nil {
-			return nil, err
+			return nil, cleanup, err
 		}
 		if r.done {
 			heap.Pop(&h)
@@ -317,15 +391,95 @@ func (b *contentExternalSectionBuilder) merge() ([]byte, error) {
 		}
 	}
 	asm.endKey()
-	return asm.bytes(), nil
+	return asm, cleanup, nil
+}
+
+// contentBlobSink streams one posting blob (keys or blocks) during the merge.
+// The in-memory sink preserves the historical merge behavior for Finish; the
+// file sink lets FinishFile merge multi-gigabyte sections with O(metadata)
+// heap. Lengths are exact byte counts; copyTo replays the bytes in order.
+type contentBlobSink interface {
+	io.Writer
+	Len() int64
+	copyTo(w io.Writer) error
+	abort()
+}
+
+// contentMemoryBlobSink is the in-memory blob sink.
+type contentMemoryBlobSink struct {
+	buf bytes.Buffer
+}
+
+func newContentMemoryBlobSink() *contentMemoryBlobSink { return &contentMemoryBlobSink{} }
+
+func (s *contentMemoryBlobSink) Write(p []byte) (int, error) { return s.buf.Write(p) }
+func (s *contentMemoryBlobSink) Len() int64                  { return int64(s.buf.Len()) }
+func (s *contentMemoryBlobSink) copyTo(w io.Writer) error {
+	_, err := w.Write(s.buf.Bytes())
+	return err
+}
+func (s *contentMemoryBlobSink) abort() {}
+
+// contentFileBlobSink spills one posting blob to a temp file.
+type contentFileBlobSink struct {
+	f    *os.File
+	bw   *bufio.Writer
+	path string
+	n    int64
+}
+
+func newContentFileBlobSink(tmpDir string) (*contentFileBlobSink, error) {
+	f, err := os.CreateTemp(tmpDir, "cxsec-*.blob")
+	if err != nil {
+		return nil, err
+	}
+	return &contentFileBlobSink{f: f, bw: bufio.NewWriterSize(f, contentSectionFileBufSize), path: f.Name()}, nil
+}
+
+func (s *contentFileBlobSink) Write(p []byte) (int, error) {
+	n, err := s.bw.Write(p)
+	s.n += int64(n)
+	return n, err
+}
+
+func (s *contentFileBlobSink) Len() int64 { return s.n }
+
+func (s *contentFileBlobSink) copyTo(w io.Writer) error {
+	if err := s.bw.Flush(); err != nil {
+		return err
+	}
+	if _, err := s.f.Seek(0, io.SeekStart); err != nil {
+		return err
+	}
+	_, err := io.CopyBuffer(w, s.f, make([]byte, contentSectionFileBufSize))
+	return err
+}
+
+// abort releases the sink's temp file. After a successful writeFile the blob
+// files are already removed and abort is a no-op.
+func (s *contentFileBlobSink) abort() {
+	if s.bw != nil {
+		_ = s.bw.Flush()
+		s.bw = nil
+	}
+	if s.f != nil {
+		_ = s.f.Close()
+		s.f = nil
+	}
+	if s.path != "" {
+		_ = os.Remove(s.path)
+		s.path = ""
+	}
 }
 
 // contentExternalAssembler builds the output tables in the same order as
 // encodeContentPostingSection: keys ascending, each key's postings chunked into
-// 1024-doc blocks.
+// 1024-doc blocks. The key/block blobs stream to sinks (memory or temp files)
+// while the entry/block metadata stays resident; finalize (bytes or writeFile)
+// emits header + entries + blocks + keys + blocks in section order.
 type contentExternalAssembler struct {
-	keyBlob   bytes.Buffer
-	blockBlob bytes.Buffer
+	keyBlob   contentBlobSink
+	blockBlob contentBlobSink
 	entries   []contentPostingEntry
 	blocks    []contentBlockMeta
 
@@ -341,15 +495,16 @@ type contentExternalAssembler struct {
 	scratch  [binary.MaxVarintLen64]byte
 }
 
-// newContentExternalAssembler seeds blockBlob from the total record count so it
-// avoids most of the doubling growth at the end of the merge. Two bytes per
-// posting covers the common small-delta and small-tf case; a key with huge gaps
-// just makes blockBlob grow once more, still bounded by the output. keyBlob is
-// left to grow on its own (distinct keys are usually far smaller than records).
-func newContentExternalAssembler(records int) contentExternalAssembler {
-	var a contentExternalAssembler
-	if records > 0 {
-		a.blockBlob.Grow(records*2 + 1024)
+// newContentExternalAssembler seeds an in-memory blockBlob from the total
+// record count so it avoids most of the doubling growth at the end of the
+// merge. Two bytes per posting covers the common small-delta and small-tf
+// case; a key with huge gaps just makes blockBlob grow once more, still
+// bounded by the output. keyBlob is left to grow on its own (distinct keys are
+// usually far smaller than records). File sinks ignore the seed.
+func newContentExternalAssembler(records int, keys, blocks contentBlobSink) *contentExternalAssembler {
+	a := &contentExternalAssembler{keyBlob: keys, blockBlob: blocks}
+	if mem, ok := blocks.(*contentMemoryBlobSink); ok && records > 0 {
+		mem.buf.Grow(records*2 + 1024)
 	}
 	a.entries = make([]contentPostingEntry, 0, 64)
 	a.blocks = make([]contentBlockMeta, 0, 64)
@@ -419,8 +574,21 @@ func (a *contentExternalAssembler) bytes() []byte {
 	if len(a.entries) == 0 {
 		return nil
 	}
-	total := 16 + len(a.entries)*contentPostingEntrySize + len(a.blocks)*contentBlockMetaSize + a.keyBlob.Len() + a.blockBlob.Len()
+	total := 16 + len(a.entries)*contentPostingEntrySize + len(a.blocks)*contentBlockMetaSize + int(a.keyBlob.Len()) + int(a.blockBlob.Len())
 	out := make([]byte, 0, total)
+	out = a.appendTables(out)
+	if err := a.keyBlob.copyTo(sliceWriter{&out}); err != nil {
+		return nil
+	}
+	if err := a.blockBlob.copyTo(sliceWriter{&out}); err != nil {
+		return nil
+	}
+	return out
+}
+
+// appendTables emits the section header plus the entry and block tables: the
+// byte prefix shared by the in-memory and file final forms.
+func (a *contentExternalAssembler) appendTables(out []byte) []byte {
 	out = binary.LittleEndian.AppendUint32(out, uint32(len(a.entries)))
 	out = binary.LittleEndian.AppendUint32(out, uint32(a.keyBlob.Len()))
 	out = binary.LittleEndian.AppendUint32(out, uint32(len(a.blocks)))
@@ -440,7 +608,51 @@ func (a *contentExternalAssembler) bytes() []byte {
 		out = binary.LittleEndian.AppendUint32(out, b.byteLen)
 		out = binary.LittleEndian.AppendUint32(out, b.maxTF)
 	}
-	out = append(out, a.keyBlob.Bytes()...)
-	out = append(out, a.blockBlob.Bytes()...)
 	return out
+}
+
+// writeFile finalizes the section into the file at path: header + tables,
+// then the streamed key and block blobs. The bytes are identical to bytes().
+// The blob sinks' temp files are removed.
+func (a *contentExternalAssembler) writeFile(path string) error {
+	if len(a.entries) == 0 {
+		return nil
+	}
+	f, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	bw := bufio.NewWriterSize(f, contentSectionFileBufSize)
+	_, err = bw.Write(a.appendTables(nil))
+	if err == nil {
+		err = a.keyBlob.copyTo(bw)
+	}
+	if err == nil {
+		err = a.blockBlob.copyTo(bw)
+	}
+	if err == nil {
+		err = bw.Flush()
+	}
+	cerr := f.Close()
+	a.keyBlob.abort()
+	a.blockBlob.abort()
+	if err != nil {
+		_ = os.Remove(path)
+		return err
+	}
+	if cerr != nil {
+		_ = os.Remove(path)
+		return cerr
+	}
+	return nil
+}
+
+// sliceWriter appends to a byte slice through the io.Writer interface.
+type sliceWriter struct {
+	out *[]byte
+}
+
+func (w sliceWriter) Write(p []byte) (int, error) {
+	*w.out = append(*w.out, p...)
+	return len(p), nil
 }
