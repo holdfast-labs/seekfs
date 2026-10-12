@@ -18,6 +18,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"fmt"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -161,7 +162,8 @@ type contentHealth struct {
 }
 
 // contentDeltaDoc is an extracted document for a file changed since the base,
-// keyed on FRN. Its text is verified at query time; the base index is untouched.
+// keyed on FRN (USN volumes) or the stable path-hash key (walk volumes). Its
+// text is verified at query time; the base index is untouched.
 type contentDeltaDoc struct {
 	FRN     uint64
 	Path    string
@@ -173,6 +175,10 @@ type contentDeltaDoc struct {
 	// the same extractor identity the base would have (P1).
 	ContentType      uint16
 	ExtractorVersion uint16
+	// FileSize/FileModNano mirror the base doc fingerprint so a fold carries
+	// the same change-detection identity the base would have (walk volumes).
+	FileSize    int64
+	FileModNano int64
 }
 
 // contentDelta is the in-memory overlay of changed documents. Its own mutex
@@ -260,6 +266,37 @@ func (d *contentDelta) textFor(frn uint64) (text []byte, found, deleted bool) {
 		return nil, true, true
 	}
 	return doc.Text, true, false
+}
+
+// rescind drops a tombstone for frn: the file it pronounced deleted is live
+// again with content matching the base (restored before the fold), so the
+// fold must keep the base doc. A live entry is never touched. Reports
+// whether a tombstone was dropped.
+func (d *contentDelta) rescind(frn uint64) bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	i, ok := d.byFRN[frn]
+	if !ok || !d.docs[i].Deleted {
+		return false
+	}
+	d.docs = append(d.docs[:i], d.docs[i+1:]...)
+	d.byFRN = make(map[uint64]int, len(d.docs))
+	for j := range d.docs {
+		d.byFRN[d.docs[j].FRN] = j
+	}
+	return true
+}
+
+// docFor returns a copy of the delta doc for the key, if any (live or
+// tombstoned). The walk reconcile uses its fingerprint to tell a current
+// entry from a stale one.
+func (d *contentDelta) docFor(frn uint64) (contentDeltaDoc, bool) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if i, ok := d.byFRN[frn]; ok {
+		return d.docs[i], true
+	}
+	return contentDeltaDoc{}, false
 }
 
 func (d *contentDelta) priorHash(frn uint64) ([contentHashLen]byte, bool) {
@@ -398,12 +435,74 @@ type contentVolumeState struct {
 	// clears when a fold republishes the base at the current versions.
 	refreshActive  bool
 	refreshPending int
+	// walkReconcileGen/At record the last walk reconcile: the filename
+	// generation (replayGen) it diffed and when. The drain reconciles only on
+	// a new generation (or past the throttle interval), so a hot tick does
+	// not re-diff a large tree every 2 s.
+	walkReconcileGen uint64
+	walkReconcileAt  time.Time
+	// walkUnindexable remembers keys whose last extraction attempt produced
+	// no indexable text (empty or text-free files), qualified by the
+	// fingerprint attempted, so a reconcile does not re-enqueue them every
+	// pass forever. A fingerprint change drops the memory and retries, so a
+	// file that gains content is still picked up. In-memory only: a restart
+	// re-learns it in one fast-fail round. This is the walk equivalent of
+	// the USN stream never re-reporting a declined file.
+	walkUnindexable map[uint64]contentWalkPrint
 	// integrityFailures counts consecutive checksum failures of the attached
 	// base. It resets when a base passes the post-attach integrity pass and
 	// caps the rebuilds one failure streak schedules, so a disk that corrupts
 	// every write leaves the volume stale instead of spinning rebuilds. It
 	// survives setReady (attach happens before the pass runs) and markStale.
 	integrityFailures int
+}
+
+// walkDeclinedNote records that key extracted to nothing at print. A later
+// change re-arms it via the fingerprint mismatch in walkDeclinedSkipped.
+func (s *contentVolumeState) walkDeclinedNote(key uint64, print contentWalkPrint) {
+	if s == nil || key == 0 {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.walkUnindexable == nil {
+		s.walkUnindexable = make(map[uint64]contentWalkPrint)
+	}
+	s.walkUnindexable[key] = print
+}
+
+// walkDeclinedSkipped reports whether key was already attempted at print
+// without indexable text. A fingerprint change returns false (retry).
+func (s *contentVolumeState) walkDeclinedSkipped(key uint64, print contentWalkPrint) bool {
+	if s == nil || key == 0 {
+		return false
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	got, ok := s.walkUnindexable[key]
+	return ok && got == print
+}
+
+// walkReconcileMark returns the generation and time of the last walk
+// reconcile. Zero values force one.
+func (s *contentVolumeState) walkReconcileMark() (uint64, time.Time) {
+	if s == nil {
+		return 0, time.Time{}
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.walkReconcileGen, s.walkReconcileAt
+}
+
+// walkReconcileDone records a completed walk reconcile against gen.
+func (s *contentVolumeState) walkReconcileDone(gen uint64) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.walkReconcileGen = gen
+	s.walkReconcileAt = time.Now()
 }
 
 func newContentVolumeState(volume string) *contentVolumeState {
@@ -1212,6 +1311,12 @@ type contentCoordinator struct {
 	// drains. Bounded in memory (an FRN per change, not its text).
 	deferred     map[uint64]struct{}
 	drainEnabled bool
+	// declined, when non-nil, receives keys whose extraction deterministically
+	// produced no indexable text (skipped/empty input, no error) with the
+	// stat at attempt time. The walk drain sets it around processQueue to
+	// feed the unindexable skip-set; it stays nil everywhere else (the USN
+	// journal never re-reports a declined file, so USN needs no memory).
+	declined func(frn uint64, size, modNano int64)
 	// observedUSN is the highest change USN handed to observeChanges. It is a
 	// contiguous persistence bound only when no observed-but-unextracted work
 	// remains and catch-up is complete, which foldSnapshot enforces before a
@@ -1583,7 +1688,7 @@ func contentExtractDeltaDocContext(baseCtx context.Context, frn uint64, path str
 	if havePrior && h == prior {
 		return contentDeltaDoc{}, false, nil
 	}
-	return contentDeltaDoc{FRN: frn, Path: path, Text: stored, Hash: h, ContentType: res.Class, ExtractorVersion: e.Version()}, true, nil
+	return contentDeltaDoc{FRN: frn, Path: path, Text: stored, Hash: h, ContentType: res.Class, ExtractorVersion: e.Version(), FileSize: size, FileModNano: info.ModTime().UnixNano()}, true, nil
 }
 
 // sha256Of is the shared content hash: sha256 truncated to contentHashLen bytes
@@ -1649,6 +1754,14 @@ func (c *contentCoordinator) processQueue(resolvePath func(frn uint64) (string, 
 			// must not delete acknowledged content.
 			if !havePrior && c.state.hasContentForFRN(frn) {
 				delta.delete(frn)
+			} else if !havePrior && c.declined != nil {
+				// A never-indexed file declined deterministically: remember
+				// its current fingerprint so the caller stops retrying it
+				// until it changes. (A stat race here only costs one extra
+				// attempt: any later change re-arms it.)
+				if st, serr := os.Stat(path); serr == nil {
+					c.declined(frn, st.Size(), st.ModTime().UnixNano())
+				}
 			}
 			continue
 		}

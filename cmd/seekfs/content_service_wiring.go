@@ -58,15 +58,23 @@ func (s *goSearchService) attachContentForVolume(vol *serviceVolumeIndex) {
 	if contentScopeForVolume(s.contentConfig(), vol.volume).disabled() {
 		return
 	}
-	// Only USN volumes can join content docs (keyed by FRN) to records. Walk
-	// volumes use synthesized FRNs and a path-keyed `.gsx`, so attaching would
-	// advertise `ready` with a resolver that maps nothing.
+	// A volume joins content docs on its origin's key: the NTFS FRN for USN
+	// volumes, the stable path hash for walk volumes (whose record FRNs are
+	// positional and renumber on every rescan). Anything else has no join
+	// column and stays unavailable.
 	s.indexMu.RLock()
-	eligible := vol.index != nil && vol.index.Source == "usn"
+	var wantOrigin uint32
+	switch {
+	case vol.index != nil && vol.index.Source == "usn":
+		wantOrigin = contentOriginUSN
+	case vol.index != nil && vol.index.Source == "walk":
+		wantOrigin = contentOriginWalk
+	}
 	s.indexMu.RUnlock()
-	if !eligible {
+	if wantOrigin == contentOriginUnknown {
 		return
 	}
+	isWalk := wantOrigin == contentOriginWalk
 	s.acquireContentVolumeLock(vol)
 	// A volume that already has a usable base attached is done. This replaced
 	// the old "drain enabled" guard: after a journal reset invalidates the base
@@ -94,10 +102,11 @@ func (s *goSearchService) attachContentForVolume(vol *serviceVolumeIndex) {
 			idx.Release()
 		}
 	}()
-	if idx.Origin != contentOriginUSN {
-		// A path-keyed (walk) sidecar does not join to record FRNs; attaching it
-		// would report `ready` while every document resolves to nothing.
-		serviceLog("content index for volume %s is not FRN-keyed (origin=%d); leaving unavailable", vol.volume, idx.Origin)
+	if idx.Origin != wantOrigin {
+		// A sidecar from the other key space does not join to this volume's
+		// records; attaching it would report `ready` while every document
+		// resolves to nothing.
+		serviceLog("content index for volume %s is not keyed for this volume (origin=%d, want=%d); leaving unavailable", vol.volume, idx.Origin, wantOrigin)
 		return
 	}
 	resolvedScope, ok := s.resolvedContentScope(vol)
@@ -125,6 +134,13 @@ func (s *goSearchService) attachContentForVolume(vol *serviceVolumeIndex) {
 		}
 		pathCache := make(map[int]string, 64)
 		plan := contentPlanStaleExtractorRefresh(idx, func(frn uint64) (string, bool) {
+			if isWalk {
+				// contentWalkKeys needs indexMu; attach holds no lock here
+				// (unlike the drain/reconcile paths, which already hold it).
+				s.indexMu.RLock()
+				defer s.indexMu.RUnlock()
+				return s.contentResolveWalkPath(vol, frn, pathCache)
+			}
 			return s.contentResolvePath(vol, frn, pathCache)
 		})
 		if plan.rebuild {
@@ -139,8 +155,19 @@ func (s *goSearchService) attachContentForVolume(vol *serviceVolumeIndex) {
 	// cannot be joined or caught up: a zero watermark would attach `ready` and
 	// never catch up. Treat it as stale/needs-rebuild instead; PF-3 schedules
 	// the rebuild.
-	if idx.JournalID == 0 || idx.CheckpointUSN == 0 {
+	if !isWalk && (idx.JournalID == 0 || idx.CheckpointUSN == 0) {
 		reason := "content base has no USN watermark"
+		serviceLog("content index for volume %s %s; leaving stale", vol.volume, reason)
+		vol.content.markStale(reason)
+		return
+	}
+	// A walk-origin base carries no journal: JournalID must be 0 (anything
+	// else is a foreign sidecar) and CheckpointUSN holds the wall-clock
+	// reconcile watermark the service-owned build stamped. A zero watermark
+	// is a hand-built or offline sidecar the service did not build; rebuild
+	// it under the service's key convention and scope instead of serving it.
+	if isWalk && (idx.JournalID != 0 || idx.CheckpointUSN == 0) {
+		reason := "content base has no walk watermark"
 		serviceLog("content index for volume %s %s; leaving stale", vol.volume, reason)
 		vol.content.markStale(reason)
 		return
@@ -167,18 +194,35 @@ func (s *goSearchService) attachContentForVolume(vol *serviceVolumeIndex) {
 		serviceLog("content attach skipped volume=%s state=%s; let the rebuild finish (PF-3 re-attach)", vol.volume, state)
 		return
 	}
-	frns, ids, ok := contentBaseFRNColumns(vol.index)
 	journalID := vol.journalID
-	if !ok {
-		s.indexMu.Unlock()
-		serviceLog("content index for volume %s has no FRN column; leaving unavailable", vol.volume)
-		return
+	var frns []uint64
+	var ids []uint32
+	if isWalk {
+		// Walk records carry positional FRNs, so the persisted FRN column
+		// cannot join: build the stable path-hash join column from the live
+		// records instead.
+		var ok bool
+		frns, ids, ok = s.contentWalkKeys(vol)
+		if !ok {
+			s.indexMu.Unlock()
+			serviceLog("content index for volume %s has no walk records; leaving unavailable", vol.volume)
+			return
+		}
+	} else {
+		var ok bool
+		frns, ids, ok = contentBaseFRNColumns(vol.index)
+		if !ok {
+			s.indexMu.Unlock()
+			serviceLog("content index for volume %s has no FRN column; leaving unavailable", vol.volume)
+			return
+		}
 	}
 	// WP0/PB3: a base built against a different USN journal generation can
 	// never be joined to this volume's current FRNs. Refuse it (stale) rather
 	// than advertise ready with docs that resolve to nothing; PF-3 schedules
-	// the rebuild.
-	if idx.JournalID != journalID {
+	// the rebuild. Walk volumes have no journal generation; their join is
+	// validated by the zero-join guard below instead.
+	if !isWalk && idx.JournalID != journalID {
 		s.indexMu.Unlock()
 		reason := fmt.Sprintf("content base journal %d != volume journal %d", idx.JournalID, journalID)
 		serviceLog("content index journal mismatch for volume %s: %s", vol.volume, reason)
@@ -193,7 +237,7 @@ func (s *goSearchService) attachContentForVolume(vol *serviceVolumeIndex) {
 	// empty corpus.
 	if len(idx.Docs) > 0 && resolver.liveDocCount() == 0 {
 		s.indexMu.Unlock()
-		reason := "content docs do not join the base FRN column"
+		reason := "content docs do not join the base key column"
 		serviceLog("content index for volume %s %s; leaving stale", vol.volume, reason)
 		vol.content.markStale(reason)
 		return
@@ -224,6 +268,24 @@ func (s *goSearchService) attachContentForVolume(vol *serviceVolumeIndex) {
 		}
 		if startDrain && s.beginContentTask(vol) {
 			go func() { defer endContentTask(vol); s.contentDrainLoop(vol) }()
+		}
+		if isWalk {
+			// No journal to replay: restart freshness is a metadata reconcile
+			// of the persisted filename index against the base, run inline
+			// (it opens no files) before the fold gate opens. Disk changes
+			// newer than the persisted index arrive via the watcher's next
+			// filename rebuild, which reconciles in turn.
+			s.contentReconcileWalkVolume(vol, true)
+			vol.content.markCatchUpComplete()
+			vol.contentBuildAttempts.Store(0)
+			// Same background integrity pass as the USN path below: the
+			// small sections (including the doc table) were verified at
+			// load; the large text/posting sections hash off-path.
+			if s.beginContentTask(vol) {
+				contentVerifyAsync(func() { defer endContentTask(vol); s.verifyContentAfterAttach(vol, idx) })
+			}
+			serviceLog("content index loaded for volume %s docs=%d (walk)", vol.volume, len(idx.Docs))
+			return
 		}
 		// Catch up OFF the startup path: a far-behind base must not block
 		// startup or grow an unbounded delta. Catch-up runs after the drain is
@@ -602,13 +664,40 @@ func (s *goSearchService) contentDrainLoop(vol *serviceVolumeIndex) {
 			// cadence, so a service that lost the startup race acquires it once
 			// the CLI build releases it.
 			s.retryContentVolumeLock(vol)
+			// Walk volumes have no USN stream: reconcile the filename index
+			// against the content base first (a no-op unless the filename
+			// generation moved or the safety-net period elapsed), so changed
+			// files are extracted on this tick.
+			s.indexMu.RLock()
+			isWalkDrain := vol.contentWalkOriginAttached()
+			s.indexMu.RUnlock()
+			if isWalkDrain {
+				s.contentReconcileWalkVolume(vol, false)
+				// Feed deterministic declines into the walk skip-set, so
+				// unindexable files are not retried every reconcile. The
+				// coordinator is per-volume, so no other volume's drain
+				// can observe this.
+				vol.contentCoord.declined = func(key uint64, size, modNano int64) {
+					vol.content.walkDeclinedNote(key, contentWalkPrint{size: size, mod: modNano})
+				}
+			}
 			vol.contentCoord.promoteAll()
 			// A private path cache: the drain must not touch vol.pathCache,
 			// which the search path trims under searchMu (a different lock).
 			pathCache := make(map[int]string, 64)
 			ignoreChanged := false
 			vol.contentCoord.processQueue(func(frn uint64) (string, bool) {
-				path, ok := s.contentResolvePath(vol, frn, pathCache)
+				var path string
+				var ok bool
+				if isWalkDrain {
+					// The walk join column needs indexMu; the tick holds no
+					// lock here.
+					s.indexMu.RLock()
+					path, ok = s.contentResolveWalkPath(vol, frn, pathCache)
+					s.indexMu.RUnlock()
+				} else {
+					path, ok = s.contentResolvePath(vol, frn, pathCache)
+				}
 				if !ok {
 					return "", false
 				}
@@ -640,6 +729,7 @@ func (s *goSearchService) contentDrainLoop(vol *serviceVolumeIndex) {
 				scope = nil
 				s.scheduleContentRebuild(vol)
 			}
+			vol.contentCoord.declined = nil
 			// M1: after the tick's extractions, fold if the delta has grown
 			// past its bound. A fold failure keeps the delta and backs off.
 			s.maybeFoldContentDelta(vol)
@@ -704,13 +794,23 @@ func contentLookupFRNColumn(frns []uint64, frn uint64) (int, bool) {
 // recordIDForFRN resolves an FRN to a base record id, falling back to the
 // persisted FRN column when the resident arrays are absent (low-memory mode).
 // Content delta docs and candidate mapping must never drop a record just
-// because the resident FRN index was not built.
+// because the resident FRN index was not built. For walk-origin volumes the
+// key is the stable path hash, resolved through the cached walk join column
+// (walk FRNs are positional and renumber on every rescan). Call with indexMu
+// held (read or write); the walk set is immutable and pointer-keyed, so a
+// concurrent base swap can only make it miss, never misjoin.
 func (vol *serviceVolumeIndex) recordIDForFRN(frn uint64) (int, bool) {
 	if vol == nil || vol.index == nil || frn == 0 {
 		return 0, false
 	}
 	if id, ok := vol.idForFRN(frn); ok {
 		return id, true
+	}
+	if set := vol.walkKeys; set != nil && set.idx == vol.index {
+		if i, found := contentLookupFRNColumn(set.keys, frn); found && i < len(set.ids) {
+			return int(set.ids[i]), true
+		}
+		return 0, false
 	}
 	derived := vol.index.Derived
 	if i, ok := contentLookupFRNColumn(derived.FRNs, frn); ok && i < len(derived.FRNRecordIDs) {
@@ -748,9 +848,35 @@ func (vol *serviceVolumeIndex) stopContentDrain() {
 
 // rebindContentAfterBaseSwap rebuilds a volume's content->record resolver
 // against its new record table. Content itself is untouched: docs are keyed on
-// FRN, so a persist/compaction swap must never re-extract.
+// FRN, so a persist/compaction swap must never re-extract. Walk record IDs
+// renumber on every rescan, so a walk rebind also rebuilds the stable-key
+// join column first — rebinding positional FRNs would resolve results to the
+// wrong records.
 func rebindContentAfterBaseSwap(vol *serviceVolumeIndex) {
 	if vol == nil || vol.content == nil {
+		return
+	}
+	vol.content.mu.RLock()
+	origin := uint32(contentOriginUnknown)
+	if vol.content.idx != nil {
+		origin = vol.content.idx.Origin
+	}
+	vol.content.mu.RUnlock()
+	if origin == contentOriginWalk {
+		keys, ids := buildContentWalkKeys(vol.index)
+		vol.walkKeys = &walkKeySet{idx: vol.index, keys: keys, ids: ids}
+		vol.content.rebuildResolver(keys, ids)
+		// A base whose docs join nothing (e.g. the roots changed out from
+		// under the sidecar) must not serve empty as ready. The next
+		// ensureContentBuild (walk rebuild path, runtime swap) re-attaches
+		// or rebuilds it.
+		vol.content.mu.RLock()
+		joined := vol.content.resolver.liveDocCount()
+		docs := len(vol.content.idx.Docs)
+		vol.content.mu.RUnlock()
+		if docs > 0 && joined == 0 {
+			vol.content.markStale("content docs do not join the rebuilt walk index")
+		}
 		return
 	}
 	frns, ids, ok := contentBaseFRNColumns(vol.index)

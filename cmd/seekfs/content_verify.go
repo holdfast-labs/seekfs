@@ -257,13 +257,26 @@ func entryMatchesContentAt(entry Entry, pq parsedQuery, matchPath bool, matched 
 
 // contentTextForEntry resolves an entry's normalized content text. The delta
 // wins over the base for a changed FRN; a tombstoned delta doc means absent.
+// On a walk-origin volume the key is the stable path hash derived from the
+// entry's path (walk record FRNs are positional and renumber on every
+// rescan); on USN volumes it is the entry's FRN.
 func (vol *serviceVolumeIndex) contentTextForEntry(entry *Entry) ([]byte, bool) {
-	if vol == nil || vol.content == nil || entry.FRN == 0 {
+	if vol == nil || vol.content == nil {
+		return nil, false
+	}
+	key := entry.FRN
+	if vol.contentWalkOriginAttached() {
+		var ok bool
+		key, ok = contentWalkKeyOfEntry(entry)
+		if !ok {
+			return nil, false
+		}
+	} else if key == 0 {
 		return nil, false
 	}
 	reader, resolver := vol.content.readerResolverView()
 	if delta := vol.content.deltaView(); delta != nil {
-		if text, found, deleted := delta.textFor(entry.FRN); found {
+		if text, found, deleted := delta.textFor(key); found {
 			if deleted {
 				return nil, false
 			}
@@ -273,7 +286,7 @@ func (vol *serviceVolumeIndex) contentTextForEntry(entry *Entry) ([]byte, bool) 
 	if reader == nil || resolver == nil {
 		return nil, false
 	}
-	docIndex, ok := resolver.docForFRN(entry.FRN)
+	docIndex, ok := resolver.docForFRN(key)
 	if !ok {
 		return nil, false
 	}

@@ -239,7 +239,7 @@ func (s *goSearchService) pluginStatuses() []pluginStatus {
 				loading := s.loading
 				var healths []contentHealth
 				for _, vol := range s.volumes {
-					if vol.index != nil && vol.index.Source == "usn" && !contentScopeForVolume(s.contentConfig(), vol.volume).disabled() && vol.content != nil {
+					if vol.index != nil && (vol.index.Source == "usn" || vol.index.Source == "walk") && !contentScopeForVolume(s.contentConfig(), vol.volume).disabled() && vol.content != nil {
 						depth := 0
 						if vol.contentCoord != nil {
 							depth = vol.contentCoord.queued()
@@ -266,7 +266,7 @@ func (s *goSearchService) pluginStatuses() []pluginStatus {
 				} else if loading {
 					p.State = "loading"
 				} else {
-					p.Error = "no eligible indexed NTFS volume; check loaded volumes and content scope"
+					p.Error = "no eligible indexed volume (NTFS or walk root); check loaded volumes and content scope"
 				}
 			}
 		} else if companion := f.companions[name]; companion != nil {

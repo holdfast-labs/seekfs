@@ -603,6 +603,10 @@ func replaceServiceVolumeContents(dst, src *serviceVolumeIndex) {
 	dst.frnToID = src.frnToID
 	dst.frns = src.frns
 	dst.frnRecordIDs = src.frnRecordIDs
+	// A base swap installs a new index pointer; the walk join column is
+	// rebuilt by the content rebind below (featuresBaseReplaced), so drop
+	// the old pointer-keyed set here rather than serve it stale.
+	dst.walkKeys = src.walkKeys
 	dst.children = src.children
 	dst.childOffsets = src.childOffsets
 	dst.childIDs = src.childIDs
@@ -672,6 +676,10 @@ func snapshotServiceVolumeForSearch(vol *serviceVolumeIndex) *serviceVolumeIndex
 		frnToID:           vol.frnToID,
 		frns:              vol.frns,
 		frnRecordIDs:      vol.frnRecordIDs,
+		// The walk join column is immutable and keyed by index pointer
+		// (walkKeySet.idx); the view always shares the volume's index
+		// (snap.base == vol.index), so sharing the set is exact.
+		walkKeys: vol.walkKeys,
 		children:          vol.children,
 		childOffsets:      vol.childOffsets,
 		childIDs:          vol.childIDs,

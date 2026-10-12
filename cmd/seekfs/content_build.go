@@ -110,6 +110,12 @@ type contentBuildDoc struct {
 	// into the doc table so per-class invalidation can see a version bump.
 	class   uint16
 	version uint16
+	// fileSize and fileModNano are the source file's byte size and nanosecond
+	// mtime at extraction time. The walk reconcile diffs them against the
+	// filename index; every producer stamps them from the same stat the
+	// extraction read.
+	fileSize    int64
+	fileModNano int64
 }
 
 // contentWalkDoc is one extracted file awaiting assembly: the spool offset of
@@ -123,6 +129,11 @@ type contentWalkDoc struct {
 	modUnix int64
 	class   uint16
 	version uint16
+	// fileSize and fileModNano are the source file's byte size and nanosecond
+	// mtime at extraction time (walk reconcile fingerprint); every producer
+	// stamps them from the same stat the extraction read.
+	fileSize    int64
+	fileModNano int64
 }
 
 // contentWalkSpool streams extracted documents back out of a spool file in the
@@ -139,7 +150,7 @@ func contentWalkSpool(f *os.File, spooled []contentWalkDoc, order []int) content
 		if _, err := f.ReadAt(text, s.offset); err != nil {
 			return contentBuildDoc{}, false, err
 		}
-		return contentBuildDoc{path: s.item.path, frn: s.item.frn, text: text, modUnix: s.modUnix, class: s.class, version: s.version}, true, nil
+		return contentBuildDoc{path: s.item.path, frn: s.item.frn, text: text, modUnix: s.modUnix, class: s.class, version: s.version, fileSize: s.fileSize, fileModNano: s.fileModNano}, true, nil
 	}
 }
 
@@ -313,12 +324,14 @@ func buildContentIndexFromDir(ctx context.Context, root string, opts contentBuil
 			return werr
 		}
 		spooled = append(spooled, contentWalkDoc{
-			item:    contentBuildItem{frn: contentPathKey(rel), path: rel},
-			offset:  offset,
-			length:  len(res.Text),
-			modUnix: info.ModTime().Unix(),
-			class:   res.Class,
-			version: e.Version(),
+			item:        contentBuildItem{frn: contentPathKey(rel), path: rel},
+			offset:      offset,
+			length:      len(res.Text),
+			modUnix:     info.ModTime().Unix(),
+			class:       res.Class,
+			version:     e.Version(),
+			fileSize:    size,
+			fileModNano: info.ModTime().UnixNano(),
 		})
 		return nil
 	})
@@ -505,6 +518,8 @@ func assembleContentIndexStreamed(source contentBuildSource, tmpDir string) (*co
 				ContentHash:      sha256Of(stored),
 				TextOff:          textSize,
 				TextLen:          uint32(len(stored)),
+				FileSize:         d.fileSize,
+				FileModNano:      d.fileModNano,
 			})
 			textSize += uint64(len(stored))
 			// Documents arrive in ascending docID order, so each key's Adds arrive
@@ -641,12 +656,14 @@ func buildContentIndexForIndex(ctx context.Context, idx *Index, opts contentBuil
 				return nil, werr
 			}
 			spooled = append(spooled, contentWalkDoc{
-				item:    item,
-				offset:  offset,
-				length:  len(doc.text),
-				modUnix: doc.modUnix,
-				class:   doc.class,
-				version: doc.version,
+				item:        item,
+				offset:      offset,
+				length:      len(doc.text),
+				modUnix:     doc.modUnix,
+				class:       doc.class,
+				version:     doc.version,
+				fileSize:    doc.fileSize,
+				fileModNano: doc.fileModNano,
 			})
 			continue
 		}

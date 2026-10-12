@@ -510,6 +510,12 @@ type serviceVolumeIndex struct {
 	frnToID           map[uint64]int
 	frns              []uint64
 	frnRecordIDs      []uint32
+	// walkKeys is the cached content join column for walk-indexed volumes:
+	// the stable path-hash key of every live file record, sorted with
+	// record IDs parallel. Walk record FRNs are positional and renumber on
+	// every rescan, so content joins on these keys instead. Rebuilt whenever
+	// the index pointer moves; guarded by indexMu like the index itself.
+	walkKeys *walkKeySet
 	children          map[uint64]map[int]struct{}
 	childOffsets      []uint32
 	childIDs          []uint32

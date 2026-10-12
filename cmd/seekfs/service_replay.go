@@ -155,6 +155,18 @@ func (s *goSearchService) rebuildWalkVolumeInPlace(vol *serviceVolumeIndex, reas
 	s.startBackgroundNameTrigramBuilds([]*serviceVolumeIndex{vol})
 	s.startBackgroundNameIdentityBuilds([]*serviceVolumeIndex{vol})
 	serviceLog("rebuilt walk index db=%s entries=%d reason=%s", vol.dbPath, loaded.entryCount(), reason)
+	// The rescan renumbered every record ID: the content resolver was rebound
+	// by the replace above, and the content diff must now follow — files the
+	// watcher noticed changed on disk are new/changed keys here. A rebind
+	// that joined nothing (roots changed) left content stale; reschedule so
+	// it re-attaches or rebuilds instead of sticking.
+	if vol.content != nil && vol.contentCoord != nil {
+		if vol.content.stateOf() == contentStateStale {
+			s.ensureContentBuild(vol)
+		} else {
+			s.contentReconcileWalkVolume(vol, true)
+		}
+	}
 	return nil
 }
 

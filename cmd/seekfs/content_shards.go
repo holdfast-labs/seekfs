@@ -558,7 +558,7 @@ func contentShardFoldSource(sh *contentShard, incoming []contentDeltaDoc, drop m
 			case haveDelta && (!haveBase || incoming[j].FRN <= base[i].FRN):
 				d := incoming[j]
 				j++
-				return contentBuildDoc{frn: d.FRN, path: d.Path, text: d.Text, class: d.ContentType, version: d.ExtractorVersion}, true, nil
+				return contentBuildDoc{frn: d.FRN, path: d.Path, text: d.Text, class: d.ContentType, version: d.ExtractorVersion, fileSize: d.FileSize, fileModNano: d.FileModNano}, true, nil
 			case haveBase:
 				doc := base[i]
 				i++
@@ -566,7 +566,7 @@ func contentShardFoldSource(sh *contentShard, incoming []contentDeltaDoc, drop m
 				if len(text) == 0 {
 					continue
 				}
-				return contentBuildDoc{frn: doc.FRN, path: sh.reader.docPath(doc.DocID), text: text, modUnix: doc.ModUnix, class: doc.ContentType, version: doc.ExtractorVersion}, true, nil
+				return contentBuildDoc{frn: doc.FRN, path: sh.reader.docPath(doc.DocID), text: text, modUnix: doc.ModUnix, class: doc.ContentType, version: doc.ExtractorVersion, fileSize: doc.FileSize, fileModNano: doc.FileModNano}, true, nil
 			default:
 				return contentBuildDoc{}, false, nil
 			}
@@ -602,7 +602,7 @@ func contentReshardAndSave(gsx string, whole *contentIndex, header *contentIndex
 			}
 			d := whole.Docs[g.docs[k]]
 			k++
-			return contentBuildDoc{frn: d.FRN, path: paths[d.DocID], text: reader.docText(d.DocID), modUnix: d.ModUnix, class: d.ContentType, version: d.ExtractorVersion}, true, nil
+			return contentBuildDoc{frn: d.FRN, path: paths[d.DocID], text: reader.docText(d.DocID), modUnix: d.ModUnix, class: d.ContentType, version: d.ExtractorVersion, fileSize: d.FileSize, fileModNano: d.FileModNano}, true, nil
 		}, tmpDir)
 		if err != nil {
 			return 0, err

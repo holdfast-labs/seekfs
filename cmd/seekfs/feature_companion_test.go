@@ -488,6 +488,9 @@ func TestFeatureCommandDispatchAndMixedContent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// The docs join USN record FRNs; stamp the true origin (the assembler
+	// defaults to walk, which the walk-keyed query path must not claim).
+	idx.Origin = contentOriginUSN
 	reader, err := openContentReader(idx)
 	if err != nil {
 		t.Fatal(err)
