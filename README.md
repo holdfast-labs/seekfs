@@ -75,6 +75,38 @@ Query through the service:
 When no `-db` is supplied, `search` and `count` use the resident service by
 default. Use `-local` to skip the service and read a local DB file instead.
 
+## Native Desktop UI (`seekfs-native`)
+
+`seekfs-native.exe` is a GPU-rendered desktop search window (Gio) that talks
+to the resident service over its named pipe — same JSON protocol as the CLI.
+Build and run it against a standalone service (no admin needed):
+
+```powershell
+# Serve the prebuilt Chromium filename index on a dev pipe:
+E:\bench\seekfs-content.exe service -pipe \\.\pipe\seekfs-native-dev -sddl "D:P(A;;GA;;;OW)(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;AU)" -db E:\bench\chromium.gsi
+
+# In this repo (all go commands via the shared build lock):
+bash /e/bench/gorun.sh build -ldflags=-H=windowsgui -o E:/bench/seekfs-native.exe ./cmd/seekfs-native
+E:\bench\seekfs-native.exe -pipe \\.\pipe\seekfs-native-dev
+```
+
+Flags: `-pipe` (service pipe, default `\\.\pipe\seekfs-service`), `-n`
+(result limit). Environment: `SEEKFS_NATIVE_QUERY` runs one search at
+startup (deterministic screenshots), `SEEKFS_NATIVE_DPISCALE=1.5` scales all
+layout for scaling tests, `SEEKFS_NATIVE_DEBUGLOG=<file>` logs search
+delivery and frames, `SEEKFS_NATIVE_SETTINGS` overrides the settings path
+(`%APPDATA%\seekfs\native.json` by default).
+
+Features: instant debounced search, Contents toggle (`content:` rewrite with
+snippet matches), Details/Icons/grouped views, sortable/resizable columns,
+sidebar (Favorites, indexed volumes, saved searches), preview pane (text
+with match highlight, images, metadata), Explorer shell menu, drag-out,
+Recycle Bin delete, in-place rename, back/forward history, system
+light/dark theme with accent color, per-monitor DPI.
+
+Content search needs an NTFS change-journal content index; without one the
+UI reports "content unavailable" instead of empty results.
+
 ## Examples
 
 Search file names:

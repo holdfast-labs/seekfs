@@ -55,6 +55,13 @@ func newUI(pipe string, limit int, onFrame func()) *UI {
 	u.renameEd.Submit = true
 	u.dark = u.shell.SystemDark()
 	u.accent = u.shell.SystemAccent()
+	// SEEKFS_NATIVE_THEME=dark|light overrides the OS theme (screenshots).
+	switch os.Getenv("SEEKFS_NATIVE_THEME") {
+	case "dark":
+		u.dark = true
+	case "light":
+		u.dark = false
+	}
 	dbgLog("newUI dark=%v accent=%v", u.dark, u.accent)
 	u.applyScheme()
 	u.searcher.OnDeliver(func(res SearchResult) { u.deliver(res) })
@@ -142,6 +149,12 @@ func (u *UI) themePoll(w *app.Window) {
 	for range t.C {
 		dark := u.shell.SystemDark()
 		accent := u.shell.SystemAccent()
+		switch os.Getenv("SEEKFS_NATIVE_THEME") {
+		case "dark":
+			dark = true
+		case "light":
+			dark = false
+		}
 		u.mu.Lock()
 		changed := dark != u.dark || accent != u.accent
 		u.mu.Unlock()
