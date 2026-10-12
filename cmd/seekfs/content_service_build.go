@@ -43,9 +43,11 @@ package main
 // attaches the fresh base and leaves the delta overlay intact; catch-up resumes
 // from the new base's checkpoint, so no change is double-counted or lost.
 //
-// Default scope (M5). Unlike the offline CLI (which indexes any extractable
-// file when no -ext is given), the service build is allowlisted: the curated
-// text/code/config set below plus every registered rich-extractor extension. A
+// Default scope (M5, sniff-selected since the recall follow-up). Unlike the
+// offline CLI (which indexes any extractable file when no -ext is given),
+// the service build used to be allowlisted; now, without a configured exts
+// list, it admits every file the scope roots allow (minus known-binary
+// extensions) and head-sniffs each at build time, ripgrep-style. A
 // whole-volume build is never the default.
 
 import (
@@ -140,10 +142,12 @@ var contentBuildSnapshotBatchHook = func(*goSearchService, *serviceVolumeIndex) 
 // state. Tests use it to observe the indexing state/progress deterministically.
 var contentBuildIndexingHook = func(*contentVolumeState) {}
 
-// defaultServiceContentBuildOptions is the service build's default scope (M5):
-// a curated text/code/config allowlist unioned with every registered
-// extractor's extensions. The offline builder defaults to "any extractable
-// file"; the service deliberately does not.
+// defaultServiceContentBuildOptions is the service build's default scope:
+// sniff-based selection (the scope admits everything but known-binary
+// extensions; each file's head decides at build time). The curated
+// text/code/config allowlist below plus every registered extractor's
+// extensions seed the registry the scope fingerprint names and the explicit
+// exts opt-in restores.
 func defaultServiceContentBuildOptions() contentBuildOptions {
 	opts := defaultContentBuildOptions()
 	opts.Exts = contentServiceExtensions()
@@ -496,7 +500,9 @@ func contentBuildDocSafe(ctx context.Context, item contentBuildItem) (doc conten
 	head, _ := contentReadBounded(f, size, 512)
 	e := contentExtractorForPath(item.path, head)
 	if e == nil {
-		return contentBuildDoc{}, contentExtractResult{}, false
+		// No extractor claimed the head: binary (NUL in the sniff window),
+		// counted apart from skipped/declined.
+		return contentBuildDoc{}, contentExtractResult{Binary: true, Reason: "binary"}, false
 	}
 	// Bound one document's extraction so a hang cannot stall the serial build;
 	// contentExtractSafely nests the deadline inside the build's stop/cancel
@@ -677,7 +683,7 @@ func (s *goSearchService) runContentBuild(vol *serviceVolumeIndex, reuseSidecar 
 	selected := make([]selectedDoc, 0, 1024)
 	total := len(items)
 	done := 0
-	var used, skipped, truncated int64
+	var used, skipped, truncated, binary int64
 	// overBudget latches once the scope byte budget bites; see the tally below.
 	overBudget := false
 	abortReason := ""
@@ -707,8 +713,12 @@ func (s *goSearchService) runContentBuild(vol *serviceVolumeIndex, reuseSidecar 
 		if ok && res.Truncated {
 			truncated++
 		}
-		if !ok && res.Skipped {
-			skipped++
+		if !ok {
+			if res.Binary {
+				binary++
+			} else if res.Skipped {
+				skipped++
+			}
 		}
 		if done%contentBuildBatchSize == 0 {
 			if !s.contentBuildCurrent(vol, gen, journalID) {
@@ -802,7 +812,7 @@ func (s *goSearchService) runContentBuild(vol *serviceVolumeIndex, reuseSidecar 
 		Origin:        contentOriginUSN,
 		JournalID:     journalID,
 		CheckpointUSN: uint64(checkpoint),
-		Policy:        contentBuildPolicy{MaxRaw: settings.maxRaw, MaxText: settings.maxText, Skipped: skipped, Truncated: truncated, ScopeDropped: scopeDropped, ScopeDroppedBytes: scopeDroppedBytes, BudgetBytes: budgetBytes},
+		Policy:        contentBuildPolicy{MaxRaw: settings.maxRaw, MaxText: settings.maxText, Skipped: skipped, Truncated: truncated, ScopeDropped: scopeDropped, ScopeDroppedBytes: scopeDroppedBytes, BudgetBytes: budgetBytes, Binary: binary},
 	}
 	if opts.Scope != nil {
 		header.ScopeHash = opts.Scope.fingerprint()

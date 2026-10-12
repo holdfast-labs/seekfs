@@ -7,6 +7,8 @@ package main
 
 import (
 	"container/heap"
+	"errors"
+	"io"
 	"os"
 	"sort"
 	"strings"
@@ -49,8 +51,25 @@ type contentEstimate struct {
 	// candidate set, so a budget_hit names exactly what was cut: eligible
 	// files were considered, files fit. (When MaxFilesHit, both are over the
 	// priority-truncated set, like Files/Bytes.)
-	EligibleFiles     int64 `json:"eligible_files"`
-	EligibleBytes     int64 `json:"eligible_bytes"`
+	EligibleFiles int64 `json:"eligible_files"`
+	EligibleBytes int64 `json:"eligible_bytes"`
+	// Paths holds every selected (post-budget) path when the estimate was
+	// asked to list them (--paths), for set reconciliation against ripgrep.
+	Paths []string `json:"paths,omitempty"`
+	// TextCandidates counts eligible files no registered extractor claims by
+	// extension (unknown or missing): the build opens and head-sniffs them,
+	// keeping the text ones like ripgrep does. BinaryCandidates counts the
+	// cheap rejections (known-binary extensions); the build never opens those.
+	TextCandidates   int64 `json:"text_candidates"`
+	BinaryCandidates int64 `json:"binary_candidates,omitempty"`
+	// SampledFiles/SampledBinary report an opt-in head-sniff sample over the
+	// text candidates (--sniff-sample N): how many were opened and how many
+	// sniffed binary. ProjectedTextFiles subtracts the projected binary share
+	// from Files. Zero when sampling is off.
+	SampledFiles       int   `json:"sampled_files,omitempty"`
+	SampledBinary      int   `json:"sampled_binary,omitempty"`
+	ProjectedTextFiles int64 `json:"projected_text_files,omitempty"`
+
 	ProjectedGSXBytes int64 `json:"projected_gsx_bytes"`
 }
 
@@ -136,7 +155,10 @@ func (r *contentScopeResolved) attachGitIgnore(ignoreFiles map[string][]string) 
 
 // scanContentScope estimates what a scoped build would index. maxFiles mirrors
 // contentBuildOptions.MaxFiles (0 = unbounded); reaching it sets MaxFilesHit.
-func scanContentScope(idx *Index, scope contentScope, volume string, maxFiles int) contentEstimate {
+// sniffSample opens up to that many text-candidate heads to project the binary
+// share (0 = no sampling; the estimate otherwise never touches the filesystem).
+// listPaths records every selected (post-budget) path in est.Paths.
+func scanContentScope(idx *Index, scope contentScope, volume string, maxFiles int, sniffSample int, listPaths bool) contentEstimate {
 	est := contentEstimate{
 		ByExt:    make(map[string]int64),
 		Excluded: make(map[string]int64),
@@ -159,7 +181,15 @@ func scanContentScope(idx *Index, scope contentScope, volume string, maxFiles in
 			continue // already counted as a repo marker
 		}
 		ext := strings.ToLower(contentPathExtension(rec.Name))
-		if _, ok := resolved.ExtSet[ext]; !ok {
+		if resolved.SniffText {
+			// Cheap binary rejections are tallied apart from scope
+			// exclusions; the build never opens them.
+			if contentBinaryExtension(ext) && !contentRegistryClaimsExt(ext) {
+				est.Excluded["binary"]++
+				est.BinaryCandidates++
+				continue
+			}
+		} else if _, ok := resolved.ExtSet[ext]; !ok {
 			est.Excluded["ext"]++
 			continue
 		}
@@ -202,6 +232,9 @@ func scanContentScope(idx *Index, scope contentScope, volume string, maxFiles in
 	for _, c := range candidates {
 		est.EligibleFiles++
 		est.EligibleBytes += c.bytes
+		if !contentKnownTextExt(c.ext) {
+			est.TextCandidates++
+		}
 	}
 	for _, c := range candidates {
 		if est.Bytes+c.bytes > resolved.BudgetBytes {
@@ -210,6 +243,9 @@ func scanContentScope(idx *Index, scope contentScope, volume string, maxFiles in
 		}
 		est.Files++
 		est.Bytes += c.bytes
+		if listPaths {
+			est.Paths = append(est.Paths, c.item.path)
+		}
 		est.ByExt[c.ext]++
 		if i, seen := unitIndex[c.unit]; seen {
 			est.ByUnit[i].Files++
@@ -220,5 +256,83 @@ func scanContentScope(idx *Index, scope contentScope, volume string, maxFiles in
 		}
 	}
 	est.ProjectedGSXBytes = int64(float64(est.Bytes) * contentGSXOverheadMultiplier)
+	if sniffSample > 0 {
+		est.applySniffSample(candidates, sniffSample)
+	}
 	return est
+}
+
+// contentKnownTextExt reports whether ext is claimed by a registered extractor
+// or is in the curated text list: files the build extracts without depending
+// on the head sniff. Anything else admitted is a text candidate.
+func contentKnownTextExt(ext string) bool {
+	if contentRegistryClaimsExt(ext) {
+		return true
+	}
+	for _, want := range contentDefaultTextExtensions {
+		if want == ext {
+			return true
+		}
+	}
+	return false
+}
+
+// applySniffSample stride-samples up to n text-candidate heads for NUL bytes
+// (the same predicate the build applies) and projects the binary share onto
+// all text candidates: ProjectedTextFiles is the indexable total the build
+// should land near. It opens files, so the estimate calls it only for an
+// explicit --sniff-sample.
+func (est *contentEstimate) applySniffSample(candidates contentEstimateHeap, n int) {
+	var paths []string
+	for _, c := range candidates {
+		if !contentKnownTextExt(c.ext) {
+			paths = append(paths, c.item.path)
+		}
+	}
+	if len(paths) == 0 {
+		return
+	}
+	if n > len(paths) {
+		n = len(paths)
+	}
+	step := len(paths) / n
+	if step < 1 {
+		step = 1
+	}
+	sampled, binary := 0, 0
+	for i := 0; i < len(paths) && sampled < n; i += step {
+		head, err := contentReadHead(paths[i], 512)
+		if err != nil {
+			continue
+		}
+		sampled++
+		if contentExtractorForPath(paths[i], head) == nil {
+			binary++
+		}
+	}
+	if sampled == 0 {
+		return
+	}
+	est.SampledFiles = sampled
+	est.SampledBinary = binary
+	projectedBinary := int64(float64(len(paths)) * float64(binary) / float64(sampled))
+	est.ProjectedTextFiles = est.Files - projectedBinary
+	if est.ProjectedTextFiles < 0 {
+		est.ProjectedTextFiles = 0
+	}
+}
+
+// contentReadHead reads up to max head bytes of path for sniffing.
+func contentReadHead(path string, max int) ([]byte, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	buf := make([]byte, max)
+	n, err := f.Read(buf)
+	if err != nil && !errors.Is(err, io.EOF) {
+		return nil, err
+	}
+	return buf[:n], nil
 }

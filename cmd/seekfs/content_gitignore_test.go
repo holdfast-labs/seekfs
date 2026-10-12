@@ -41,17 +41,17 @@ func TestContentGitIgnoreRules(t *testing.T) {
 	writeContentTree(t, root, map[string]string{
 		".git/HEAD":         "ref: refs/heads/main\n",
 		".git/info/exclude": "secret.txt\n",
-		".gitignore":        "# comment\nOUT/\n*.log\n!keep.log\n/build-cache\n!out/keep.txt\n",
+		".gitignore":        "# comment\nout/\n*.log\n!keep.log\n/build-cache\n!out/keep.txt\nUPPER/\n",
 		"sub/.gitignore":    "generated/\n",
 	})
 	g := newContentGitIgnore([]string{root})
-	norm := func(rel string) string { return contentNormPath(filepath.Join(root, filepath.FromSlash(rel))) }
+	abs := func(rel string) string { return filepath.Join(root, filepath.FromSlash(rel)) }
 	cases := []struct {
 		rel   string
 		isDir bool
 		want  bool
 	}{
-		{"out/a.txt", false, true},              // directory pattern, case-folded
+		{"out/a.txt", false, true},              // directory pattern
 		{"out/keep.txt", false, true},           // cannot re-include under an ignored dir
 		{"x.log", false, true},                  // floating glob
 		{"keep.log", false, false},              // later negation wins
@@ -64,14 +64,49 @@ func TestContentGitIgnoreRules(t *testing.T) {
 		{"build/b.py", false, false},
 		{".git/config", false, true},
 		{"sub", true, false},
+		// Patterns match case-sensitively, like git (for existing files)
+		// and ripgrep: OUT/ must not match out/, and vice versa.
+		{"OUT/a.txt", false, false},
+		{"upper/a.txt", false, false},
+		{"UPPER/a.txt", false, true},
+		{"X.LOG", false, false},
 	}
 	for _, tc := range cases {
-		if got := g.ignored(norm(tc.rel), tc.isDir); got != tc.want {
+		if got := g.ignored(abs(tc.rel), tc.isDir); got != tc.want {
 			t.Errorf("ignored(%s) = %v, want %v", tc.rel, got, tc.want)
 		}
 	}
-	if g.ignored(contentNormPath(filepath.Join(t.TempDir(), "out", "a.txt")), false) {
+	if g.ignored(filepath.Join(t.TempDir(), "out", "a.txt"), false) {
 		t.Error("a path outside every worktree must not be ignored")
+	}
+}
+
+// A tracked file whose name differs in case from an ignore pattern is NOT
+// ignored: git matches patterns case-sensitively for files that exist
+// (build/.gitignore's LASTCHANGE* ignores a hypothetical LASTCHANGE.foo but
+// not the tracked lastchange.gni), and ripgrep agrees. Case-folding here
+// silently dropped tracked source (Chromium's build/util/lastchange.gni).
+func TestContentGitIgnoreCaseMismatchDoesNotIgnore(t *testing.T) {
+	root := t.TempDir()
+	writeContentTree(t, root, map[string]string{
+		".git/HEAD":  "ref: refs/heads/main\n",
+		".gitignore": "/util/LASTCHANGE*\n!/util/LASTCHANGE.dummy\n",
+	})
+	g := newContentGitIgnore([]string{root})
+	abs := func(rel string) string { return filepath.Join(root, filepath.FromSlash(rel)) }
+	for _, tc := range []struct {
+		rel  string
+		want bool
+	}{
+		{"util/LASTCHANGE.foo", true},
+		{"util/LASTCHANGE.dummy", false}, // negation wins at the same level
+		{"util/lastchange.gni", false},   // case differs: not ignored
+		{"util/lastchange.py", false},
+		{"util/LaStChAnGe.txt", false},
+	} {
+		if got := g.ignored(abs(tc.rel), false); got != tc.want {
+			t.Errorf("ignored(%s) = %v, want %v", tc.rel, got, tc.want)
+		}
 	}
 }
 
@@ -229,7 +264,7 @@ func TestContentGitGlobalExcludesMatchingAndPrecedence(t *testing.T) {
 		".gitignore":        "top.txt\n!excluded.txt\n",
 	})
 	g := newContentGitIgnore([]string{root})
-	norm := func(rel string) string { return contentNormPath(filepath.Join(root, filepath.FromSlash(rel))) }
+	abs := func(rel string) string { return filepath.Join(root, filepath.FromSlash(rel)) }
 	cases := []struct {
 		rel   string
 		isDir bool
@@ -241,7 +276,7 @@ func TestContentGitGlobalExcludesMatchingAndPrecedence(t *testing.T) {
 		{"excluded.txt", false, false}, // .gitignore negation beats exclude
 	}
 	for _, tc := range cases {
-		if got := g.ignored(norm(tc.rel), tc.isDir); got != tc.want {
+		if got := g.ignored(abs(tc.rel), tc.isDir); got != tc.want {
 			t.Errorf("ignored(%s) = %v, want %v", tc.rel, got, tc.want)
 		}
 	}

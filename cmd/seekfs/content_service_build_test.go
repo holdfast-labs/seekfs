@@ -194,6 +194,60 @@ func TestContentServiceBuildOverCapRefuses(t *testing.T) {
 	}
 }
 
+// A sharded build whose shard exceeds the per-file cap refuses to publish,
+// exactly like a single-file over-cap build: no manifest is written and the
+// volume surfaces degraded with the size-cap reason, never a partial corpus.
+func TestContentServiceShardedBuildOverCapRefuses(t *testing.T) {
+	t.Setenv("SEEKFS_CONTENT_SEARCH", "1")
+	stubContentCatchUpSync(t)
+	stubContentBuildSync(t)
+
+	dir := t.TempDir()
+	sub := filepath.Join(dir, "sub")
+	if err := os.MkdirAll(sub, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range []struct{ path, body string }{
+		{filepath.Join(dir, "a.txt"), "hello needle world"},
+		{filepath.Join(sub, "b.txt"), "hello needle world"},
+	} {
+		if err := os.WriteFile(f.path, []byte(f.body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	const journal = uint64(0xABD)
+	const cp = int64(121)
+	stubContentCatchUpJournal(t, usnJournalDataV0{UsnJournalID: journal, FirstUsn: 1, LowestValidUsn: 1, NextUsn: cp})
+
+	vol, gsx := contentBuildTestVolume(t, dir, journal, uint64(cp), []CompactRecord{
+		{FRN: 10, ParentFRN: 10, Parent: -1, Name: "a.txt", Size: 18},
+		{FRN: 11, ParentFRN: 11, Parent: -1, Name: "sub", Mode: uint32(os.ModeDir)},
+		{FRN: 12, Parent: 1, ParentFRN: 11, Name: "b.txt", Size: 18},
+	})
+
+	// Force two shards (one per folder) and a per-file cap every shard breaks.
+	restoreTarget := contentShardTargetBytes
+	contentShardTargetBytes = 1
+	t.Cleanup(func() { contentShardTargetBytes = restoreTarget })
+	restoreCap := contentGSXMaxBytes
+	contentGSXMaxBytes = 64
+	t.Cleanup(func() { contentGSXMaxBytes = restoreCap })
+
+	s := contentTestService(t)
+	s.ensureContentBuild(vol)
+
+	if _, err := os.Stat(gsx); !os.IsNotExist(err) {
+		t.Fatalf("over-cap sharded build wrote a manifest (stat err=%v)", err)
+	}
+	if got := vol.content.stateOf(); got != contentStateDegraded {
+		t.Fatalf("state after over-cap sharded build = %q; want degraded", got)
+	}
+	h := vol.content.healthSnapshot(0)
+	if !strings.Contains(h.BuildError, "size cap") {
+		t.Fatalf("health after over-cap sharded build = %+v; want a size-cap reason", h)
+	}
+}
+
 // A drain tick during a background build must not flip an indexing volume to
 // ready: the build owns the state until it publishes or fails.
 func TestContentIndexingNotClobberedByDrain(t *testing.T) {
@@ -263,9 +317,10 @@ func TestContentServiceBuildsMissingBase(t *testing.T) {
 	}
 }
 
-// The service build defaults to an extension allowlist, not the whole volume
-// (M5): an out-of-allowlist file with matching text is not indexed.
-func TestContentServiceBuildDefaultScope(t *testing.T) {
+// The service build defaults to sniff selection, not an extension allowlist:
+// an unknown-extension text file is indexed, a known-binary extension is
+// rejected without opening, and a NUL-sniffed file tallies as binary.
+func TestContentServiceBuildDefaultScopeSniffs(t *testing.T) {
 	t.Setenv("SEEKFS_CONTENT_SEARCH", "1")
 	stubContentCatchUpSync(t)
 	stubContentBuildSync(t)
@@ -273,10 +328,18 @@ func TestContentServiceBuildDefaultScope(t *testing.T) {
 	dir := t.TempDir()
 	note := filepath.Join(dir, "note.txt")
 	junk := filepath.Join(dir, "blob.xyz")
+	pic := filepath.Join(dir, "pic.png")
+	bin := filepath.Join(dir, "junk.dat")
 	if err := os.WriteFile(note, []byte("allowed needle term"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(junk, []byte("hidden uniqueterm"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(pic, []byte("png words here"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(bin, []byte("bin\x00ary"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	const journal = uint64(7)
@@ -285,7 +348,9 @@ func TestContentServiceBuildDefaultScope(t *testing.T) {
 
 	vol, gsx := contentBuildTestVolume(t, dir, journal, uint64(cp), []CompactRecord{
 		{FRN: 10, ParentFRN: 10, Parent: -1, Name: "note.txt", Size: 19},
-		{FRN: 20, ParentFRN: 20, Parent: -1, Name: "blob.xyz", Size: 16},
+		{FRN: 20, ParentFRN: 20, Parent: -1, Name: "blob.xyz", Size: 17},
+		{FRN: 30, ParentFRN: 30, Parent: -1, Name: "pic.png", Size: 14},
+		{FRN: 40, ParentFRN: 40, Parent: -1, Name: "junk.dat", Size: 7},
 	})
 	s := contentTestService(t)
 	s.ensureContentBuild(vol)
@@ -295,14 +360,20 @@ func TestContentServiceBuildDefaultScope(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(built.Docs) != 1 {
-		t.Fatalf("built %d docs; want 1 (only the allowlisted .txt)", len(built.Docs))
+	if len(built.Docs) != 2 {
+		t.Fatalf("built %d docs; want 2 (note.txt and the sniffed blob.xyz)", len(built.Docs))
 	}
-	if hits, _ := contentServiceSearch(t, vol, "content:uniqueterm", false); len(hits) != 0 {
-		t.Fatalf("out-of-allowlist file was indexed: %v", hits)
+	if built.Policy.Binary != 1 {
+		t.Fatalf("policy binary = %d; want 1 (junk.dat)", built.Policy.Binary)
+	}
+	if hits, _ := contentServiceSearch(t, vol, "content:uniqueterm", false); len(hits) != 1 {
+		t.Fatalf("sniffed text file missing from content: %v", hits)
 	}
 	if hits, _ := contentServiceSearch(t, vol, "content:needle", false); len(hits) != 1 {
 		t.Fatalf("allowlisted file missing from content: %v", hits)
+	}
+	if hits, _ := contentServiceSearch(t, vol, "content:\"png words\"", false); len(hits) != 0 {
+		t.Fatalf("skip-listed extension was indexed: %v", hits)
 	}
 }
 

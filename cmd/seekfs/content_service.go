@@ -139,6 +139,9 @@ type contentHealth struct {
 	ScopeDropped      int   `json:"scope_dropped,omitempty"`
 	ScopeDroppedBytes int64 `json:"scope_dropped_bytes,omitempty"`
 	BudgetBytes       int64 `json:"budget_bytes,omitempty"`
+	// Binary counts files that sniffed as binary at build time (NUL in the
+	// head window, like ripgrep): expected rejections, not drops.
+	Binary int `json:"binary,omitempty"`
 	// SidecarBytes/SidecarCap report the attached `.gsx` encoded size and the
 	// size cap (WP10/M7), so unbounded sidecar growth is observable in
 	// `loaded --json` instead of only failing silently.
@@ -444,6 +447,7 @@ func mergeContentHealth(dst *contentHealth, src contentHealth) {
 	dst.ExtractionErrors += src.ExtractionErrors
 	dst.Skipped += src.Skipped
 	dst.Truncated += src.Truncated
+	dst.Binary += src.Binary
 	dst.ScopeDropped += src.ScopeDropped
 	dst.ScopeDroppedBytes += src.ScopeDroppedBytes
 	// Budgets can differ per volume; the aggregate names the largest so the
@@ -563,8 +567,8 @@ func aggregateContentHealth(healths []contentHealth) contentHealth {
 //   - State is the most severe state: ready/off < unavailable < indexing <
 //     degraded < stale (contentStateSeverity).
 //   - Docs, DeltaBytes, Deferred, QueueDepth, Evictions, ExtractionErrors,
-//     Skipped, Truncated, ScopeDropped, ScopeDroppedBytes, SidecarBytes and
-//     SidecarCap are summed; BudgetBytes takes the largest;
+//     Skipped, Truncated, Binary, ScopeDropped, ScopeDroppedBytes, SidecarBytes
+//     and SidecarCap are summed; BudgetBytes takes the largest;
 //     BuildDone/BuildTotal sum only while indexing.
 //   - Partial, Incomplete and CountDivergent are OR-ed.
 //   - ExtractorRefresh is OR-ed and StaleExtractorDocs summed, so a targeted
@@ -680,6 +684,7 @@ func (s *contentVolumeState) setReady(idx *contentIndex, reader *contentReader, 
 		s.health.ScopeDropped = int(idx.Policy.ScopeDropped)
 		s.health.ScopeDroppedBytes = idx.Policy.ScopeDroppedBytes
 		s.health.BudgetBytes = idx.Policy.BudgetBytes
+		s.health.Binary = int(idx.Policy.Binary)
 	}
 	// A targeted extractor-version refresh (WP11) keeps the volume usable: its
 	// text is a valid, if older, extraction. The refresh signal is only raised

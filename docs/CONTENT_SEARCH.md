@@ -101,19 +101,39 @@ Inside a detected worktree the scope follows git's ignore rules with git's
 precedence: `.gitignore` files, then `.git/info/exclude`, then the global
 excludes file (`core.excludesFile` from the repo's `.git/config` or the
 user's `~/.gitconfig`, else `%USERPROFILE%\.config\git\ignore` /
-`$XDG_CONFIG_HOME/git/ignore`). The global file joins the scope digest, and
-the drain loop polls its stat (it lives outside the volume, so the USN
-stream never reports it), so edits rebuild under the new rules.
+`$XDG_CONFIG_HOME/git/ignore`). Patterns match case-sensitively, like
+ripgrep and like git for every file that exists (git's `core.ignorecase`
+only relaxes matching for paths with no on-disk entry); folding would
+silently drop tracked source whenever a pattern differs in case
+(`build/.gitignore`'s `LASTCHANGE*` vs the tracked `lastchange.gni`). The
+global file joins the scope digest, and the drain loop polls its stat (it
+lives outside the volume, so the USN stream never reports it), so edits
+rebuild under the new rules.
 
 The service selects Git repositories before configured roots, then known
 folders. It spools accepted extracted text to temporary disk before assembling
 the FRN-sorted sidecar, so a large scoped build needs temporary disk space up
 to its extracted-text budget.
 
+File selection is ripgrep-style: unless `[content] exts` pins an explicit
+allowlist, every file the scope admits is opened and head-sniffed at build
+time — NUL in the first 8 KiB means binary (the same heuristic ripgrep uses;
+BOM and BOM-less UTF-16 still count as text). Only known-binary extensions
+(images, archives, media, objects, fonts, legacy OLE documents) are rejected
+without opening. Unknown extensions and extensionless files (`OWNERS`,
+`BUILD`, `DEPS`, `Makefile`) are text candidates: indexed when they sniff as
+text, tallied as `binary` in the `.gsx` policy and content health when they
+do not. `content-index -db <gsi> --estimate` reports `text_candidates` and
+`binary_candidates` separately, and `--sniff-sample N` opens a stride sample
+of the candidates to project the binary share (`projected_text_files`).
+
 The extracted-text budget (`budget_bytes`) defaults to a tenth of the index
-volume's free space (floored at 2 GiB, capped at the 4 GiB sidecar cap), so a
-Chromium-size repo indexes completely; sharding bounds build and fold memory
-per 64 MiB shard, so the budget is really disk space. Set `[content]`
+volume's free space (floored at 2 GiB, ceiling 32 GiB), so a Chromium-size
+repo indexes completely; sharding bounds build and fold memory per 64 MiB
+shard, so the budget is really disk space. Corpora past the shard target
+build as folder shards, each individually capped at the 4 GiB per-file
+sidecar cap (an over-cap shard refuses to publish, like a single-file
+over-cap build), which is why totals past 4 GiB are safe. Set `[content]`
 `budget_bytes` (or `[content."E:"]` per volume, or
 `SEEKFS_CONTENT_BUDGET_BYTES`) to pin an explicit budget. Only an explicit
 budget joins the sidecar identity: the derived default tracks free space, and

@@ -11,9 +11,13 @@ package main
 // Matching follows git precedence: the deepest .gitignore wins, later lines
 // win within a file, .git/info/exclude ranks below every .gitignore, and the
 // global excludes file ranks below .git/info/exclude. A path under an ignored
-// directory stays ignored (a negation cannot re-include it). Patterns and
-// paths are compared case-folded, matching git's default core.ignorecase on
-// Windows.
+// directory stays ignored (a negation cannot re-include it). Patterns match
+// case-sensitively, like ripgrep and like git for every file that exists:
+// git's core.ignorecase only relaxes matching for paths with no on-disk entry
+// (verified: build/.gitignore's LASTCHANGE* ignores a hypothetical
+// LASTCHANGE.foo but not the tracked lastchange.gni), and the index only ever
+// holds files that exist. Folding would silently drop tracked source whenever
+// an ignore pattern differs in case (Chromium's lastchange.gni/.py).
 
 import (
 	"crypto/sha256"
@@ -118,26 +122,34 @@ func (g *contentGitIgnore) repoFor(p string) (string, bool) {
 	return "", false
 }
 
-// ignored reports whether the normalized path p is excluded by git. Paths
-// outside every worktree are never ignored here; callers apply their own
-// rules there. The .git directory itself is always ignored.
-func (g *contentGitIgnore) ignored(p string, isDir bool) bool {
+// ignored reports whether path (any case; normalized internally for worktree
+// lookup) is excluded by git. Paths outside every worktree are never ignored
+// here; callers apply their own rules there. The .git directory itself is
+// always ignored. Pattern matching is case-sensitive on the path's original
+// components (see the package comment); only worktree lookup folds case,
+// because Windows path prefixes are case-insensitive.
+func (g *contentGitIgnore) ignored(original string, isDir bool) bool {
+	p := contentNormPath(original)
 	root, ok := g.repoFor(p)
 	if !ok || p == root {
 		return false
 	}
-	comps := contentRelComponents(root, p)
-	for _, c := range comps {
+	relOrig := contentRelCompsOriginal(root, p, original)
+	relFold := contentRelCompsOriginal(root, p, p)
+	if relOrig == nil || relFold == nil {
+		return false
+	}
+	for _, c := range relFold {
 		if c == ".git" {
 			return true
 		}
 	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	if len(comps) > 1 && g.dirIgnoredLocked(root, comps[:len(comps)-1]) {
+	if len(relOrig) > 1 && g.dirIgnoredLocked(root, relOrig[:len(relOrig)-1]) {
 		return true
 	}
-	return g.matchLocked(root, comps, isDir)
+	return g.matchLocked(root, relOrig, isDir)
 }
 
 // invalidate drops cached rules after an ignore file changed, including the
@@ -211,14 +223,14 @@ func (g *contentGitIgnore) globalForLocked(root string) string {
 	return p
 }
 
-func (g *contentGitIgnore) dirIgnoredLocked(root string, comps []string) bool {
-	key := root + `\` + strings.Join(comps, `\`)
+func (g *contentGitIgnore) dirIgnoredLocked(root string, relOrig []string) bool {
+	key := root + `\` + strings.Join(relOrig, `\`)
 	if v, ok := g.dirIgnored[key]; ok {
 		return v
 	}
-	res := len(comps) > 1 && g.dirIgnoredLocked(root, comps[:len(comps)-1])
+	res := len(relOrig) > 1 && g.dirIgnoredLocked(root, relOrig[:len(relOrig)-1])
 	if !res {
-		res = g.matchLocked(root, comps, true)
+		res = g.matchLocked(root, relOrig, true)
 	}
 	g.dirIgnored[key] = res
 	return res
@@ -226,19 +238,26 @@ func (g *contentGitIgnore) dirIgnoredLocked(root string, comps []string) bool {
 
 // matchLocked applies the ignore files from the path's own directory up to
 // the worktree root, then .git/info/exclude, then git's global excludes file;
-// the first matching pattern decides.
-func (g *contentGitIgnore) matchLocked(root string, comps []string, isDir bool) bool {
-	for depth := len(comps) - 1; depth >= 0; depth-- {
+// the first matching pattern decides. relOrig holds the path's original-case
+// components below root, which is what patterns match against; the ignore
+// files themselves are loaded through case-folded directory paths (the same
+// physical file on a case-insensitive volume) and cached under them.
+func (g *contentGitIgnore) matchLocked(root string, relOrig []string, isDir bool) bool {
+	relFold := make([]string, len(relOrig))
+	for i, c := range relOrig {
+		relFold[i] = strings.ToLower(c)
+	}
+	for depth := len(relOrig) - 1; depth >= 0; depth-- {
 		dir := root
 		if depth > 0 {
-			dir = root + `\` + strings.Join(comps[:depth], `\`)
+			dir = root + `\` + strings.Join(relFold[:depth], `\`)
 		}
 		file, ok := g.files[dir]
 		if !ok {
-			file = loadContentIgnoreFile(filepath.Join(dir, ".gitignore"), comps[:depth])
+			file = loadContentIgnoreFile(filepath.Join(dir, ".gitignore"), relOrig[:depth])
 			g.files[dir] = file
 		}
-		if result := file.match(comps, depth, isDir); result != gitignore.NoMatch {
+		if result := file.match(relOrig, depth, isDir); result != gitignore.NoMatch {
 			return result == gitignore.Exclude
 		}
 	}
@@ -247,7 +266,7 @@ func (g *contentGitIgnore) matchLocked(root string, comps []string, isDir bool) 
 		exclude = loadContentIgnoreFile(filepath.Join(root, ".git", "info", "exclude"), nil)
 		g.excludes[root] = exclude
 	}
-	if result := exclude.match(comps, 0, isDir); result != gitignore.NoMatch {
+	if result := exclude.match(relOrig, 0, isDir); result != gitignore.NoMatch {
 		return result == gitignore.Exclude
 	}
 	// Git's global excludes file (core.excludesFile) ranks below
@@ -258,7 +277,7 @@ func (g *contentGitIgnore) matchLocked(root string, comps []string, isDir bool) 
 			global = loadContentIgnoreFile(path, nil)
 			g.global[root] = global
 		}
-		return global.match(comps, 0, isDir) == gitignore.Exclude
+		return global.match(relOrig, 0, isDir) == gitignore.Exclude
 	}
 	return false
 }
@@ -297,7 +316,9 @@ func loadContentIgnoreFile(path string, domain []string) *contentIgnoreFile {
 func parseContentIgnoreFile(data string, domain []string) *contentIgnoreFile {
 	f := &contentIgnoreFile{anchored: make(map[string][]contentIgnorePattern)}
 	for i, raw := range strings.Split(data, "\n") {
-		line := strings.ToLower(strings.TrimSuffix(raw, "\r"))
+		// No case-folding: patterns match case-sensitively, like ripgrep and
+		// like git for every file that exists (see the package comment).
+		line := strings.TrimSuffix(raw, "\r")
 		if strings.TrimSpace(line) == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
@@ -342,7 +363,32 @@ func contentIgnoreAnchor(line string) (string, bool) {
 // contentRelComponents splits normalized path p into components below root.
 func contentRelComponents(root, p string) []string {
 	rel := strings.TrimPrefix(p[len(root):], `\`)
-	return strings.FieldsFunc(rel, func(r rune) bool { return r == '\\' || r == '/' })
+	return contentSplitComponents(rel)
+}
+
+// contentSplitComponents splits a path into components on either separator.
+func contentSplitComponents(s string) []string {
+	return strings.FieldsFunc(s, func(r rune) bool { return r == '\\' || r == '/' })
+}
+
+// contentRelCompsOriginal splits original (any case) into the components below
+// the folded worktree root, for case-sensitive pattern matching. folded is the
+// normalized form of original; the root prefix is aligned component-wise (not
+// byte-sliced, since case-folding can change byte length) and verified, so a
+// misaligned path degrades to nil instead of matching the wrong components.
+func contentRelCompsOriginal(root, folded, original string) []string {
+	oComps := contentSplitComponents(original)
+	fComps := contentSplitComponents(folded)
+	rComps := contentSplitComponents(root)
+	if len(oComps) != len(fComps) || len(fComps) <= len(rComps) {
+		return nil
+	}
+	for i := range rComps {
+		if fComps[i] != rComps[i] {
+			return nil
+		}
+	}
+	return oComps[len(rComps):]
 }
 
 // contentIgnoreDigest fingerprints the ignore files of the given worktrees by

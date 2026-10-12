@@ -1,9 +1,11 @@
 package main
 
 // Content scope: which files an automatic content build considers. A scope
-// turns "whole volume, every allowlisted extension" (the old default) into a
-// bounded, inspectable corpus: explicit roots, detected git worktrees, the
-// built-in system/generated excludes, and a byte budget under the `.gsx` cap.
+// turns "whole volume, every sniffed-as-text file" into a bounded,
+// inspectable corpus: explicit roots, detected git worktrees, the built-in
+// system/generated excludes, known-binary extension skips, and a byte budget
+// (ceiling 32 GiB; corpora past 64 MiB shard, so totals past the 4 GiB
+// single-file `.gsx` cap stay per-file safe).
 //
 // Scope affects *which* docs are indexed, never the `.gsx` layout, so it needs
 // no format bump. It is resolved per volume from the global config plus a
@@ -47,10 +49,13 @@ const (
 	// 2 GiB default truncates Chromium-size repos (509k files) mid-corpus.
 	contentScopeBudgetFreeFraction = 0.1
 	// contentScopeBudgetFloorBytes keeps the derived default sane on small or
-	// nearly-full volumes; contentScopeBudgetCeilBytes keeps it at or under the
-	// sidecar cap the encode-time check enforces.
+	// nearly-full volumes. contentScopeBudgetCeilBytes caps the derived and
+	// explicit budgets well above the 4 GiB single-file sidecar cap: any
+	// corpus past the 64 MiB shard target builds as folder shards, each
+	// individually capped at contentGSXMaxBytes by contentSaveFile, so a large
+	// total budget stays memory-bounded and per-file safe.
 	contentScopeBudgetFloorBytes = 2 << 30
-	contentScopeBudgetCeilBytes  = 4 << 30
+	contentScopeBudgetCeilBytes  = 32 << 30
 )
 
 // contentScopeConfig is the raw, per-key config form (pointer bools are
@@ -227,7 +232,7 @@ func contentScopeForVolume(cfg appConfig, volume string) contentScope {
 			s.BudgetBytes = defaultContentScopeBudget(anchor)
 		}
 	}
-	if s.BudgetBytes <= 0 || s.BudgetBytes > contentGSXMaxBytes {
+	if s.BudgetBytes <= 0 || s.BudgetBytes > contentScopeBudgetCeilBytes {
 		if anchor := contentScopeBudgetAnchor(volume); anchor != "" {
 			s.BudgetBytes = defaultContentScopeBudget(anchor)
 		} else {
