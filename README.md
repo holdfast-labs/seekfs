@@ -81,13 +81,12 @@ files with highlighted snippets.
 ```powershell
 go build -ldflags=-H=windowsgui -o seekfs-native.exe ./cmd/seekfs-native
 .\seekfs-native.exe                 # uses the default service pipe
-.\seekfs-native.exe -pipe \.\pipe\<name>
+.\seekfs-native.exe -pipe \\.\pipe\<name>
 ```
 
 `SEEKFS_NATIVE_PRESENTER=dxgi` switches from the default GDI presentation path
 (GPU render, then a GDI copy, which works on every display setup) to Gio's
-swapchain. Settings live in `%APPDATA%\seekfs
-ative.json`.
+swapchain. Settings live in `%APPDATA%\seekfs\native.json`.
 
 ## Search your way
 
