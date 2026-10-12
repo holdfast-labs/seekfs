@@ -55,6 +55,23 @@ Check health:
 serving the pipe and the loaded DB state. If a DB reports `state: "stale"`, the
 service is answering from the index but journal replay is not active.
 
+## Walk-indexed content search
+
+`content:` queries also work on walk-indexed databases (`seekfs index -root
+<dir> -db <file.gsi>`, served with `-db`), which covers filesystems without a
+USN journal (FAT/exFAT/ReFS-without-journal, network shares) and non-Windows
+builds. Enable content the same way (`seekfs plugin add content` or
+`SEEKFS_CONTENT_SEARCH=1`); the service builds, attaches, and freshens a
+stable-path-hash-keyed sidecar with the same `indexing`/`ready`/`degraded`/
+`stale` states and progress reporting as NTFS volumes (see
+[CONTENT_SEARCH.md §6j](CONTENT_SEARCH.md)). Change detection diffs the live
+index against the sidecar after every watcher-triggered filename rebuild plus
+a periodic safety net, so an edit typically becomes findable within seconds
+(mostly the filename rewalk itself). If the indexed tree has no `.git`
+markers under it, auto scope finds no roots — pin the tree with
+`plugin config content --root <path>` (or `SEEKFS_CONTENT_SCOPE=explicit` +
+`SEEKFS_CONTENT_ROOTS=<path>`) or the build attaches an empty index.
+
 ## Query Semantics
 
 In path-scoped queries, short dotted tokens such as `.pdf`, `.raw`, and `.nrrd`

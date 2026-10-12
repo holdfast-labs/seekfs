@@ -327,25 +327,29 @@ func (s *goSearchService) contentReconcileWalkVolume(vol *serviceVolumeIndex, fo
 	// Vanished files tombstone so the fold drops them; a rename is exactly
 	// this (old key tombstoned) plus a new-key enqueue above. A file back at
 	// its base fingerprint has its pre-fold tombstone rescinded instead, so
-	// restoring a file before the fold cannot drop live content.
-	for key, want := range base {
-		got, ok := live[key]
-		if !ok {
-			scoped = append(scoped, key)
-			continue
-		}
-		if got == want && delta != nil {
-			delta.rescind(key)
-		}
-	}
+	// restoring a file before the fold cannot drop live content. Tombstones
+	// are collected from one delta snapshot so the per-key loop above stays
+	// lock-free.
+	var tombstoned []uint64
 	if delta != nil {
 		for _, doc := range delta.snapshot() {
-			if doc.Deleted {
+			if !doc.Deleted {
+				if _, ok := live[doc.FRN]; !ok {
+					scoped = append(scoped, doc.FRN)
+				}
 				continue
 			}
-			if _, ok := live[doc.FRN]; !ok {
-				scoped = append(scoped, doc.FRN)
-			}
+			tombstoned = append(tombstoned, doc.FRN)
+		}
+	}
+	for key := range base {
+		if _, ok := live[key]; !ok {
+			scoped = append(scoped, key)
+		}
+	}
+	for _, key := range tombstoned {
+		if want, ok := live[key]; ok && base[key] == want && delta != nil {
+			delta.rescind(key)
 		}
 	}
 	// Tombstones first, so a path that moved between keys never briefly

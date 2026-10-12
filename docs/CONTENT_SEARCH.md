@@ -21,11 +21,14 @@ delta observability. The optional PB8 items 4–7 (global-lane integration) is n
 content inline, single and multi volume, but is **off by default** behind
 `SEEKFS_CONTENT_GLOBAL_LANE` and still declines overlays/hidden, `under:`/
 `exists:`, relevance, and biased order (see the WP7 section of the roadmap). The
-documented §7 residuals remain. `.gsx` is format **v5** (sharded manifests; see §6i). P4 document-extraction
+documented §7 residuals remain. `.gsx` doc tables are format **v6** (source
+size + nanosecond mtime per doc; see §6j) and sharded manifests are **v5**
+(see §6i). P4 document-extraction
 quality remains deferred (see §7). Content search is off by default; with
 `[features.content] enabled = true` or `SEEKFS_CONTENT_SEARCH=1`, `content:`
 queries work through the service once the
-service-owned build has attached an FRN-keyed `.gsx`.
+service-owned build has attached a `.gsx` — FRN-keyed for USN volumes,
+stable-path-hash-keyed for walk volumes (see §6j).
 
 This document is the committed handoff for an agent continuing the work. The
 fuller working plan lives at `docs/CONTENT_SEARCH_PLAN.md`, which is
@@ -102,6 +105,20 @@ folders. It spools accepted extracted text to temporary disk before assembling
 the FRN-sorted sidecar, so a large scoped build needs temporary disk space up
 to its extracted-text budget.
 
+Walk-indexed volumes (`seekfs index -root <dir>`, FAT/exFAT/ReFS-without-journal
+drives, network shares, non-Windows builds) get the same service-owned build
+through the same scope machinery, keyed on the stable path hash instead of the
+FRN (see §6j). Git worktree detection reads the index's `.git` markers, so a
+walk root that is not itself inside a worktree (e.g. a subtree of a repo)
+detects no repos under auto scope; pin it explicitly instead:
+
+```powershell
+$env:SEEKFS_CONTENT_SCOPE = "explicit"
+$env:SEEKFS_CONTENT_ROOTS = "E:\bench\chromium\third_party\blink"
+```
+
+or `plugin config content --root <path>`.
+
 ### 2b. Content matching semantics
 
 A `content:` leaf is a **case-insensitive literal substring** match by default:
@@ -158,10 +175,14 @@ when none is usable the query errors rather than returning empty.
 ## 4. Invariants (do not break these)
 
 - **Origin guard.** `.gsx` carries an `Origin`. `contentOriginWalk` = doc key is
-  the FNV-1a hash of the relative path; `contentOriginUSN` = doc key is the NTFS
-  FRN. `attachContentForVolume` attaches only `contentOriginUSN`; anything else
-  stays `unavailable`. A walk-keyed index next to a `.gsi` would otherwise
-  report `ready` while mapping nothing.
+  the stable path hash (`contentWalkKey`: FNV-1a of the cleaned absolute
+  path); `contentOriginUSN` = doc key is the NTFS FRN. `attachContentForVolume`
+  attaches a sidecar only when its origin matches the volume source (USN↔USN,
+  walk↔walk); anything else stays `unavailable`/`stale`, never `ready` with an
+  unmapped resolver. A cross-origin sidecar would otherwise report `ready`
+  while mapping nothing. The query path derives the key the same way
+  (`contentTextForEntry` branches on the attached origin *and* the volume
+  source), so results can never resolve to the wrong record.
 - **One doc per FRN, `DocID == index`** in the FRN-sorted doc table;
   `contentIndexDecode` enforces it. Cross-file content dedup is deferred.
 - **One repair, one fold.** `contentRepairText` = lossy repair preserving case
@@ -562,8 +583,8 @@ A corpus with more than `contentShardTargetBytes` (64 MiB) of extracted text is
 split by folder. `<gsx>.shards\` holds immutable shard files and the `.gsx`
 becomes a small **manifest** (format v5, section `CXSH`) listing each shard's
 file name, doc count and owned folder prefixes. Smaller corpora still produce a
-single v4 file. Older binaries reject v5, so they rebuild rather than attaching
-an empty index.
+single file (v6 doc tables since §6j). Older binaries reject v5/v6, so they
+rebuild rather than attaching an empty index.
 
 - **Ownership.** A path belongs to the shard owning its longest matching
   folder prefix. The root prefix `""` always exists, so folders created after
@@ -602,6 +623,65 @@ an empty index.
   tokenizing.
 - **Not yet:** shards are not rebalanced between rebuilds. The offline
   `content-index` CLI still writes a single file and holds all text in memory.
+
+## 6j. Walk-indexed volumes (done)
+
+Content search works through the service for walk-indexed volumes and roots
+(`seekfs index -root` databases, FAT/exFAT/ReFS-without-journal drives,
+network shares, non-Windows builds), with the same states, progress, sharded
+layout, and gitignore scope as USN volumes.
+
+- **Stable key.** Walk record FRNs are positional (`FRN = i+1` in walk order)
+  and renumber on every rescan, so docs join on `contentWalkKey` — the FNV-1a
+  hash of the cleaned, slash-normalized absolute path, stored in the doc's FRN
+  field (no new key field). The key is case-sensitive: two case-differing names
+  on a case-sensitive filesystem never share one, while a Windows case-only
+  rename becomes a delete+create pair (correct, not a misjoin). The service
+  builds a key→recordID join column per base generation (`walkKeySet`,
+  refreshed at attach/rebind, shared read-only with search snapshots); the
+  persisted `.gsi` FRN column is untouched.
+- **Change detection without a journal.** `contentReconcileWalkVolume` diffs
+  (path, size, mtime) of the live filename index against the doc table and
+  enqueues changed keys / tombstones deleted keys into the existing
+  delta/fold pipeline, whose extraction hash-verifies before upserting. The
+  diff compares the v6 fingerprint (`FileSize` source bytes +
+  `FileModNano` source mtime nanos, stamped by every builder and carried by
+  every fold); same-second FAT/exFAT rewrites are still caught whenever the
+  size differs. Out-of-scope files are skipped silently (never tombstoned —
+  phantom tombstones once bloated the delta and forced constant folds), empty
+  files are never enqueued, unindexable files are remembered per fingerprint
+  (coordinator decline hook) until they change, and a pre-fold restore
+  rescinds its tombstone.
+- **Freshness layers.** The existing `ReadDirectoryChangesW` watcher rebuilds
+  the filename index on change; the rebuild path rebinds the resolver and
+  reconciles immediately after. The drain loop reconciles on every filename
+  generation change, and a 60 s safety net (`contentWalkReconcilePeriod`)
+  covers a missed watcher event and platforms without a watcher. New files are
+  discovered by the diff (no extra directory walk); renames are delete+create
+  pairs. Cost per reconcile is one metadata index scan; extraction stays
+  serial/IO-governed through `processQueue`.
+- **Origin-appropriate watermark.** Walk bases stamp `JournalID = 0` and
+  `CheckpointUSN` = wall-clock build/reconcile nanos. Attach skips journal
+  validation (scope + extractor + zero-join guards still apply, plus a nonzero
+  watermark requirement so hand-built sidecars rebuild under the service's key
+  convention); restart freshness is a reconcile at attach; folds restamp the
+  watermark instead of advancing a USN checkpoint. USN invariants (§4) are
+  unchanged — every walk branch is additive.
+- **Format v6.** Doc records widen 64→80 bytes with the fingerprint. Older
+  sidecars fail the version gate and rebuild; manifests stay v5; shards, folds,
+  and the offline CLI carry the fields unchanged.
+
+Tests: `content_service_walk_test.go` mirrors the USN ones (build/attach/query,
+edit/create/delete/rename via watcher-equivalent rebuild + drain, fold,
+restart, sharded variant, zero-join-stays-stale, steady-state idempotence,
+unindexable convergence, restore-before-fold).
+
+Measured on `E:\bench\chromium\third_party\blink` (225,303 filename entries):
+service build ~18 min for 159,548 files → 159,157 docs in a 612 MB sharded
+sidecar (7 shards); `content:PaintLayer` answers in ~43 ms; create→findable
+6.2 s and delete→unfindable 4.7 s end to end (dominated by the ~5.5 s full
+filename rewalk the pre-existing watcher performs on this tree); converged
+steady-state reconciles are silent and queue nothing.
 
 ## 7. Carried debt / known gaps
 
