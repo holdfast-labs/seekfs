@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"image"
 	"image/color"
 
 	"gioui.org/layout"
@@ -113,11 +114,11 @@ func (u *UI) layoutStatus(gtx layout.Context) layout.Dimensions {
 	)
 }
 
-// healthDot draws the status dot.
+// healthDot draws the status dot at a fixed 8px.
 func (u *UI) healthDot(gtx layout.Context, c color.NRGBA) layout.Dimensions {
 	d := gtx.Dp(Dp(8))
-	gtx.Constraints.Min.X = d
-	gtx.Constraints.Min.Y = d
+	gtx.Constraints.Min = image.Point{X: d, Y: d}
+	gtx.Constraints.Max = image.Point{X: d, Y: d}
 	roundedFill(gtx, c, gtx.Constraints.Min, Dp(4))
 	return layout.Dimensions{Size: gtx.Constraints.Min}
 }

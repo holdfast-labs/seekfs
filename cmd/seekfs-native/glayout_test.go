@@ -75,13 +75,6 @@ func testUI(t *testing.T, dark bool) *UI {
 	return u
 }
 
-// applySchemeNoFrame restyles without touching a window (headless).
-func (u *UI) applySchemeNoFrame() {
-	u.scheme = schemeFor(u.dark, u.accent)
-	restyle(u.th, u.scheme)
-	u.lastDark = u.dark
-}
-
 func testFrame(u *UI, w, h int) layout.Dimensions {
 	r := new(input.Router)
 	gtx := layout.Context{

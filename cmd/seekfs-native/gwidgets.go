@@ -18,11 +18,15 @@ import (
 // gwidgets.go: small custom widgets for the design system — rounded fills,
 // icon buttons with vector glyphs, toggle chips, hairlines, and labels.
 
-// fillRect paints a solid rect over the min constraints.
+// fillRect paints a solid rect over the min constraints. The clip is
+// mandatory: a bare PaintOp covers an infinite plane (Gio docs), which
+// flattened whole frames during development.
 func fillRect(gtx layout.Context, c color.NRGBA) layout.Dimensions {
+	size := gtx.Constraints.Min
+	defer clip.Rect{Max: size}.Push(gtx.Ops).Pop()
 	paint.ColorOp{Color: c}.Add(gtx.Ops)
 	paint.PaintOp{}.Add(gtx.Ops)
-	return layout.Dimensions{Size: gtx.Constraints.Min}
+	return layout.Dimensions{Size: size}
 }
 
 // roundedFill paints a rounded-rect fill of size.
@@ -46,6 +50,59 @@ func label(th *material.Theme, size unit.Sp, txt string, c color.NRGBA) material
 	l.MaxLines = 1
 	l.Truncator = "…"
 	return l
+}
+
+// ficon is a Segoe Fluent Icons glyph label (16px, secondary color).
+func ficon(th *material.Theme, size unit.Sp, glyph string, c color.NRGBA) material.LabelStyle {
+	l := material.Label(th, size, glyph)
+	l.Color = c
+	l.Font.Typeface = fluentFace
+	l.MaxLines = 1
+	return l
+}
+
+// fluentBtn is a square Fluent-icon button with hover, pressed and keyboard
+// focus states.
+func fluentBtn(gtx layout.Context, th *material.Theme, s Scheme, clk *widget.Clickable, glyph string, enabled, active bool, sz unit.Dp) layout.Dimensions {
+	px := gtx.Dp(sz)
+	gtx.Constraints.Min = image.Point{X: px, Y: px}
+	bg := color.NRGBA{}
+	fg := s.Subtle
+	if active {
+		fg = s.Accent
+	} else if !enabled {
+		fg = s.Muted
+	} else if clk.Hovered() {
+		bg = s.Hover
+	}
+	if clk.Pressed() && enabled {
+		bg = s.Pressed
+	}
+	focused := gtx.Focused(clk)
+	return clk.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+		gtx.Constraints.Min = image.Point{X: px, Y: px}
+		mac := op.Record(gtx.Ops)
+		dims := layout.Center.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+			g := fg
+			if !enabled {
+				gtx = gtx.Disabled()
+			}
+			return ficon(th, Sp(16), glyph, g).Layout(gtx)
+		})
+		call := mac.Stop()
+		sz := dims.Size
+		if sz.X < px || sz.Y < px {
+			sz = image.Point{X: px, Y: px}
+		}
+		if bg.A != 0 {
+			roundedFill(gtx, bg, sz, Dp(6))
+		}
+		call.Add(gtx.Ops)
+		if focused {
+			border(gtx, sz, s.Accent, Dp(6), Dp(2))
+		}
+		return layout.Dimensions{Size: sz}
+	})
 }
 
 // iconBtn is a square icon button; glyph draws the vector icon centered.
@@ -73,7 +130,8 @@ func iconBtn(gtx layout.Context, th *material.Theme, s Scheme, clk *widget.Click
 	})
 }
 
-// chip is a pill toggle (Contents) or action chip.
+// chip is a pill toggle (Contents) or action chip, with hover, pressed and
+// keyboard focus states.
 func chip(gtx layout.Context, th *material.Theme, s Scheme, clk *widget.Clickable, txt string, on bool) layout.Dimensions {
 	bg := s.Field
 	fg := s.Text
@@ -88,6 +146,7 @@ func chip(gtx layout.Context, th *material.Theme, s Scheme, clk *widget.Clickabl
 			fg = s.OnAccent
 		}
 	}
+	focused := gtx.Focused(clk)
 	return clk.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
 		mac := op.Record(gtx.Ops)
 		dims := layout.Inset{Left: Dp(10), Right: Dp(10), Top: Dp(5), Bottom: Dp(5)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
@@ -97,7 +156,11 @@ func chip(gtx layout.Context, th *material.Theme, s Scheme, clk *widget.Clickabl
 		sz := dims.Size
 		gtx.Constraints.Min = sz
 		roundedFill(gtx, bg, sz, Dp(14))
-		border(gtx, sz, s.Border, Dp(14), Dp(1))
+		if focused {
+			border(gtx, sz, s.Accent, Dp(14), Dp(2))
+		} else {
+			border(gtx, sz, s.Border, Dp(14), Dp(1))
+		}
 		call.Add(gtx.Ops)
 		return layout.Dimensions{Size: sz}
 	})

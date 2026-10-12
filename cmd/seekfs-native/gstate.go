@@ -88,6 +88,12 @@ type UI struct {
 	divTags   map[SortKey]*divTag
 	anchor    int
 
+	// Column visibility for the current frame (priority-hide when narrow).
+	showType  bool
+	showMatch bool
+	// Preview splitter drag state.
+	splitTag splitDrag
+
 	// Preview image cache (bounded).
 	imgCache map[string]image.Image
 

@@ -27,6 +27,11 @@ func (u *UI) layoutResults(gtx layout.Context) layout.Dimensions {
 	// Focusable results area (keyboard shortcuts + type-to-select).
 	event.Op(gtx.Ops, &u.list)
 
+	// Priority column visibility: Type hides first, then Match, so columns
+	// never overflow their region (the area is also hard-clipped).
+	availDP := float32(gtx.Constraints.Max.X) / float32(gtx.Metric.PxPerDp)
+	u.fitColumns(availDP)
+
 	u.mu.Lock()
 	rows := u.rows
 	view := u.view
@@ -51,18 +56,95 @@ func (u *UI) layoutResults(gtx layout.Context) layout.Dimensions {
 			}
 		}),
 	)
-	if renameRow < 0 {
-		return base
+	if renameRow >= 0 {
+		// Rename overlay card.
+		base = layout.Stack{}.Layout(gtx,
+			layout.Stacked(func(gtx layout.Context) layout.Dimensions { return base }),
+			layout.Stacked(func(gtx layout.Context) layout.Dimensions {
+				return layout.Center.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+					return u.layoutRenameCard(gtx, s)
+				})
+			}),
+		)
 	}
-	// Rename overlay card.
-	return layout.Stack{}.Layout(gtx,
-		layout.Stacked(func(gtx layout.Context) layout.Dimensions { return base }),
-		layout.Stacked(func(gtx layout.Context) layout.Dimensions {
-			return layout.Center.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
-				return u.layoutRenameCard(gtx, s)
-			})
-		}),
-	)
+	// Folder tooltip for the hovered row with a truncated path.
+	if tip := u.hoverTipRow(); tip >= 0 {
+		u.mu.Lock()
+		dir := ""
+		if tip < len(u.rows) {
+			dir = u.rows[tip].Dir
+		}
+		first := u.list.Position.First
+		nameW := u.colW["name"]
+		u.mu.Unlock()
+		if dir != "" && tip >= first {
+			y := gtx.Dp(Dp(34)) + (tip-first)*gtx.Dp(Dp(32)) + gtx.Dp(Dp(32))
+			x := gtx.Dp(Dp(8)) + gtx.Dp(Dp(nameW)) + gtx.Dp(Dp(15))
+			base = layout.Stack{}.Layout(gtx,
+				layout.Stacked(func(gtx layout.Context) layout.Dimensions { return base }),
+				layout.Stacked(func(gtx layout.Context) layout.Dimensions {
+					return layout.Inset{Top: Dp(float32(y)), Left: Dp(float32(x))}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+						return u.layoutTipCard(gtx, dir)
+					})
+				}),
+			)
+		}
+	}
+	return base
+}
+
+// hoverTipRow returns the hovered row index when its folder is truncated,
+// else -1.
+func (u *UI) hoverTipRow() int {
+	u.mu.Lock()
+	rows := u.rows
+	folderW := u.colW["folder"]
+	u.mu.Unlock()
+	for i := range rows {
+		if i < len(u.rowClicks) && u.rowClicks[i].Hovered() && folderTruncated(rows[i].Dir, folderW) {
+			return i
+		}
+	}
+	return -1
+}
+
+// layoutTipCard renders the floating full-path tooltip.
+func (u *UI) layoutTipCard(gtx layout.Context, dir string) layout.Dimensions {
+	s := u.scheme
+	mac := opRecord(gtx)
+	dims := layout.UniformInset(Dp(8)).Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+		gtx.Constraints.Max.X = gtx.Dp(Dp(480))
+		return label(u.th, Sp(12), dir, s.Text).Layout(gtx)
+	})
+	call := mac.Stop()
+	sz := dims.Size
+	gtx.Constraints.Min = sz
+	roundedFill(gtx, s.Panel, sz, Dp(6))
+	border(gtx, sz, s.Border, Dp(6), Dp(1))
+	call.Add(gtx.Ops)
+	return layout.Dimensions{Size: sz}
+}
+
+// fitColumns sets showType/showMatch from the available width in dp.
+// Essential columns (Name, Folder, Size, Date) always show.
+func (u *UI) fitColumns(avail float32) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	essentials := u.colW["name"] + u.colW["folder"] + u.colW["size"] + u.colW["modified"] + 48
+	u.showType = avail >= essentials+u.colW["type"]
+	u.showMatch = avail >= essentials+u.colW["type"]+140
+}
+
+func (u *UI) showTypeNow() bool {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return u.showType
+}
+
+func (u *UI) showMatchNow() bool {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return u.showMatch
 }
 
 // ---- Details header ----
@@ -87,6 +169,12 @@ func (u *UI) layoutHeader(gtx layout.Context) layout.Dimensions {
 	}
 	// Header clicks: sort (Match column keeps current sort).
 	for i, c := range detailCols {
+		if c.key == SortType && !u.showTypeNow() {
+			continue
+		}
+		if c.key == SortSnippet && !u.showMatchNow() {
+			continue
+		}
 		if u.colClicks[i].Clicked(gtx) && c.key != SortSnippet {
 			u.clickColumn(c.key)
 		}
@@ -112,12 +200,31 @@ func (u *UI) layoutHeader(gtx layout.Context) layout.Dimensions {
 }
 
 func (u *UI) headerCells(th *material.Theme, s Scheme, key SortKey, asc bool) []layout.FlexChild {
-	var out []layout.FlexChild
+	u.mu.Lock()
+	showType, showMatch := u.showType, u.showMatch
+	u.mu.Unlock()
+	// Visible columns in order (priority-hide Type, then Match).
+	type colDef struct {
+		idx   int
+		key   SortKey
+		title string
+	}
+	var cols []colDef
 	for i, c := range detailCols {
-		i, c := i, c
+		if c.key == SortType && !showType {
+			continue
+		}
+		if c.key == SortSnippet && !showMatch {
+			continue
+		}
+		cols = append(cols, colDef{i, c.key, c.title})
+	}
+	var out []layout.FlexChild
+	for ci, c := range cols {
+		c := c
 		w := u.colW[c.key.String()]
 		title := c.title
-		if i < len(detailCols)-1 && c.key != SortSnippet && key == c.key {
+		if c.key != SortSnippet && key == c.key {
 			if asc {
 				title += " ▲"
 			} else {
@@ -127,14 +234,14 @@ func (u *UI) headerCells(th *material.Theme, s Scheme, key SortKey, asc bool) []
 		out = append(out, layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 			gtx.Constraints.Min.X = gtx.Dp(Dp(w))
 			gtx.Constraints.Max.X = gtx.Dp(Dp(w))
-			return u.colClicks[i].Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+			return u.colClicks[c.idx].Layout(gtx, func(gtx layout.Context) layout.Dimensions {
 				return layout.Inset{Top: Dp(7), Bottom: Dp(7), Left: Dp(4)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
 					return label(th, Sp(12), title, s.Muted).Layout(gtx)
 				})
 			})
 		}))
-		// Divider handle (except after last column).
-		if i < len(detailCols)-1 {
+		// Divider handle (except after last visible column).
+		if ci < len(cols)-1 {
 			out = append(out, layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 				return u.layoutDivider(gtx, c.key)
 			}))
@@ -235,9 +342,53 @@ func (u *UI) persistCols() {
 
 func (u *UI) layoutDetailList(gtx layout.Context, rows []ResultRow) layout.Dimensions {
 	th := u.th
+	if len(rows) == 0 {
+		return u.layoutEmpty(gtx)
+	}
 	u.ensureRowState(len(rows))
 	return material.List(th, &u.list).Layout(gtx, len(rows), func(gtx layout.Context, i int) layout.Dimensions {
 		return u.layoutRow(gtx, rows, i)
+	})
+}
+
+// layoutEmpty renders the centered empty/error state for the results area:
+// icon + title + hint. It lives below the column headers, never over them.
+func (u *UI) layoutEmpty(gtx layout.Context) layout.Dimensions {
+	th := u.th
+	s := u.scheme
+	u.mu.Lock()
+	query := u.query
+	unavail := u.unavail
+	fuzzy := u.fuzzyMsg
+	u.mu.Unlock()
+	icon, title, hint := iconSearch, "Type to search", "Results appear as you type"
+	if unavail != "" {
+		icon, title, hint = iconContents, "Content search is off", "Run `seekfs plugin add content` to enable it"
+	} else if query != "" {
+		icon, title = iconSearch, "No matches for \u201c"+query+"\u201d"
+		hint = fuzzy
+		if hint == "" {
+			hint = "Try different terms or filters"
+		}
+	}
+	return layout.Center.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+		return layout.Inset{Top: Dp(48), Bottom: Dp(48)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+			return layout.Flex{Axis: layout.Vertical, Alignment: layout.Middle}.Layout(gtx,
+				layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+					return ficon(th, Sp(40), icon, s.Muted).Layout(gtx)
+				}),
+				layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+					return layout.Inset{Top: Dp(12)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+						return label(th, Sp(15), title, s.Text).Layout(gtx)
+					})
+				}),
+				layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+					return layout.Inset{Top: Dp(4)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+						return label(th, Sp(13), hint, s.Muted).Layout(gtx)
+					})
+				}),
+			)
+		})
 	})
 }
 
@@ -292,7 +443,15 @@ func (u *UI) layoutRow(gtx layout.Context, rows []ResultRow, i int) layout.Dimen
 	} else if clk.Hovered() {
 		bg = s.Hover
 	}
+	// Explorer density: exactly 32px rows at 100%. Pin Max as well as
+	// Min: layout.Inset does not shrink Min for its child, so a Min-only
+	// floor stacks cell padding on top (42px rows).
+	rowH := gtx.Dp(Dp(32))
+	gtx.Constraints.Min.Y = rowH
+	gtx.Constraints.Max.Y = rowH
 	return clk.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+		gtx.Constraints.Min.Y = rowH
+		gtx.Constraints.Max.Y = rowH
 		if bg.A != 0 {
 			fillRect(gtx, bg)
 		}
@@ -313,10 +472,12 @@ func (u *UI) layoutRow(gtx layout.Context, rows []ResultRow, i int) layout.Dimen
 			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 				gtx.Constraints.Min.X = gtx.Dp(Dp(u.colW["name"]))
 				gtx.Constraints.Max.X = gtx.Dp(Dp(u.colW["name"]))
-				return u.cellNameSnippet(gtx, r, terms)
+				return layout.Inset{Left: Dp(6), Right: Dp(4)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+					return label(u.th, Sp(13), r.Name, u.scheme.Text).Layout(gtx)
+				})
 			}),
 			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-				return u.cellText(gtx, r.Dir, u.colW["folder"])
+				return u.cellText(gtx, folderText(r.Dir, u.colW["folder"]), u.colW["folder"])
 			}),
 			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 				return u.cellTextRight(gtx, sizeText(r), u.colW["size"])
@@ -325,10 +486,13 @@ func (u *UI) layoutRow(gtx layout.Context, rows []ResultRow, i int) layout.Dimen
 				return u.cellText(gtx, modText(r), u.colW["modified"])
 			}),
 			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+				if !u.showTypeNow() {
+					return layout.Dimensions{}
+				}
 				return u.cellText(gtx, u.typeText(r), u.colW["type"])
 			}),
 			layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
-				if r.Snippet == "" {
+				if r.Snippet == "" || !u.showMatchNow() {
 					return layout.Dimensions{}
 				}
 				return u.cellSnippet(gtx, r.Snippet, terms)
@@ -460,34 +624,40 @@ func (u *UI) cellText(gtx layout.Context, txt string, w float32) layout.Dimensio
 	gtx.Constraints.Min.X = gtx.Dp(Dp(w))
 	gtx.Constraints.Max.X = gtx.Dp(Dp(w))
 	return layout.Inset{Left: Dp(4), Right: Dp(4), Top: Dp(5), Bottom: Dp(5)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
-		return label(u.th, Sp(13), txt, u.scheme.Text).Layout(gtx)
+		return label(u.th, Sp(13), txt, u.scheme.Subtle).Layout(gtx)
 	})
+}
+
+// folderText middle-ellipsizes long folder paths so rows like
+// "android-15-chrome-wpt-fyi-rel" stay distinguishable; the full path
+// shows in a hover tooltip (see layoutFolderTip).
+func folderText(dir string, w float32) string {
+	// ~7.5px per rune at 13sp; reserve padding.
+	maxRunes := int(w / 7.5)
+	if maxRunes < 12 {
+		maxRunes = 12
+	}
+	runes := []rune(dir)
+	if len(runes) <= maxRunes {
+		return dir
+	}
+	head := (maxRunes - 1) / 2
+	tail := maxRunes - 1 - head
+	return string(runes[:head]) + "…" + string(runes[len(runes)-tail:])
+}
+
+// folderTruncated reports whether the folder cell was ellipsized.
+func folderTruncated(dir string, w float32) bool {
+	return len([]rune(dir)) > int(w/7.5)
 }
 
 func (u *UI) cellTextRight(gtx layout.Context, txt string, w float32) layout.Dimensions {
 	gtx.Constraints.Min.X = gtx.Dp(Dp(w))
 	gtx.Constraints.Max.X = gtx.Dp(Dp(w))
 	return layout.Inset{Left: Dp(4), Right: Dp(8), Top: Dp(5), Bottom: Dp(5)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
-		l := label(u.th, Sp(13), txt, u.scheme.Text)
+		l := label(u.th, Sp(13), txt, u.scheme.Subtle)
 		l.Alignment = text.End
 		return l.Layout(gtx)
-	})
-}
-
-// cellNameSnippet renders name + optional snippet second line.
-func (u *UI) cellNameSnippet(gtx layout.Context, r ResultRow, terms []string) layout.Dimensions {
-	return layout.Inset{Left: Dp(6), Right: Dp(4), Top: Dp(4), Bottom: Dp(4)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
-		return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
-			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-				return label(u.th, Sp(13), r.Name, u.scheme.Text).Layout(gtx)
-			}),
-			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-				if r.Snippet == "" {
-					return layout.Dimensions{}
-				}
-				return u.snippetSpans(gtx, r.Snippet, terms)
-			}),
-		)
 	})
 }
 
@@ -498,13 +668,19 @@ func (u *UI) cellSnippet(gtx layout.Context, snippet string, terms []string) lay
 	})
 }
 
-// snippetSpans lays out snippet segments with match emphasis.
+// snippetSpans lays out snippet segments with match emphasis (single-line
+// for the Match column).
 func (u *UI) snippetSpans(gtx layout.Context, snippet string, terms []string) layout.Dimensions {
+	return u.snippetSpansWrap(gtx, snippet, terms, true)
+}
+
+// snippetSpansWrap lays out snippet segments; singleLine keeps Match-column
+// rows at 32px (preview text wraps instead).
+func (u *UI) snippetSpansWrap(gtx layout.Context, snippet string, terms []string, singleLine bool) layout.Dimensions {
 	segs := highlightSegments(snippet, terms)
 	if len(segs) == 0 {
 		return layout.Dimensions{}
 	}
-	// Cap spans for pathological snippets.
 	if len(segs) > 24 {
 		segs = append(segs[:23], Segment{Text: "…"})
 	}
@@ -517,7 +693,10 @@ func (u *UI) snippetSpans(gtx layout.Context, snippet string, terms []string) la
 		}
 		children = append(children, layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 			l := label(u.th, Sp(12), sg.Text, c)
-			l.Truncator = ""
+			if singleLine {
+				l.MaxLines = 1
+				l.Truncator = ""
+			}
 			return l.Layout(gtx)
 		}))
 	}
@@ -535,7 +714,7 @@ func modText(r ResultRow) string {
 	if !r.HasMod {
 		return ""
 	}
-	return r.Modified.Format("2006-01-02 15:04")
+	return formatExplorerTime(r.Modified)
 }
 
 func (u *UI) typeText(r ResultRow) string {
@@ -559,6 +738,9 @@ func (u *UI) layoutIconGrid(gtx layout.Context, rows []ResultRow) layout.Dimensi
 	u.mu.Lock()
 	u.gridCols = cols
 	u.mu.Unlock()
+	if len(rows) == 0 {
+		return u.layoutEmpty(gtx)
+	}
 	nrows := (len(rows) + cols - 1) / cols
 	return material.List(th, &u.iconList).Layout(gtx, nrows, func(gtx layout.Context, gi int) layout.Dimensions {
 		var cells []layout.FlexChild
@@ -650,6 +832,9 @@ func flattenGrouped(rows []ResultRow) []flatItem {
 func (u *UI) layoutGrouped(gtx layout.Context, rows []ResultRow) layout.Dimensions {
 	th := u.th
 	s := u.scheme
+	if len(rows) == 0 {
+		return u.layoutEmpty(gtx)
+	}
 	u.ensureRowState(len(rows))
 	flat := flattenGrouped(rows)
 	return material.List(th, &u.list).Layout(gtx, len(flat), func(gtx layout.Context, i int) layout.Dimensions {
@@ -690,7 +875,7 @@ func (u *UI) layoutRenameCard(gtx layout.Context, s Scheme) layout.Dimensions {
 				return layout.Inset{Top: Dp(12), Bottom: Dp(12)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
 					return u.roundedField(gtx, func(gtx layout.Context) layout.Dimensions {
 						return layout.Inset{Left: Dp(8), Right: Dp(8), Top: Dp(6), Bottom: Dp(6)}.Layout(gtx, ed.Layout)
-					})
+					}, true)
 				})
 			}),
 			layout.Rigid(func(gtx layout.Context) layout.Dimensions {

@@ -1,9 +1,6 @@
 package main
 
 import (
-	"image"
-	"image/color"
-
 	"gioui.org/layout"
 	"gioui.org/op"
 	"gioui.org/widget"
@@ -12,8 +9,6 @@ import (
 
 // gtoolbar.go: back/forward, the search field (leading icon, clear button),
 // the folder-scope field, the Contents toggle chip, and the view switcher.
-
-type glyphFunc func(gtx layout.Context, c color.NRGBA, size image.Point) layout.Dimensions
 
 // layoutToolbar renders the top bar. Clicks and editor events are handled
 // inline; the searcher runs on its own goroutine.
@@ -49,11 +44,11 @@ func (u *UI) layoutToolbar(gtx layout.Context) layout.Dimensions {
 		return layout.Flex{Axis: layout.Horizontal, Alignment: layout.Middle}.Layout(gtx,
 			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 				return layout.Inset{Left: Dp(8)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
-					return iconBtn(gtx, th, s, &u.backBtn, chevGlyph(true), canBack, Dp(32))
+					return fluentBtn(gtx, th, s, &u.backBtn, iconBack, canBack, false, Dp(32))
 				})
 			}),
 			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-				return iconBtn(gtx, th, s, &u.fwdBtn, chevGlyph(false), canFwd, Dp(32))
+				return fluentBtn(gtx, th, s, &u.fwdBtn, iconForward, canFwd, false, Dp(32))
 			}),
 			layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
 				return layout.Inset{Left: Dp(8), Right: Dp(4)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
@@ -101,8 +96,7 @@ func (u *UI) layoutSearchField(gtx layout.Context) layout.Dimensions {
 		return layout.Flex{Axis: layout.Horizontal, Alignment: layout.Middle}.Layout(gtx,
 			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 				return layout.Inset{Left: Dp(10)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
-					sz := gtx.Dp(Dp(18))
-					return searchGlyph(gtx, s.Muted, image.Point{X: sz, Y: sz})
+					return ficon(th, Sp(16), iconSearch, s.Muted).Layout(gtx)
 				})
 			}),
 			layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
@@ -113,11 +107,11 @@ func (u *UI) layoutSearchField(gtx layout.Context) layout.Dimensions {
 					return layout.Dimensions{}
 				}
 				return layout.Inset{Right: Dp(6)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
-					return iconBtn(gtx, th, s, &u.clearBtn, xGlyph, true, Dp(24))
+					return fluentBtn(gtx, th, s, &u.clearBtn, iconClear, true, false, Dp(24))
 				})
 			}),
 		)
-	})
+	}, gtx.Focused(&u.searchEd))
 }
 
 // layoutScopeField renders the compact folder-scope box.
@@ -133,11 +127,12 @@ func (u *UI) layoutScopeField(gtx layout.Context) layout.Dimensions {
 	ed.TextSize = Sp(13)
 	return u.roundedField(gtx, func(gtx layout.Context) layout.Dimensions {
 		return layout.Inset{Left: Dp(10), Right: Dp(6), Top: Dp(6), Bottom: Dp(6)}.Layout(gtx, ed.Layout)
-	})
+	}, gtx.Focused(&u.scopeEd))
 }
 
-// roundedField draws the field background + border around content.
-func (u *UI) roundedField(gtx layout.Context, content layout.Widget) layout.Dimensions {
+// roundedField draws the field background + border around content. The
+// border turns accent while the field has keyboard focus.
+func (u *UI) roundedField(gtx layout.Context, content layout.Widget, focused bool) layout.Dimensions {
 	s := u.scheme
 	mac := op.Record(gtx.Ops)
 	dims := content(gtx)
@@ -145,14 +140,18 @@ func (u *UI) roundedField(gtx layout.Context, content layout.Widget) layout.Dime
 	sz := dims.Size
 	gtx.Constraints.Min = sz
 	roundedFill(gtx, s.Field, sz, Dp(8))
-	border(gtx, sz, s.Border, Dp(8), Dp(1))
 	call.Add(gtx.Ops)
+	if focused {
+		border(gtx, sz, s.Accent, Dp(8), Dp(2))
+	} else {
+		border(gtx, sz, s.Border, Dp(8), Dp(1))
+	}
 	return layout.Dimensions{Size: sz}
 }
 
 // layoutViewSwitcher renders the 3-way segmented view control.
 func (u *UI) layoutViewSwitcher(gtx layout.Context, cur ViewMode) layout.Dimensions {
-	glyphs := []glyphFunc{listGlyph, gridGlyph, groupGlyph}
+	glyphs := []string{iconList, iconGrid, iconGroup}
 	modes := []ViewMode{ViewDetails, ViewIcons, ViewGrouped}
 	return layout.Flex{Axis: layout.Horizontal}.Layout(gtx,
 		layout.Rigid(func(gtx layout.Context) layout.Dimensions {
@@ -168,21 +167,6 @@ func (u *UI) layoutViewSwitcher(gtx layout.Context, cur ViewMode) layout.Dimensi
 }
 
 // segBtn is one segment of the view switcher.
-func (u *UI) segBtn(gtx layout.Context, clk *widget.Clickable, glyph glyphFunc, on bool) layout.Dimensions {
-	s := u.scheme
-	return clk.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
-		px := gtx.Dp(Dp(32))
-		gtx.Constraints.Min = image.Point{X: px, Y: px}
-		bg := color.NRGBA{}
-		fg := s.Subtle
-		if on {
-			bg, fg = s.Selected, s.Text
-		} else if clk.Hovered() {
-			bg = s.Hover
-		}
-		if bg.A != 0 {
-			roundedFill(gtx, bg, gtx.Constraints.Min, Dp(6))
-		}
-		return glyph(gtx, fg, gtx.Constraints.Min)
-	})
+func (u *UI) segBtn(gtx layout.Context, clk *widget.Clickable, glyph string, on bool) layout.Dimensions {
+	return fluentBtn(gtx, u.th, u.scheme, clk, glyph, true, on, Dp(32))
 }

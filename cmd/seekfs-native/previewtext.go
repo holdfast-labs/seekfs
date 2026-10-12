@@ -97,7 +97,7 @@ func previewMetadata(r ResultRow, typeLabel string) string {
 			out += formatSizeShort(r.Size) + "\n"
 		}
 		if r.HasMod {
-			out += r.Modified.Format("2006-01-02 15:04") + "\n"
+			out += formatExplorerTime(r.Modified) + "\n"
 		}
 	}
 	if r.Snippet != "" {

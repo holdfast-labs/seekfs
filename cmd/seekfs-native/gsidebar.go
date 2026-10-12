@@ -1,7 +1,6 @@
 package main
 
 import (
-	"image/color"
 	"os"
 	"path/filepath"
 
@@ -56,23 +55,63 @@ func (u *UI) layoutSideRow(gtx layout.Context, r sideRow, clk *widget.Clickable)
 		})
 	}
 	active := u.sideActive(r)
+	focused := gtx.Focused(clk)
 	return clk.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
-		bg := color.NRGBA{}
-		if active {
-			bg = s.Selected
-		} else if clk.Hovered() {
-			bg = s.Hover
-		}
-		if bg.A != 0 {
-			fillRect(gtx, bg)
-		}
-		return layout.Inset{Left: Dp(16 + float32(r.depth)*12), Right: Dp(8), Top: Dp(6), Bottom: Dp(6)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
-			return label(th, Sp(13), r.label, s.Text).Layout(gtx)
+		gtx.Constraints.Min.X = gtx.Constraints.Max.X
+		mac := opRecord(gtx)
+		dims := layout.Inset{Left: Dp(12 + float32(r.depth)*12), Right: Dp(8), Top: Dp(5), Bottom: Dp(5)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+			return layout.Flex{Axis: layout.Horizontal, Alignment: layout.Middle}.Layout(gtx,
+				layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+					return u.sideIcon(gtx, r)
+				}),
+				layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
+					return label(th, Sp(13), r.label, s.Text).Layout(gtx)
+				}),
+			)
 		})
+		call := mac.Stop()
+		// Rounded 4px hover/selection, accent-tinted when active.
+		if active || clk.Hovered() {
+			bg := s.Hover
+			if active {
+				bg = s.Selected
+			}
+			roundedFill(gtx, bg, dims.Size, Dp(4))
+		}
+		call.Add(gtx.Ops)
+		if focused {
+			border(gtx, dims.Size, s.Accent, Dp(4), Dp(2))
+		}
+		return layout.Dimensions{Size: dims.Size}
 	})
 }
 
 // sideActive highlights the scope matching the current under:.
+// sideIcon renders the row icon: shell icon for paths, Fluent glyphs for
+// actions (save) where no shell icon applies.
+func (u *UI) sideIcon(gtx layout.Context, r sideRow) layout.Dimensions {
+	if r.kind == sideHeader {
+		return layout.Dimensions{}
+	}
+	if r.query == "\x00save" {
+		return layout.Inset{Right: Dp(8)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+			return ficon(u.th, Sp(16), iconAdd, u.scheme.Subtle).Layout(gtx)
+		})
+	}
+	if r.query != "" {
+		return layout.Inset{Right: Dp(8)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+			return ficon(u.th, Sp(16), iconSaved, u.scheme.Subtle).Layout(gtx)
+		})
+	}
+	return layout.Inset{Right: Dp(8)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+		path := r.under
+		if path == "" {
+			path = r.label
+		}
+		return u.cellIcon(gtx, ResultRow{Path: path, IsDir: true}, Dp(16))
+	})
+}
+
 func (u *UI) sideActive(r sideRow) bool {
 	if r.kind != sideScope || r.under == "" {
 		return false
@@ -139,16 +178,22 @@ func (u *UI) rebuildSideRows(vols []DBVolume) {
 		rows = append(rows, sideRow{kind: sideScope, label: "No indexes loaded", depth: 1})
 	}
 	for _, v := range vols {
+		under := ""
+		if v.Volume != "" {
+			under = v.Volume + `\`
+		}
+		// Explorer-style "Local Disk (E:)" with a muted entry count.
 		lbl := v.Volume
+		if under != "" {
+			if name := volumeLabel(under); name != "" {
+				lbl = name
+			}
+		}
 		if lbl == "" {
 			lbl = v.Path
 		}
 		if v.Entries > 0 {
 			lbl += "  (" + formatCount(v.Entries) + ")"
-		}
-		under := ""
-		if v.Volume != "" {
-			under = v.Volume + `\`
 		}
 		rows = append(rows, sideRow{kind: sideScope, label: lbl, under: under, depth: 1})
 	}

@@ -51,6 +51,7 @@ type Settings struct {
 	View         string         `json:"view,omitempty"`
 	ContentsMode bool           `json:"contents_mode,omitempty"`
 	PreviewOpen  bool           `json:"preview_open,omitempty"`
+	PreviewW     int            `json:"preview_w,omitempty"`
 	Under        string         `json:"under,omitempty"`
 	Saved        []string       `json:"saved_searches,omitempty"`
 }

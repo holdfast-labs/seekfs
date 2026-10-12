@@ -99,7 +99,7 @@ func schemeFor(dark bool, accent color.NRGBA) Scheme {
 		Divider:  color.NRGBA{R: 0x00, G: 0x00, B: 0x00, A: 0x12},
 		Hover:    color.NRGBA{R: 0x00, G: 0x00, B: 0x00, A: 0x0D},
 		Pressed:  color.NRGBA{R: 0x00, G: 0x00, B: 0x00, A: 0x1A},
-		Selected: withAlpha(accent, 0x30),
+		Selected: withAlpha(accent, 0x33),
 		FocusBar: accent,
 		Text:     nrgba(0x1B1B1B),
 		Subtle:   nrgba(0x424242),
@@ -138,15 +138,36 @@ var (
 	fontColl []font.FontFace
 )
 
-// typefaces returns Segoe UI (+bold) prepended to the bundled Go fonts as
-// fallback. On non-Windows systems (or when the files are missing) the Go
-// fonts plus Gio's system-font fallback render instead.
+// Segoe Fluent icon codepoints (SegoeIcons.ttf).
+const (
+	iconBack     = "\ue72b"
+	iconForward  = "\ue72a"
+	iconSearch   = "\ue721"
+	iconClear    = "\ue711"
+	iconList     = "\ue8fd"
+	iconGrid     = "\ue80a"
+	iconGroup    = "\ue8a4"
+	iconContents = "\ue8a5"
+	iconSaved    = "\ue728"
+	iconAdd      = "\ue710"
+	iconFolder   = "\ue8b7"
+	iconFile     = "\ue7b8"
+)
+
+// fluentFace is the typeface name for Segoe Fluent Icons.
+const fluentFace = "Segoe Fluent Icons"
+
+// typefaces returns Segoe UI (+bold) and Segoe Fluent Icons prepended to
+// the bundled Go fonts as fallback. On non-Windows systems (or when the
+// files are missing) the Go fonts plus Gio's system-font fallback render
+// instead.
 func typefaces() []font.FontFace {
 	fontOnce.Do(func() {
 		var faces []font.FontFace
 		for _, path := range []string{
 			`C:\Windows\Fonts\segoeui.ttf`,
 			`C:\Windows\Fonts\segoeuib.ttf`,
+			`C:\Windows\Fonts\SegoeIcons.ttf`,
 		} {
 			data, err := os.ReadFile(path)
 			if err != nil {
@@ -177,6 +198,14 @@ func newMaterialTheme() *material.Theme {
 	th.Face = "Segoe UI"
 	th.TextSize = Sp(14)
 	return th
+}
+
+// applySchemeNoFrame restyles without touching a window (headless —
+// snapshots and tests).
+func (u *UI) applySchemeNoFrame() {
+	u.scheme = schemeFor(u.dark, u.accent)
+	restyle(u.th, u.scheme)
+	u.lastDark = u.dark
 }
 
 // restyle applies the scheme to a material theme.

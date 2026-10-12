@@ -6,8 +6,11 @@ import (
 	"time"
 
 	"gioui.org/app"
+	"gioui.org/io/event"
+	"gioui.org/io/pointer"
 	"gioui.org/layout"
 	"gioui.org/op"
+	"gioui.org/op/clip"
 	"gioui.org/op/paint"
 	"gioui.org/unit"
 )
@@ -51,6 +54,10 @@ func newUI(pipe string, limit int, onFrame func()) *UI {
 	u.scopeEd.SingleLine = true
 	u.scopeEd.Submit = true
 	u.scopeEd.SetText(settings.Under)
+	u.list.Axis = layout.Vertical
+	u.iconList.Axis = layout.Vertical
+	u.sideList.Axis = layout.Vertical
+	u.previewList.Axis = layout.Vertical
 	u.renameEd.SingleLine = true
 	u.renameEd.Submit = true
 	u.dark = u.shell.SystemDark()
@@ -72,7 +79,7 @@ func newUI(pipe string, limit int, onFrame func()) *UI {
 
 func defaultColW() map[string]float32 {
 	return map[string]float32{
-		"name": 280, "folder": 260, "size": 110, "modified": 150, "type": 150, "match": 320,
+		"name": 240, "folder": 220, "size": 100, "modified": 170, "type": 140, "match": 320,
 	}
 }
 
@@ -311,8 +318,11 @@ func (u *UI) saveNow() {
 	_ = saveSettings(s)
 }
 
-// paintBG fills the frame background.
+// paintBG fills the frame background (explicit full-frame clip; a bare
+// PaintOp is an infinite plane).
 func (u *UI) paintBG(gtx layout.Context) {
+	size := gtx.Constraints.Max
+	defer clip.Rect{Max: size}.Push(gtx.Ops).Pop()
 	paint.ColorOp{Color: u.scheme.BG}.Add(gtx.Ops)
 	paint.PaintOp{}.Add(gtx.Ops)
 }
@@ -342,9 +352,12 @@ func (u *UI) layout(gtx layout.Context) layout.Dimensions {
 	)
 }
 
-// layoutBody is sidebar | results | preview.
+// layoutBody is sidebar | results | splitter | preview. The results list
+// never draws outside its own region: columns hide by priority when narrow
+// and the area is hard-clipped as a backstop.
 func (u *UI) layoutBody(gtx layout.Context) layout.Dimensions {
 	previewOpen := u.previewOpen()
+	previewW := u.previewWidth(gtx)
 	return layout.Flex{Axis: layout.Horizontal}.Layout(gtx,
 		layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 			gtx.Constraints.Min.X = gtx.Dp(Dp(220))
@@ -352,17 +365,98 @@ func (u *UI) layoutBody(gtx layout.Context) layout.Dimensions {
 			return u.layoutSidebar(gtx)
 		}),
 		layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
-			return u.layoutResults(gtx)
+			return u.layoutResultsClipped(gtx)
 		}),
 		layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 			if !previewOpen {
 				return layout.Dimensions{}
 			}
-			gtx.Constraints.Min.X = gtx.Dp(Dp(330))
-			gtx.Constraints.Max.X = gtx.Dp(Dp(330))
+			return u.layoutSplitter(gtx)
+		}),
+		layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+			if !previewOpen {
+				return layout.Dimensions{}
+			}
+			gtx.Constraints.Min.X = gtx.Dp(Dp(float32(previewW)))
+			gtx.Constraints.Max.X = gtx.Dp(Dp(float32(previewW)))
 			return u.layoutPreview(gtx)
 		}),
 	)
+}
+
+// previewWidth returns the preview pane width in dp (persisted).
+func (u *UI) previewWidth(gtx layout.Context) int {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	w := u.settings.PreviewW
+	if w < 200 {
+		w = 330
+	}
+	if w > 600 {
+		w = 600
+	}
+	return w
+}
+
+// layoutResultsClipped hard-clips results to their own region so columns
+// can never draw under the preview or sidebar.
+func (u *UI) layoutResultsClipped(gtx layout.Context) layout.Dimensions {
+	size := gtx.Constraints.Max
+	defer clip.Rect{Max: size}.Push(gtx.Ops).Pop()
+	return u.layoutResults(gtx)
+}
+
+type splitDrag struct {
+	start float32
+	w0    int
+	on    bool
+}
+
+// layoutSplitter is the draggable preview boundary (7px handle + 1px line).
+func (u *UI) layoutSplitter(gtx layout.Context) layout.Dimensions {
+	s := u.scheme
+	tag := &u.splitTag
+	event.Op(gtx.Ops, tag)
+	for {
+		ev, ok := gtx.Event(pointer.Filter{Target: tag, Kinds: pointer.Press | pointer.Drag | pointer.Release})
+		if !ok {
+			break
+		}
+		e, ok := ev.(pointer.Event)
+		if !ok {
+			continue
+		}
+		switch e.Kind {
+		case pointer.Press:
+			tag.start = e.Position.X
+			tag.w0 = u.previewWidth(gtx)
+			tag.on = true
+		case pointer.Drag:
+			if tag.on {
+				dx := (e.Position.X - tag.start) / gtx.Metric.PxPerDp
+				w := tag.w0 - int(dx)
+				if w < 200 {
+					w = 200
+				}
+				if w > 600 {
+					w = 600
+				}
+				u.mu.Lock()
+				u.settings.PreviewW = w
+				u.mu.Unlock()
+			}
+		case pointer.Release, pointer.Cancel:
+			if tag.on {
+				tag.on = false
+				u.saveSoon()
+			}
+		}
+	}
+	gtx.Constraints.Min.X = gtx.Dp(Dp(7))
+	gtx.Constraints.Max.X = gtx.Dp(Dp(7))
+	return layout.Center.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+		return vline(gtx, s.Border)
+	})
 }
 
 func (u *UI) previewOpen() bool { return u.settings.PreviewOpen }
