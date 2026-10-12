@@ -15,20 +15,30 @@ volume. PB8 landed bounded content-candidate materialization, the rank-ordered
 bounded scan fallback, and the biased/overlay early-stop fix (see §6h). WP11
 landed the HTML/EML/mbox/RTF/MSG/PDF extractors (with per-parser fuzz targets),
 and WP8 landed the M1 replay-bounded delta, M9 count/remote health, and the M1
-delta observability. The optional PB8 items 4–7 (global-lane integration) is now
-**partly landed**: a compound content + selective-filename lane
-(`cmd/seekfs/content_global_lane.go`) drives the filename iterator and verifies
-content inline, single and multi volume, but is **off by default** behind
-`SEEKFS_CONTENT_GLOBAL_LANE` and still declines overlays/hidden, `under:`/
-`exists:`, relevance, and biased order (see the WP7 section of the roadmap). The
-documented §7 residuals remain. `.gsx` doc tables are format **v6** (source
-size + nanosecond mtime per doc; see §6j) and sharded manifests are **v5**
+delta observability. The PB8 items 4–7 (global-lane integration) has now landed:
+a compound content + selective-filename lane (`cmd/seekfs/content_global_lane.go`)
+drives the filename iterator and verifies content inline. It is **on by default**
+(`SEEKFS_CONTENT_GLOBAL_LANE=0` is the kill switch back to the per-volume
+content path) and engages single-volume compound queries whose filename side is
+small (estimated drive at most max(1024, 4×limit)). It handles `under:`
+(under-root narrowing on the filename side, shard-mask pruning on sharded
+bases), `exists:`, overlay hidden-base filtering with the live-slot merge, and
+biased order on pristine volumes — every newly in-scope shape proven by
+randomized differentials against the slow path (identical sets, order, counts
+and snippets). It still declines `sort:relevance` on search, content under
+OR/NOT groups, case-sensitive filename parts, filename OR-unions, bare
+non-path terms and other unsupported filename roots, multi-usable-volume
+queries, truncated catch-up (`healthIncomplete`), a missing overlay snapshot,
+and biased queries while the volume carries overlay activity (see the WP7
+section of the roadmap for the precise list and rationale). The documented §7
+residuals remain. `.gsx` doc tables are format **v6** (source size +
+nanosecond mtime per doc; see §6k) and sharded manifests are **v5**
 (see §6i). P4 document-extraction
 quality remains deferred (see §7). Content search is off by default; with
 `[features.content] enabled = true` or `SEEKFS_CONTENT_SEARCH=1`, `content:`
 queries work through the service once the
 service-owned build has attached a `.gsx` — FRN-keyed for USN volumes,
-stable-path-hash-keyed for walk volumes (see §6j).
+stable-path-hash-keyed for walk volumes (see §6k).
 
 This document is the committed handoff for an agent continuing the work. The
 fuller working plan lives at `docs/CONTENT_SEARCH_PLAN.md`, which is
@@ -100,15 +110,62 @@ are `SEEKFS_CONTENT_SCOPE`, `SEEKFS_CONTENT_ROOTS`, and
 the service rebuilds an older sidecar or one whose scope changed before serving
 its stored content.
 
+Inside a detected worktree the scope follows git's ignore rules with git's
+precedence: `.gitignore` files, then `.git/info/exclude`, then the global
+excludes file (`core.excludesFile` from the repo's `.git/config` or the
+user's `~/.gitconfig`, else `%USERPROFILE%\.config\git\ignore` /
+`$XDG_CONFIG_HOME/git/ignore`). Patterns match case-sensitively, like
+ripgrep and like git for every file that exists (git's `core.ignorecase`
+only relaxes matching for paths with no on-disk entry); folding would
+silently drop tracked source whenever a pattern differs in case
+(`build/.gitignore`'s `LASTCHANGE*` vs the tracked `lastchange.gni`). The
+global file joins the scope digest, and the drain loop polls its stat (it
+lives outside the volume, so the USN stream never reports it), so edits
+rebuild under the new rules.
+
 The service selects Git repositories before configured roots, then known
 folders. It spools accepted extracted text to temporary disk before assembling
 the FRN-sorted sidecar, so a large scoped build needs temporary disk space up
-to its extracted-text budget.
+to its extracted-text budget. Assembly itself is fully streamed: the text
+store is spooled to a temp file as docs arrive, the term/gram posting sections
+merge straight into section files, and the `.gsx` is written by streaming
+those payloads with a running section table (see §6j). A 64 MiB shard builds
+or folds under ~250 MB of heap.
+
+File selection is ripgrep-style: unless `[content] exts` pins an explicit
+allowlist, every file the scope admits is opened and head-sniffed at build
+time — NUL in the first 8 KiB means binary (the same heuristic ripgrep uses;
+BOM and BOM-less UTF-16 still count as text). Only known-binary extensions
+(images, archives, media, objects, fonts, legacy OLE documents) are rejected
+without opening. Unknown extensions and extensionless files (`OWNERS`,
+`BUILD`, `DEPS`, `Makefile`) are text candidates: indexed when they sniff as
+text, tallied as `binary` in the `.gsx` policy and content health when they
+do not. `content-index -db <gsi> --estimate` reports `text_candidates` and
+`binary_candidates` separately, and `--sniff-sample N` opens a stride sample
+of the candidates to project the binary share (`projected_text_files`).
+
+The extracted-text budget (`budget_bytes`) defaults to a tenth of the index
+volume's free space (floored at 2 GiB, ceiling 32 GiB), so a Chromium-size
+repo indexes completely; sharding bounds build and fold memory per 64 MiB
+shard, so the budget is really disk space. Corpora past the shard target
+build as folder shards, each individually capped at the 4 GiB per-file
+sidecar cap (an over-cap shard refuses to publish, like a single-file
+over-cap build), which is why totals past 4 GiB are safe. Set `[content]`
+`budget_bytes` (or `[content."E:"]` per volume, or
+`SEEKFS_CONTENT_BUDGET_BYTES`) to pin an explicit budget. Only an explicit
+budget joins the sidecar identity: the derived default tracks free space, and
+fingerprinting it would rebuild on every drift. When a budget does bite, the
+build still extracts the excluded files and tallies their exact sizes, so the
+`.gsx` policy records exact `scope_dropped` files and `scope_dropped_bytes`
+plus the enforced `budget_bytes`; content health (`loaded --json`,
+`scope_dropped`/`scope_dropped_bytes`/`budget_bytes`) and the UI footer
+surface them as e.g. "12,345 files not indexed (budget 2 GiB) — raise
+[features.content] budget_bytes" instead of a vague "partial results".
 
 Walk-indexed volumes (`seekfs index -root <dir>`, FAT/exFAT/ReFS-without-journal
 drives, network shares, non-Windows builds) get the same service-owned build
 through the same scope machinery, keyed on the stable path hash instead of the
-FRN (see §6j). Git worktree detection reads the index's `.git` markers, so a
+FRN (see §6k). Git worktree detection reads the index's `.git` markers, so a
 walk root that is not itself inside a worktree (e.g. a subtree of a repo)
 detects no repos under auto scope; pin it explicitly instead:
 
@@ -135,6 +192,21 @@ unless `case:true` is set. The fold is the same on both sides because the
 builder folds documents and the query folds the leaf with the one shared
 `contentFoldText`.
 
+**Typo tolerance.** A `content:` query that matches zero documents is retried
+with per-word corrections from the term dictionary (the folded CXTR words):
+each correctable word (4+ runes) of every positive term/phrase leaf is replaced
+by the dictionary term within edit distance 1 (2 for 8+ rune words) with the
+best document frequency, and the first retry that returns results wins (at most
+a few trials: single-word rewrites, then the combined rewrite). Exact results
+are never altered — fuzzy only fires on a total miss — and `case:true` queries,
+regex leaves, and NOT leaves are never corrected. Sharded indexes merge
+candidates across shards, and the resident delta vocabulary covers unflushed
+changes. The response sets `fuzzy` plus `fuzzy_correction` (the corrected
+words), so the UI summary says "Showing results for receive" and counts agree
+with searches. Measured on the Chromium content sample (62k docs, 500 random
+5+ letter words, one random edit each): 98.4% top-1 at p50 ~24 ms / p99
+~40 ms per corrected term (`content_fuzzy.go`, `content_fuzzy_test.go`).
+
 **Per-format scope.** Matching is against *extracted* text, not raw bytes. Plain
 text/code is indexed as text. HTML indexes the visible page text only — tags,
 entities, `<script>`/`<style>`/`<textarea>` and comments are excluded (verified:
@@ -154,7 +226,8 @@ when none is usable the query errors rather than returning empty.
 | File | Role |
 | --- | --- |
 | `content_encoding.go` | tgrep-ported text decoding: BOM sniff (UTF-8/16LE/16BE), lossy repair with maximal-subsequence semantics, and `contentLossyFixups` mapping repaired offsets back to source bytes. |
-| `content_index.go` | `.gsx` container: magic/version, `Origin`, section table, 64-byte `contentDoc` records, encode/decode, atomic save, FRN bisection. |
+| `content_index.go` | `.gsx` container: magic/version, `Origin`, section table (with per-section CRC32C), 64-byte `contentDoc` records, encode/decode, atomic save (in-memory and streaming), FRN bisection. |
+| `content_integrity.go` | Post-attach checksum verification, stale-marking and rebuild scheduling for corrupt sidecars. |
 | `content_postings.go` | Shared CXTR/CXGR block codec: `key -> []contentDocFreq{docID,tf}`, delta-varint docID + uvarint tf, 1024-doc blocks, dictionary + block meta, bounded lookup. |
 | `content_external_build.go` | Bounded external spill/merge builder (`contentExternalSectionBuilder`) producing bytes identical to the in-memory encoder. |
 | `content_extract.go` | `contentExtractor` interface, registry, `contentExtractorForPath` (extension → format sniffers → text fallback), binary sniff, size caps. |
@@ -165,6 +238,7 @@ when none is usable the query errors rather than returning empty.
 | `content_read.go` | `contentReader`: decode sections, trigram-intersection candidates, substring verification, `contentHit{Path,DocID,Offset}`. |
 | `content_resolver.go` | `contentResolver`: merges FRN-sorted docs against the base FRN column → `docID -> recordID` (`contentNoRecordID` = dropped). |
 | `content_query.go` | `contentLeaf`, `contentSearchEnabled`, `contentUnavailableError`, `parseContentLeaf`, `queryHasPositiveContentLeaf`, deterministic `contentAssignLeafIDs`. |
+| `content_fuzzy.go` | Typo tolerance for zero-result `content:` queries: dictionary correction per word (pigeonhole/bitmap prefilters + bounded Damerau-Levenshtein, reusing `fuzzy.go`), merged across shards and the delta vocabulary, retried through the exact search/count paths; `fuzzy_correction` surfaces the corrected words. |
 | `content_tokenize.go` | Quote- and regex-span-aware query tokenizer (`content:/a b/` survives whitespace and `|`). |
 | `content_service.go` | `contentVolumeState` (idx/reader/resolver/delta/state/health), `contentDelta`, `contentCoordinator` (dirty/promote/drain/invalidate), `contentExtractDeltaDoc`, `processQueue`, `contentEligibleForExtraction`, `contentHealth`, `sha256Of`. |
 | `content_service_wiring.go` | Service glue: `contentIndexPathForDB`, `contentBaseFRNColumns`, `attachContentForVolume`, `contentDrainLoop`, `contentResolvePath`, `rebindContentAfterBaseSwap`, `contentLookupFRNColumn`. |
@@ -516,11 +590,16 @@ whole posting superset. It also carries the count-parity, remote-content-health
 
 Residual / known limitations (all explicit deferrals):
 
-- **Content bypasses the global planner lanes (PB8 items 4–7).** A compound
-  content + selective-filename query (`content:<common> ext:.go under:<dir>`)
-  does not lane-intersect: the content path runs per-volume and the cost is
-  driven by the content candidates. Deferred/optional; if pursued, prototype the
-  `globalRecordID` ↔ content-docID join first.
+- **Content bypasses the global planner lanes for broad filename sides (PB8
+  items 4–7).** The compound lane (see intro) engages only when the filename
+  side is small (at most max(1024, 4×limit) estimated candidates): driving the
+  filename iterator and verifying every candidate inline is only cheaper than
+  the bounded content scan below that line (measured: an 8-doc ext side against
+  a 50k-doc broad term answers ~143× faster; a 50k-doc side would cost ~640×
+  more than the 16-candidate slow path, so it stays on the content path, at
+  identical results). The old "prototype the `globalRecordID` ↔ content-docID
+  join" note is obsolete: no join was needed, since `contentCandidatesBounded`
+  already maps to local record IDs and the lane drives the other direction.
 - **OR-alternative candidate union.** `contentAltCandidateDocs` still
   materializes each alternative's doc set (`budget=0`); a k-way streamed union is
   an optimization tail.
@@ -583,7 +662,7 @@ A corpus with more than `contentShardTargetBytes` (64 MiB) of extracted text is
 split by folder. `<gsx>.shards\` holds immutable shard files and the `.gsx`
 becomes a small **manifest** (format v5, section `CXSH`) listing each shard's
 file name, doc count and owned folder prefixes. Smaller corpora still produce a
-single file (v6 doc tables since §6j). Older binaries reject v5/v6, so they
+single file (v6 doc tables since §6k). Older binaries reject v5/v6, so they
 rebuild rather than attaching an empty index.
 
 - **Ownership.** A path belongs to the shard owning its longest matching
@@ -607,7 +686,10 @@ rebuild rather than attaching an empty index.
   later sweep.
 - **`under:`.** `shardMaskUnder` limits content candidates to the shards that
   can hold docs under the folder: the folder's owner plus any shard owning a
-  prefix inside it.
+  prefix inside it, including a shard that owns `under` itself (equality
+  counts: the folder's own files live in its owner's shard, so excluding it
+  dropped true matches — caught by the compound-lane differential on a sharded
+  corpus).
 - **Measured (Chromium, 62k files / 508 MB text):** with a single file, every
   fold re-assembled everything in about 2m13s with a 3.4 GB heap peak. With 64
   MiB shards (10 shards, 6% larger on disk), a 100-file edit in one folder took
@@ -622,9 +704,58 @@ rebuild rather than attaching an empty index.
   the build dropped from 2m16s to 28 s, with extraction fully hidden behind
   tokenizing.
 - **Not yet:** shards are not rebalanced between rebuilds. The offline
-  `content-index` CLI still writes a single file and holds all text in memory.
+  `content-index` CLI still writes a single file, but it now spools extracted
+  text to disk during the walk and streams the save like the service paths.
 
-## 6j. Walk-indexed volumes (done)
+## 6j. Streaming build/save + per-section integrity (done)
+
+**Streaming.** `assembleContentIndexStreamed` (`content_build.go`) consumes
+documents exactly like the in-memory assembler but never retains the corpus:
+each doc's repaired text is appended to a temp text-store file as it arrives,
+and the term/gram builders merge straight into section files
+(`FinishFile` in `content_external_build.go`) instead of returning whole
+`[]byte`. `contentSaveAssembled` (`content_index.go`) streams those payloads
+into the `.gsx` with a running section table and patches the header, computing
+each section's CRC32C as it goes. The temp-then-rename atomicity, the
+`contentGSXSizeError` cap (checked from the payload sizes before anything is
+written), the deterministic section order and the byte-identical output for
+the same input all match the in-memory save (a test builds the same corpus
+both ways and compares bytes). Callers that need the index after a build
+(attach, fold publish) reload the saved file through the mmap loader instead
+of keeping heap copies. The in-memory API stays for tests and small corpora.
+Peak transient heap per shard is one document's text plus the two posting
+arenas (now 12 MiB each) plus O(docs) metadata and the posting entry/block
+tables; the per-document tokenizer map hints are capped so one huge document
+cannot preallocate gigabytes of empty buckets (hints are allocation-only and
+do not change the output).
+
+**Integrity.** Every section-table entry carries a CRC32C (Castagnoli,
+hardware-accelerated via `hash/crc32`) of its payload in the entry's trailing
+word, flagged by `contentSectionFlagCRC`. The format version stays 4: older
+binaries ignore both words and keep loading, and a file without the flag is a
+legacy (pre-checksum) section that loads and is upgraded with checksums on
+the next save. Decode verifies the small sections (doc table, paths, policy,
+scope, manifest) immediately, so a corrupt small section fails the load; the
+large text/term/gram sections are verified by a background pass after attach
+(`verifyContentAfterAttach`), so startup does not page in gigabytes. The pass
+hashes each index (and each shard index) under its read pin, and `Release`
+refuses new pins and waits for pinned reads before unmapping, so the unmap
+can never race an in-flight section read even outside `indexMu` (a mapping
+torn down mid-pass stops the pass early with an error instead of faulting).
+A mismatch drops the base (stale — queries are refused, never served from
+corrupt bytes) and schedules a full rebuild (v1 has no per-shard rebuild),
+capped at `contentIntegrityMaxRebuilds` per failure streak so a disk that
+corrupts every write leaves the volume visibly stale with `integrity_error`
+in health instead of spinning rebuilds. The offline `content` command
+verifies the whole file synchronously before searching.
+
+**Residual:** a fold that reads a base corrupted after its attach-time pass
+re-encodes the corrupt bytes with fresh (valid) checksums, so the corruption
+persists until the next rebuild rather than tripping the pass. Closing it
+needs per-document checksums or a pre-fold verify (which pages the base);
+deferred.
+
+## 6k. Walk-indexed volumes (done)
 
 Content search works through the service for walk-indexed volumes and roots
 (`seekfs index -root` databases, FAT/exFAT/ReFS-without-journal drives,
@@ -671,16 +802,27 @@ layout, and gitignore scope as USN volumes.
   sidecars fail the version gate and rebuild; manifests stay v5; shards, folds,
   and the offline CLI carry the fields unchanged.
 
+Attach also runs the background integrity pass (per-section CRC32C, §6j),
+and the sharded layout, streaming save, fuzzy variants, and compound lane all
+operate on the walk base unchanged (the lane verifies through the same
+walk-keyed resolution).
+
 Tests: `content_service_walk_test.go` mirrors the USN ones (build/attach/query,
 edit/create/delete/rename via watcher-equivalent rebuild + drain, fold,
 restart, sharded variant, zero-join-stays-stale, steady-state idempotence,
-unindexable convergence, restore-before-fold).
+unindexable convergence, restore-before-fold, compound-lane parity).
 
 Measured on `E:\bench\chromium\third_party\blink` (225,303 filename entries):
-service build ~18 min for 159,548 files → 159,157 docs in a 612 MB sharded
-sidecar (7 shards); `content:PaintLayer` answers in ~43 ms; create→findable
-6.2 s and delete→unfindable 4.7 s end to end (dominated by the ~5.5 s full
-filename rewalk the pre-existing watcher performs on this tree); converged
+service build ~19 min for 178,595 files → 177,311 docs in a 669 MB sharded
+sidecar (plus `binary: 873` declinations in health), identical with and
+without readiness polling — polling was exonerated as a slowdown (`loaded`
+never trips the query-activity governor, and the 4-worker count is sampled
+once at build start; the time is cold-IO extraction plus sequential
+streaming assembly on a shared box). `content:PaintLayer` answers in ~40 ms
+through the service and ~0.5 s cold through the offline `content -db` path
+(which verifies section CRCs before searching); create→findable 6.2 s and
+delete→unfindable 4.7 s end to end (dominated by the ~5.5 s full filename
+rewalk the pre-existing watcher performs on this tree); converged
 steady-state reconciles are silent and queue nothing.
 
 ## 7. Carried debt / known gaps
@@ -815,8 +957,10 @@ real in-cap PDFs measured mean recall **0.933 → 0.980** and perfect files
   — or whose extractor produced no text, e.g. empty), so `indexed == eligible -
   declined - skipped`. Not persisted to the `.gsx` (the policy section is a fixed
   size), so the service health view does not carry it yet.
-- **`.gsx` has no integrity checksum.** Payload/text byte flips are undetected
-  (structural damage is caught); fuzzing found no panic. Accepted.
+- **Fold-after-corruption window (see §6j).** A base corrupted after its
+  attach-time checksum pass is re-encoded by a fold with fresh checksums, so
+  the corruption persists until a rebuild. Per-document checksums or a
+  pre-fold verify would close it; deferred.
 - Confirmed clean: encrypted/image-only PDFs → `skipped` with no false hits;
   OOXML oracle parity 13/13 under the 32 MiB cap; RTF/EML/mbox/MSG end-to-end
   synthetic parity (only `\fldrslt`, non-allowlisted headers and encoded blobs

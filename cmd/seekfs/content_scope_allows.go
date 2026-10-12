@@ -26,16 +26,71 @@ var contentSystemExcludeVolumeDirs = []string{
 	"$recycle.bin", "system volume information", "recovery", "perflogs",
 }
 
+// contentBinaryExtensions are known-binary extensions rejected without
+// opening the file. Anything a registered extractor claims (PDF, OOXML, ...)
+// is never listed here — the disjointness is asserted by
+// TestContentBinarySkipListDisjointFromExtractors — and anything else with an
+// unknown or missing extension is admitted for head-sniffing at build time.
+// The list is intentionally conservative: an extension that could be either
+// (like .dat) is left to the NUL sniff, which mirrors ripgrep.
+var contentBinaryExtensions = map[string]struct{}{
+	// Images.
+	".png": {}, ".jpg": {}, ".jpeg": {}, ".gif": {}, ".bmp": {}, ".ico": {},
+	".tif": {}, ".tiff": {}, ".webp": {}, ".avif": {}, ".heic": {}, ".heif": {},
+	".psd": {}, ".ai": {},
+	// Archives, installers, packages.
+	".zip": {}, ".7z": {}, ".rar": {}, ".tar": {}, ".gz": {}, ".bz2": {},
+	".xz": {}, ".cab": {}, ".iso": {}, ".dmg": {}, ".jar": {}, ".war": {},
+	".ear": {}, ".apk": {}, ".aab": {}, ".msi": {}, ".pkg": {}, ".deb": {},
+	".rpm": {},
+	// Media.
+	".mp3": {}, ".mp4": {}, ".wav": {}, ".avi": {}, ".mov": {}, ".mkv": {},
+	".flac": {}, ".ogg": {}, ".ogv": {}, ".webm": {}, ".m4a": {}, ".m4v": {},
+	".aac": {}, ".wma": {}, ".wmv": {}, ".mid": {}, ".midi": {}, ".opus": {},
+	".3gp": {}, ".flv": {}, ".wasm": {},
+	// Objects, libraries, executables, debug info.
+	".o": {}, ".obj": {}, ".so": {}, ".dylib": {}, ".dll": {}, ".exe": {},
+	".lib": {}, ".a": {}, ".pyc": {}, ".pyo": {}, ".class": {}, ".pdb": {},
+	".ilk": {}, ".exp": {}, ".pch": {}, ".gch": {}, ".ko": {}, ".sys": {},
+	".drv": {},
+	// Fonts.
+	".ttf": {}, ".otf": {}, ".woff": {}, ".woff2": {}, ".eot": {},
+	// Legacy document formats with no registered extractor (OLE2; see §7).
+	".doc": {}, ".xls": {}, ".ppt": {},
+	// Misc certainly-binary stores.
+	".bin": {}, ".db": {}, ".sqlite": {}, ".sqlite3": {},
+}
+
+// contentBinaryExtension reports whether ext is a known-binary extension:
+// rejected without opening. ext must be lowercase with a leading dot (as
+// contentPathExtension returns); "" (extensionless) is never binary here.
+func contentBinaryExtension(ext string) bool {
+	if ext == "" {
+		return false
+	}
+	_, ok := contentBinaryExtensions[ext]
+	return ok
+}
+
 // contentScopeResolved is a scope with its effective roots and excludes for one
 // volume plus the detected git worktrees.
 type contentScopeResolved struct {
-	Mode           contentScopeMode
-	Roots          []string // effective include roots (normalized)
-	Repos          []string // detected git worktree roots (normalized)
-	ExplicitRoots  []string // configured roots, before known folders are added
-	Excludes       []string // normalized exclude prefixes
-	ExtSet         map[string]struct{}
-	BudgetBytes    int64
+	Mode          contentScopeMode
+	Roots         []string // effective include roots (normalized)
+	Repos         []string // detected git worktree roots (normalized)
+	ExplicitRoots []string // configured roots, before known folders are added
+	Excludes      []string // normalized exclude prefixes
+	ExtSet        map[string]struct{}
+	// SniffText selects ripgrep-style selection: any file not cheaply rejected
+	// (the binary skip list) is admitted and its 512-byte head sniffed at
+	// build time (NUL in the first 8 KiB means binary). It is on unless the
+	// operator configured an explicit extension allowlist, which stays an
+	// opt-in verbatim gate.
+	SniffText   bool
+	BudgetBytes int64
+	// BudgetExplicit mirrors contentScope.BudgetExplicit: only an explicit
+	// budget joins the scope fingerprint (see contentScopeSelectionVersion).
+	BudgetExplicit bool
 	SystemExcludes bool
 	// Ignore applies git ignore rules inside detected worktrees in place of
 	// the name-based system excludes; IgnoreDigest fingerprints the ignore
@@ -47,11 +102,15 @@ type contentScopeResolved struct {
 // resolve computes the effective roots/excludes. repoRoots are the detected git
 // worktree roots (contentDetectGitRepos).
 func (s contentScope) resolve(volume string, repoRoots []string) contentScopeResolved {
-	r := contentScopeResolved{Mode: s.Mode, BudgetBytes: s.BudgetBytes, SystemExcludes: s.SystemExcludes}
+	r := contentScopeResolved{Mode: s.Mode, BudgetBytes: s.BudgetBytes, BudgetExplicit: s.BudgetExplicit, SystemExcludes: s.SystemExcludes}
 	if s.Exts != nil {
 		r.ExtSet = s.Exts
 	} else {
+		// No explicit allowlist: sniff-based selection over the registry.
+		// ExtSet still carries the registry so the fingerprint names the
+		// selection, but allows() consults the skip list instead of it.
 		r.ExtSet = contentServiceExtensions()
+		r.SniffText = true
 	}
 	if s.IncludeGit {
 		r.Repos = repoRoots
@@ -105,7 +164,9 @@ func (r contentScopeResolved) priority(path string) int {
 
 // allows decides whether path is in scope, returning the matching include unit
 // and its kind ("repo" or "root"). Both the build and the estimate use this, so
-// the extension gate, excludes, and roots are applied identically.
+// the extension gate, excludes, and roots are applied identically. In sniff
+// mode (the default) only known-binary extensions are rejected here; anything
+// else is admitted and head-sniffed at build time.
 func (r contentScopeResolved) allows(path string) (unit, kind string, ok bool) {
 	if r.Mode == contentScopeOff {
 		return "", "", false
@@ -114,7 +175,12 @@ func (r contentScopeResolved) allows(path string) (unit, kind string, ok bool) {
 	if p == "" {
 		return "", "", false
 	}
-	if _, ok := r.ExtSet[contentPathExtension(p)]; !ok {
+	ext := contentPathExtension(p)
+	if r.SniffText {
+		if contentBinaryExtension(ext) && !contentRegistryClaimsExt(ext) {
+			return "", "", false
+		}
+	} else if _, ok := r.ExtSet[ext]; !ok {
 		return "", "", false
 	}
 	for _, ex := range r.Excludes {
@@ -124,8 +190,10 @@ func (r contentScopeResolved) allows(path string) (unit, kind string, ok bool) {
 	}
 	if _, inRepo := r.Ignore.repoFor(p); inRepo {
 		// Inside a worktree git decides: tracked "build" or "vendor"
-		// directories are source, while ignored output is skipped.
-		if r.Ignore.ignored(p, false) {
+		// directories are source, while ignored output is skipped. The
+		// original-case path drives pattern matching (case-sensitive,
+		// like git and ripgrep); p is only the normalized lookup key.
+		if r.Ignore.ignored(path, false) {
 			return "", "", false
 		}
 	} else if r.SystemExcludes && contentPathHasExcludedSegment(p, contentSystemExcludeSegments) {

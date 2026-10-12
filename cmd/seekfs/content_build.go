@@ -8,11 +8,13 @@ package main
 // service-driven incremental path is P2.
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -116,19 +118,70 @@ type contentBuildDoc struct {
 	fileModNano int64
 }
 
+// contentWalkDoc is one extracted file awaiting assembly: the spool offset of
+// its extracted text plus the identity the doc table needs. The walk builders
+// spool text to disk during the walk and assemble in FRN order afterwards, so
+// a large corpus never sits in memory as raw text.
+type contentWalkDoc struct {
+	item    contentBuildItem
+	offset  int64
+	length  int
+	modUnix int64
+	class   uint16
+	version uint16
+	// fileSize and fileModNano are the source file's byte size and nanosecond
+	// mtime at extraction time (walk reconcile fingerprint); every producer
+	// stamps them from the same stat the extraction read.
+	fileSize    int64
+	fileModNano int64
+}
+
+// contentWalkSpool streams extracted documents back out of a spool file in the
+// order order lists (indexes into spooled).
+func contentWalkSpool(f *os.File, spooled []contentWalkDoc, order []int) contentBuildSource {
+	next := 0
+	return func() (contentBuildDoc, bool, error) {
+		if next == len(order) {
+			return contentBuildDoc{}, false, nil
+		}
+		s := spooled[order[next]]
+		next++
+		text := make([]byte, s.length)
+		if _, err := f.ReadAt(text, s.offset); err != nil {
+			return contentBuildDoc{}, false, err
+		}
+		return contentBuildDoc{path: s.item.path, frn: s.item.frn, text: text, modUnix: s.modUnix, class: s.class, version: s.version, fileSize: s.fileSize, fileModNano: s.fileModNano}, true, nil
+	}
+}
+
 // buildContentIndexFromDir builds an in-memory `.gsx` for root.
 func buildContentIndexFromDir(ctx context.Context, root string, opts contentBuildOptions) (*contentIndex, error) {
 	settings := opts.extractSettings()
 	ctx = contentWithExtractSettings(ctx, settings)
-	docs := make([]contentBuildDoc, 0, 4096)
+	tmpDir, err := os.MkdirTemp("", "seekfs-content-*")
+	if err != nil {
+		return nil, err
+	}
+	defer os.RemoveAll(tmpDir)
+	spool, err := os.Create(filepath.Join(tmpDir, "text.spool"))
+	if err != nil {
+		return nil, err
+	}
+	defer spool.Close()
+	var spooled []contentWalkDoc
 	var scanned int
-	var skipped, truncated, declined int64
+	var skipped, truncated, declined, binary int64
 	// Inside a git worktree, git's ignore rules decide what is skipped; the
 	// name-based skips below only apply outside any worktree.
-	absRoot, aerr := filepath.Abs(root)
+	absRootOrig, aerr := filepath.Abs(root)
 	if aerr != nil {
-		absRoot = root
+		absRootOrig = root
 	}
+	// absRoot is the folded form for worktree registration and lookup (the
+	// filesystem is case-insensitive); ignore-pattern matching always runs on
+	// original-case absolute paths via absOfOrig, because patterns match
+	// case-sensitively like git and ripgrep.
+	absRoot := contentNormPath(absRootOrig)
 	ignore := newContentGitIgnore(nil)
 	for dir := absRoot; ; {
 		if _, serr := os.Lstat(filepath.Join(dir, ".git")); serr == nil {
@@ -141,7 +194,7 @@ func buildContentIndexFromDir(ctx context.Context, root string, opts contentBuil
 		}
 		dir = parent
 	}
-	if ignore.ignored(contentNormPath(absRoot), true) {
+	if ignore.ignored(absRootOrig, true) {
 		// An explicitly requested root that git ignores (repo\out) is
 		// indexed under the outside-worktree rules, not skipped entirely.
 		ignore = newContentGitIgnore(nil)
@@ -153,7 +206,14 @@ func buildContentIndexFromDir(ctx context.Context, root string, opts contentBuil
 		}
 		return contentNormPath(filepath.Join(absRoot, rel))
 	}
-	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+	absOfOrig := func(path string) string {
+		rel, rerr := filepath.Rel(root, path)
+		if rerr != nil {
+			return path
+		}
+		return filepath.Join(absRootOrig, rel)
+	}
+	walkErr := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
 			// A failure on the root itself (a typo'd or inaccessible path) is
 			// fatal — otherwise an empty index is silently published. Failures
@@ -178,7 +238,7 @@ func buildContentIndexFromDir(ctx context.Context, root string, opts contentBuil
 				}
 			}
 			if _, inRepo := ignore.repoFor(abs); inRepo {
-				if path != root && ignore.ignored(abs, true) {
+				if path != root && ignore.ignored(absOfOrig(path), true) {
 					return filepath.SkipDir
 				}
 				return nil
@@ -194,7 +254,7 @@ func buildContentIndexFromDir(ctx context.Context, root string, opts contentBuil
 		if strings.HasSuffix(name, ".gsx") || strings.HasPrefix(name, ".seekfs") {
 			return nil
 		}
-		if abs := absOf(path); ignore.ignored(abs, false) {
+		if ignore.ignored(absOfOrig(path), false) {
 			return nil
 		}
 		if !opts.allows(path) {
@@ -208,18 +268,19 @@ func buildContentIndexFromDir(ctx context.Context, root string, opts contentBuil
 		if ferr != nil {
 			return nil
 		}
-		defer f.Close()
 		info, serr := f.Stat()
 		if serr != nil || info.IsDir() {
+			f.Close()
 			return nil
 		}
 		size := info.Size()
 		head, _ := contentReadBounded(f, size, 512)
 		e := contentExtractorForPath(path, head)
 		if e == nil {
-			// No extractor: a binary/unsupported file, or an empty one the
-			// sniffer declined. Tallied so the counters reconcile.
-			declined++
+			// No extractor claimed the head: binary (NUL in the sniff
+			// window), tallied apart from declined so the counters reconcile
+			// as indexed == eligible - declined - skipped - binary.
+			binary++
 			return nil
 		}
 		// The extractor applies the raw/text policy: an over-cap container is
@@ -228,8 +289,13 @@ func buildContentIndexFromDir(ctx context.Context, root string, opts contentBuil
 		// is panic-isolated and deadline-bounded (contentExtractSafely), so one
 		// hostile file cannot crash or wedge the CLI build.
 		res, eerr := contentExtractSafely(ctx, e, f, size)
+		f.Close()
 		if eerr != nil {
 			skipped++
+			return nil
+		}
+		if res.Binary {
+			binary++
 			return nil
 		}
 		if res.Skipped {
@@ -249,30 +315,63 @@ func buildContentIndexFromDir(ctx context.Context, root string, opts contentBuil
 		if rerr != nil {
 			rel = path
 		}
-		docs = append(docs, contentBuildDoc{path: filepath.ToSlash(rel), frn: contentPathKey(rel), text: res.Text, modUnix: info.ModTime().Unix(), class: res.Class, version: e.Version(), fileSize: size, fileModNano: info.ModTime().UnixNano()})
+		rel = filepath.ToSlash(rel)
+		offset, serr := spool.Seek(0, io.SeekCurrent)
+		if serr != nil {
+			return serr
+		}
+		if _, werr := spool.Write(res.Text); werr != nil {
+			return werr
+		}
+		spooled = append(spooled, contentWalkDoc{
+			item:        contentBuildItem{frn: contentPathKey(rel), path: rel},
+			offset:      offset,
+			length:      len(res.Text),
+			modUnix:     info.ModTime().Unix(),
+			class:       res.Class,
+			version:     e.Version(),
+			fileSize:    size,
+			fileModNano: info.ModTime().UnixNano(),
+		})
 		return nil
 	})
+	if walkErr != nil {
+		return nil, walkErr
+	}
+	sort.Slice(spooled, func(i, j int) bool {
+		if spooled[i].item.frn != spooled[j].item.frn {
+			return spooled[i].item.frn < spooled[j].item.frn
+		}
+		return spooled[i].item.path < spooled[j].item.path
+	})
+	order := make([]int, len(spooled))
+	for i := range order {
+		order[i] = i
+	}
+	idx, err := assembleContentIndexFromSpool(spool, spooled, order, tmpDir)
 	if err != nil {
 		return nil, err
 	}
-	tmpDir, err := os.MkdirTemp("", "seekfs-content-*")
-	if err != nil {
-		return nil, err
-	}
-	defer os.RemoveAll(tmpDir)
-	idx, err := assembleContentIndex(docs, tmpDir)
-	if err != nil {
-		return nil, err
-	}
-	idx.Policy = contentBuildPolicy{MaxRaw: settings.maxRaw, MaxText: settings.maxText, Skipped: skipped, Truncated: truncated}
+	idx.Policy = contentBuildPolicy{MaxRaw: settings.maxRaw, MaxText: settings.maxText, Skipped: skipped, Truncated: truncated, Binary: binary}
 	idx.Scanned = int64(scanned)
 	idx.Declined = declined
 	return idx, nil
 }
 
+// assembleContentIndexFromSpool runs the streaming assembler over spooled docs
+// and materializes the in-memory index (tests and small-corpus CLI builds).
+// Production sharded paths use assembleContentIndexStreamed + the streaming
+// save instead of materializing.
+func assembleContentIndexFromSpool(spool *os.File, spooled []contentWalkDoc, order []int, tmpDir string) (*contentIndex, error) {
+	return assembleContentIndexStream(contentWalkSpool(spool, spooled, order), tmpDir)
+}
+
 // contentBuildArenaBytes bounds the external builder's raw-posting buffer; when
-// it fills, sorted runs spill to disk and merge.
-const contentBuildArenaBytes = 64 << 20
+// it fills, sorted runs spill to disk and merge. The counted bytes understate
+// the resident records (string headers and slice growth), so the arena is sized
+// well below the per-shard heap budget: a 64 MiB shard must assemble under
+// ~250 MB of heap (see the shard-scale harness).
+const contentBuildArenaBytes = 12 << 20
 
 // contentBuildSource yields extracted documents one at a time for
 // assembleContentIndexStream. It must return docs in ascending (frn, path)
@@ -299,6 +398,63 @@ func assembleContentIndexStream(source contentBuildSource, tmpDir string) (*cont
 	if source == nil {
 		return nil, errors.New("nil content build source")
 	}
+	built, err := assembleContentIndexStreamed(source, tmpDir)
+	if err != nil {
+		return nil, err
+	}
+	idx := newContentIndex()
+	idx.Origin = contentOriginWalk
+	idx.Docs = built.docs
+	if built.termPath != "" {
+		terms, err := os.ReadFile(built.termPath)
+		if err != nil {
+			return nil, err
+		}
+		idx.Sections[contentSectionTerms] = terms
+	}
+	if built.gramPath != "" {
+		grams, err := os.ReadFile(built.gramPath)
+		if err != nil {
+			return nil, err
+		}
+		idx.Sections[contentSectionGrams] = grams
+	}
+	text, err := os.ReadFile(built.textPath)
+	if err != nil {
+		return nil, err
+	}
+	idx.Sections[contentSectionText] = text
+	idx.Sections[contentSectionPaths] = encodeContentPaths(built.paths)
+	return idx, nil
+}
+
+// contentStreamedBuild is the assembled form of one shard: the doc table and
+// paths in memory, the text store and posting sections spooled to temp files.
+// It is what the production build/fold/reshard paths save with
+// contentSaveAssembled and then reload through the mmap loader; the in-memory
+// assembleContentIndexStream above stays for tests and small corpora.
+type contentStreamedBuild struct {
+	docs []contentDoc
+	// paths parallels docs by DocID.
+	paths []string
+	// textPath holds the exact CXST section bytes; textSize is its length.
+	textPath string
+	textSize uint64
+	// termPath/gramPath hold the exact CXTR/CXGR section bytes, or "" when
+	// the corpus has no terms/grams.
+	termPath string
+	gramPath string
+}
+
+// assembleContentIndexStreamed consumes documents like assembleContentIndexStream
+// but never retains the corpus: the text store is spooled to a temp file as
+// docs arrive and the posting sections merge straight into section files, so
+// peak heap is one document's text plus the two posting arenas plus O(docs)
+// metadata and the posting entry/block tables.
+func assembleContentIndexStreamed(source contentBuildSource, tmpDir string) (*contentStreamedBuild, error) {
+	if source == nil {
+		return nil, errors.New("nil content build source")
+	}
 	termBuilder, err := newContentExternalSectionBuilder(tmpDir, contentBuildArenaBytes)
 	if err != nil {
 		return nil, err
@@ -310,67 +466,105 @@ func assembleContentIndexStream(source contentBuildSource, tmpDir string) (*cont
 	}
 	defer gramBuilder.Close()
 
-	idx := newContentIndex()
-	idx.Origin = contentOriginWalk
-	var textStore bytes.Buffer
+	textFile, err := os.CreateTemp(tmpDir, "cxtext-*.sec")
+	if err != nil {
+		return nil, err
+	}
+	textPath := textFile.Name()
+	textW := bufio.NewWriterSize(textFile, contentSectionFileBufSize)
+	var textSize uint64
+	// closeText flushes and closes the spool; removeOnErr deletes the partial
+	// file when assembly fails.
+	closeText := func() error {
+		if err := textW.Flush(); err != nil {
+			_ = textFile.Close()
+			return err
+		}
+		return textFile.Close()
+	}
+
+	built := &contentStreamedBuild{textPath: textPath}
+	var docs []contentDoc
 	var paths []string
-
-	for {
-		d, ok, err := source()
-		if err != nil {
-			return nil, err
+	asmErr := func() error {
+		for {
+			d, ok, err := source()
+			if err != nil {
+				return err
+			}
+			if !ok {
+				break
+			}
+			docID := uint32(len(docs))
+			paths = append(paths, d.path)
+			// Store case-preserving repaired text (PF-6a): a case-sensitive query
+			// verifies against these exact bytes, and snippets show the real case.
+			// The index (terms and grams) is built from a case-folded copy, so the
+			// case-insensitive prefilter stays a superset of every case-sensitive
+			// match (tgrep's merged-case index, case-aware verify).
+			stored := contentRepairText(d.text)
+			folded := contentFoldText(stored)
+			if _, err := textW.Write(stored); err != nil {
+				return err
+			}
+			docs = append(docs, contentDoc{
+				DocID:            docID,
+				FRN:              d.frn,
+				ContentType:      d.class,
+				ExtractorVersion: d.version,
+				DocLen:           uint32(len(folded)),
+				RawSize:          int64(len(stored)),
+				ModUnix:          d.modUnix,
+				ContentHash:      sha256Of(stored),
+				TextOff:          textSize,
+				TextLen:          uint32(len(stored)),
+				FileSize:         d.fileSize,
+				FileModNano:      d.fileModNano,
+			})
+			textSize += uint64(len(stored))
+			// Documents arrive in ascending docID order, so each key's Adds arrive
+			// in ascending docID order as the builder requires.
+			for term, tf := range contentTermsOf(folded) {
+				termBuilder.Add(term, docID, tf)
+			}
+			for gram := range contentGramsOf(folded) {
+				gramBuilder.Add(gram, docID, 1)
+			}
+			contentAssembleStreamHook(int(docID))
 		}
-		if !ok {
-			break
-		}
-		docID := uint32(len(idx.Docs))
-		paths = append(paths, d.path)
-		// Store case-preserving repaired text (PF-6a): a case-sensitive query
-		// verifies against these exact bytes, and snippets show the real case.
-		// The index (terms and grams) is built from a case-folded copy, so the
-		// case-insensitive prefilter stays a superset of every case-sensitive
-		// match (tgrep's merged-case index, case-aware verify).
-		stored := contentRepairText(d.text)
-		folded := contentFoldText(stored)
-		textStore.Write(stored)
-		idx.Docs = append(idx.Docs, contentDoc{
-			DocID:            docID,
-			FRN:              d.frn,
-			ContentType:      d.class,
-			ExtractorVersion: d.version,
-			DocLen:           uint32(len(folded)),
-			RawSize:          int64(len(stored)),
-			ModUnix:          d.modUnix,
-			ContentHash:      sha256Of(stored),
-			TextOff:          uint64(textStore.Len() - len(stored)),
-			TextLen:          uint32(len(stored)),
-			FileSize:         d.fileSize,
-			FileModNano:      d.fileModNano,
-		})
-		// Documents arrive in ascending docID order, so each key's Adds arrive
-		// in ascending docID order as the builder requires.
-		for term, tf := range contentTermsOf(folded) {
-			termBuilder.Add(term, docID, tf)
-		}
-		for gram := range contentGramsOf(folded) {
-			gramBuilder.Add(gram, docID, 1)
-		}
-		contentAssembleStreamHook(int(docID))
+		return nil
+	}()
+	if asmErr != nil {
+		_ = textW.Flush()
+		_ = textFile.Close()
+		_ = os.Remove(textPath)
+		return nil, asmErr
 	}
-
-	if terms, err := termBuilder.Finish(); err != nil {
+	if err := closeText(); err != nil {
+		_ = os.Remove(textPath)
 		return nil, err
-	} else if len(terms) > 0 {
-		idx.Sections[contentSectionTerms] = terms
 	}
-	if grams, err := gramBuilder.Finish(); err != nil {
+	termPath := filepath.Join(tmpDir, "cxterm.sec")
+	if err := termBuilder.FinishFile(termPath); err != nil {
+		_ = os.Remove(textPath)
 		return nil, err
-	} else if len(grams) > 0 {
-		idx.Sections[contentSectionGrams] = grams
 	}
-	idx.Sections[contentSectionText] = textStore.Bytes()
-	idx.Sections[contentSectionPaths] = encodeContentPaths(paths)
-	return idx, nil
+	gramPath := filepath.Join(tmpDir, "cxgram.sec")
+	if err := gramBuilder.FinishFile(gramPath); err != nil {
+		_ = os.Remove(textPath)
+		_ = os.Remove(termPath)
+		return nil, err
+	}
+	built.docs = docs
+	built.paths = paths
+	built.textSize = textSize
+	if st, err := os.Stat(termPath); err == nil && st.Size() > 0 {
+		built.termPath = termPath
+	}
+	if st, err := os.Stat(gramPath); err == nil && st.Size() > 0 {
+		built.gramPath = gramPath
+	}
+	return built, nil
 }
 
 // assembleContentIndex turns extracted documents into a `.gsx`, assigning
@@ -406,8 +600,18 @@ func buildContentIndexForIndex(ctx context.Context, idx *Index, opts contentBuil
 	settings := opts.extractSettings()
 	ctx = contentWithExtractSettings(ctx, settings)
 	cache := make(map[int]string, 1024)
-	docs := make([]contentBuildDoc, 0, 4096)
-	var skipped, truncated int64
+	tmpDir, err := os.MkdirTemp("", "seekfs-content-*")
+	if err != nil {
+		return nil, err
+	}
+	defer os.RemoveAll(tmpDir)
+	spool, err := os.Create(filepath.Join(tmpDir, "text.spool"))
+	if err != nil {
+		return nil, err
+	}
+	defer spool.Close()
+	var spooled []contentWalkDoc
+	var skipped, truncated, binary int64
 	var scopeBytes int64
 	count := idx.compactRecordCount()
 	var items []contentBuildItem
@@ -424,7 +628,7 @@ func buildContentIndexForIndex(ctx context.Context, idx *Index, opts contentBuil
 	}
 	next, stop := contentPrefetchExtract(ctx, items, contentBuildWorkers, contentBuildDocSafe)
 	defer stop()
-	for range items {
+	for _, item := range items {
 		got, live := next()
 		if err := ctx.Err(); err != nil || !live {
 			if err == nil {
@@ -444,24 +648,49 @@ func buildContentIndexForIndex(ctx context.Context, idx *Index, opts contentBuil
 				}
 				scopeBytes += n
 			}
-			docs = append(docs, doc)
+			offset, serr := spool.Seek(0, io.SeekCurrent)
+			if serr != nil {
+				return nil, serr
+			}
+			if _, werr := spool.Write(doc.text); werr != nil {
+				return nil, werr
+			}
+			spooled = append(spooled, contentWalkDoc{
+				item:        item,
+				offset:      offset,
+				length:      len(doc.text),
+				modUnix:     doc.modUnix,
+				class:       doc.class,
+				version:     doc.version,
+				fileSize:    doc.fileSize,
+				fileModNano: doc.fileModNano,
+			})
+			continue
+		}
+		if res.Binary {
+			binary++
 			continue
 		}
 		if res.Skipped {
 			skipped++
 		}
 	}
-	tmpDir, err := os.MkdirTemp("", "seekfs-content-*")
-	if err != nil {
-		return nil, err
+	sort.Slice(spooled, func(i, j int) bool {
+		if spooled[i].item.frn != spooled[j].item.frn {
+			return spooled[i].item.frn < spooled[j].item.frn
+		}
+		return spooled[i].item.path < spooled[j].item.path
+	})
+	order := make([]int, len(spooled))
+	for i := range order {
+		order[i] = i
 	}
-	defer os.RemoveAll(tmpDir)
-	cidx, err := assembleContentIndex(docs, tmpDir)
+	cidx, err := assembleContentIndexFromSpool(spool, spooled, order, tmpDir)
 	if err != nil {
 		return nil, err
 	}
 	cidx.Origin = contentOriginUSN
-	cidx.Policy = contentBuildPolicy{MaxRaw: settings.maxRaw, MaxText: settings.maxText, Skipped: skipped, Truncated: truncated}
+	cidx.Policy = contentBuildPolicy{MaxRaw: settings.maxRaw, MaxText: settings.maxText, Skipped: skipped, Truncated: truncated, Binary: binary}
 	// Stamp the content USN checkpoint from the record index metadata: the
 	// base is complete as of the .gsi checkpoint, so restart catch-up resumes
 	// from here rather than re-reading the whole journal (WP0/PB3).
@@ -516,11 +745,27 @@ func contentPathKey(rel string) uint64 {
 	return h
 }
 
+// contentTokenMapHint caps a per-document tokenizer map's size hint: the hint
+// is allocation only (never output), and an uncapped hint on a huge document
+// preallocates gigabytes of empty buckets. Distinct terms/grams saturate, so
+// the cap only trims waste on large docs.
+const contentTokenMapHintMax = 1 << 20
+
+func contentTokenMapHint(n int) int {
+	if n < 0 {
+		n = 0
+	}
+	if n > contentTokenMapHintMax {
+		n = contentTokenMapHintMax
+	}
+	return n
+}
+
 // contentTermsOf tokenizes text into lowercase words with term frequencies.
 // Word bytes are ASCII alphanumerics, underscore, and any byte >= 0x80 (so a
 // UTF-8 word stays one term).
 func contentTermsOf(text []byte) map[string]uint32 {
-	out := make(map[string]uint32)
+	out := make(map[string]uint32, contentTokenMapHint(len(text)/8+1))
 	start := -1
 	for i := 0; i <= len(text); i++ {
 		var isWord bool
@@ -546,7 +791,7 @@ func contentTermsOf(text []byte) map[string]uint32 {
 // contentGramsOf returns the distinct 3-byte trigrams of text, skipping grams
 // that contain a control byte.
 func contentGramsOf(text []byte) map[string]struct{} {
-	out := make(map[string]struct{}, len(text)/4)
+	out := make(map[string]struct{}, contentTokenMapHint(len(text)/4))
 	for i := 0; i+3 <= len(text); i++ {
 		g := text[i : i+3]
 		if g[0] < 32 || g[1] < 32 || g[2] < 32 {

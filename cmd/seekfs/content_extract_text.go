@@ -42,11 +42,11 @@ func (contentTextExtractor) Extract(ctx context.Context, r io.ReaderAt, size int
 	// its raw bytes contain NULs; decode first, and only a NUL that no text
 	// encoding explains makes a file binary.
 	if !contentDetectsTextEncoding(raw) && contentLooksBinary(raw) {
-		return contentExtractResult{Skipped: true, Reason: "binary", Class: contentClassText}, nil
+		return contentExtractResult{Skipped: true, Binary: true, Reason: "binary", Class: contentClassText}, nil
 	}
 	text := contentDecodeForIndex(raw, s.encoding, truncated)
 	if !contentDetectsTextEncoding(raw) && contentLooksBinary([]byte(text)) {
-		return contentExtractResult{Skipped: true, Reason: "binary", Class: contentClassText}, nil
+		return contentExtractResult{Skipped: true, Binary: true, Reason: "binary", Class: contentClassText}, nil
 	}
 	if int64(len(text)) > s.maxText {
 		text = truncateUTF8(text, int(s.maxText))

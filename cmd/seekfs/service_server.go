@@ -313,6 +313,7 @@ func (s *goSearchService) serviceCommandSearch(w io.Writer, caps serviceCapabili
 	var matches []Entry
 	var err error
 	var fuzzyApplied bool
+	var fuzzyCorrection string
 	searchStart := time.Now()
 	if len(s.volumes) == len(s.indexes) {
 		volumes := snapshotServiceVolumesForSearch(s.volumes)
@@ -327,7 +328,8 @@ func (s *goSearchService) serviceCommandSearch(w io.Writer, caps serviceCapabili
 					_ = json.NewEncoder(w).Encode(serviceResponse{OK: false, Message: countErr.Error()})
 				} else {
 					trace.setSource("count-fast-posting", count)
-					_ = json.NewEncoder(w).Encode(serviceResponse{OK: true, Count: count, SearchMS: searchMS, Source: trace.Source, Decline: trace.Decline, Candidates: trace.Candidates, PlannerMode: trace.PlannerMode, EligibleVolumes: trace.EligibleVolumes, BlocksDecoded: trace.BlocksDecoded, BlocksSkipped: trace.BlocksSkipped, ScalarDriver: trace.ScalarDriver, ScalarInterval: trace.ScalarInterval, RecordsVerified: trace.ScalarRecordsVerified, ComponentDriver: trace.ComponentDriver, ComponentRoots: trace.ComponentRoots, ComponentIntervals: trace.ComponentIntervals, ComponentCardinality: trace.ComponentCardinality, ComponentSelfHits: trace.ComponentSelfHits, ComponentBounds: trace.ComponentBounds, ComponentRecordsVerified: trace.ComponentRecordsVerified, FilenameDriver: trace.FilenameDriver, FilenameRequiredGrams: trace.FilenameRequiredGrams, FilenamePostingHint: trace.FilenamePostingHint, FilenameRecordsVerified: trace.FilenameRecordsVerified, OverlayBaseWindow: trace.OverlayBaseWindow, PostingPrefetchBytes: trace.PostingPrefetchBytes, PostingPrefetchRanges: trace.PostingPrefetchRanges, PostingPrefetchPages: trace.PostingPrefetchPages, Terms: trace.Terms, Declines: trace.Declines, Fallback: trace.Fallback, Complete: trace.completePtr(), Content: s.searchContentHealth(trace)})
+					fuzzy := trace.FuzzyCorrection != ""
+					_ = json.NewEncoder(w).Encode(serviceResponse{OK: true, Count: count, SearchMS: searchMS, Fuzzy: fuzzy, FuzzyCorrection: trace.FuzzyCorrection, Source: trace.Source, Decline: trace.Decline, Candidates: trace.Candidates, PlannerMode: trace.PlannerMode, EligibleVolumes: trace.EligibleVolumes, BlocksDecoded: trace.BlocksDecoded, BlocksSkipped: trace.BlocksSkipped, ScalarDriver: trace.ScalarDriver, ScalarInterval: trace.ScalarInterval, RecordsVerified: trace.ScalarRecordsVerified, ComponentDriver: trace.ComponentDriver, ComponentRoots: trace.ComponentRoots, ComponentIntervals: trace.ComponentIntervals, ComponentCardinality: trace.ComponentCardinality, ComponentSelfHits: trace.ComponentSelfHits, ComponentBounds: trace.ComponentBounds, ComponentRecordsVerified: trace.ComponentRecordsVerified, FilenameDriver: trace.FilenameDriver, FilenameRequiredGrams: trace.FilenameRequiredGrams, FilenamePostingHint: trace.FilenamePostingHint, FilenameRecordsVerified: trace.FilenameRecordsVerified, OverlayBaseWindow: trace.OverlayBaseWindow, PostingPrefetchBytes: trace.PostingPrefetchBytes, PostingPrefetchRanges: trace.PostingPrefetchRanges, PostingPrefetchPages: trace.PostingPrefetchPages, Terms: trace.Terms, Declines: trace.Declines, Fallback: trace.Fallback, Complete: trace.completePtr(), Content: s.searchContentHealth(trace)})
 				}
 				return
 			}
@@ -339,13 +341,17 @@ func (s *goSearchService) serviceCommandSearch(w io.Writer, caps serviceCapabili
 			// and must stay under the read lock: it reads compact records
 			// that a background persist may unmap.
 			if limit := normalizedLimit(opts.Limit, false); len(matches) < limit {
-				if !tryMultiTermFuzzyRewrite(volumes, &opts, &matches, &fuzzied) {
-					matches, fuzzied = appendFuzzyServiceMatches(volumes, opts, matches)
+				if handled := tryMultiTermFuzzyRewrite(volumes, &opts, &matches, &fuzzied); !handled {
+					if contentMatches, correction, ok := tryContentFuzzyRewrite(volumes, opts, matches); ok {
+						matches, fuzzied, fuzzyCorrection = contentMatches, true, correction
+					} else {
+						matches, fuzzied = appendFuzzyServiceMatches(volumes, opts, matches)
+					}
 				}
 			}
 		}
 		s.indexMu.RUnlock()
-		if fuzzied {
+		if fuzzied && fuzzyCorrection == "" {
 			opts.Trace.setPlannerMode("fuzzy-trigram")
 		}
 		fuzzyApplied = fuzzied
@@ -366,7 +372,7 @@ func (s *goSearchService) serviceCommandSearch(w io.Writer, caps serviceCapabili
 	} else {
 		serviceLog("search query=%q ms=%.1f planner=%s source=%s decline=%s filename_driver=%s candidates=%d results=%d", req.Query, searchMS, trace.PlannerMode, trace.Source, trace.Decline, trace.FilenameDriver, trace.Candidates, len(matches))
 	}
-	resp := serviceResponse{OK: true, Count: len(matches), SearchMS: searchMS, Fuzzy: fuzzyApplied, Source: trace.Source, Decline: trace.Decline, Candidates: trace.Candidates, PlannerMode: trace.PlannerMode, EligibleVolumes: trace.EligibleVolumes, BlocksDecoded: trace.BlocksDecoded, BlocksSkipped: trace.BlocksSkipped, ScalarDriver: trace.ScalarDriver, ScalarInterval: trace.ScalarInterval, RecordsVerified: trace.ScalarRecordsVerified, ComponentDriver: trace.ComponentDriver, ComponentRoots: trace.ComponentRoots, ComponentIntervals: trace.ComponentIntervals, ComponentCardinality: trace.ComponentCardinality, ComponentSelfHits: trace.ComponentSelfHits, ComponentBounds: trace.ComponentBounds, ComponentRecordsVerified: trace.ComponentRecordsVerified, FilenameDriver: trace.FilenameDriver, FilenameRequiredGrams: trace.FilenameRequiredGrams, FilenamePostingHint: trace.FilenamePostingHint, FilenameRecordsVerified: trace.FilenameRecordsVerified, OverlayBaseWindow: trace.OverlayBaseWindow, PostingPrefetchBytes: trace.PostingPrefetchBytes, PostingPrefetchRanges: trace.PostingPrefetchRanges, PostingPrefetchPages: trace.PostingPrefetchPages, Terms: trace.Terms, Declines: trace.Declines, Fallback: trace.Fallback, Complete: trace.completePtr()}
+	resp := serviceResponse{OK: true, Count: len(matches), SearchMS: searchMS, Fuzzy: fuzzyApplied, FuzzyCorrection: fuzzyCorrection, Source: trace.Source, Decline: trace.Decline, Candidates: trace.Candidates, PlannerMode: trace.PlannerMode, EligibleVolumes: trace.EligibleVolumes, BlocksDecoded: trace.BlocksDecoded, BlocksSkipped: trace.BlocksSkipped, ScalarDriver: trace.ScalarDriver, ScalarInterval: trace.ScalarInterval, RecordsVerified: trace.ScalarRecordsVerified, ComponentDriver: trace.ComponentDriver, ComponentRoots: trace.ComponentRoots, ComponentIntervals: trace.ComponentIntervals, ComponentCardinality: trace.ComponentCardinality, ComponentSelfHits: trace.ComponentSelfHits, ComponentBounds: trace.ComponentBounds, ComponentRecordsVerified: trace.ComponentRecordsVerified, FilenameDriver: trace.FilenameDriver, FilenameRequiredGrams: trace.FilenameRequiredGrams, FilenamePostingHint: trace.FilenamePostingHint, FilenameRecordsVerified: trace.FilenameRecordsVerified, OverlayBaseWindow: trace.OverlayBaseWindow, PostingPrefetchBytes: trace.PostingPrefetchBytes, PostingPrefetchRanges: trace.PostingPrefetchRanges, PostingPrefetchPages: trace.PostingPrefetchPages, Terms: trace.Terms, Declines: trace.Declines, Fallback: trace.Fallback, Complete: trace.completePtr()}
 	if !req.CountOnly {
 		resp.Results = make([]string, len(matches))
 		for i, entry := range matches {
@@ -736,7 +742,9 @@ func searchService(pipeName string, opts queryOptions, countOnly bool, jsonOut b
 		return nil
 	}
 	w := bufio.NewWriter(os.Stdout)
-	if resp.Fuzzy {
+	if resp.FuzzyCorrection != "" {
+		fmt.Fprintf(w, "(showing results for %q)\n", resp.FuzzyCorrection)
+	} else if resp.Fuzzy {
 		fmt.Fprintf(w, "(showing close matches for %q)\n", opts.Query)
 	}
 	for _, result := range resp.Results {
@@ -782,6 +790,7 @@ func newJSONSearchResponse(resp serviceResponse, opts queryOptions, countOnly bo
 		PostingPrefetchPages:     resp.PostingPrefetchPages,
 		PlannerMode:              resp.PlannerMode,
 		Fuzzy:                    resp.Fuzzy,
+		FuzzyCorrection:          resp.FuzzyCorrection,
 		EligibleVolumes:          resp.EligibleVolumes,
 		Terms:                    resp.Terms,
 		Declines:                 resp.Declines,

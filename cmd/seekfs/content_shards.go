@@ -214,7 +214,13 @@ func (r *contentReader) shardedCandidateStream(term string, mask []bool) func() 
 // shardMaskUnder returns which shards can hold documents under the normalized
 // folder under, or nil when every shard can (an unsharded reader, or no
 // scope). A shard qualifies if it owns a prefix inside under, or owns the
-// longest prefix containing under (the folder's own owner).
+// longest prefix containing under (the folder's own owner). The mask is a
+// pure prefilter: doc paths are matched against the same normalized folder
+// tree the planner assigns shards from, so a mask that is too narrow would
+// drop true matches. In particular the under root is cleaned but never
+// absolutized: callers pass the query's under: value verbatim, and an
+// under: that names no indexed folder still selects its would-be owner's
+// shard (whose docs then fail verification), never an empty set.
 func (r *contentReader) shardMaskUnder(under string) []bool {
 	if r == nil || r.idx == nil || len(r.idx.shards) == 0 {
 		return nil
@@ -228,7 +234,14 @@ func (r *contentReader) shardMaskUnder(under string) []bool {
 	mask[assign.dir(under)] = true
 	for i, sh := range r.idx.shards {
 		for _, p := range sh.info.Prefixes {
-			if p != "" && contentPathUnder(p, under) {
+			// A prefix inside under qualifies its shard. Equality counts
+			// as inside here (not just a strict descendant): the folder's
+			// own files are assigned to the shard owning the folder's
+			// longest matching prefix, which may be exactly this prefix,
+			// so a shard that owns `under` itself must be read. (The
+			// owner's shard is already set above; this covers the case
+			// where the owner comes from a longer prefix of a parent.)
+			if p != "" && (p == under || contentPathUnder(p, under)) {
 				mask[i] = true
 				break
 			}
@@ -367,13 +380,44 @@ func contentShardFileName() string {
 }
 
 // contentSaveShard writes one shard file into dir and returns its manifest
-// entry.
-func contentSaveShard(dir string, idx *contentIndex, prefixes []string) (contentShardInfo, error) {
+// entry. idx carries the shard's header fields (origin, watermark, policy,
+// scope, doc table); files carries its spooled section payloads, so the save
+// streams without assembling the shard in memory.
+func contentSaveShard(dir string, idx *contentIndex, files map[uint32]string, prefixes []string) (contentShardInfo, error) {
 	name := contentShardFileName()
-	if err := contentSaveFile(filepath.Join(dir, name), idx); err != nil {
+	if err := contentSaveAssembled(filepath.Join(dir, name), idx, files); err != nil {
 		return contentShardInfo{}, err
 	}
 	return contentShardInfo{File: name, Docs: len(idx.Docs), Prefixes: prefixes}, nil
+}
+
+// contentShardHeader builds the header index a streaming shard save needs:
+// the sidecar identity (origin, watermark, policy, scope) plus the assembled
+// doc table. The caller adds the resident small sections (paths).
+func contentShardHeader(header *contentIndex, built *contentStreamedBuild) *contentIndex {
+	return &contentIndex{
+		Version:       contentIndexVersion,
+		BuiltAt:       header.BuiltAt,
+		Origin:        header.Origin,
+		JournalID:     header.JournalID,
+		CheckpointUSN: header.CheckpointUSN,
+		Docs:          built.docs,
+		Policy:        header.Policy,
+		ScopeHash:     header.ScopeHash,
+	}
+}
+
+// contentBuildFiles maps an assembled shard's spool files by section tag for
+// the streaming save.
+func contentBuildFiles(built *contentStreamedBuild) map[uint32]string {
+	files := map[uint32]string{contentSectionText: built.textPath}
+	if built.termPath != "" {
+		files[contentSectionTerms] = built.termPath
+	}
+	if built.gramPath != "" {
+		files[contentSectionGrams] = built.gramPath
+	}
+	return files
 }
 
 // contentSaveManifest atomically publishes a manifest naming shards. header
@@ -552,7 +596,7 @@ func contentReshardAndSave(gsx string, whole *contentIndex, header *contentIndex
 	infos := make([]contentShardInfo, 0, len(groups))
 	for _, g := range groups {
 		k := 0
-		cidx, err := assembleContentIndexStream(func() (contentBuildDoc, bool, error) {
+		built, err := assembleContentIndexStreamed(func() (contentBuildDoc, bool, error) {
 			if k == len(g.docs) {
 				return contentBuildDoc{}, false, nil
 			}
@@ -563,9 +607,9 @@ func contentReshardAndSave(gsx string, whole *contentIndex, header *contentIndex
 		if err != nil {
 			return 0, err
 		}
-		cidx.Origin, cidx.JournalID, cidx.CheckpointUSN = header.Origin, header.JournalID, header.CheckpointUSN
-		cidx.Policy, cidx.ScopeHash = header.Policy, header.ScopeHash
-		info, err := contentSaveShard(dir, cidx, g.prefixes)
+		shard := contentShardHeader(header, built)
+		shard.Sections = map[uint32][]byte{contentSectionPaths: encodeContentPaths(built.paths)}
+		info, err := contentSaveShard(dir, shard, contentBuildFiles(built), g.prefixes)
 		if err != nil {
 			return 0, err
 		}

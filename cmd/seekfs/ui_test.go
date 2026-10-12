@@ -538,6 +538,18 @@ func TestUIResultCarriesContentSnippet(t *testing.T) {
 	}
 }
 
+func TestUIFuzzyMessageNamesCorrection(t *testing.T) {
+	if got := uiFuzzyMessage(serviceResponse{FuzzyCorrection: "receive"}); got != "Showing results for receive" {
+		t.Fatalf("message = %q", got)
+	}
+	if got := uiFuzzyMessage(serviceResponse{Fuzzy: true}); got != "showing close matches" {
+		t.Fatalf("message = %q", got)
+	}
+	if got := uiFuzzyMessage(serviceResponse{}); got != "" {
+		t.Fatalf("message = %q; want empty", got)
+	}
+}
+
 func TestUIContentStatusFromHealth(t *testing.T) {
 	if uiContentStatusFrom(nil) != nil {
 		t.Fatal("no content health must yield no UI content status")
@@ -545,5 +557,9 @@ func TestUIContentStatusFromHealth(t *testing.T) {
 	got := uiContentStatusFrom(&contentHealth{State: contentStateIndexing, BuildDone: 5, BuildTotal: 10, FoldError: "disk full"})
 	if got.State != contentStateIndexing || got.BuildDone != 5 || got.BuildTotal != 10 || got.Error != "disk full" {
 		t.Fatalf("uiContentStatusFrom = %+v", got)
+	}
+	dropped := uiContentStatusFrom(&contentHealth{State: contentStateDegraded, ScopeDropped: 12345, ScopeDroppedBytes: 6789, BudgetBytes: 2 << 30})
+	if dropped.ScopeDropped != 12345 || dropped.ScopeDroppedBytes != 6789 || dropped.BudgetBytes != 2<<30 {
+		t.Fatalf("uiContentStatusFrom dropped = %+v", dropped)
 	}
 }

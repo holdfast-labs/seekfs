@@ -29,9 +29,11 @@ package main
 // it never retains the raw corpus in memory. Peak transient heap is one
 // document's text plus posting arenas, assembled text, and capped metadata.
 //
-// IO governor. Extraction is serial and paused every batch so filename search
-// and USN replay keep the disk; the loop is cancelable through s.stop and the
-// per-volume build generation.
+// IO governor. Extraction runs on contentBuildWorkerCount workers (dropped to
+// one while the user queries or the machine is on battery) with per-handle
+// low disk priority (contentOpenNoRecall), and pauses every batch so filename
+// search and USN replay keep the disk; the loop is cancelable through s.stop
+// and the per-volume build generation.
 //
 // Build vs catch-up. A base build extracts the base corpus while restart
 // catch-up and the drain loop may extract changed files into the in-memory
@@ -41,9 +43,11 @@ package main
 // attaches the fresh base and leaves the delta overlay intact; catch-up resumes
 // from the new base's checkpoint, so no change is double-counted or lost.
 //
-// Default scope (M5). Unlike the offline CLI (which indexes any extractable
-// file when no -ext is given), the service build is allowlisted: the curated
-// text/code/config set below plus every registered rich-extractor extension. A
+// Default scope (M5, sniff-selected since the recall follow-up). Unlike the
+// offline CLI (which indexes any extractable file when no -ext is given),
+// the service build used to be allowlisted; now, without a configured exts
+// list, it admits every file the scope roots allow (minus known-binary
+// extensions) and head-sniffs each at build time, ripgrep-style. A
 // whole-volume build is never the default.
 
 import (
@@ -138,10 +142,12 @@ var contentBuildSnapshotBatchHook = func(*goSearchService, *serviceVolumeIndex) 
 // state. Tests use it to observe the indexing state/progress deterministically.
 var contentBuildIndexingHook = func(*contentVolumeState) {}
 
-// defaultServiceContentBuildOptions is the service build's default scope (M5):
-// a curated text/code/config allowlist unioned with every registered
-// extractor's extensions. The offline builder defaults to "any extractable
-// file"; the service deliberately does not.
+// defaultServiceContentBuildOptions is the service build's default scope:
+// sniff-based selection (the scope admits everything but known-binary
+// extensions; each file's head decides at build time). The curated
+// text/code/config allowlist below plus every registered extractor's
+// extensions seed the registry the scope fingerprint names and the explicit
+// exts opt-in restores.
 func defaultServiceContentBuildOptions() contentBuildOptions {
 	opts := defaultContentBuildOptions()
 	opts.Exts = contentServiceExtensions()
@@ -516,7 +522,9 @@ func contentBuildDocSafe(ctx context.Context, item contentBuildItem) (doc conten
 	head, _ := contentReadBounded(f, size, 512)
 	e := contentExtractorForPath(item.path, head)
 	if e == nil {
-		return contentBuildDoc{}, contentExtractResult{}, false
+		// No extractor claimed the head: binary (NUL in the sniff window),
+		// counted apart from skipped/declined.
+		return contentBuildDoc{}, contentExtractResult{Binary: true, Reason: "binary"}, false
 	}
 	// Bound one document's extraction so a hang cannot stall the serial build;
 	// contentExtractSafely nests the deadline inside the build's stop/cancel
@@ -550,7 +558,7 @@ func (s *goSearchService) runContentBuild(vol *serviceVolumeIndex, reuseSidecar 
 		return
 	}
 	retry := false
-	var scopeDropped int64
+	var scopeDropped, scopeDroppedBytes int64
 	select {
 	case contentBuildGate <- struct{}{}:
 	case <-contentActivationDone(vol):
@@ -699,10 +707,12 @@ func (s *goSearchService) runContentBuild(vol *serviceVolumeIndex, reuseSidecar 
 	selected := make([]selectedDoc, 0, 1024)
 	total := len(items)
 	done := 0
-	var used, skipped, truncated int64
+	var used, skipped, truncated, binary int64
+	// overBudget latches once the scope byte budget bites; see the tally below.
+	overBudget := false
 	abortReason := ""
 	abortRetry := false
-	nextExtracted, stopPrefetch := contentPrefetchExtract(ctx, items, contentBuildWorkers, contentBuildDocSafe)
+	nextExtracted, stopPrefetch := contentPrefetchExtract(ctx, items, contentBuildWorkerCount(), contentBuildDocSafe)
 	defer stopPrefetch()
 	for done < total {
 		// The atomic generation covers the common abort (a rebuild/journal
@@ -727,8 +737,12 @@ func (s *goSearchService) runContentBuild(vol *serviceVolumeIndex, reuseSidecar 
 		if ok && res.Truncated {
 			truncated++
 		}
-		if !ok && res.Skipped {
-			skipped++
+		if !ok {
+			if res.Binary {
+				binary++
+			} else if res.Skipped {
+				skipped++
+			}
 		}
 		if done%contentBuildBatchSize == 0 {
 			if !s.contentBuildCurrent(vol, gen, journalID) {
@@ -754,9 +768,17 @@ func (s *goSearchService) runContentBuild(vol *serviceVolumeIndex, reuseSidecar 
 			continue
 		}
 		n := int64(len(doc.text))
-		if opts.Scope != nil && opts.Scope.BudgetBytes > 0 && n > opts.Scope.BudgetBytes-used {
-			scopeDropped += int64(total - done + 1)
-			break
+		// Once the byte budget bites, extraction keeps consuming the ordered
+		// stream to the end (abort and pacing checks above are unchanged) so
+		// the dropped files and bytes are exact: every remaining file is
+		// still extracted, its text tallied and released instead of spooled.
+		// Selection order is unchanged; this only costs extraction work on a
+		// build that was already going to publish incomplete.
+		if overBudget || opts.Scope != nil && opts.Scope.BudgetBytes > 0 && n > opts.Scope.BudgetBytes-used {
+			overBudget = true
+			scopeDropped++
+			scopeDroppedBytes += n
+			continue
 		}
 		offset, err := spool.Seek(0, io.SeekCurrent)
 		if err != nil {
@@ -809,11 +831,15 @@ func (s *goSearchService) runContentBuild(vol *serviceVolumeIndex, reuseSidecar 
 	s.indexMu.RLock()
 	isWalkBuild := vol.index != nil && vol.index.Source == "walk"
 	s.indexMu.RUnlock()
+	var budgetBytes int64
+	if opts.Scope != nil {
+		budgetBytes = opts.Scope.BudgetBytes
+	}
 	header := &contentIndex{
 		Origin:        contentOriginUSN,
 		JournalID:     journalID,
 		CheckpointUSN: uint64(checkpoint),
-		Policy:        contentBuildPolicy{MaxRaw: settings.maxRaw, MaxText: settings.maxText, Skipped: skipped, Truncated: truncated, ScopeDropped: scopeDropped},
+		Policy:        contentBuildPolicy{MaxRaw: settings.maxRaw, MaxText: settings.maxText, Skipped: skipped, Truncated: truncated, ScopeDropped: scopeDropped, ScopeDroppedBytes: scopeDroppedBytes, BudgetBytes: budgetBytes, Binary: binary},
 	}
 	if isWalkBuild {
 		// Walk sidecars join on the stable path hash with no journal: the
@@ -825,17 +851,24 @@ func (s *goSearchService) runContentBuild(vol *serviceVolumeIndex, reuseSidecar 
 	if opts.Scope != nil {
 		header.ScopeHash = opts.Scope.fingerprint()
 	}
-	stamp := func(cidx *contentIndex) {
-		cidx.Origin = header.Origin
-		cidx.JournalID = header.JournalID
-		cidx.CheckpointUSN = header.CheckpointUSN
-		cidx.Policy = header.Policy
-		cidx.ScopeHash = header.ScopeHash
-	}
 	gsx := contentIndexPathForDB(vol.dbPath)
 	if gsx == "" {
 		vol.content.markBuildFailed("no content sidecar path")
 		return
+	}
+	// assemble runs the streaming assembler over the selected docs at the given
+	// positions and returns the spooled shard plus a header index carrying the
+	// doc table and sidecar identity for the streaming save. The spooled
+	// section files, not a heap index, are what gets saved; attach reloads
+	// the sidecar through the mmap loader.
+	assemble := func(order []int) (*contentStreamedBuild, *contentIndex, error) {
+		built, err := assembleContentIndexStreamed(sourceOf(order), tmpDir)
+		if err != nil {
+			return nil, nil, err
+		}
+		shard := contentShardHeader(header, built)
+		shard.Sections = map[uint32][]byte{contentSectionPaths: encodeContentPaths(built.paths)}
+		return built, shard, nil
 	}
 	// save assembles and writes the sidecar: one file for a corpus within a
 	// shard, otherwise folder shards plus a manifest. Shards are assembled one
@@ -846,15 +879,14 @@ func (s *goSearchService) runContentBuild(vol *serviceVolumeIndex, reuseSidecar 
 			for i := range all {
 				all[i] = i
 			}
-			cidx, err := assembleContentIndexStream(sourceOf(all), tmpDir)
+			built, shard, err := assemble(all)
 			if err != nil {
 				return err
 			}
-			stamp(cidx)
 			if !s.contentBuildCurrent(vol, gen, journalID) {
 				return errContentBuildStale
 			}
-			return contentSaveFile(gsx, cidx)
+			return contentSaveAssembled(gsx, shard, contentBuildFiles(built))
 		}
 		paths := make([]string, len(selected))
 		sizes := make([]int64, len(selected))
@@ -868,12 +900,11 @@ func (s *goSearchService) runContentBuild(vol *serviceVolumeIndex, reuseSidecar 
 		}
 		infos := make([]contentShardInfo, 0, len(groups))
 		for _, g := range groups {
-			cidx, err := assembleContentIndexStream(sourceOf(g.docs), tmpDir)
+			built, shard, err := assemble(g.docs)
 			if err != nil {
 				return err
 			}
-			stamp(cidx)
-			info, err := contentSaveShard(dir, cidx, g.prefixes)
+			info, err := contentSaveShard(dir, shard, contentBuildFiles(built), g.prefixes)
 			if err != nil {
 				return err
 			}

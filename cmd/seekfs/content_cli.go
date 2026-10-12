@@ -26,6 +26,8 @@ func cmdContentIndex(args []string) error {
 	all := fs.Bool("all", false, "with -db, explicitly opt in to a whole-volume build (every extractable file)")
 	scoped := fs.Bool("scoped", false, "with -db, derive the auto content scope from the index (git worktrees + configured/known roots)")
 	estimate := fs.Bool("estimate", false, "with -db, print the auto content scope estimate (files/bytes/repos) and exit")
+	sniffSample := fs.Int("sniff-sample", 0, "with -estimate, head-sniff up to N text-candidate files to project the binary share")
+	listPaths := fs.Bool("paths", false, "with -estimate, print every selected path (one per line) instead of the summary")
 	jsonOut := fs.Bool("json", false, "with -estimate, emit JSON")
 	configPath := fs.String("config", "", "optional seekfs.toml config path")
 	encoding := fs.String("encoding", "auto", "text encoding override: auto, none, or a WHATWG label (latin1, windows-1252, utf-16le, sjis, ...)")
@@ -89,14 +91,28 @@ func cmdContentIndex(args []string) error {
 			return fmt.Errorf("content-index: config: %w", err)
 		}
 		scope := contentScopeForVolume(cfg, rec.Volume)
-		est := scanContentScope(rec, scope, rec.Volume, opts.MaxFiles)
+		est := scanContentScope(rec, scope, rec.Volume, opts.MaxFiles, *sniffSample, *listPaths)
 		if *jsonOut {
 			enc := json.NewEncoder(os.Stdout)
 			enc.SetIndent("", "  ")
 			return enc.Encode(est)
 		}
+		if *listPaths {
+			for _, p := range est.Paths {
+				fmt.Fprintln(os.Stdout, p)
+			}
+			return nil
+		}
 		fmt.Fprintf(os.Stdout, "content scope estimate for %s (mode=%s):\n", rec.Volume, scope.Mode)
-		fmt.Fprintf(os.Stdout, "  files=%d bytes=%d projected_gsx=%d max_files_hit=%v budget_hit=%v\n", est.Files, est.Bytes, est.ProjectedGSXBytes, est.MaxFilesHit, est.BudgetHit)
+		fmt.Fprintf(os.Stdout, "  files=%d bytes=%d projected_gsx=%d max_files_hit=%v budget_hit=%v budget=%d eligible_files=%d eligible_bytes=%d\n", est.Files, est.Bytes, est.ProjectedGSXBytes, est.MaxFilesHit, est.BudgetHit, est.BudgetBytes, est.EligibleFiles, est.EligibleBytes)
+		fmt.Fprintf(os.Stdout, "  text_candidates=%d binary_candidates=%d", est.TextCandidates, est.BinaryCandidates)
+		for reason, n := range est.Excluded {
+			fmt.Fprintf(os.Stdout, " excluded_%s=%d", reason, n)
+		}
+		fmt.Fprintln(os.Stdout)
+		if *sniffSample > 0 {
+			fmt.Fprintf(os.Stdout, "  sniff_sample: opened=%d binary=%d projected_text_files=%d\n", est.SampledFiles, est.SampledBinary, est.ProjectedTextFiles)
+		}
 		for _, r := range est.Repos {
 			fmt.Fprintf(os.Stdout, "  repo: %s\n", r)
 		}
@@ -161,7 +177,7 @@ func cmdContentIndex(args []string) error {
 	}
 	fmt.Fprintf(os.Stdout, "indexed %d documents into %s\n", len(idx.Docs), outPath)
 	if p := idx.Policy; p != (contentBuildPolicy{}) {
-		fmt.Fprintf(os.Stdout, "policy: max_raw=%d max_text=%d skipped=%d truncated=%d\n", p.MaxRaw, p.MaxText, p.Skipped, p.Truncated)
+		fmt.Fprintf(os.Stdout, "policy: max_raw=%d max_text=%d skipped=%d truncated=%d scope_dropped=%d scope_dropped_bytes=%d budget=%d\n", p.MaxRaw, p.MaxText, p.Skipped, p.Truncated, p.ScopeDropped, p.ScopeDroppedBytes, p.BudgetBytes)
 	}
 	if idx.Scanned > 0 || idx.Declined > 0 {
 		// Reconcile: indexed == eligible - declined - skipped (truncated files
@@ -174,12 +190,15 @@ func cmdContentIndex(args []string) error {
 // contentCLIResponse is the additive JSON shape for the offline `content`
 // command: `results` stays an array of path strings (the original shape) and
 // `snippets` is a parallel array of matched-text windows, aligned to `results`.
-// Consumers that only know the old shape are unaffected.
+// Consumers that only know the old shape are unaffected. When a zero-result
+// query was retried with typo-tolerant corrections, FuzzyCorrection names the
+// corrected words ("Showing results for receive").
 type contentCLIResponse struct {
-	OK       bool     `json:"ok"`
-	Count    int      `json:"count"`
-	Results  []string `json:"results"`
-	Snippets []string `json:"snippets"`
+	OK              bool     `json:"ok"`
+	Count           int      `json:"count"`
+	Results         []string `json:"results"`
+	Snippets        []string `json:"snippets"`
+	FuzzyCorrection string   `json:"fuzzy_correction,omitempty"`
 }
 
 func cmdContent(args []string) error {
@@ -208,18 +227,33 @@ func cmdContent(args []string) error {
 	// A one-shot CLI query owns the mapping only for its own duration; release
 	// it on return. The hits are copied strings, so nothing outlives it.
 	defer idx.Release()
+	// Small sections were verified at load; check the large ones before
+	// serving results, so a flipped byte fails the query instead of answering
+	// from corrupt bytes.
+	if err := verifyContentSectionCRCs(idx); err != nil {
+		return fmt.Errorf("content: %s failed integrity check: %w", *db, err)
+	}
 	r, err := openContentReader(idx)
 	if err != nil {
 		return err
 	}
 	hits := r.search(term, *n)
+	fuzzy := ""
+	if len(hits) == 0 {
+		if corrected, show, ok := contentFuzzyCorrectOfflineText(r, term); ok {
+			if retry := r.search(corrected, *n); len(retry) > 0 {
+				hits, fuzzy = retry, show
+			}
+		}
+	}
 
 	if *asJSON {
 		resp := contentCLIResponse{
-			OK:       true,
-			Count:    len(hits),
-			Results:  make([]string, 0, len(hits)),
-			Snippets: make([]string, 0, len(hits)),
+			OK:              true,
+			Count:           len(hits),
+			Results:         make([]string, 0, len(hits)),
+			Snippets:        make([]string, 0, len(hits)),
+			FuzzyCorrection: fuzzy,
 		}
 		for _, h := range hits {
 			resp.Results = append(resp.Results, h.Path)
@@ -227,6 +261,9 @@ func cmdContent(args []string) error {
 		}
 		enc := json.NewEncoder(os.Stdout)
 		return enc.Encode(resp)
+	}
+	if fuzzy != "" {
+		fmt.Fprintf(os.Stdout, "(showing results for %q)\n", fuzzy)
 	}
 	for _, h := range hits {
 		if *withSnippet && h.Snippet != "" {

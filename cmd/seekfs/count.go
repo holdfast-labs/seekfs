@@ -59,6 +59,24 @@ func countServiceVolumes(volumes []*serviceVolumeIndex, opts queryOptions) (int,
 		}
 		markContentQueryDegraded(opts.Trace, skipped)
 		markContentQueryIncomplete(opts.Trace, usable)
+		// A typo'd content query that fuzzy-retried on search must count the
+		// same retried query, so count == len(search) holds on the fuzzy path
+		// too. The retry runs only on a total miss, mirroring the search gate.
+		if total, correction, ok, err := countContentFuzzyRewrite(volumes, opts, usable); err != nil {
+			return 0, true, err
+		} else if ok {
+			if correction != "" && opts.Trace != nil {
+				opts.Trace.FuzzyCorrection = correction
+			}
+			// The same completeness refusal as the exact tail: a capped
+			// retry is not an exact count.
+			if opts.Trace != nil && opts.Trace.ContentIncomplete {
+				return 0, true, errContentIncomplete
+			}
+			opts.Trace.setPlannerMode("service-content")
+			opts.Trace.setComplete(opts.Trace == nil || (!opts.Trace.ContentPartial && !opts.Trace.ContentIncomplete))
+			return total, true, nil
+		}
 		total := 0
 		for _, vol := range volumes {
 			if queryCanceled(parsedQuery{DeadlineUnix: opts.DeadlineUnix, Cancel: opts.Cancel}) {

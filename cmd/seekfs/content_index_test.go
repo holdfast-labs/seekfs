@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/binary"
 	"path/filepath"
 	"testing"
 	"time"
@@ -68,13 +69,37 @@ func TestContentIndexRoundTrip(t *testing.T) {
 func TestContentIndexPolicyRoundTrip(t *testing.T) {
 	idx := newContentIndex()
 	idx.Docs = contentTestDocs()
-	idx.Policy = contentBuildPolicy{MaxRaw: 1 << 20, MaxText: 1 << 19, Skipped: 3, Truncated: 2, ScopeDropped: 1}
+	idx.Policy = contentBuildPolicy{MaxRaw: 1 << 20, MaxText: 1 << 19, Skipped: 3, Truncated: 2, ScopeDropped: 1, ScopeDroppedBytes: 42, BudgetBytes: 1 << 20, Binary: 7}
 	got, err := contentIndexDecode(contentIndexEncode(idx))
 	if err != nil {
 		t.Fatalf("contentDecode: %v", err)
 	}
 	if got.Policy != idx.Policy {
 		t.Fatalf("policy = %+v; want %+v", got.Policy, idx.Policy)
+	}
+}
+
+func TestContentIndexPolicyDecodesOlderSizes(t *testing.T) {
+	// A 40-byte CXPL (pre dropped-bytes/budget fields) decodes with the new
+	// fields zero; a 32-byte one (pre scope-dropped) likewise; a 56-byte one
+	// (pre binary) likewise.
+	old := contentBuildPolicy{MaxRaw: 8, MaxText: 4, Skipped: 2, Truncated: 1, ScopeDropped: 1}
+	b := make([]byte, 40)
+	binary.LittleEndian.PutUint64(b[0:], uint64(old.MaxRaw))
+	binary.LittleEndian.PutUint64(b[8:], uint64(old.MaxText))
+	binary.LittleEndian.PutUint64(b[16:], uint64(old.Skipped))
+	binary.LittleEndian.PutUint64(b[24:], uint64(old.Truncated))
+	binary.LittleEndian.PutUint64(b[32:], uint64(old.ScopeDropped))
+	if got, ok := decodeContentPolicy(b); !ok || got != old {
+		t.Fatalf("40-byte policy = %+v, %v; want %+v", got, ok, old)
+	}
+	if got, ok := decodeContentPolicy(b[:32]); !ok || got.ScopeDropped != 0 || got.ScopeDroppedBytes != 0 || got.BudgetBytes != 0 {
+		t.Fatalf("32-byte policy = %+v, %v; want zero drop fields", got, ok)
+	}
+	full := contentBuildPolicy{MaxRaw: 8, MaxText: 4, Skipped: 2, Truncated: 1, ScopeDropped: 1, ScopeDroppedBytes: 44, BudgetBytes: 100}
+	b56 := full.encode()[:56]
+	if got, ok := decodeContentPolicy(b56); !ok || got != full || got.Binary != 0 {
+		t.Fatalf("56-byte policy = %+v, %v; want %+v with zero binary", got, ok, full)
 	}
 }
 

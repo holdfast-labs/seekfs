@@ -224,6 +224,7 @@ type jsonSearchResponse struct {
 	PostingPrefetchPages     int            `json:"posting_prefetch_pages,omitempty"`
 	PlannerMode              string         `json:"planner_mode,omitempty"`
 	Fuzzy                    bool           `json:"fuzzy,omitempty"`
+	FuzzyCorrection          string         `json:"fuzzy_correction,omitempty"`
 	EligibleVolumes          []string       `json:"eligible_volumes,omitempty"`
 	Terms                    []traceTerm    `json:"terms,omitempty"`
 	Declines                 []traceDecline `json:"declines,omitempty"`
@@ -633,6 +634,10 @@ type searchTrace struct {
 	// content scan), so the downstream verify loop can skip re-evaluating it.
 	// Local-only plumbing; never serialized.
 	ContentCandidatesVerified bool `json:"-"`
+	// FuzzyCorrection names the corrected content word(s) when a zero-result
+	// content count was retried with typo-tolerant corrections, so the count
+	// response can carry the same "Showing results for X" signal as search.
+	FuzzyCorrection string `json:"-"`
 }
 
 type traceTerm struct {

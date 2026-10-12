@@ -17,13 +17,17 @@ import (
 )
 
 type serviceResponse struct {
-	PluginAPI                int                 `json:"plugin_api,omitempty"`
-	PluginConfig             string              `json:"plugin_config,omitempty"`
-	Plugins                  []pluginStatus      `json:"plugins,omitempty"`
-	Features                 []featureHealth     `json:"features,omitempty"`
-	OK                       bool                `json:"ok"`
-	Message                  string              `json:"message,omitempty"`
-	Fuzzy                    bool                `json:"fuzzy,omitempty"`
+	PluginAPI    int             `json:"plugin_api,omitempty"`
+	PluginConfig string          `json:"plugin_config,omitempty"`
+	Plugins      []pluginStatus  `json:"plugins,omitempty"`
+	Features     []featureHealth `json:"features,omitempty"`
+	OK           bool            `json:"ok"`
+	Message      string          `json:"message,omitempty"`
+	Fuzzy        bool            `json:"fuzzy,omitempty"`
+	// FuzzyCorrection names the corrected content word(s) when a zero-result
+	// `content:` query was retried with typo-tolerant corrections, so the UI
+	// can say "Showing results for receive".
+	FuzzyCorrection          string              `json:"fuzzy_correction,omitempty"`
 	PID                      int                 `json:"pid,omitempty"`
 	Executable               string              `json:"executable,omitempty"`
 	ExecutableHash           string              `json:"executable_hash,omitempty"`

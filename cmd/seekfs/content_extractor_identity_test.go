@@ -249,10 +249,22 @@ func TestContentAttachExtractorIdentityRefresh(t *testing.T) {
 		t.Fatalf("zero-class health = %+v; want degraded refresh of 1 doc", h)
 	}
 
-	// A zero class whose extension nothing extracts cannot be refreshed: rebuild.
+	// A zero class with an unknown extension refreshes in place too: sniff
+	// selection extracts whatever the head claims, so re-extraction (which
+	// re-sniffs) is the repair, not a rebuild.
 	vol = attachWith(t, "a.zzzunknown", func(idx *contentIndex) { idx.Docs[0].ContentType = 0 })
+	if st := vol.content.stateOf(); st != contentStateReady {
+		t.Fatalf("unmapped zero-class state = %q; want ready (refresh in place)", st)
+	}
+	if h := vol.content.healthSnapshot(0); !h.ExtractorRefresh || h.StaleExtractorDocs != 1 {
+		t.Fatalf("unmapped zero-class health = %+v; want degraded refresh of 1 doc", h)
+	}
+
+	// A zero class whose extension nothing can extract (known-binary) cannot
+	// be refreshed: rebuild.
+	vol = attachWith(t, "a.png", func(idx *contentIndex) { idx.Docs[0].ContentType = 0 })
 	if st := vol.content.stateOf(); st != contentStateStale {
-		t.Fatalf("unmapped zero-class state = %q; want stale (rebuild)", st)
+		t.Fatalf("binary zero-class state = %q; want stale (rebuild)", st)
 	}
 
 	// An unregistered class cannot be refreshed: rebuild.

@@ -598,7 +598,7 @@ func entryMatchesScalar(entry Entry, pq parsedQuery, matchPath bool) bool {
 		return false
 	}
 	if pq.Exists {
-		if _, err := os.Stat(path); err != nil {
+		if _, err := contentStatExists(path); err != nil {
 			return false
 		}
 	}

@@ -53,9 +53,9 @@ var (
 	contentDeltaHardMaxBytes = int64(256 << 20)
 )
 
-// contentFoldSave is contentSaveFile for the fold, a var so tests can inject a
-// save failure and prove the delta is kept.
-var contentFoldSave = contentSaveFile
+// contentFoldSave streams one assembled fold to its sidecar path, a var so
+// tests can inject a save failure and prove the delta is kept.
+var contentFoldSave = contentSaveAssembled
 
 // contentFoldSaveManifest publishes a sharded fold's manifest; a var for the
 // same reason as contentFoldSave.
@@ -163,19 +163,11 @@ func (s *goSearchService) runContentFold(vol *serviceVolumeIndex) {
 	// was. A walk fold keeps the walk origin and restamps the wall-clock
 	// watermark (there is no journal checkpoint to advance); a USN fold
 	// advances the observed-USN checkpoint as before.
-	isWalkFold := base.Origin == contentOriginWalk
-	if isWalkFold {
-		if now := uint64(time.Now().UnixNano()); now > checkpoint {
-			checkpoint = now
-		}
-	}
 	header := &contentIndex{Origin: base.Origin, JournalID: base.JournalID, CheckpointUSN: checkpoint, Policy: base.Policy, ScopeHash: base.ScopeHash}
-	stamp := func(cidx *contentIndex) {
-		cidx.Origin = header.Origin
-		cidx.JournalID = header.JournalID
-		cidx.CheckpointUSN = header.CheckpointUSN
-		cidx.Policy = header.Policy
-		cidx.ScopeHash = header.ScopeHash
+	if base.Origin == contentOriginWalk {
+		if now := uint64(time.Now().UnixNano()); now > header.CheckpointUSN {
+			header.CheckpointUSN = now
+		}
 	}
 	gsx := contentIndexPathForDB(vol.dbPath)
 	if gsx == "" {
@@ -184,22 +176,35 @@ func (s *goSearchService) runContentFold(vol *serviceVolumeIndex) {
 	}
 	stopped := func() bool { return s.contentStopped(vol) }
 	contentFoldAssembleHook()
+	// foldShard assembles one fold source into a spooled shard plus the header
+	// index the streaming save needs. The spooled section files, not a heap
+	// index, are what gets saved; publish reloads the sidecar through the
+	// mmap loader.
+	foldShard := func(source contentBuildSource) (*contentStreamedBuild, *contentIndex, error) {
+		guarded := func() (contentBuildDoc, bool, error) {
+			if stopped() {
+				return contentBuildDoc{}, false, errContentBuildAborted
+			}
+			return source()
+		}
+		built, err := assembleContentIndexStreamed(guarded, tmpDir)
+		if err != nil {
+			return nil, nil, err
+		}
+		shard := contentShardHeader(header, built)
+		shard.Sections = map[uint32][]byte{contentSectionPaths: encodeContentPaths(built.paths)}
+		return built, shard, nil
+	}
 	var rewritten int
 	var saveErr error
 	if base.shards == nil {
 		source := newContentFoldSource(reader, snap)
-		cidx, err := assembleContentIndexStream(func() (contentBuildDoc, bool, error) {
-			if stopped() {
-				return contentBuildDoc{}, false, errContentBuildAborted
-			}
-			return source.next()
-		}, tmpDir)
+		built, shard, err := foldShard(source.next)
 		if err != nil {
 			serviceLog("content fold assemble failed volume=%s err=%v", vol.volume, err)
 			vol.contentCoord.foldFailed(contentFoldRetryBackoff)
 			return
 		}
-		stamp(cidx)
 		if !s.contentBuildCurrent(vol, gen, base.JournalID) {
 			// A rebuild/journal reset moved under the fold; keep the delta for
 			// the next fold against the new generation rather than publish
@@ -207,19 +212,28 @@ func (s *goSearchService) runContentFold(vol *serviceVolumeIndex) {
 			vol.contentCoord.foldFailed(contentFoldRetryBackoff)
 			return
 		}
-		rewritten = len(cidx.Docs)
-		if int64(len(cidx.Sections[contentSectionText])) > 2*contentShardTargetBytes {
-			// Grown well past one shard through folds: split it now rather
-			// than keep rewriting one ever-larger file.
-			var shards int
-			shards, saveErr = contentReshardAndSave(gsx, cidx, header, tmpDir)
-			if saveErr == nil {
-				serviceLog("content fold resharded volume=%s shards=%d", vol.volume, shards)
-			} else {
-				contentSweepShards(gsx)
+		rewritten = len(built.docs)
+		if built.textSize > uint64(2*contentShardTargetBytes) {
+			// Grown well past one shard through folds: publish the single
+			// file, reload it through the mmap loader, and split it into
+			// shards rather than keep rewriting one ever-larger file. The
+			// published single file is complete and correct, so a reshard
+			// failure still publishes it instead of failing the fold.
+			if saveErr = contentFoldSave(gsx, shard, contentBuildFiles(built)); saveErr == nil {
+				var shards int
+				if reloaded, rerr := contentLoadFile(gsx); rerr != nil {
+					saveErr = rerr
+					contentSweepShards(gsx)
+				} else if shards, saveErr = contentReshardAndSave(gsx, reloaded, header, tmpDir); saveErr == nil {
+					serviceLog("content fold resharded volume=%s shards=%d", vol.volume, shards)
+					reloaded.Release()
+				} else {
+					reloaded.Release()
+					contentSweepShards(gsx)
+				}
 			}
 		} else {
-			saveErr = contentFoldSave(gsx, cidx)
+			saveErr = contentFoldSave(gsx, shard, contentBuildFiles(built))
 		}
 	} else {
 		// Sharded: rewrite only the shards the delta touches; the others are
@@ -232,20 +246,14 @@ func (s *goSearchService) runContentFold(vol *serviceVolumeIndex) {
 				continue
 			}
 			source := contentShardFoldSource(sh, plan.incoming[i], plan.drop)
-			cidx, err := assembleContentIndexStream(func() (contentBuildDoc, bool, error) {
-				if stopped() {
-					return contentBuildDoc{}, false, errContentBuildAborted
-				}
-				return source()
-			}, tmpDir)
+			built, shard, err := foldShard(source)
 			if err != nil {
 				serviceLog("content fold assemble failed volume=%s shard=%s err=%v", vol.volume, sh.info.File, err)
 				vol.contentCoord.foldFailed(contentFoldRetryBackoff)
 				return
 			}
-			stamp(cidx)
-			rewritten += len(cidx.Docs)
-			infos[i], saveErr = contentSaveShard(contentShardDir(gsx), cidx, sh.info.Prefixes)
+			rewritten += len(built.docs)
+			infos[i], saveErr = contentSaveShard(contentShardDir(gsx), shard, contentBuildFiles(built), sh.info.Prefixes)
 		}
 		if saveErr == nil {
 			if !s.contentBuildCurrent(vol, gen, base.JournalID) {
@@ -365,6 +373,12 @@ func (s *goSearchService) publishFoldedContent(vol *serviceVolumeIndex, gen uint
 		old.Release()
 	}
 	attached = true
+	// Verify the large sections in the background, as attach does: the fold
+	// just wrote this file, so a mismatch here means the write itself is
+	// suspect and the base must not be served.
+	if s.beginContentTask(vol) {
+		contentVerifyAsync(func() { defer endContentTask(vol); s.verifyContentAfterAttach(vol, idx) })
+	}
 	return true
 }
 

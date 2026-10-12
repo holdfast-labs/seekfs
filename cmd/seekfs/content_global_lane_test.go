@@ -48,7 +48,7 @@ func contentGlobalLaneSearch(vols []*serviceVolumeIndex, query string, limit int
 	if enabled {
 		os.Setenv("SEEKFS_CONTENT_GLOBAL_LANE", "1")
 	} else {
-		os.Unsetenv("SEEKFS_CONTENT_GLOBAL_LANE")
+		os.Setenv("SEEKFS_CONTENT_GLOBAL_LANE", "0")
 	}
 	trace := &searchTrace{}
 	matches, err := searchServiceVolumes(vols, queryOptions{Query: query, Limit: limit, Trace: trace}, false)
@@ -62,7 +62,7 @@ func contentGlobalLaneCount(vols []*serviceVolumeIndex, query string, enabled bo
 	if enabled {
 		os.Setenv("SEEKFS_CONTENT_GLOBAL_LANE", "1")
 	} else {
-		os.Unsetenv("SEEKFS_CONTENT_GLOBAL_LANE")
+		os.Setenv("SEEKFS_CONTENT_GLOBAL_LANE", "0")
 	}
 	trace := &searchTrace{}
 	n, ok, err := countServiceVolumes(vols, queryOptions{Query: query, Trace: trace})
@@ -323,9 +323,29 @@ func TestContentGlobalLaneLargeCorpusDifferential(t *testing.T) {
 				t.Run(fmt.Sprintf("%s/%s/limit=%d", scope.name, q, limit), func(t *testing.T) {
 					want, _ := contentGlobalLaneSearch(scope.vols, q, limit, false)
 					got, laneTrace := contentGlobalLaneSearch(scope.vols, q, limit, true)
+					// The selectivity gate admits only small filename
+					// sides: every matrix query carries one ext filter,
+					// so the lane engages single-volume exactly when
+					// that ext posting fits the scaled drive budget.
+					// Either way the result sets must match exactly.
 					didEngage := laneTrace.PlannerMode == "global-content-components"
-					if didEngage != (scope.name == "single") {
-						t.Fatalf("%q: lane engaged=%v (planner=%q)", q, didEngage, laneTrace.PlannerMode)
+					est := contentLaneEstOver
+					if pq, err := parseQuery(queryOptions{Query: q}); err == nil {
+						if filters, ok := globalExtPostingFilters(pq); ok && len(filters) == 1 {
+							est = 0
+							for _, vol := range scope.vols {
+								posting, ok := vol.extPostingCountCandidate(filters[0].ext)
+								if !ok {
+									est = contentLaneEstOver
+									break
+								}
+								est += posting.len()
+							}
+						}
+					}
+					wantEngaged := scope.name == "single" && est <= contentLaneDriveBudget(limit)
+					if didEngage != wantEngaged {
+						t.Fatalf("%q: lane engaged=%v want %v (planner=%q)", q, didEngage, wantEngaged, laneTrace.PlannerMode)
 					}
 					if len(got) != len(want) {
 						t.Fatalf("%q: count diverged lane=%d content=%d", q, len(got), len(want))

@@ -133,6 +133,16 @@ type contentHealth struct {
 	MaxText   int64 `json:"max_text,omitempty"`
 	Skipped   int   `json:"skipped,omitempty"`
 	Truncated int   `json:"truncated,omitempty"`
+	// ScopeDropped/ScopeDroppedBytes are the exact files and extracted-text
+	// bytes the scope byte budget excluded at build time; BudgetBytes is the
+	// budget that was enforced. Non-zero means the corpus is partial and the
+	// operator action is to raise [features.content] budget_bytes.
+	ScopeDropped      int   `json:"scope_dropped,omitempty"`
+	ScopeDroppedBytes int64 `json:"scope_dropped_bytes,omitempty"`
+	BudgetBytes       int64 `json:"budget_bytes,omitempty"`
+	// Binary counts files that sniffed as binary at build time (NUL in the
+	// head window, like ripgrep): expected rejections, not drops.
+	Binary int `json:"binary,omitempty"`
 	// SidecarBytes/SidecarCap report the attached `.gsx` encoded size and the
 	// size cap (WP10/M7), so unbounded sidecar growth is observable in
 	// `loaded --json` instead of only failing silently.
@@ -145,6 +155,10 @@ type contentHealth struct {
 	// fold publishes a base re-extracted at the current versions.
 	ExtractorRefresh   bool `json:"extractor_refresh,omitempty"`
 	StaleExtractorDocs int  `json:"stale_extractor_docs,omitempty"`
+	// IntegrityError records why the attached base failed its post-attach
+	// checksum pass. The base is dropped (stale) and a rebuild scheduled, so
+	// the field names the corruption instead of serving wrong results.
+	IntegrityError string `json:"integrity_error,omitempty"`
 }
 
 // contentDeltaDoc is an extracted document for a file changed since the base,
@@ -435,6 +449,12 @@ type contentVolumeState struct {
 	// re-learns it in one fast-fail round. This is the walk equivalent of
 	// the USN stream never re-reporting a declined file.
 	walkUnindexable map[uint64]contentWalkPrint
+	// integrityFailures counts consecutive checksum failures of the attached
+	// base. It resets when a base passes the post-attach integrity pass and
+	// caps the rebuilds one failure streak schedules, so a disk that corrupts
+	// every write leaves the volume stale instead of spinning rebuilds. It
+	// survives setReady (attach happens before the pass runs) and markStale.
+	integrityFailures int
 }
 
 // walkDeclinedNote records that key extracted to nothing at print. A later
@@ -536,6 +556,14 @@ func mergeContentHealth(dst *contentHealth, src contentHealth) {
 	dst.ExtractionErrors += src.ExtractionErrors
 	dst.Skipped += src.Skipped
 	dst.Truncated += src.Truncated
+	dst.Binary += src.Binary
+	dst.ScopeDropped += src.ScopeDropped
+	dst.ScopeDroppedBytes += src.ScopeDroppedBytes
+	// Budgets can differ per volume; the aggregate names the largest so the
+	// operator action ("raise budget_bytes past this") stays meaningful.
+	if src.BudgetBytes > dst.BudgetBytes {
+		dst.BudgetBytes = src.BudgetBytes
+	}
 	dst.SidecarBytes += src.SidecarBytes
 	dst.SidecarCap += src.SidecarCap
 	// Extractor versions should agree across volumes; keep the highest so a
@@ -648,7 +676,8 @@ func aggregateContentHealth(healths []contentHealth) contentHealth {
 //   - State is the most severe state: ready/off < unavailable < indexing <
 //     degraded < stale (contentStateSeverity).
 //   - Docs, DeltaBytes, Deferred, QueueDepth, Evictions, ExtractionErrors,
-//     Skipped, Truncated, SidecarBytes and SidecarCap are summed;
+//     Skipped, Truncated, Binary, ScopeDropped, ScopeDroppedBytes, SidecarBytes
+//     and SidecarCap are summed; BudgetBytes takes the largest;
 //     BuildDone/BuildTotal sum only while indexing.
 //   - Partial, Incomplete and CountDivergent are OR-ed.
 //   - ExtractorRefresh is OR-ed and StaleExtractorDocs summed, so a targeted
@@ -761,6 +790,10 @@ func (s *contentVolumeState) setReady(idx *contentIndex, reader *contentReader, 
 		s.health.MaxText = idx.Policy.MaxText
 		s.health.Skipped = int(idx.Policy.Skipped)
 		s.health.Truncated = int(idx.Policy.Truncated)
+		s.health.ScopeDropped = int(idx.Policy.ScopeDropped)
+		s.health.ScopeDroppedBytes = idx.Policy.ScopeDroppedBytes
+		s.health.BudgetBytes = idx.Policy.BudgetBytes
+		s.health.Binary = int(idx.Policy.Binary)
 	}
 	// A targeted extractor-version refresh (WP11) keeps the volume usable: its
 	// text is a valid, if older, extraction. The refresh signal is only raised
@@ -788,6 +821,62 @@ func (s *contentVolumeState) rebuildResolver(baseFRNs []uint64, baseIDs []uint32
 		return
 	}
 	s.resolver = buildContentResolver(s.idx.Docs, baseFRNs, baseIDs)
+}
+
+// markIntegrityFailed drops a checksum-failed base so it is never served and
+// records the reason. It acts only when expect is still the attached base in
+// a serving state (ready/degraded); a newer base, or a volume already owned
+// by a build/rebuild, is left alone. It reports whether the caller should
+// schedule a rebuild: only the first detector of a given base does, so one
+// corrupt base schedules exactly one rebuild.
+func (s *contentVolumeState) markIntegrityFailed(expect *contentIndex, reason string) bool {
+	if s == nil {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.idx != expect || expect == nil {
+		return false
+	}
+	if s.state != contentStateReady && s.state != contentStateDegraded {
+		return false
+	}
+	s.integrityFailures++
+	s.health.IntegrityError = reason
+	s.state = contentStateStale
+	s.health.State = contentStateStale
+	s.reader = nil
+	s.resolver = nil
+	s.delta = newContentDelta()
+	s.catchUpPending = false
+	s.catchUpFailed = false
+	s.refreshActive = false
+	s.refreshPending = 0
+	s.health.ExtractorRefresh = false
+	s.health.StaleExtractorDocs = 0
+	return true
+}
+
+// markIntegrityVerified resets the integrity failure streak once a base passes
+// the post-attach checksum pass.
+func (s *contentVolumeState) markIntegrityVerified() {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.integrityFailures = 0
+	s.health.IntegrityError = ""
+}
+
+// integrityFailureCount returns the current integrity failure streak.
+func (s *contentVolumeState) integrityFailureCount() int {
+	if s == nil {
+		return 0
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.integrityFailures
 }
 
 // markStale is the journal-reset / index-rebuild invalidation: the decoded

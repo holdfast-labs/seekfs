@@ -278,6 +278,12 @@ func (s *goSearchService) attachContentForVolume(vol *serviceVolumeIndex) {
 			s.contentReconcileWalkVolume(vol, true)
 			vol.content.markCatchUpComplete()
 			vol.contentBuildAttempts.Store(0)
+			// Same background integrity pass as the USN path below: the
+			// small sections (including the doc table) were verified at
+			// load; the large text/posting sections hash off-path.
+			if s.beginContentTask(vol) {
+				contentVerifyAsync(func() { defer endContentTask(vol); s.verifyContentAfterAttach(vol, idx) })
+			}
 			serviceLog("content index loaded for volume %s docs=%d (walk)", vol.volume, len(idx.Docs))
 			return
 		}
@@ -289,6 +295,13 @@ func (s *goSearchService) attachContentForVolume(vol *serviceVolumeIndex) {
 		if s.beginContentTask(vol) {
 			contentCatchUpAsync(func() { defer endContentTask(vol); s.contentCatchUpAfterAttach(vol, idx) })
 		}
+	}
+	// Verify the large sections in the background: the small ones were checked
+	// at load, and hashing gigabytes synchronously would stall startup. A
+	// mismatch drops the base and schedules a rebuild, so corrupt bytes are
+	// never served.
+	if s.beginContentTask(vol) {
+		contentVerifyAsync(func() { defer endContentTask(vol); s.verifyContentAfterAttach(vol, idx) })
 	}
 	serviceLog("content index loaded for volume %s docs=%d", vol.volume, len(idx.Docs))
 }
@@ -700,6 +713,12 @@ func (s *goSearchService) contentDrainLoop(vol *serviceVolumeIndex) {
 				}
 				return path, true
 			})
+			if scope != nil && scope.Ignore != nil && scope.Ignore.globalChanged() {
+				// The global excludes file lives outside the volume, so the
+				// USN stream never reports its edits; poll its stat instead.
+				// Same rebuild as an edited in-volume ignore file.
+				ignoreChanged = true
+			}
 			if ignoreChanged {
 				// Files the edit newly ignores or un-ignores are not in the
 				// change stream, so only a rebuild under the new rules (and

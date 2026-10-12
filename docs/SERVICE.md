@@ -64,7 +64,7 @@ builds. Enable content the same way (`seekfs plugin add content` or
 `SEEKFS_CONTENT_SEARCH=1`); the service builds, attaches, and freshens a
 stable-path-hash-keyed sidecar with the same `indexing`/`ready`/`degraded`/
 `stale` states and progress reporting as NTFS volumes (see
-[CONTENT_SEARCH.md §6j](CONTENT_SEARCH.md)). Change detection diffs the live
+[CONTENT_SEARCH.md §6k](CONTENT_SEARCH.md)). Change detection diffs the live
 index against the sidecar after every watcher-triggered filename rebuild plus
 a periodic safety net, so an edit typically becomes findable within seconds
 (mostly the filename rewalk itself). If the indexed tree has no `.git`

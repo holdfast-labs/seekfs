@@ -162,6 +162,46 @@ func TestContentWalkBuildAttachQuery(t *testing.T) {
 	}
 }
 
+// A compound filename+content query on a walk volume must agree between the
+// compound lane (on by default) and the per-volume path: both verify through
+// the same walk-keyed content resolution.
+func TestContentWalkCompoundLaneParity(t *testing.T) {
+	stubContentBuildSync(t)
+	stubContentCatchUpSync(t)
+	dir := t.TempDir()
+	root := filepath.Join(dir, "root")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "a.txt"), []byte("laneparity needle here"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "b.md"), []byte("laneparity other place"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "c.txt"), []byte("unrelated words"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	vol, _ := newContentWalkTestVolume(t, root)
+	s := contentTestService(t)
+	s.volumes = []*serviceVolumeIndex{vol}
+	s.indexes = []*Index{vol.index}
+	s.ensureContentBuild(vol)
+	if got := vol.content.stateOf(); got != contentStateReady {
+		t.Fatalf("precondition state = %q; want ready", got)
+	}
+	t.Setenv("SEEKFS_CONTENT_GLOBAL_LANE", "1")
+	lane := contentWalkNames(contentWalkSearch(t, vol, "ext:txt content:laneparity"))
+	t.Setenv("SEEKFS_CONTENT_GLOBAL_LANE", "0")
+	slow := contentWalkNames(contentWalkSearch(t, vol, "ext:txt content:laneparity"))
+	if len(lane) != 1 || lane[0] != "a.txt" {
+		t.Fatalf("lane route = %v; want [a.txt]", lane)
+	}
+	if len(slow) != 1 || slow[0] != "a.txt" {
+		t.Fatalf("per-volume route = %v; want [a.txt]", slow)
+	}
+}
+
 // A USN-keyed sidecar next to a walk .gsi must be refused, mirroring the
 // existing USN-refuses-walk guard: the key spaces never join.
 func TestContentWalkRejectsUSNSidecar(t *testing.T) {
