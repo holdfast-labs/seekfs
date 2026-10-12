@@ -108,6 +108,12 @@ type contentBuildDoc struct {
 	// into the doc table so per-class invalidation can see a version bump.
 	class   uint16
 	version uint16
+	// fileSize and fileModNano are the source file's byte size and nanosecond
+	// mtime at extraction time. The walk reconcile diffs them against the
+	// filename index; every producer stamps them from the same stat the
+	// extraction read.
+	fileSize    int64
+	fileModNano int64
 }
 
 // buildContentIndexFromDir builds an in-memory `.gsx` for root.
@@ -243,7 +249,7 @@ func buildContentIndexFromDir(ctx context.Context, root string, opts contentBuil
 		if rerr != nil {
 			rel = path
 		}
-		docs = append(docs, contentBuildDoc{path: filepath.ToSlash(rel), frn: contentPathKey(rel), text: res.Text, modUnix: info.ModTime().Unix(), class: res.Class, version: e.Version()})
+		docs = append(docs, contentBuildDoc{path: filepath.ToSlash(rel), frn: contentPathKey(rel), text: res.Text, modUnix: info.ModTime().Unix(), class: res.Class, version: e.Version(), fileSize: size, fileModNano: info.ModTime().UnixNano()})
 		return nil
 	})
 	if err != nil {
@@ -338,6 +344,8 @@ func assembleContentIndexStream(source contentBuildSource, tmpDir string) (*cont
 			ContentHash:      sha256Of(stored),
 			TextOff:          uint64(textStore.Len() - len(stored)),
 			TextLen:          uint32(len(stored)),
+			FileSize:         d.fileSize,
+			FileModNano:      d.fileModNano,
 		})
 		// Documents arrive in ascending docID order, so each key's Adds arrive
 		// in ascending docID order as the builder requires.

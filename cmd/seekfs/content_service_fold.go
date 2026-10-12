@@ -160,8 +160,16 @@ func (s *goSearchService) runContentFold(vol *serviceVolumeIndex) {
 	}
 	// The folded base keeps the prior extraction policy/caps so health stays
 	// truthful; the snapshot already filtered the corpus the same way the base
-	// was.
-	header := &contentIndex{Origin: contentOriginUSN, JournalID: base.JournalID, CheckpointUSN: checkpoint, Policy: base.Policy, ScopeHash: base.ScopeHash}
+	// was. A walk fold keeps the walk origin and restamps the wall-clock
+	// watermark (there is no journal checkpoint to advance); a USN fold
+	// advances the observed-USN checkpoint as before.
+	isWalkFold := base.Origin == contentOriginWalk
+	if isWalkFold {
+		if now := uint64(time.Now().UnixNano()); now > checkpoint {
+			checkpoint = now
+		}
+	}
+	header := &contentIndex{Origin: base.Origin, JournalID: base.JournalID, CheckpointUSN: checkpoint, Policy: base.Policy, ScopeHash: base.ScopeHash}
 	stamp := func(cidx *contentIndex) {
 		cidx.Origin = header.Origin
 		cidx.JournalID = header.JournalID
@@ -300,7 +308,11 @@ func (s *goSearchService) publishFoldedContent(vol *serviceVolumeIndex, gen uint
 			idx.Release()
 		}
 	}()
-	if idx.Origin != contentOriginUSN || idx.JournalID != journalID || idx.CheckpointUSN == 0 {
+	if idx.Origin == contentOriginWalk {
+		if idx.JournalID != 0 || idx.CheckpointUSN == 0 {
+			return false
+		}
+	} else if idx.Origin != contentOriginUSN || idx.JournalID != journalID || idx.CheckpointUSN == 0 {
 		return false
 	}
 	reader, err := openContentReader(idx)
@@ -309,7 +321,24 @@ func (s *goSearchService) publishFoldedContent(vol *serviceVolumeIndex, gen uint
 	}
 	s.indexMu.Lock()
 	defer s.indexMu.Unlock()
-	if vol.state != "ready" || vol.index == nil || vol.index.Source != "usn" {
+	if vol.state != "ready" || vol.index == nil {
+		return false
+	}
+	if idx.Origin == contentOriginWalk {
+		if vol.index.Source != "walk" {
+			return false
+		}
+		frns, ids, ok := s.contentWalkKeys(vol)
+		if !ok {
+			return false
+		}
+		if old := vol.content.setReady(idx, reader, buildContentResolver(idx.Docs, frns, ids)); old != nil {
+			old.Release()
+		}
+		attached = true
+		return true
+	}
+	if vol.index.Source != "usn" {
 		return false
 	}
 	if vol.journalID != journalID {
@@ -379,7 +408,7 @@ func (m *contentFoldSource) next() (contentBuildDoc, bool, error) {
 			if d.Deleted {
 				continue
 			}
-			return contentBuildDoc{frn: d.FRN, path: d.Path, text: d.Text, class: d.ContentType, version: d.ExtractorVersion}, true, nil
+			return contentBuildDoc{frn: d.FRN, path: d.Path, text: d.Text, class: d.ContentType, version: d.ExtractorVersion, fileSize: d.FileSize, fileModNano: d.FileModNano}, true, nil
 		case haveBase && (!haveDelta || baseFRN < deltaFRN):
 			doc := m.base[m.i]
 			m.i++
@@ -387,7 +416,7 @@ func (m *contentFoldSource) next() (contentBuildDoc, bool, error) {
 			if len(text) == 0 {
 				continue
 			}
-			return contentBuildDoc{frn: doc.FRN, path: m.reader.docPath(doc.DocID), text: text, modUnix: doc.ModUnix, class: doc.ContentType, version: doc.ExtractorVersion}, true, nil
+			return contentBuildDoc{frn: doc.FRN, path: m.reader.docPath(doc.DocID), text: text, modUnix: doc.ModUnix, class: doc.ContentType, version: doc.ExtractorVersion, fileSize: doc.FileSize, fileModNano: doc.FileModNano}, true, nil
 		case haveBase && haveDelta:
 			// Same FRN: the delta replaces the base doc; a tombstone drops it.
 			d := m.delta[m.j]
@@ -396,7 +425,7 @@ func (m *contentFoldSource) next() (contentBuildDoc, bool, error) {
 			if d.Deleted {
 				continue
 			}
-			return contentBuildDoc{frn: d.FRN, path: d.Path, text: d.Text, class: d.ContentType, version: d.ExtractorVersion}, true, nil
+			return contentBuildDoc{frn: d.FRN, path: d.Path, text: d.Text, class: d.ContentType, version: d.ExtractorVersion, fileSize: d.FileSize, fileModNano: d.FileModNano}, true, nil
 		default:
 			return contentBuildDoc{}, false, nil
 		}

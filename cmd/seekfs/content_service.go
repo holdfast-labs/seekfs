@@ -147,7 +147,8 @@ type contentHealth struct {
 }
 
 // contentDeltaDoc is an extracted document for a file changed since the base,
-// keyed on FRN. Its text is verified at query time; the base index is untouched.
+// keyed on FRN (USN volumes) or the stable path-hash key (walk volumes). Its
+// text is verified at query time; the base index is untouched.
 type contentDeltaDoc struct {
 	FRN     uint64
 	Path    string
@@ -159,6 +160,10 @@ type contentDeltaDoc struct {
 	// the same extractor identity the base would have (P1).
 	ContentType      uint16
 	ExtractorVersion uint16
+	// FileSize/FileModNano mirror the base doc fingerprint so a fold carries
+	// the same change-detection identity the base would have (walk volumes).
+	FileSize    int64
+	FileModNano int64
 }
 
 // contentDelta is the in-memory overlay of changed documents. Its own mutex
@@ -246,6 +251,18 @@ func (d *contentDelta) textFor(frn uint64) (text []byte, found, deleted bool) {
 		return nil, true, true
 	}
 	return doc.Text, true, false
+}
+
+// docFor returns a copy of the delta doc for the key, if any (live or
+// tombstoned). The walk reconcile uses its fingerprint to tell a current
+// entry from a stale one.
+func (d *contentDelta) docFor(frn uint64) (contentDeltaDoc, bool) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if i, ok := d.byFRN[frn]; ok {
+		return d.docs[i], true
+	}
+	return contentDeltaDoc{}, false
 }
 
 func (d *contentDelta) priorHash(frn uint64) ([contentHashLen]byte, bool) {
@@ -384,6 +401,34 @@ type contentVolumeState struct {
 	// clears when a fold republishes the base at the current versions.
 	refreshActive  bool
 	refreshPending int
+	// walkReconcileGen/At record the last walk reconcile: the filename
+	// generation (replayGen) it diffed and when. The drain reconciles only on
+	// a new generation (or past the throttle interval), so a hot tick does
+	// not re-diff a large tree every 2 s.
+	walkReconcileGen uint64
+	walkReconcileAt  time.Time
+}
+
+// walkReconcileMark returns the generation and time of the last walk
+// reconcile. Zero values force one.
+func (s *contentVolumeState) walkReconcileMark() (uint64, time.Time) {
+	if s == nil {
+		return 0, time.Time{}
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.walkReconcileGen, s.walkReconcileAt
+}
+
+// walkReconcileDone records a completed walk reconcile against gen.
+func (s *contentVolumeState) walkReconcileDone(gen uint64) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.walkReconcileGen = gen
+	s.walkReconcileAt = time.Now()
 }
 
 func newContentVolumeState(volume string) *contentVolumeState {
@@ -1494,7 +1539,7 @@ func contentExtractDeltaDocContext(baseCtx context.Context, frn uint64, path str
 	if havePrior && h == prior {
 		return contentDeltaDoc{}, false, nil
 	}
-	return contentDeltaDoc{FRN: frn, Path: path, Text: stored, Hash: h, ContentType: res.Class, ExtractorVersion: e.Version()}, true, nil
+	return contentDeltaDoc{FRN: frn, Path: path, Text: stored, Hash: h, ContentType: res.Class, ExtractorVersion: e.Version(), FileSize: size, FileModNano: info.ModTime().UnixNano()}, true, nil
 }
 
 // sha256Of is the shared content hash: sha256 truncated to contentHashLen bytes

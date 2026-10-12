@@ -25,12 +25,16 @@ import (
 // PF-4's encoding breadth + size policy, which changes normalized text and the
 // policy section; the 04 bump (PF-6a) makes the text store case-preserving (the
 // index stays case-folded), so a v3 text store must not be read as if it were
-// case-preserving. A sidecar whose version does not match is rejected on load,
-// so it can never be attached stale: the service sees no usable base and its
-// PF-3 build path rebuilds it.
+// case-preserving; the 06 bump (walk volumes) widens each doc record with the
+// source file's size and nanosecond mtime, which the walk reconcile diffs
+// against the filename index for change detection without a journal. A sidecar
+// whose version does not match is rejected on load, so it can never be
+// attached stale: the service sees no usable base and its PF-3 build path
+// rebuilds it. (05 is the sharded-manifest version, which carries no doc
+// table; manifests are unaffected by the 06 bump.)
 var contentIndexMagic = [8]byte{'G', 'O', 'S', 'C', 'X', '0', '0', '4'}
 
-const contentIndexVersion = 4
+const contentIndexVersion = 6
 
 // contentOrigin records what the doc keys are, so a `.gsx` can never be
 // attached to a key space it does not join.
@@ -135,6 +139,13 @@ type contentDoc struct {
 	ModUnix          int64
 	TextOff          uint64 // offset into the case-preserving CXST text store
 	TextLen          uint32
+	// FileSize and FileModNano are the source file's byte size and nanosecond
+	// mtime at extraction time. The walk reconcile (no USN journal) diffs them
+	// against the filename index for change detection; USN volumes stamp them
+	// too so folds stay uniform. Zero on sidecars predating v6, which never
+	// attach (version gate) and are rebuilt instead.
+	FileSize    int64
+	FileModNano int64
 }
 
 // contentIndex is the in-memory form of a `.gsx`. Sections map tag -> payload.
@@ -273,13 +284,15 @@ func contentDocTableBytes(docs []contentDoc) []byte {
 		_ = binary.Write(&buf, binary.LittleEndian, d.ModUnix)
 		_ = binary.Write(&buf, binary.LittleEndian, d.TextOff)
 		_ = binary.Write(&buf, binary.LittleEndian, d.TextLen)
+		_ = binary.Write(&buf, binary.LittleEndian, d.FileSize)
+		_ = binary.Write(&buf, binary.LittleEndian, d.FileModNano)
 	}
 	return buf.Bytes()
 }
 
 // contentDocFixedSize is the encoded width of one doc record:
-// docID(4)+frn(8)+type(2)+extractor(2)+hash(16)+rawSize(8)+docLen(4)+modUnix(8)+textOff(8)+textLen(4)
-const contentDocFixedSize = 64
+// docID(4)+frn(8)+type(2)+extractor(2)+hash(16)+rawSize(8)+docLen(4)+modUnix(8)+textOff(8)+textLen(4)+fileSize(8)+fileModNano(8)
+const contentDocFixedSize = 80
 
 func contentDecodeDocTable(data []byte) ([]contentDoc, error) {
 	if len(data) < 4 {
@@ -304,6 +317,8 @@ func contentDecodeDocTable(data []byte) ([]contentDoc, error) {
 		d.ModUnix = int64(binary.LittleEndian.Uint64(data[p+12:]))
 		d.TextOff = binary.LittleEndian.Uint64(data[p+20:])
 		d.TextLen = binary.LittleEndian.Uint32(data[p+28:])
+		d.FileSize = int64(binary.LittleEndian.Uint64(data[p+32:]))
+		d.FileModNano = int64(binary.LittleEndian.Uint64(data[p+40:]))
 		off += contentDocFixedSize
 	}
 	return docs, nil

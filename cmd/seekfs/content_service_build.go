@@ -286,8 +286,9 @@ func (s *goSearchService) ensureContentBuild(vol *serviceVolumeIndex) {
 }
 
 // scheduleContentBuild first tries to attach an existing valid sidecar; if none
-// is usable and the volume is a ready USN volume with a live watermark, it
-// schedules exactly one background build.
+// is usable and the volume is ready with an anchorable watermark (a live USN
+// journal watermark, or a walk index, which needs no journal), it schedules
+// exactly one background build.
 func (s *goSearchService) scheduleContentBuild(vol *serviceVolumeIndex) {
 	if s == nil || vol == nil {
 		return
@@ -308,16 +309,19 @@ func (s *goSearchService) scheduleContentBuild(vol *serviceVolumeIndex) {
 		return
 	}
 	s.indexMu.RLock()
-	ready := vol.state == "ready" && vol.index != nil && vol.index.Source == "usn"
+	ready := vol.state == "ready" && vol.index != nil &&
+		(vol.index.Source == "usn" || vol.index.Source == "walk")
 	journalID := vol.journalID
 	checkpoint := vol.baseCheckpoint
 	if checkpoint <= 0 && vol.index != nil {
 		checkpoint = vol.index.Checkpoint
 	}
+	isWalk := vol.index != nil && vol.index.Source == "walk"
 	s.indexMu.RUnlock()
-	if !ready || journalID == 0 || checkpoint <= 0 {
-		// Not a USN volume, not ready (a rebuild owns it), or no watermark to
-		// anchor a sidecar to. The post-rebuild hook reschedules when it is.
+	if !ready || (!isWalk && (journalID == 0 || checkpoint <= 0)) {
+		// Not ready (a rebuild owns it), a USN volume with no watermark to
+		// anchor a sidecar to, or a non-indexable source. The post-rebuild
+		// hook reschedules when it is.
 		return
 	}
 	if !vol.contentBuildBusy.CompareAndSwap(false, true) {
@@ -351,14 +355,16 @@ func (s *goSearchService) scheduleContentRebuild(vol *serviceVolumeIndex) {
 		return
 	}
 	s.indexMu.RLock()
-	ready := vol.state == "ready" && vol.index != nil && vol.index.Source == "usn"
+	ready := vol.state == "ready" && vol.index != nil &&
+		(vol.index.Source == "usn" || vol.index.Source == "walk")
 	journalID := vol.journalID
 	checkpoint := vol.baseCheckpoint
 	if checkpoint <= 0 && vol.index != nil {
 		checkpoint = vol.index.Checkpoint
 	}
+	isWalk := vol.index != nil && vol.index.Source == "walk"
 	s.indexMu.RUnlock()
-	if !ready || journalID == 0 || checkpoint <= 0 {
+	if !ready || (!isWalk && (journalID == 0 || checkpoint <= 0)) {
 		return
 	}
 	if !vol.contentBuildBusy.CompareAndSwap(false, true) {
@@ -393,20 +399,27 @@ func (s *goSearchService) snapshotContentBuildItems(vol *serviceVolumeIndex, opt
 		return nil, 0, 0, contentBuildSnapshotUnavailable
 	}
 	s.indexMu.RLock()
-	if vol.index == nil || vol.index.Source != "usn" {
+	if vol.index == nil || (vol.index.Source != "usn" && vol.index.Source != "walk") {
 		s.indexMu.RUnlock()
 		return nil, 0, 0, contentBuildSnapshotUnavailable
 	}
 	idx := vol.index
+	isWalk := idx.Source == "walk"
 	journalID = vol.journalID
 	checkpoint = vol.baseCheckpoint
 	if checkpoint <= 0 {
 		checkpoint = idx.Checkpoint
 	}
+	if isWalk {
+		// Walk volumes have no journal; the sidecar watermark is the
+		// wall-clock build time (see runContentBuild's header).
+		journalID = 0
+		checkpoint = time.Now().UnixNano()
+	}
 	gen := vol.replayGen.Load()
 	count := idx.compactRecordCount()
 	s.indexMu.RUnlock()
-	if journalID == 0 || checkpoint <= 0 {
+	if (!isWalk && (journalID == 0 || checkpoint <= 0)) || checkpoint <= 0 {
 		return nil, 0, 0, contentBuildSnapshotUnavailable
 	}
 
@@ -441,7 +454,16 @@ func (s *goSearchService) snapshotContentBuildItems(vol *serviceVolumeIndex, opt
 			if path == "" || !opts.allows(path) {
 				continue
 			}
-			item := contentBuildItem{frn: rec.FRN, path: path}
+			frn := rec.FRN
+			if isWalk {
+				// Positional record FRNs renumber on every rescan; key the
+				// doc on the stable path hash instead.
+				frn = contentWalkKey(path)
+				if frn == 0 {
+					continue
+				}
+			}
+			item := contentBuildItem{frn: frn, path: path}
 			if opts.Scope != nil {
 				item.priority = opts.Scope.priority(path)
 			}
@@ -503,7 +525,7 @@ func contentBuildDocSafe(ctx context.Context, item contentBuildItem) (doc conten
 	if err != nil || res.Skipped || len(res.Text) == 0 {
 		return contentBuildDoc{}, res, false
 	}
-	return contentBuildDoc{path: item.path, frn: item.frn, text: res.Text, modUnix: info.ModTime().Unix(), class: res.Class, version: e.Version()}, res, true
+	return contentBuildDoc{path: item.path, frn: item.frn, text: res.Text, modUnix: info.ModTime().Unix(), class: res.Class, version: e.Version(), fileSize: size, fileModNano: info.ModTime().UnixNano()}, res, true
 }
 
 // contentBuildCurrent reports whether a build may still publish: the per-volume
@@ -665,12 +687,14 @@ func (s *goSearchService) runContentBuild(vol *serviceVolumeIndex, reuseSidecar 
 	// Selection extracts in scope priority order. A single spool keeps memory
 	// bounded while the assembler later consumes selected docs in FRN order.
 	type selectedDoc struct {
-		item    contentBuildItem
-		offset  int64
-		length  int
-		modUnix int64
-		class   uint16
-		version uint16
+		item         contentBuildItem
+		offset       int64
+		length       int
+		modUnix      int64
+		class        uint16
+		version      uint16
+		fileSize     int64
+		fileModNano  int64
 	}
 	selected := make([]selectedDoc, 0, 1024)
 	total := len(items)
@@ -743,7 +767,7 @@ func (s *goSearchService) runContentBuild(vol *serviceVolumeIndex, reuseSidecar 
 			vol.content.markBuildFailed(err.Error())
 			return
 		}
-		selected = append(selected, selectedDoc{item: item, offset: offset, length: len(doc.text), modUnix: doc.modUnix, class: doc.class, version: doc.version})
+		selected = append(selected, selectedDoc{item: item, offset: offset, length: len(doc.text), modUnix: doc.modUnix, class: doc.class, version: doc.version, fileSize: doc.fileSize, fileModNano: doc.fileModNano})
 		used += n
 	}
 	if abortReason != "" {
@@ -779,14 +803,24 @@ func (s *goSearchService) runContentBuild(vol *serviceVolumeIndex, reuseSidecar 
 			if _, err := spool.ReadAt(text, s.offset); err != nil {
 				return contentBuildDoc{}, false, err
 			}
-			return contentBuildDoc{path: s.item.path, frn: s.item.frn, text: text, modUnix: s.modUnix, class: s.class, version: s.version}, true, nil
+			return contentBuildDoc{path: s.item.path, frn: s.item.frn, text: text, modUnix: s.modUnix, class: s.class, version: s.version, fileSize: s.fileSize, fileModNano: s.fileModNano}, true, nil
 		}
 	}
+	s.indexMu.RLock()
+	isWalkBuild := vol.index != nil && vol.index.Source == "walk"
+	s.indexMu.RUnlock()
 	header := &contentIndex{
 		Origin:        contentOriginUSN,
 		JournalID:     journalID,
 		CheckpointUSN: uint64(checkpoint),
 		Policy:        contentBuildPolicy{MaxRaw: settings.maxRaw, MaxText: settings.maxText, Skipped: skipped, Truncated: truncated, ScopeDropped: scopeDropped},
+	}
+	if isWalkBuild {
+		// Walk sidecars join on the stable path hash with no journal: the
+		// checkpoint is the wall-clock build watermark, and JournalID 0
+		// marks the origin next to the Origin field.
+		header.Origin = contentOriginWalk
+		header.JournalID = 0
 	}
 	if opts.Scope != nil {
 		header.ScopeHash = opts.Scope.fingerprint()
