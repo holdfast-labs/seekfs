@@ -135,6 +135,17 @@ func TestContentUnavailable(t *testing.T) {
 	}
 }
 
+func TestFolderTextPrefersTail(t *testing.T) {
+	got := folderText(`E:\bench\chromium\chrome\browser\ui`, 220)
+	if got != `E:\…\browser\ui` {
+		t.Fatalf("folderText = %q, want tail components", got)
+	}
+	short := `C:\proj\src`
+	if got := folderText(short, 220); got != short {
+		t.Fatalf("short path must pass through, got %q", got)
+	}
+}
+
 func TestSortKeyRoundTrip(t *testing.T) {
 	for _, k := range []SortKey{SortName, SortFolder, SortSize, SortModified, SortType} {
 		if sortKeyFromString(k.String()) != k {

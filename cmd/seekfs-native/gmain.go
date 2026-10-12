@@ -384,10 +384,22 @@ func (u *UI) layout(gtx layout.Context) layout.Dimensions {
 
 // layoutBody is sidebar | results | splitter | preview. The results list
 // never draws outside its own region: columns hide by priority when narrow
-// and the area is hard-clipped as a backstop.
+// and the area is hard-clipped as a backstop. The preview auto-narrows (to
+// 200px) and auto-collapses below a 450px minimum list width.
 func (u *UI) layoutBody(gtx layout.Context) layout.Dimensions {
 	previewOpen := u.previewOpen()
 	previewW := u.previewWidth(gtx)
+	totalDP := float32(gtx.Constraints.Max.X) / float32(gtx.Metric.PxPerDp)
+	if previewOpen {
+		resultsW := totalDP - 220 - 7 - float32(previewW)
+		if resultsW < 450 {
+			previewW = 200
+			resultsW = totalDP - 220 - 7 - 200
+			if resultsW < 450 {
+				previewOpen = false
+			}
+		}
+	}
 	return layout.Flex{Axis: layout.Horizontal}.Layout(gtx,
 		layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 			gtx.Constraints.Min.X = gtx.Dp(Dp(220))

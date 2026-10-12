@@ -100,6 +100,9 @@ Environment: `SEEKFS_NATIVE_QUERY` runs one search at startup,
 `SEEKFS_NATIVE_DEBUGLOG=<file>` logs search delivery and frames,
 `SEEKFS_NATIVE_SETTINGS` overrides the settings path
 (`%APPDATA%\seekfs\native.json` by default).
+`SEEKFS_NATIVE_PRESENTER=gdi|dxgi` selects the presentation path
+(default `gdi`: GPU headless render + GDI blit, which composites
+everywhere; `dxgi` uses Gio's swapchain where it works).
 
 Features: instant debounced search, Contents toggle (`content:` rewrite with
 snippet matches), Details/Icons/grouped views, sortable/resizable columns,

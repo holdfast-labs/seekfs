@@ -201,7 +201,7 @@ func (u *UI) rebuildSideRows(vols []DBVolume) {
 	for _, q := range saved {
 		rows = append(rows, sideRow{kind: sideSaved, label: q, query: q, depth: 1})
 	}
-	rows = append(rows, sideRow{kind: sideSaved, label: "+ Save current search", query: "\x00save", depth: 1})
+	rows = append(rows, sideRow{kind: sideSaved, label: "Save current search", query: "\x00save", depth: 1})
 	u.mu.Lock()
 	u.sideRows = rows
 	u.mu.Unlock()

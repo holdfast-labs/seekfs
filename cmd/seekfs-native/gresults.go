@@ -677,9 +677,9 @@ func (u *UI) cellText(gtx layout.Context, txt string, w float32) layout.Dimensio
 	})
 }
 
-// folderText middle-ellipsizes long folder paths so rows like
-// "android-15-chrome-wpt-fyi-rel" stay distinguishable; the full path
-// shows in a hover tooltip (see layoutFolderTip).
+// folderText middle-ellipsizes long folder paths, preferring to keep the
+// last 1-2 full path components ("…\browser\ui") so sibling folders stay
+// distinguishable; the full path shows in a hover tooltip.
 func folderText(dir string, w float32) string {
 	// ~7.5px per rune at 13sp; reserve padding.
 	maxRunes := int(w / 7.5)
@@ -690,9 +690,66 @@ func folderText(dir string, w float32) string {
 	if len(runes) <= maxRunes {
 		return dir
 	}
+	// Drive/root prefix, e.g. "E:\" or "\\server\".
+	prefix := ""
+	rest := runes
+	if len(runes) >= 3 && runes[1] == ':' && (runes[2] == '\\' || runes[2] == '/') {
+		prefix, rest = string(runes[:3]), runes[3:]
+	}
+	// Prefer the last 1-2 full components after the prefix.
+	parts := splitPath(rest)
+	for keep := 2; keep >= 1; keep-- {
+		if len(parts) > keep {
+			tail := joinPath(parts[len(parts)-keep:])
+			if len([]rune(prefix))+1+len([]rune(tail)) <= maxRunes {
+				return prefix + "…" + sepStr(dir) + tail
+			}
+		}
+	}
+	// Fall back to head/tail split.
 	head := (maxRunes - 1) / 2
 	tail := maxRunes - 1 - head
 	return string(runes[:head]) + "…" + string(runes[len(runes)-tail:])
+}
+
+func splitPath(s []rune) []string {
+	var parts []string
+	start := 0
+	for i, r := range s {
+		if r == '\\' || r == '/' {
+			if i > start {
+				parts = append(parts, string(s[start:i]))
+			}
+			start = i + 1
+		}
+	}
+	if start < len(s) {
+		parts = append(parts, string(s[start:]))
+	}
+	return parts
+}
+
+func joinPath(parts []string) string {
+	out := ""
+	for i, p := range parts {
+		if i > 0 {
+			out += `\`
+		}
+		out += p
+	}
+	return out
+}
+
+func sepStr(dir string) string {
+	for _, r := range dir {
+		if r == '/' {
+			return "/"
+		}
+		if r == '\\' {
+			return `\`
+		}
+	}
+	return `\`
 }
 
 // folderTruncated reports whether the folder cell was ellipsized.
