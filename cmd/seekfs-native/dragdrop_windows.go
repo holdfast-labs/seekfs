@@ -25,6 +25,12 @@ var (
 	pDoDragDropDrag         = proc(modOle32, "DoDragDrop")
 )
 
+// IID_IUnknown {00000000-0000-0000-C000-000000000046}
+var iidIUnknown = syscall.GUID{
+	Data1: 0x00000000, Data2: 0x0000, Data3: 0x0000,
+	Data4: [8]byte{0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46},
+}
+
 // IID_IDataObject {0000010e-0000-0000-C000-000000000046}
 var iidIDataObject = syscall.GUID{
 	Data1: 0x0000010e, Data2: 0x0000, Data3: 0x0000,

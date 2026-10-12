@@ -318,6 +318,13 @@ func itoa(n int) string {
 	return string(buf[pos:])
 }
 
+func plural(n int) string {
+	if n == 1 {
+		return ""
+	}
+	return "s"
+}
+
 func formatCount(n int) string {
 	s := itoa(n)
 	if len(s) <= 3 {

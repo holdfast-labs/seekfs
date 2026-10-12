@@ -3,15 +3,16 @@
 package main
 
 import (
+	"image/color"
 	"syscall"
 	"unsafe"
 
 	"golang.org/x/sys/windows/registry"
 )
 
-// theme_windows.go: system theme tracking (dark/light follows Windows),
-// DWM backdrop (Mica with fallback), immersive dark title bars, dark-mode
-// common controls via uxtheme, and the system UI font.
+// theme_windows.go: Windows system theme + accent color detection for the
+// Gio UI. The UI polls systemTheme() and re-renders on change; all painting
+// is GPU-rendered by Gio, so no per-control Win32 theming is needed.
 
 // DWM attributes (see dwmapi.h).
 const (
@@ -20,19 +21,9 @@ const (
 	dwmsbtMainWindow          = 2 // Mica
 )
 
-// appTheme is a snapshot of the Windows personalization state.
-type appTheme struct {
-	dark bool
-	dpi  int
-}
-
-func currentAppTheme(hwnd uintptr) appTheme {
-	return appTheme{dark: systemUsesDarkMode(), dpi: windowDPI(hwnd)}
-}
-
-// systemUsesDarkMode reads AppsUseLightTheme: 0 (or missing with a dark
-// system theme) means dark mode. Missing key defaults to light.
-func systemUsesDarkMode() bool {
+// systemTheme reports whether Windows apps should use dark mode
+// (AppsUseLightTheme == 0).
+func systemTheme() (dark bool) {
 	k, err := registry.OpenKey(registry.CURRENT_USER,
 		`Software\Microsoft\Windows\CurrentVersion\Themes\Personalize`, registry.QUERY_VALUE)
 	if err != nil {
@@ -46,136 +37,36 @@ func systemUsesDarkMode() bool {
 	return v == 0
 }
 
-// applyWindowTheme applies the backdrop, title-bar mode and control themes
-// for hwnd. controls lists child HWNDs that need SetWindowTheme
-// ("DarkMode_Explorer" in dark mode, "Explorer" in light mode); the
-// ListView/TreeView/Header/Edit pick up dark scrollbars, caret and selection
-// colors from the theme, so custom drawing stays minimal.
-func applyWindowTheme(hwnd uintptr, dark bool, controls []uintptr) {
+// systemAccent returns the user's accent color (DwmGetColorizationColor),
+// falling back to a default blue.
+func systemAccent() color.NRGBA {
+	var dwmapi = syscall.NewLazyDLL("dwmapi.dll")
+	p := dwmapi.NewProc("DwmGetColorizationColor")
+	var clr uint32
+	var opaque uint32
+	r, _, _ := syscall.SyscallN(p.Addr(), uintptr(unsafe.Pointer(&clr)), uintptr(unsafe.Pointer(&opaque)))
+	if r != 0 {
+		return color.NRGBA{R: 0x00, G: 0x66, B: 0xCC, A: 0xFF}
+	}
+	// COLORREF 0x00BBGGRR.
+	return color.NRGBA{R: uint8(clr), G: uint8(clr >> 8), B: uint8(clr >> 16), A: 0xFF}
+}
+
+// applyFrameTheme sets the immersive dark title bar and Mica backdrop on a
+// top-level HWND. Values are ignored on systems that don't support them.
+func applyFrameTheme(hwnd uintptr, dark bool) {
 	useDark := uint32(0)
 	if dark {
 		useDark = 1
 	}
-	// Immersive dark title bar (Win10 1903+; harmless elsewhere).
-	if pDwmSetWindowAttribute.Addr() != 0 {
-		_, _, _ = syscall.SyscallN(pDwmSetWindowAttribute.Addr(), hwnd,
-			uintptr(dwmwaUseImmersiveDarkMode), uintptr(unsafe.Pointer(&useDark)), unsafe.Sizeof(useDark))
-		// Mica backdrop where supported (Win11 22000+); ignored otherwise.
-		mica := uint32(dwmsbtMainWindow)
-		_, _, _ = syscall.SyscallN(pDwmSetWindowAttribute.Addr(), hwnd,
-			uintptr(dwmwaSystemBackdropType), uintptr(unsafe.Pointer(&mica)), unsafe.Sizeof(mica))
+	var dwmapi = syscall.NewLazyDLL("dwmapi.dll")
+	p := dwmapi.NewProc("DwmSetWindowAttribute")
+	if p.Find() != nil {
+		return
 	}
-	for _, c := range controls {
-		if pSetWindowTheme.Addr() == 0 {
-			continue
-		}
-		if dark {
-			_, _, _ = syscall.SyscallN(pSetWindowTheme.Addr(), c,
-				uintptr(unsafe.Pointer(utf16("DarkMode_Explorer"))), 0)
-		} else {
-			_, _, _ = syscall.SyscallN(pSetWindowTheme.Addr(), c,
-				uintptr(unsafe.Pointer(utf16("Explorer"))), 0)
-		}
-	}
-}
-
-// colorref builds a COLORREF (0x00BBGGRR).
-func colorref(r, g, b uint32) uintptr { return uintptr(r | (g << 8) | (b << 16)) }
-
-// palette holds the app's control colors per mode. The dark values match
-// Windows 11 File Explorer's dark surfaces.
-type palette struct {
-	windowBg   uintptr // main window / list background
-	text       uintptr
-	grayText   uintptr
-	headerBg   uintptr
-	headerText uintptr
-	editBg     uintptr
-	editText   uintptr
-	statusBg   uintptr
-	statusText uintptr
-	accent     uintptr
-	// selection is drawn by the themed ListView itself.
-}
-
-func darkPalette() palette {
-	return palette{
-		windowBg:   colorref(0x20, 0x20, 0x20), // #202020 Explorer dark
-		text:       colorref(0xFF, 0xFF, 0xFF),
-		grayText:   colorref(0xA0, 0xA0, 0xA0),
-		headerBg:   colorref(0x2B, 0x2B, 0x2B),
-		headerText: colorref(0xFF, 0xFF, 0xFF),
-		editBg:     colorref(0x2D, 0x2D, 0x2D),
-		editText:   colorref(0xFF, 0xFF, 0xFF),
-		statusBg:   colorref(0x20, 0x20, 0x20),
-		statusText: colorref(0xCC, 0xCC, 0xCC),
-		accent:     colorref(0x4C, 0xC2, 0xFF),
-	}
-}
-
-func lightPalette() palette {
-	return palette{
-		windowBg:   colorref(0xF3, 0xF3, 0xF3), // Win11 light
-		text:       colorref(0x00, 0x00, 0x00),
-		grayText:   colorref(0x60, 0x60, 0x60),
-		headerBg:   colorref(0xF9, 0xF9, 0xF9),
-		headerText: colorref(0x00, 0x00, 0x00),
-		editBg:     colorref(0xFF, 0xFF, 0xFF),
-		editText:   colorref(0x00, 0x00, 0x00),
-		statusBg:   colorref(0xF3, 0xF3, 0xF3),
-		statusText: colorref(0x40, 0x40, 0x40),
-		accent:     colorref(0x00, 0x66, 0xCC),
-	}
-}
-
-func paletteFor(dark bool) palette {
-	if dark {
-		return darkPalette()
-	}
-	return lightPalette()
-}
-
-// ---- system font ----
-
-// systemUIFont creates the system message-box font (Segoe UI Variable on
-// Windows 11, Segoe UI on 10) at the right size for dpi. Callers own the
-// HFONT and must DeleteObject it.
-func systemUIFont(dpi int) uintptr {
-	lf := messageLogFont()
-	// NCM heights are in logical units at 96 DPI; scale to the window DPI.
-	lf.Height = (lf.Height*int32(dpi) + 48) / 96
-	if lf.Height == 0 {
-		lf.Height = -scaleDPI(12, dpi)
-	}
-	h, _, _ := syscall.SyscallN(pCreateFontIndirectW.Addr(), uintptr(unsafe.Pointer(&lf)))
-	return h
-}
-
-// messageLogFont reads lfMessageFont from NONCLIENTMETRICS via
-// SystemParametersInfoW, falling back to Segoe UI 9pt.
-func messageLogFont() logfont {
-	const ncmSize = 512
-	buf := make([]byte, ncmSize)
-	*(*uint32)(unsafe.Pointer(&buf[0])) = 500 // pre-Vista size works everywhere
-	r, _, _ := syscall.SyscallN(pSystemParametersInfoW.Addr(), 41 /*SPI_GETNONCLIENTMETRICS*/, uintptr(ncmSize), uintptr(unsafe.Pointer(&buf[0])), 0)
-	if r != 0 {
-		lf := *(*logfont)(unsafe.Pointer(&buf[408])) // lfMessageFont offset
-		if lf.Height != 0 {
-			return lf
-		}
-	}
-	var lf logfont
-	lf.Height = -12
-	lf.Weight = fwNormal
-	lf.CharSet = 1 // DEFAULT_CHARSET
-	copy(lf.FaceName[:], utf16Slice("Segoe UI Variable Text"))
-	if lf.FaceName[0] == 0 {
-		copy(lf.FaceName[:], utf16Slice("Segoe UI"))
-	}
-	return lf
-}
-
-func utf16Slice(s string) []uint16 {
-	u, _ := syscall.UTF16FromString(s)
-	return u
+	_, _, _ = syscall.SyscallN(p.Addr(), hwnd,
+		uintptr(dwmwaUseImmersiveDarkMode), uintptr(unsafe.Pointer(&useDark)), unsafe.Sizeof(useDark))
+	mica := uint32(dwmsbtMainWindow)
+	_, _, _ = syscall.SyscallN(p.Addr(), hwnd,
+		uintptr(dwmwaSystemBackdropType), uintptr(unsafe.Pointer(&mica)), unsafe.Sizeof(mica))
 }

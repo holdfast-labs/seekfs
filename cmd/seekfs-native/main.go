@@ -15,6 +15,12 @@ var (
 func main() {
 	if err := run(os.Args[1:]); err != nil {
 		fmt.Fprintln(os.Stderr, "seekfs-native:", err)
+		// The GUI subsystem build has no console; mirror fatal errors
+		// where screenshots/debugging can find them.
+		if f, ferr := os.OpenFile(`E:\bench\native-shots\fatal.log`, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600); ferr == nil {
+			fmt.Fprintln(f, "seekfs-native:", err)
+			f.Close()
+		}
 		os.Exit(1)
 	}
 }
