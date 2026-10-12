@@ -530,3 +530,20 @@ func TestIsServiceTimeoutErrorMapping(t *testing.T) {
 		t.Fatal("missing-pipe error must not classify as a service timeout")
 	}
 }
+
+func TestUIResultCarriesContentSnippet(t *testing.T) {
+	got := uiResultFromJSON(jsonResult{Path: `C:\src\main.go`, Snippet: "func needle() {}"})
+	if got.Snippet != "func needle() {}" || got.Name != "main.go" {
+		t.Fatalf("uiResultFromJSON = %+v; want the snippet and name carried", got)
+	}
+}
+
+func TestUIContentStatusFromHealth(t *testing.T) {
+	if uiContentStatusFrom(nil) != nil {
+		t.Fatal("no content health must yield no UI content status")
+	}
+	got := uiContentStatusFrom(&contentHealth{State: contentStateIndexing, BuildDone: 5, BuildTotal: 10, FoldError: "disk full"})
+	if got.State != contentStateIndexing || got.BuildDone != 5 || got.BuildTotal != 10 || got.Error != "disk full" {
+		t.Fatalf("uiContentStatusFrom = %+v", got)
+	}
+}

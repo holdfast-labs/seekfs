@@ -12,6 +12,7 @@
     <main class="shell">
       <section class="searchbar">
         <input id="query" class="search-input" type="search" autocomplete="off" spellcheck="false" autofocus placeholder="Search" />
+        <button id="content-toggle" class="mode-toggle" type="button" aria-pressed="false" title="Search inside files (Ctrl+Shift+F)">Contents</button>
       </section>
 
       <section class="results-wrap">
@@ -38,6 +39,7 @@
       <section class="footer">
         <span id="summary">Ready</span>
         <span id="selected"></span>
+        <span id="content-status" class="content-status"></span>
         <span id="health" class="health" title="">
           <span id="health-dot" class="health-dot health-ok"></span>
           <span id="health-text"></span>
