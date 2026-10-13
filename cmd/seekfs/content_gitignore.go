@@ -54,6 +54,9 @@ type contentIgnoreFile struct {
 // watches its stat for edits the USN stream can never report.
 type contentGitIgnore struct {
 	repos []string // normalized worktree roots, deepest first
+	// repoPrefix parallels repos with separator-terminated forms, so the
+	// per-file worktree lookup is one HasPrefix per repo with no cleaning.
+	repoPrefix []string
 
 	mu          sync.Mutex
 	files       map[string]*contentIgnoreFile // normalized dir -> its .gitignore (nil: none)
@@ -85,7 +88,7 @@ func contentIgnoreFileStat(path string) contentIgnoreStat {
 func newContentGitIgnore(repos []string) *contentGitIgnore {
 	roots := normalizeContentPaths(repos)
 	sort.Slice(roots, func(i, j int) bool { return len(roots[i]) > len(roots[j]) })
-	return &contentGitIgnore{
+	g := &contentGitIgnore{
 		repos:       roots,
 		files:       make(map[string]*contentIgnoreFile),
 		excludes:    make(map[string]*contentIgnoreFile),
@@ -93,6 +96,18 @@ func newContentGitIgnore(repos []string) *contentGitIgnore {
 		globalPaths: make(map[string]string),
 		globalStats: make(map[string]contentIgnoreStat),
 		dirIgnored:  make(map[string]bool),
+	}
+	g.rebuildRepoPrefix()
+	return g
+}
+
+// rebuildRepoPrefix refreshes the separator-terminated repo forms after the
+// root list changes. Callers that mutate repos (construction, addRepo) own
+// the update; readers only need the slices to stay parallel.
+func (g *contentGitIgnore) rebuildRepoPrefix() {
+	g.repoPrefix = g.repoPrefix[:0]
+	for _, root := range g.repos {
+		g.repoPrefix = append(g.repoPrefix, contentScopePrefix(root))
 	}
 }
 
@@ -107,15 +122,23 @@ func (g *contentGitIgnore) addRepo(root string) {
 	}
 	g.repos = append(g.repos, root)
 	sort.Slice(g.repos, func(i, j int) bool { return len(g.repos[i]) > len(g.repos[j]) })
+	g.rebuildRepoPrefix()
 }
 
 // repoFor returns the deepest worktree containing the normalized path p.
+// Repos resolve deepest-first, so the first prefix hit wins.
 func (g *contentGitIgnore) repoFor(p string) (string, bool) {
 	if g == nil {
 		return "", false
 	}
-	for _, root := range g.repos {
-		if contentPathUnder(p, root) {
+	for i, root := range g.repos {
+		sep := ""
+		if i < len(g.repoPrefix) {
+			sep = g.repoPrefix[i]
+		} else {
+			sep = contentScopePrefix(root)
+		}
+		if contentPrefixUnder(p, root, sep) {
 			return root, true
 		}
 	}
@@ -150,6 +173,33 @@ func (g *contentGitIgnore) ignored(original string, isDir bool) bool {
 		return true
 	}
 	return g.matchLocked(root, relOrig, isDir)
+}
+
+// ignoredInRepo answers ignored() for a path already known to sit in repo,
+// skipping the worktree lookup. The caller must have established membership
+// with the same case rules repoFor uses (a normalized-prefix hit); behavior
+// is otherwise identical to ignored().
+func (g *contentGitIgnore) ignoredInRepo(original string, isDir bool, repo string) bool {
+	p := contentNormPath(original)
+	if p == "" || p == repo {
+		return false
+	}
+	relOrig := contentRelCompsOriginal(repo, p, original)
+	relFold := contentRelCompsOriginal(repo, p, p)
+	if relOrig == nil || relFold == nil {
+		return false
+	}
+	for _, c := range relFold {
+		if c == ".git" {
+			return true
+		}
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if len(relOrig) > 1 && g.dirIgnoredLocked(repo, relOrig[:len(relOrig)-1]) {
+		return true
+	}
+	return g.matchLocked(repo, relOrig, isDir)
 }
 
 // invalidate drops cached rules after an ignore file changed, including the

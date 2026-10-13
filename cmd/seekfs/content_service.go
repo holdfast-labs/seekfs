@@ -34,6 +34,11 @@ const (
 	contentStateReady       = "ready"
 	contentStateStale       = "stale"
 	contentStateDegraded    = "degraded"
+	// contentStateReconciling is a health-only state (s.state stays ready):
+	// the attached base is serving while a metadata reconcile brings it
+	// current after a USN journal wrap. Queries keep flowing; the fold that
+	// persists the reconciled delta returns health to ready.
+	contentStateReconciling = "reconciling"
 )
 
 // Windows file attributes the content pipeline cares about.
@@ -121,6 +126,12 @@ type contentHealth struct {
 	BuildDone  int    `json:"build_done,omitempty"`
 	BuildTotal int    `json:"build_total,omitempty"`
 	BuildError string `json:"build_error,omitempty"`
+	// BuildPhase names the build's current phase while indexing: "scanning"
+	// (metadata selection scan), "extracting", or "assembling". Before this,
+	// the minutes-long scan reported "unavailable" with no progress, which
+	// looked broken; the scan now enters indexing immediately with
+	// records-scanned progress.
+	BuildPhase string `json:"build_phase,omitempty"`
 	// FoldError records why the last delta fold failed. The delta is retained
 	// and search stays correct, but a fold that keeps failing accumulates the
 	// delta; surfacing the reason makes that visible instead of silent.
@@ -159,6 +170,13 @@ type contentHealth struct {
 	// fold publishes a base re-extracted at the current versions.
 	ExtractorRefresh   bool `json:"extractor_refresh,omitempty"`
 	StaleExtractorDocs int  `json:"stale_extractor_docs,omitempty"`
+	// ScopeReconcile/ScopeReconcilePending report an in-flight scope
+	// reconcile: the attached base was built under a different selection and
+	// ScopeReconcilePending docs are enqueued (new) or tombstoned (dropped),
+	// waiting for a fold to persist them. Degraded until the fold, like the
+	// extractor refresh above; the delta keeps queries correct meanwhile.
+	ScopeReconcile        bool `json:"scope_reconcile,omitempty"`
+	ScopeReconcilePending int  `json:"scope_reconcile_pending,omitempty"`
 	// IntegrityError records why the attached base failed its post-attach
 	// checksum pass. The base is dropped (stale) and a rebuild scheduled, so
 	// the field names the corruption instead of serving wrong results.
@@ -439,6 +457,25 @@ type contentVolumeState struct {
 	// clears when a fold republishes the base at the current versions.
 	refreshActive  bool
 	refreshPending int
+	// scopeFP is the scope fingerprint the attached base was reconciled to
+	// when it differs from the fingerprint stamped in the sidecar header:
+	// the next fold persists scopeFP instead of the stale header hash. Zero
+	// means the base agrees with its header. scopePending counts reconcile
+	// enqueues not yet folded; scopeActive degrades the volume until a fold
+	// publishes them, exactly like the extractor refresh above.
+	scopeFP      [32]byte
+	scopePending int
+	scopeActive  bool
+	// reconcileActive is true while a USN journal-wrap metadata reconcile is
+	// bringing the attached base current (see contentCatchUpReconcileMetadata).
+	// Unlike a build, the base keeps serving: s.state stays ready while
+	// health shows degraded/"reconciling" with progress, until a fold
+	// persists the reconciled delta. Forces a fold like a pending refresh.
+	reconcileActive bool
+	// scopeDriftCheckedAt is the last steady-state fingerprint drift check
+	// (drain loop); checks are throttled so a big volume does not re-resolve
+	// (repo-marker scan plus ignore digest) every tick.
+	scopeDriftCheckedAt time.Time
 	// walkReconcileGen/At record the last walk reconcile: the filename
 	// generation (replayGen) it diffed and when. The drain reconciles only on
 	// a new generation (or past the throttle interval), so a hot tick does
@@ -447,12 +484,12 @@ type contentVolumeState struct {
 	walkReconcileAt  time.Time
 	// walkUnindexable remembers keys whose last extraction attempt produced
 	// no indexable text (empty or text-free files), qualified by the
-	// fingerprint attempted, so a reconcile does not re-enqueue them every
+	// fingerprint attempted, so reconciles do not re-enqueue them every
 	// pass forever. A fingerprint change drops the memory and retries, so a
 	// file that gains content is still picked up. In-memory only: a restart
-	// re-learns it in one fast-fail round. This is the walk equivalent of
-	// the USN stream never re-reporting a declined file.
-	walkUnindexable map[uint64]contentWalkPrint
+	// re-learns it in one fast-fail round. (Named for the walk reconcile
+	// that introduced it; the scope reconcile and the USN drain share it.)
+	walkUnindexable map[uint64]contentFilePrint
 	// integrityFailures counts consecutive checksum failures of the attached
 	// base. It resets when a base passes the post-attach integrity pass and
 	// caps the rebuilds one failure streak schedules, so a disk that corrupts
@@ -463,21 +500,21 @@ type contentVolumeState struct {
 
 // walkDeclinedNote records that key extracted to nothing at print. A later
 // change re-arms it via the fingerprint mismatch in walkDeclinedSkipped.
-func (s *contentVolumeState) walkDeclinedNote(key uint64, print contentWalkPrint) {
+func (s *contentVolumeState) walkDeclinedNote(key uint64, print contentFilePrint) {
 	if s == nil || key == 0 {
 		return
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.walkUnindexable == nil {
-		s.walkUnindexable = make(map[uint64]contentWalkPrint)
+		s.walkUnindexable = make(map[uint64]contentFilePrint)
 	}
 	s.walkUnindexable[key] = print
 }
 
 // walkDeclinedSkipped reports whether key was already attempted at print
 // without indexable text. A fingerprint change returns false (retry).
-func (s *contentVolumeState) walkDeclinedSkipped(key uint64, print contentWalkPrint) bool {
+func (s *contentVolumeState) walkDeclinedSkipped(key uint64, print contentFilePrint) bool {
 	if s == nil || key == 0 {
 		return false
 	}
@@ -529,12 +566,13 @@ func newContentVolumeState(volume string) *contentVolumeState {
 // contentStateSeverity orders content health states from best to worst so a
 // multi-volume snapshot can report the worst one: ready and off (content
 // disabled for the volume) are benign, then unavailable (enabled but not wired),
-// a build in flight, a degraded volume, and finally stale (needs a rebuild).
+// a build in flight, a degraded or reconciling volume, and finally stale
+// (needs a rebuild).
 func contentStateSeverity(state string) int {
 	switch state {
 	case contentStateStale:
 		return 4
-	case contentStateDegraded:
+	case contentStateDegraded, contentStateReconciling:
 		return 3
 	case contentStateIndexing:
 		return 2
@@ -584,6 +622,11 @@ func mergeContentHealth(dst *contentHealth, src contentHealth) {
 	dst.CountDivergent = dst.CountDivergent || src.CountDivergent
 	dst.ExtractorRefresh = dst.ExtractorRefresh || src.ExtractorRefresh
 	dst.StaleExtractorDocs += src.StaleExtractorDocs
+	dst.ScopeReconcile = dst.ScopeReconcile || src.ScopeReconcile
+	dst.ScopeReconcilePending += src.ScopeReconcilePending
+	if src.State == contentStateIndexing && src.BuildPhase != "" {
+		dst.BuildPhase = src.BuildPhase
+	}
 	for _, v := range src.DegradedVolumes {
 		if !containsVolumeName(dst.DegradedVolumes, v) {
 			dst.DegradedVolumes = append(dst.DegradedVolumes, v)
@@ -664,7 +707,7 @@ func aggregateContentHealth(healths []contentHealth) contentHealth {
 	// volumes contribute.
 	out.BuildDone, out.BuildTotal = 0, 0
 	for i, h := range healths {
-		if h.State == contentStateIndexing {
+		if h.State == contentStateIndexing || h.State == contentStateReconciling {
 			out.BuildDone += h.BuildDone
 			out.BuildTotal += h.BuildTotal
 		}
@@ -683,13 +726,16 @@ func aggregateContentHealth(healths []contentHealth) contentHealth {
 //
 //   - State is the most severe state: ready/off < unavailable < indexing <
 //     degraded < stale (contentStateSeverity).
-//   - Docs, DeltaBytes, Deferred, QueueDepth, Evictions, ExtractionErrors,
-//     Skipped, Truncated, Binary, ScopeDropped, ScopeDroppedBytes, SidecarBytes
-//     and SidecarCap are summed; BudgetBytes takes the largest;
-//     BuildDone/BuildTotal sum only while indexing.
-//   - Partial, Incomplete and CountDivergent are OR-ed.
-//   - ExtractorRefresh is OR-ed and StaleExtractorDocs summed, so a targeted
-//     extractor-version refresh in progress on any volume is visible.
+ //   - Docs, DeltaBytes, Deferred, QueueDepth, Evictions, ExtractionErrors,
+ //     Skipped, Truncated, Binary, ScopeDropped, ScopeDroppedBytes, SidecarBytes
+ //     and SidecarCap are summed; BudgetBytes takes the largest;
+ //     BuildDone/BuildTotal sum while indexing or reconciling; BuildPhase
+ //     comes from an indexing or reconciling volume.
+ //   - Partial, Incomplete and CountDivergent are OR-ed.
+ //   - ExtractorRefresh is OR-ed and StaleExtractorDocs summed, so a targeted
+ //     extractor-version refresh in progress on any volume is visible.
+ //   - ScopeReconcile is OR-ed and ScopeReconcilePending summed, so an
+ //     in-flight scope reconcile is visible.
 //   - DegradedVolumes is the deduped stable union.
 //   - ExtractorVersion takes the highest.
 //   - BuildError and FoldError each join the distinct non-empty reasons with "; ".
@@ -777,6 +823,8 @@ func (s *contentVolumeState) setReady(idx *contentIndex, reader *contentReader, 
 		s.health.State = contentStateDegraded
 	}
 	s.catchUpFailed = false
+	s.health.BuildPhase = ""
+	s.reconcileActive = false
 	s.health.Docs = len(idx.Docs)
 	s.health.SidecarBytes = idx.EncodedSize
 	s.health.SidecarCap = contentGSXMaxBytes
@@ -854,6 +902,7 @@ func (s *contentVolumeState) markIntegrityFailed(expect *contentIndex, reason st
 	s.health.IntegrityError = reason
 	s.state = contentStateStale
 	s.health.State = contentStateStale
+	s.health.BuildPhase = ""
 	s.reader = nil
 	s.resolver = nil
 	s.delta = newContentDelta()
@@ -863,6 +912,7 @@ func (s *contentVolumeState) markIntegrityFailed(expect *contentIndex, reason st
 	s.refreshPending = 0
 	s.health.ExtractorRefresh = false
 	s.health.StaleExtractorDocs = 0
+	s.reconcileActive = false
 	return true
 }
 
@@ -895,6 +945,7 @@ func (s *contentVolumeState) markStale(reason string) {
 	defer s.mu.Unlock()
 	s.state = contentStateStale
 	s.health.State = contentStateStale
+	s.health.BuildPhase = ""
 	s.reader = nil
 	s.resolver = nil
 	s.delta = newContentDelta()
@@ -904,17 +955,27 @@ func (s *contentVolumeState) markStale(reason string) {
 	s.refreshPending = 0
 	s.health.ExtractorRefresh = false
 	s.health.StaleExtractorDocs = 0
+	s.clearScopeReconcileLocked()
 }
 
-// markIndexing is the service-owned background build's visible state. A
-// partially built index is never served: any prior reader/resolver is dropped
-// so a query during the build sees `indexing` (unavailable) rather than a
-// torn or stale base. PF-3/WP1d.
-func (s *contentVolumeState) markIndexing(total int) {
+// Build phases reported while indexing (see BuildPhase).
+const (
+	contentBuildPhaseScanning    = "scanning"
+	contentBuildPhaseExtracting  = "extracting"
+	contentBuildPhaseAssembling  = "assembling"
+	contentBuildPhaseReconciling = "reconciling"
+)
+
+// markScanning enters the indexing state for the metadata selection scan,
+// before any record is read. The scan on a large volume runs minutes; prior
+// to phases it reported "unavailable" with no progress. Like markIndexing it
+// drops any prior reader/resolver so a query never sees a torn base.
+func (s *contentVolumeState) markScanning(total int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.state = contentStateIndexing
 	s.health.State = contentStateIndexing
+	s.health.BuildPhase = contentBuildPhaseScanning
 	s.health.BuildTotal = total
 	s.health.BuildDone = 0
 	s.health.BuildError = ""
@@ -927,6 +988,156 @@ func (s *contentVolumeState) markIndexing(total int) {
 	s.refreshPending = 0
 	s.health.ExtractorRefresh = false
 	s.health.StaleExtractorDocs = 0
+	s.reconcileActive = false
+	s.clearScopeReconcileLocked()
+}
+
+// clearScopeReconcileLocked drops scope-reconcile tracking. Caller holds mu.
+// A rebuild supersedes any pending reconcile; a matching attach converges it.
+func (s *contentVolumeState) clearScopeReconcileLocked() {
+	s.scopeFP = [32]byte{}
+	s.scopePending = 0
+	s.scopeActive = false
+	s.health.ScopeReconcile = false
+	s.health.ScopeReconcilePending = 0
+}
+
+// markScopeReconcile records that fp is the selection the base is being
+// reconciled to, with pending docs enqueued but not yet folded.
+func (s *contentVolumeState) markScopeReconcile(fp [32]byte, pending int) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.scopeFP = fp
+	s.scopePending = pending
+	s.scopeActive = pending > 0
+	s.health.ScopeReconcile = pending > 0
+	s.health.ScopeReconcilePending = pending
+	if pending > 0 && s.state == contentStateReady {
+		s.health.State = contentStateDegraded
+	}
+}
+
+// scopeReconciledFP reports the fingerprint a fold must persist, if any.
+func (s *contentVolumeState) scopeReconciledFP() ([32]byte, bool) {
+	if s == nil {
+		return [32]byte{}, false
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.scopeFP == ([32]byte{}) {
+		return [32]byte{}, false
+	}
+	return s.scopeFP, true
+}
+
+// scopePendingNow reports whether a scope reconcile is still unfolding.
+func (s *contentVolumeState) scopePendingNow() bool {
+	if s == nil {
+		return false
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.scopePending > 0
+}
+
+// markReconciling parks the volume in the serving-but-reconciling state for
+// a journal-wrap metadata reconcile: health degrades with the reconciling
+// phase and scan progress while s.state stays ready and queries keep
+// flowing. Cleared by a successful fold (or any base replacement).
+func (s *contentVolumeState) markReconciling(total int) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.reconcileActive = true
+	s.health.State = contentStateReconciling
+	s.health.BuildPhase = contentBuildPhaseReconciling
+	s.health.BuildTotal = total
+	s.health.BuildDone = 0
+}
+
+// setReconcileProgress publishes metadata-reconcile scan progress. Like
+// setBuildProgress it only applies while the reconcile is active, so a late
+// tick cannot resurrect a finished pass.
+func (s *contentVolumeState) setReconcileProgress(done, total int) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.reconcileActive {
+		return
+	}
+	s.health.BuildDone = done
+	s.health.BuildTotal = total
+}
+
+// reconcileActiveNow reports whether a wrap reconcile is unfolding (and
+// should force a fold once the drain empties the queue).
+func (s *contentVolumeState) reconcileActiveNow() bool {
+	if s == nil {
+		return false
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.reconcileActive
+}
+
+// clearReconcileActive ends the reconciling display (fold published or base
+// replaced). The next markDrained returns health to ready.
+func (s *contentVolumeState) clearReconcileActive() {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.reconcileActive = false
+	if s.health.State == contentStateReconciling {
+		s.health.State = contentStateDegraded
+	}
+}
+
+// markIndexing is the service-owned background build's visible state. A
+// partially built index is never served: any prior reader/resolver is dropped
+// so a query during the build sees `indexing` (unavailable) rather than a
+// torn or stale base. PF-3/WP1d.
+func (s *contentVolumeState) markIndexing(total int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.state = contentStateIndexing
+	s.health.State = contentStateIndexing
+	s.health.BuildPhase = contentBuildPhaseExtracting
+	s.health.BuildTotal = total
+	s.health.BuildDone = 0
+	s.health.BuildError = ""
+	s.health.Incomplete = false
+	s.reader = nil
+	s.resolver = nil
+	s.catchUpPending = false
+	s.catchUpFailed = false
+	s.refreshActive = false
+	s.refreshPending = 0
+	s.health.ExtractorRefresh = false
+	s.health.StaleExtractorDocs = 0
+	s.clearScopeReconcileLocked()
+}
+
+// setBuildPhase moves an in-flight build between phases; ignored once the
+// volume has left indexing, like setBuildProgress.
+func (s *contentVolumeState) setBuildPhase(phase string) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.state != contentStateIndexing {
+		return
+	}
+	s.health.BuildPhase = phase
 }
 
 // setBuildProgress publishes extraction progress for an in-flight build so
@@ -959,12 +1170,15 @@ func (s *contentVolumeState) markBuildFailed(reason string) {
 	s.resolver = nil
 	s.state = contentStateDegraded
 	s.health.State = contentStateDegraded
+	s.health.BuildPhase = ""
 	s.health.Incomplete = true
 	s.health.BuildError = reason
 	s.refreshActive = false
 	s.refreshPending = 0
 	s.health.ExtractorRefresh = false
 	s.health.StaleExtractorDocs = 0
+	s.reconcileActive = false
+	s.clearScopeReconcileLocked()
 }
 
 // markSidecarCapped surfaces an index whose encoded size exceeds
@@ -988,6 +1202,7 @@ func (s *contentVolumeState) markSidecarCapped(size, cap int64) {
 		s.reader = nil
 		s.resolver = nil
 		s.state = contentStateDegraded
+		s.health.BuildPhase = ""
 	}
 }
 
@@ -1044,7 +1259,9 @@ func (s *contentVolumeState) markBuildCanceled(reason string) {
 	}
 	s.state = contentStateUnavailable
 	s.health.State = contentStateUnavailable
+	s.health.BuildPhase = ""
 	s.health.BuildError = reason
+	s.reconcileActive = false
 }
 
 func (s *contentVolumeState) stateOf() string {
@@ -1146,6 +1363,16 @@ func (s *contentVolumeState) markDrained() {
 			// A targeted extractor-version refresh is still unfolding: the old
 			// (but valid) text is served, and health stays degraded until a fold
 			// publishes the refreshed base.
+			s.health.State = contentStateDegraded
+		case s.reconcileActive:
+			// A journal-wrap metadata reconcile is unfolding: the base is
+			// served while the delta catches it up; the fold returns
+			// health to ready.
+			s.health.State = contentStateReconciling
+		case s.scopePending > 0:
+			// A scope reconcile is still unfolding: newly selected files
+			// are being extracted and dropped docs await their fold. The
+			// delta keeps queries correct meanwhile.
 			s.health.State = contentStateDegraded
 		case s.health.Incomplete:
 			s.state = contentStateDegraded
@@ -1599,6 +1826,22 @@ func (c *contentCoordinator) commitFold(snapshot []contentDeltaDoc) {
 	c.state.deltaView().removeUnchanged(snapshot)
 }
 
+// noteReconciledCheckpoint advances the foldable watermark to usn after a
+// metadata reconcile covered the live index as of that point (journal-wrap
+// recovery). It only ever moves forward: the reconcile proved every change
+// below usn is represented in the base or the delta, so a fold may durably
+// claim it exactly like a fully replayed catch-up range.
+func (c *contentCoordinator) noteReconciledCheckpoint(usn uint64) {
+	if c == nil || usn == 0 {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if usn > c.observedUSN {
+		c.observedUSN = usn
+	}
+}
+
 // foldDue reports whether the live delta has grown past either bound and is not
 // in a retry backoff. A pending targeted extractor refresh also forces a fold
 // once the drain has emptied the queue: the refreshed docs must be persisted so
@@ -1614,6 +1857,12 @@ func (c *contentCoordinator) foldDue(maxDocs int, maxBytes int64, refreshPending
 		return false
 	}
 	if refreshPending && len(c.dirty) == 0 && len(c.queue) == 0 {
+		return true
+	}
+	// A wrap reconcile, like a refresh, must persist even when small: it is
+	// the pass that clears the reconciling display and advances the
+	// checkpoint past the wrapped range.
+	if c.state.reconcileActiveNow() && len(c.dirty) == 0 && len(c.queue) == 0 {
 		return true
 	}
 	delta := c.state.deltaView()

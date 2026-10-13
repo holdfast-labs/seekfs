@@ -455,6 +455,45 @@ func (s *goSearchService) snapshotContentBuildItems(vol *serviceVolumeIndex, opt
 		return nil, 0, 0, contentBuildSnapshotUnavailable
 	}
 
+	// Without a resolved scope (tests and offline callers) the legacy flat
+	// loop applies the Exts/Under gates directly; production builds always
+	// carry a scope and take the memoized parallel scan below.
+	if opts.Scope == nil {
+		return s.snapshotContentBuildItemsLegacy(vol, opts, idx, isWalk, journalID, checkpoint, gen, count)
+	}
+	cfg := contentScopeScanConfig{
+		scope:  opts.Scope,
+		idx:    idx,
+		isWalk: isWalk,
+		maxFiles: opts.MaxFiles,
+		prog: func(scanned, total int) {
+			vol.content.setBuildProgress(scanned, total)
+		},
+		stopped: func() bool { return s.contentStopped(vol) },
+		genChanged: func() bool {
+			return vol.index != idx || vol.replayGen.Load() != gen || vol.journalID != journalID
+		},
+	}
+	lists, ok := scanScopeMembers(s, vol, cfg)
+	if !ok {
+		// Stopped scans and generation changes share the legacy outcomes:
+		// a stop leaves the state as-is, a move reschedules.
+		if s.contentStopped(vol) {
+			return nil, 0, 0, contentBuildSnapshotUnavailable
+		}
+		return nil, 0, 0, contentBuildSnapshotChanged
+	}
+	items, limited := mergeScanMembers(lists, opts.MaxFiles)
+	if limited {
+		return items, journalID, checkpoint, contentBuildSnapshotLimited
+	}
+	return items, journalID, checkpoint, contentBuildSnapshotOK
+}
+
+// snapshotContentBuildItemsLegacy is the pre-parallel scan: one flat pass
+// with a shared path cache, kept for scopeless callers (tests). Production
+// builds resolve a scope first and use scanScopeMembers.
+func (s *goSearchService) snapshotContentBuildItemsLegacy(vol *serviceVolumeIndex, opts contentBuildOptions, idx *Index, isWalk bool, journalID uint64, checkpoint int64, gen uint64, count int) (items []contentBuildItem, _ uint64, _ int64, result contentBuildSnapshotResult) {
 	top := make(contentBuildItemHeap, 0, 1024)
 	limited := false
 	cache := make(map[int]string, 1024)
@@ -496,9 +535,6 @@ func (s *goSearchService) snapshotContentBuildItems(vol *serviceVolumeIndex, opt
 				}
 			}
 			item := contentBuildItem{frn: frn, path: path}
-			if opts.Scope != nil {
-				item.priority = opts.Scope.priority(path)
-			}
 			if opts.MaxFiles <= 0 || len(top) < opts.MaxFiles {
 				top = append(top, item)
 				continue
@@ -665,12 +701,28 @@ func (s *goSearchService) runContentBuild(vol *serviceVolumeIndex, reuseSidecar 
 	}
 	opts.Scope = &resolved
 
+	// Enter indexing for the metadata scan itself: on a large volume the
+	// scan runs minutes, and reporting "unavailable" with no progress looks
+	// broken. The scan publishes records-scanned progress as it goes.
+	s.indexMu.RLock()
+	scanTotal := 0
+	if vol.index != nil {
+		scanTotal = vol.index.compactRecordCount()
+	}
+	s.indexMu.RUnlock()
+	vol.content.markScanning(scanTotal)
+
 	items, journalID, checkpoint, snapshotResult := s.snapshotContentBuildItems(vol, opts)
 	contentBuildSnapshotHook(s, vol)
 	switch snapshotResult {
 	case contentBuildSnapshotUnavailable:
 		// Nothing to anchor a sidecar to (not USN, no watermark, or not
 		// ready). Leave the state as-is; the post-rebuild hook reschedules.
+		// The scan already entered indexing above: a stop returns it to
+		// unavailable rather than stranding it mid-scan.
+		if s.contentStopped(vol) {
+			vol.content.markBuildCanceled("service stopping")
+		}
 		return
 	case contentBuildSnapshotChanged:
 		// The base generation moved while the metadata was copied; reschedule
@@ -955,6 +1007,7 @@ func (s *goSearchService) runContentBuild(vol *serviceVolumeIndex, reuseSidecar 
 	// save assembles and writes the sidecar: one file for a corpus within a
 	// shard, otherwise folder shards plus a manifest. Shards are assembled one
 	// at a time, so peak memory is bounded by the largest shard.
+	vol.content.setBuildPhase(contentBuildPhaseAssembling)
 	save := func() error {
 		if used <= contentShardTargetBytes {
 			all := make([]int, len(selected))

@@ -326,7 +326,12 @@ function contentStatusText(content) {
   if (!content || !content.state) return "";
   if (content.state === "indexing") {
     const pct = content.build_total ? Math.floor((100 * (content.build_done || 0)) / content.build_total) : 0;
+    if (content.build_phase) return `Indexing contents (${content.build_phase}) ${pct}%`;
     return `Indexing contents ${pct}%`;
+  }
+  if (content.state === "reconciling") {
+    const pct = content.build_total ? Math.floor((100 * (content.build_done || 0)) / content.build_total) : 0;
+    return `Reconciling contents ${pct}%`;
   }
   if (content.error) return `Contents: ${content.error}`;
   if (content.scope_dropped) {

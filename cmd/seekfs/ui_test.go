@@ -554,8 +554,8 @@ func TestUIContentStatusFromHealth(t *testing.T) {
 	if uiContentStatusFrom(nil) != nil {
 		t.Fatal("no content health must yield no UI content status")
 	}
-	got := uiContentStatusFrom(&contentHealth{State: contentStateIndexing, BuildDone: 5, BuildTotal: 10, FoldError: "disk full"})
-	if got.State != contentStateIndexing || got.BuildDone != 5 || got.BuildTotal != 10 || got.Error != "disk full" {
+	got := uiContentStatusFrom(&contentHealth{State: contentStateIndexing, BuildDone: 5, BuildTotal: 10, FoldError: "disk full", BuildPhase: contentBuildPhaseScanning})
+	if got.State != contentStateIndexing || got.BuildDone != 5 || got.BuildTotal != 10 || got.Error != "disk full" || got.BuildPhase != contentBuildPhaseScanning {
 		t.Fatalf("uiContentStatusFrom = %+v", got)
 	}
 	dropped := uiContentStatusFrom(&contentHealth{State: contentStateDegraded, ScopeDropped: 12345, ScopeDroppedBytes: 6789, BudgetBytes: 2 << 30})
