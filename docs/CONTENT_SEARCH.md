@@ -1295,6 +1295,160 @@ stays stale, pre-v6 rebuilds, mid-loop wrap), `content_scope_scan_test.go`
 (flat + drive-root differentials, unfilled-cap regression), and the updated
 `below-lowest-valid` attach branch (ready + usable, journal never re-read).
 
+## 6s. Content query profile (done)
+
+Branch `perf/content-query`. A repeatable latency profile over the fixed
+query set users hit, then read-path-only optimizations against what it
+found. Size is byte-identical throughout (no encoding change); recall,
+result sets, order, snippets and counts are proven identical by golden
+fingerprints plus lane/serial/parallel/cold parities (see Correctness).
+
+**Corpus.** The shared read-only fixtures: `E:\bench\fixtures\v8-sample.gsx`
+(76,465 docs, 189.9 MB, v8, single-file) over `E:\bench\chromium.gsi`
+(555,849 records, walk source). The build scope excludes `third_party`
+(0 of 76,465 docs live there — under-shapes use `base`/4 instead), and
+the sidecar keys docs by the `.gsi`'s positional FRNs rather than path
+hashes, so the harness joins on FRN equality (in-memory origin
+reinterpretation only; the file is untouched) and logs the join health
+(76465/76465). If the fixture is rebuilt walk-keyed, the same harness
+takes the walk join with no code change.
+
+**Harness.** `cmd/seekfs/zz_content_queryprofile_local_test.go` is LOCAL
+ONLY (never committed): service volumes over the real `.gsi`+`.gsx`,
+fixed shapes (rare/common literals, quoted phrase, `ext:`/`under:`
+compounds with the lane on and off, limit 20 vs the service default page
+100 — a service `limit=0` normalizes to 100, so true unlimited is the
+offline reader's limit 0 plus exact counts — regex full scan, typo/fuzzy
+through the production underfill sequence, 1–2 char terms,
+`sort:relevance`), min-of-N (N=7, GOMAXPROCS=2, `go test -p 1`), warm
+(hot block cache) and cold (fresh reader = empty block cache; the OS
+page cache stays warm, so cold isolates block-cache + decompress cost),
+per-shape block-cache touches (new lifetime counters on
+contentBlockCache: hits/misses/decoded bytes), a per-stage breakdown
+(parse, full-budget candidate gen, decompress/fold/match over hits,
+snippet attach, rank), CPU + alloc profiles for the slowest shapes, and
+result fingerprints (ordered paths, per-path snippets, counts,
+planner/source/completeness/fuzzy flags) with golden compare
+(`SEEKFS_PROFILE_GOLDEN`). Timings are min-of-N on a shared box: always
+re-measure the baseline in the same session as a change.
+
+**Latency table** (min-of-7, GOMAXPROCS=2; before = §6o code at 128 MB
+cache cap, after = this branch at the default cap, which the §6s cache
+work moved to ~254 MB on a 16 GiB box; counts are single-shot exact
+totals):
+
+| query | before warm | after warm | before cold | after cold |
+|---|---|---|---|---|
+| `content:cityhash_v103` (10) | 2.5 ms | 2.1 ms | 2.7 ms | 2.7 ms |
+| `content:struct` (20-page) | 8–12 ms | 7.1 ms | 12.6 ms | 10.0 ms |
+| `content:struct` count (15,116) | 7.1 s | 2.3 s | — | — |
+| `content:EINVAL` (20-page) | 297–371 ms | 141 ms | 477–656 ms | 248 ms |
+| `content:EINVAL` count (422) | 5.6 s | 2.0 s | — | — |
+| `content:"reassemble"` (5) | 73–113 ms | 68 ms | 156–204 ms | 110 ms |
+| `ext:cc content:mutex` (20-page) | 110–153 ms | 115 ms | 303–401 ms | 338 ms |
+| `ext:cc content:mutex` (48, page 100) | 167–278 ms | 165 ms | 442–625 ms | 398 ms |
+| `ext:cc content:mutex` under `base` | — | 13 ms | — | 84 ms |
+| `content:mutex` under `base` (51) | — | 13–25 ms | — | 82 ms |
+| `content:/mutex_\w+/` (14) | 21–32 s | 0.40 s | 22.5–32 s | 0.59 s |
+| typo `mutxe`→`mute` (20) | 1017 ms | 185 ms | — | — |
+| typo `recieve` (19 literal) | 161 ms | 126 ms | — | — |
+| typo `strucure`→`structure` (20) | 1861 ms | 227 ms | — | — |
+| `content:a` / `content:en` (20-page) | 1.5–3 ms | 1–3.5 ms | 2–11 ms | 2–4 ms |
+| `content:mutex sort:relevance` | 684–761 ms | 119 ms | 711–1066 ms | 389 ms |
+| GOMAXPROCS=8 labeled: einval-20 335→126 ms, compound-100 191→49 ms, relevance 806→197 ms | | | | |
+
+(Before/after per change were also measured head-to-head in-session;
+see the commit messages. The compound lane engages only for small
+filename sides — `ext:cc` (26,622 docs) stays on the per-volume path
+while `under:agents` (490 docs) runs the lane at ~11–70 ms with
+identical results to the slow path.)
+
+**Stage breakdown** (representative, ms/op on the hot cache): parse ~0;
+full-budget candidate gen 1–6 (trigram lookup + intersection + record
+mapping; 0 for the regex, which had no candidates before); decompress
+over hits ~0.1; fold+match over hits 0.1–5.3; snippet attach ≤0.6
+(20 results); rank ≤0.5 (20 results; the window rank runs pre-trim and
+costs more — see relevance). End-to-end is dominated by verification:
+block touches × decode + folds, e.g. relevance 454 hits + 1320 misses
+(135 MB decoded) per op at 128 MB, 1774/0 at 256 MB.
+
+**What changed (all read-path; size byte-identical):**
+
+- **Allocation-free ASCII verification** (`content_verify.go`,
+  `content_read.go`): `asciiCaseIndex` decides ASCII needle-in-ASCII-text
+  with no allocation at identical offsets; anything else takes the
+  historical fold path. Match, snippet and offline verify share it.
+  Differentials over ASCII/non-ASCII corpora (incl. fold-expanding U+0130,
+  which correctly stays on the fold path — it caught a real offset bug
+  before it shipped). struct-20 13.7→7.1, compound-20 125.7→77.9,
+  relevance 820→521 ms.
+- **Trigram prefilter for regex leaves** (`content_verify.go`,
+  `search_compact.go`): pure-regex queries intersect the required
+  literals' posting streams (`regexRequiredLiteralAlternatives`, also
+  inside OR alternatives) instead of full-scanning; leaves without
+  provable literals still scan, mixed term+regex keeps term-driven
+  behavior, and prefiltered candidates keep scan order
+  (`sortCandidateIDsByScanOrder`) so results are byte-identical on
+  volumes where rank and scan orders differ (the fixture does).
+  Regex-20 19.5 s→387 ms warm (50×), 21.5 s→403 ms cold. pprof showed
+  ~85% of the scan in Go's backtracking engine (only ~6% in zstd), so
+  fewer documents (not faster matching) is the lever.
+- **Walk scan/count recall fix** (`search_compact.go`): the path-free
+  scan entry and the entry-free count never resolve walk content (keyed
+  on the entry path), so broad/capped content queries and all counts on
+  walk volumes returned 0. Walk-attached volumes keep full entries;
+  USN unchanged. Found by the profile (0-result under-shapes) and
+  proven by a negative control (0/0 without, 20/4200 with).
+- **Parallel scan/verify/count** (`candidate_scans.go`,
+  `search_compact.go`): ordered-merge parallel for the bounded scan
+  early-stop and the candidate verify (exact order + limit, bounded
+  over-verify), sharded tallies for counts; serial preserved for small
+  sets and for 2-worker early-stop pages. GOMAXPROCS=2: einval-20
+  356→172, relevance 650→405, counts 1.3–2×; GOMAXPROCS=8:
+  einval-20 335→126, compound-100 191→49, relevance 806→197.
+- **Cache policy + RAM probe fix** (`content_textblock.go`,
+  `pngc_augment.go`): `totalRamBytes` built a 72-byte MEMORYSTATUSEX
+  (the real struct is 64), so the probe always failed and every default
+  cap was the 64 MB fallback; pinned with a sizeof assertion. The
+  TotalRAM/64 ceiling is raised 128→256 MiB: a relevance window touches
+  ~135 MB, which thrashed perpetually at 128 (75% misses) and fits at
+  256 (1774/0, relevance 405→125 ms warm). Small machines keep
+  TotalRAM/64 down to the 32 MiB floor.
+- **Block-cache lifetime counters** for the touches×µs attribution.
+
+**Tried and rejected:** s2/LZ4-class codecs stay rejected (decode
+tradeoff for ratio, §6n); verifying in docID/block order for early-stop
+pages (breaks minimal-verify — rank order must drive); parallelizing the
+2-worker early-stop candidate verify (sync overhead cancels it; serial
+preserved); lowering the relevance window (changes ranking/recall);
+capping fuzzy trials (changes results); a bigger default cache than 256
+(small-machine memory); per-doc ASCII pre-transform of the corpus
+(format change — not this branch).
+
+**Remaining hotspots:** cold compound pages (~340 ms, compulsory
+dict-decodes ~170 ms + folds on a loaded 2-worker box; ~50–70 ms warm at
+8 workers); 0-result compound queries pay ~1.2 s of underfill fuzzy
+trials (each trial is a full re-search — inherits the wins above);
+cold relevance (~390 ms, same physics); short-term pages are complete
+only to the window by design (conservative incomplete flag).
+
+**Format-level suggestions (for the format/size owner; not implemented
+here):** per-block query-frequency stats to drive a hotter ordering
+(rank-ordered verify fights LRU by construction); content-aware block
+cuts (doc-boundary cuts already exist — co-locating same-extension docs
+would tighten compound working sets); skipping decompression is
+unsound from postings alone (trigram presence ≠ substring), so cold
+verify is bounded below by compulsory decodes — the lever is decode
+parallelism (shipped) and codec choice (rejected on ratio).
+
+**Correctness:** `go vet ./...` clean; full `go test -p 1 ./...` passes
+except `TestHeadlessFrameCost` (`cmd/seekfs-native`, a wall-clock GPU
+assertion failing under shared-box load in a package that does not
+import the changed code). Golden fingerprints identical for the whole
+query set before/after (only the regex source label changed
+scan→candidates, by design); lane on/off, serial/parallel,
+GOMAXPROCS 1/2/4/8, warm/cold and count==search parities all green.
+
 ## 7. Carried debt / known gaps
 
 - **Snippet case is preserved; no fixup-aware path remains.** The `.gsx` text
