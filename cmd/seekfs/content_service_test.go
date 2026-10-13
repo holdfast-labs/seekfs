@@ -106,6 +106,11 @@ func TestContentHealthSummary(t *testing.T) {
 	if dropped != want {
 		t.Fatalf("dropped summary = %q; want %q", dropped, want)
 	}
+	reserved := contentHealthSummary(&contentHealth{State: contentStateDegraded, Docs: 7, ScopeDropped: 12, ScopeDroppedBytes: 34, ReserveBytes: 20 << 30})
+	wantReserve := "state=degraded docs=7 scope_dropped_files=12 scope_dropped_bytes=34 reserve=20 GiB (free disk space below the reserve; free up space or set [features.content] budget_bytes)"
+	if reserved != wantReserve {
+		t.Fatalf("reserve summary = %q; want %q", reserved, wantReserve)
+	}
 }
 
 func TestContentCoordinatorDirtyPromote(t *testing.T) {

@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"time"
+	"unsafe"
 
 	"golang.org/x/sys/windows"
 )
@@ -469,6 +470,67 @@ func freeDiskBytes(path string) (uint64, error) {
 		return 0, err
 	}
 	return free, nil
+}
+
+// totalRamBytes reports total physical memory via kernel32's
+// GlobalMemoryStatusEx (x/sys has no wrapper for it in this version). Only
+// TotalPhys is read; an error means unknown.
+func totalRamBytes() (uint64, error) {
+	type memoryStatusEx struct {
+		length               uint32
+		_                    uint32
+		memoryLoad           uint32
+		_                    uint32
+		totalPhys            uint64
+		availPhys            uint64
+		totalPageFile        uint64
+		availPageFile        uint64
+		totalVirtual         uint64
+		availVirtual         uint64
+		availExtendedVirtual uint64
+	}
+	proc := windows.NewLazySystemDLL("kernel32.dll").NewProc("GlobalMemoryStatusEx")
+	var st memoryStatusEx
+	st.length = uint32(unsafe.Sizeof(st))
+	r1, _, _ := proc.Call(uintptr(unsafe.Pointer(&st)))
+	if r1 == 0 {
+		return 0, errors.New("GlobalMemoryStatusEx failed")
+	}
+	if st.totalPhys == 0 {
+		return 0, errors.New("no physical memory reported")
+	}
+	return st.totalPhys, nil
+}
+
+// totalDiskBytes reports the total capacity bytes of the volume holding path,
+// resolving through non-existent parents to the enclosing volume like
+// freeDiskBytes.
+func totalDiskBytes(path string) (uint64, error) {
+	path, err := filepath.Abs(path)
+	if err != nil {
+		return 0, err
+	}
+	for {
+		if _, err := os.Stat(path); err == nil {
+			break
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return 0, err
+		}
+		parent := filepath.Dir(path)
+		if parent == path {
+			break
+		}
+		path = parent
+	}
+	p, err := windows.UTF16PtrFromString(path)
+	if err != nil {
+		return 0, err
+	}
+	var total uint64
+	if err := windows.GetDiskFreeSpaceEx(p, nil, &total, nil); err != nil {
+		return 0, err
+	}
+	return total, nil
 }
 
 func closeMappedIndex(idx *Index) {

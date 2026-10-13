@@ -116,6 +116,37 @@ func TestContentSnippetWindowPreservesCase(t *testing.T) {
 	}
 }
 
+// The single-pass span mapper must agree with two separate offset maps on
+// every boundary, including fold-changers (İ/ß/É shift byte offsets),
+// negative and over-long inputs.
+func TestContentFoldSpanToRawMatchesSingles(t *testing.T) {
+	raws := [][]byte{
+		[]byte("plain ascii needle here"),
+		[]byte("STRASSE straße KELVIN k İi"),
+		[]byte("café NAÏVE résumé \u0130 \u00df"),
+		[]byte(""),
+		[]byte("x"),
+	}
+	for _, raw := range raws {
+		folded := contentFoldText(raw)
+		offs := []int{-5, -1, 0, 1, 2, 3, 5, 8, len(folded) - 1, len(folded), len(folded) + 1, len(folded) + 9}
+		for _, off := range offs {
+			for _, end := range offs {
+				if end < off {
+					continue
+				}
+				wantOff := contentFoldOffsetToRaw(raw, folded, off)
+				wantEnd := contentFoldOffsetToRaw(raw, folded, end)
+				gotOff, gotEnd := contentFoldSpanToRaw(raw, folded, off, end)
+				if gotOff != wantOff || gotEnd != wantEnd {
+					t.Fatalf("raw=%q off=%d end=%d: span=(%d,%d) singles=(%d,%d)",
+						raw, off, end, gotOff, gotEnd, wantOff, wantEnd)
+				}
+			}
+		}
+	}
+}
+
 // Relevance ranks a term and a phrase match with bounded windows.
 func TestContentServiceSnippetPhraseVsTerm(t *testing.T) {
 	vol := newContentQueryVolume(t, []contentFixtureFile{

@@ -104,7 +104,11 @@ func cmdContentIndex(args []string) error {
 			return nil
 		}
 		fmt.Fprintf(os.Stdout, "content scope estimate for %s (mode=%s):\n", rec.Volume, scope.Mode)
-		fmt.Fprintf(os.Stdout, "  files=%d bytes=%d projected_gsx=%d max_files_hit=%v budget_hit=%v budget=%d eligible_files=%d eligible_bytes=%d\n", est.Files, est.Bytes, est.ProjectedGSXBytes, est.MaxFilesHit, est.BudgetHit, est.BudgetBytes, est.EligibleFiles, est.EligibleBytes)
+		budget := fmt.Sprintf("%d", est.BudgetBytes)
+		if !scope.BudgetExplicit {
+			budget = "unlimited (reserve-governed)"
+		}
+		fmt.Fprintf(os.Stdout, "  files=%d bytes=%d projected_gsx=%d max_files_hit=%v budget_hit=%v budget=%s eligible_files=%d eligible_bytes=%d\n", est.Files, est.Bytes, est.ProjectedGSXBytes, est.MaxFilesHit, est.BudgetHit, budget, est.EligibleFiles, est.EligibleBytes)
 		fmt.Fprintf(os.Stdout, "  text_candidates=%d binary_candidates=%d", est.TextCandidates, est.BinaryCandidates)
 		for reason, n := range est.Excluded {
 			fmt.Fprintf(os.Stdout, " excluded_%s=%d", reason, n)
@@ -177,7 +181,13 @@ func cmdContentIndex(args []string) error {
 	}
 	fmt.Fprintf(os.Stdout, "indexed %d documents into %s\n", len(idx.Docs), outPath)
 	if p := idx.Policy; p != (contentBuildPolicy{}) {
-		fmt.Fprintf(os.Stdout, "policy: max_raw=%d max_text=%d skipped=%d truncated=%d scope_dropped=%d scope_dropped_bytes=%d budget=%d\n", p.MaxRaw, p.MaxText, p.Skipped, p.Truncated, p.ScopeDropped, p.ScopeDroppedBytes, p.BudgetBytes)
+		limit := fmt.Sprintf("budget=%d", p.BudgetBytes)
+		if p.ReserveBytes > 0 {
+			limit = fmt.Sprintf("reserve=%d", p.ReserveBytes)
+		} else if p.BudgetBytes == 0 {
+			limit = "budget=unlimited"
+		}
+		fmt.Fprintf(os.Stdout, "policy: max_raw=%d max_text=%d skipped=%d truncated=%d scope_dropped=%d scope_dropped_bytes=%d %s\n", p.MaxRaw, p.MaxText, p.Skipped, p.Truncated, p.ScopeDropped, p.ScopeDroppedBytes, limit)
 	}
 	if idx.Scanned > 0 || idx.Declined > 0 {
 		// Reconcile: indexed == eligible - declined - skipped (truncated files

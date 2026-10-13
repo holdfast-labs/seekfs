@@ -27,6 +27,92 @@ var contentDiskReserveBytes uint64 = 10 << 30
 // so tests can simulate a filling disk.
 var contentFreeBytesFn = contentFreeDiskBytes
 
+// contentTotalBytesFn reports the capacity bytes of the volume holding a
+// path; a var so tests can simulate disks of any size. Off Windows it
+// errors, and the reserve falls back to contentDiskReserveBytes.
+var contentTotalBytesFn = contentTotalDiskBytes
+
+// contentScopeReserveFraction and contentScopeReserveMinBytes define the
+// free-space reserve the default (non-explicit) scope budget protects on the
+// volume holding the sidecar: the larger of 10% of the volume's capacity or
+// 20 GiB. Sharding bounds build/fold memory per 64 MiB shard, so disk space
+// is the binding constraint; the reserve keeps a content build from filling
+// the volume.
+const contentScopeReserveFraction = 0.1
+
+const contentScopeReserveMinBytes = 20 << 30
+
+// contentScopeEncodedMultiplier projects encoded sidecar bytes from extracted
+// text bytes. Calibrated against the v7 encoding (measured ~0.34 of
+// extracted text including tables on the 553 MB Chromium sample); 0.5 keeps
+// headroom for denser corpora. The encode-time size-cap check stays the
+// backstop: the projection only decides when selection stops.
+const contentScopeEncodedMultiplier = 0.5
+
+// contentScopeReserveFor returns the reserve the default scope budget
+// protects on the volume holding anchorPath. Unknown capacity falls back to
+// contentDiskReserveBytes (0 in tests, which disables the reserve there).
+func contentScopeReserveFor(anchorPath string) uint64 {
+	total, err := contentTotalBytesFn(anchorPath)
+	if err != nil || total == 0 {
+		return contentDiskReserveBytes
+	}
+	reserve := uint64(float64(total) * contentScopeReserveFraction)
+	if reserve < contentScopeReserveMinBytes {
+		reserve = contentScopeReserveMinBytes
+	}
+	return reserve
+}
+
+// contentScopeAllowance returns the extracted-text bytes selectable before
+// the projected index would breach the reserve on anchorPath's volume:
+// (free - reserve) / multiplier. Math.MaxInt64 means unlimited: unknown disk
+// figures, or a volume already below its reserve (fail-open; see
+// contentScopeFitsReserve). Callers recompute it as selection proceeds (free
+// space moves as the spool grows) and keep extracting past it to tally exact
+// dropped counts.
+func contentScopeAllowance(anchorPath string) int64 {
+	free, err := contentFreeBytesFn(anchorPath)
+	if err != nil {
+		return int64(^uint64(0) >> 1)
+	}
+	reserve := contentScopeReserveFor(anchorPath)
+	if free <= reserve {
+		return int64(^uint64(0) >> 1)
+	}
+	allowance := float64(free-reserve) / contentScopeEncodedMultiplier
+	if allowance >= float64(int64(^uint64(0)>>1)) {
+		return int64(^uint64(0) >> 1)
+	}
+	return int64(allowance)
+}
+
+// contentScopeFitsReserve reports whether selecting extracted bytes (total,
+// including the candidate) still projects an index that leaves the reserve
+// free on the volume holding anchorPath. Unknown disk figures never stop the
+// build (fail-open): the write-time reserve guard is the backstop. When the
+// volume is already below its reserve the check passes: the index is not
+// what pushes the volume below, and refusing everything would disable
+// content on full disks instead of bounding it.
+func contentScopeFitsReserve(anchorPath string, extracted int64) bool {
+	if extracted < 0 {
+		return true
+	}
+	free, err := contentFreeBytesFn(anchorPath)
+	if err != nil {
+		return true
+	}
+	reserve := contentScopeReserveFor(anchorPath)
+	if free <= reserve {
+		return true
+	}
+	projected := uint64(float64(extracted) * contentScopeEncodedMultiplier)
+	if projected >= free {
+		return false
+	}
+	return free-projected >= reserve
+}
+
 // contentDiskCheckEvery is how many bytes a build writes between free-space
 // checks.
 const contentDiskCheckEvery = 256 << 20

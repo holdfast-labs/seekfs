@@ -743,8 +743,21 @@ func (s *goSearchService) runContentBuild(vol *serviceVolumeIndex, reuseSidecar 
 	done := 0
 	var used, skipped, truncated, binary int64
 	var sinceDiskCheck int64
-	// overBudget latches once the scope byte budget bites; see the tally below.
+	// overBudget latches once the scope budget bites; see the tally below.
 	overBudget := false
+	// allowance is the extracted-text budget enforced below: the explicit
+	// budget_bytes when configured, else the reserve-derived allowance for
+	// the sidecar's volume, refreshed as the spool grows (free space moves
+	// under it). MaxInt64 means unlimited (unknown disk or already below
+	// the reserve; the write-time guard stays the backstop).
+	allowance := int64(^uint64(0) >> 1)
+	var sinceAllowanceCheck int64
+	explicitBudget := opts.Scope != nil && opts.Scope.BudgetExplicit
+	if explicitBudget {
+		allowance = opts.Scope.BudgetBytes
+	} else {
+		allowance = contentScopeAllowance(tmpDir)
+	}
 	abortReason := ""
 	abortRetry := false
 	nextExtracted, stopPrefetch := contentPrefetchExtract(ctx, items, contentBuildWorkerCount(), contentBuildDocSafe)
@@ -803,13 +816,19 @@ func (s *goSearchService) runContentBuild(vol *serviceVolumeIndex, reuseSidecar 
 			continue
 		}
 		n := int64(len(doc.text))
-		// Once the byte budget bites, extraction keeps consuming the ordered
+		// Once the budget bites, extraction keeps consuming the ordered
 		// stream to the end (abort and pacing checks above are unchanged) so
 		// the dropped files and bytes are exact: every remaining file is
 		// still extracted, its text tallied and released instead of spooled.
 		// Selection order is unchanged; this only costs extraction work on a
 		// build that was already going to publish incomplete.
-		if overBudget || opts.Scope != nil && opts.Scope.BudgetBytes > 0 && n > opts.Scope.BudgetBytes-used {
+		if !explicitBudget {
+			if sinceAllowanceCheck += n; sinceAllowanceCheck >= contentDiskCheckEvery {
+				sinceAllowanceCheck = 0
+				allowance = contentScopeAllowance(tmpDir)
+			}
+		}
+		if overBudget || n > allowance-used {
 			overBudget = true
 			scopeDropped++
 			scopeDroppedBytes += n
@@ -886,11 +905,18 @@ func (s *goSearchService) runContentBuild(vol *serviceVolumeIndex, reuseSidecar 
 	if opts.Scope != nil {
 		budgetBytes = opts.Scope.BudgetBytes
 	}
+	// Name the enforced limit in the policy: the explicit budget, or the
+	// reserve when the reserve stopped selection (BudgetBytes stays 0 for
+	// the reserve-governed default).
+	var reserveBytes int64
+	if scopeDropped > 0 && !explicitBudget {
+		reserveBytes = int64(contentScopeReserveFor(tmpDir))
+	}
 	header := &contentIndex{
 		Origin:        contentOriginUSN,
 		JournalID:     journalID,
 		CheckpointUSN: uint64(checkpoint),
-		Policy:        contentBuildPolicy{MaxRaw: settings.maxRaw, MaxText: settings.maxText, Skipped: skipped, Truncated: truncated, ScopeDropped: scopeDropped, ScopeDroppedBytes: scopeDroppedBytes, BudgetBytes: budgetBytes, Binary: binary},
+		Policy:        contentBuildPolicy{MaxRaw: settings.maxRaw, MaxText: settings.maxText, Skipped: skipped, Truncated: truncated, ScopeDropped: scopeDropped, ScopeDroppedBytes: scopeDroppedBytes, BudgetBytes: budgetBytes, Binary: binary, ReserveBytes: reserveBytes},
 	}
 	if isWalkBuild {
 		// Walk sidecars join on the stable path hash with no journal: the

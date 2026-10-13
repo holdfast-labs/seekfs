@@ -90,16 +90,19 @@ without opening. Set `exts` to opt back into a verbatim extension allowlist.
 Files that sniff binary are tallied as `binary` in the `.gsx` policy and in
 `loaded --json` — expected rejections, never drops.
 
-`budget_bytes` defaults to a tenth of the index volume's free space (floored
-at 2 GiB, ceiling 32 GiB), so a Chromium-size repo indexes completely; only
-an explicit value joins the sidecar identity. Large corpora build as folder
-shards (past 64 MiB of text), each capped at the 4 GiB per-file sidecar cap,
-so a total budget past 4 GiB stays memory-bounded and safe. Environment
-overrides are `SEEKFS_CONTENT_SCOPE`, `SEEKFS_CONTENT_ROOTS`,
-`SEEKFS_CONTENT_EXCLUDE`, and `SEEKFS_CONTENT_BUDGET_BYTES`. When the budget
+There is no default `budget_bytes`: the build indexes everything selected
+and stops only when the projected index (extracted bytes × 0.5) would push
+the sidecar's volume below a free-space reserve — the larger of 10% of the
+volume's capacity or 20 GiB. Only an explicit value joins the sidecar
+identity. Large corpora build as folder shards (past 64 MiB of text), each
+capped at the 4 GiB per-file sidecar cap, so indexing everything stays
+memory-bounded and safe. Environment overrides are
+`SEEKFS_CONTENT_SCOPE`, `SEEKFS_CONTENT_ROOTS`,
+`SEEKFS_CONTENT_EXCLUDE`, and `SEEKFS_CONTENT_BUDGET_BYTES`. When a limit
 truncates a build, health reports the exact dropped files/bytes and the
-enforced budget (`scope_dropped`, `scope_dropped_bytes`, `budget_bytes` in
-`loaded --json`); raise `budget_bytes` to index the rest.
+enforced limit (`scope_dropped`, `scope_dropped_bytes`, plus `budget_bytes`
+or `reserve_bytes` in `loaded --json`); raise `budget_bytes` to index the
+rest, or free disk space past the reserve.
 
 ## Editing Config
 

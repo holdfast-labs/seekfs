@@ -95,7 +95,7 @@ func TestContentScopedIndexBudgetUsesExtractedText(t *testing.T) {
 		t.Fatal(err)
 	}
 	vol, _ := contentBuildTestVolume(t, dir, 3, 10, []CompactRecord{{FRN: 1, Parent: -1, Name: "a.txt", Size: 1}})
-	scope := contentScope{Mode: contentScopeExplicit, Roots: []string{contentNormPath(dir)}, BudgetBytes: 5}.resolve(dir, nil)
+	scope := contentScope{Mode: contentScopeExplicit, Roots: []string{contentNormPath(dir)}, BudgetBytes: 5, BudgetExplicit: true}.resolve(dir, nil)
 	opts := defaultContentBuildOptions()
 	opts.Scope = &scope
 	if _, err := buildContentIndexForIndex(context.Background(), vol.index, opts); err == nil {

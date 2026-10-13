@@ -150,12 +150,12 @@ const contentFuzzyScanWorkers = 2
 // parallelizes; small corpora (every unit test) stay single-threaded.
 const contentFuzzyScanMinEntries = 10000
 
-func contentFuzzyScanIndex(idx *contentPostingIndex, word []rune, wordBytes []byte, wordASCII bool, wordMask uint64, pieces [][]byte, tau int, keep map[string]int) {
-	if idx == nil || len(idx.entries) == 0 {
+func contentFuzzyScanIndex(dict *contentTermDict, word []rune, wordBytes []byte, wordASCII bool, wordMask uint64, pieces [][]byte, tau int, keep map[string]int) {
+	if dict == nil || dict.keyCount() == 0 {
 		return
 	}
-	if len(idx.entries) < contentFuzzyScanMinEntries {
-		contentFuzzyScanRange(idx, word, wordBytes, wordASCII, wordMask, pieces, tau, 0, len(idx.entries), keep)
+	if dict.keyCount() < contentFuzzyScanMinEntries {
+		contentFuzzyScanRange(dict, word, wordBytes, wordASCII, wordMask, pieces, tau, 0, dict.keyCount(), keep)
 		return
 	}
 	// Each worker fills its own map over a disjoint entry range; the merge
@@ -166,13 +166,13 @@ func contentFuzzyScanIndex(idx *contentPostingIndex, word []rune, wordBytes []by
 	results := make([]shardResult, contentFuzzyScanWorkers)
 	var wg sync.WaitGroup
 	for w := 0; w < contentFuzzyScanWorkers; w++ {
-		lo := w * len(idx.entries) / contentFuzzyScanWorkers
-		hi := (w + 1) * len(idx.entries) / contentFuzzyScanWorkers
+		lo := w * dict.keyCount() / contentFuzzyScanWorkers
+		hi := (w + 1) * dict.keyCount() / contentFuzzyScanWorkers
 		results[w].m = make(map[string]int)
 		wg.Add(1)
 		go func(w, lo, hi int) {
 			defer wg.Done()
-			contentFuzzyScanRange(idx, word, wordBytes, wordASCII, wordMask, pieces, tau, lo, hi, results[w].m)
+			contentFuzzyScanRange(dict, word, wordBytes, wordASCII, wordMask, pieces, tau, lo, hi, results[w].m)
 		}(w, lo, hi)
 	}
 	wg.Wait()
@@ -183,18 +183,15 @@ func contentFuzzyScanIndex(idx *contentPostingIndex, word []rune, wordBytes []by
 	}
 }
 
-func contentFuzzyScanRange(idx *contentPostingIndex, word []rune, wordBytes []byte, wordASCII bool, wordMask uint64, pieces [][]byte, tau int, lo, hi int, keep map[string]int) {
-	for i := lo; i < hi; i++ {
-		e := idx.entries[i]
-		end := int(e.keyOff) + int(e.keyLen)
-		if e.keyLen == 0 || end > len(idx.keyBlob) {
-			continue
-		}
-		key := idx.keyBlob[e.keyOff:end]
+func contentFuzzyScanRange(dict *contentTermDict, word []rune, wordBytes []byte, wordASCII bool, wordMask uint64, pieces [][]byte, tau int, lo, hi int, keep map[string]int) {
+	if dict == nil {
+		return
+	}
+	dict.scanRange(lo, hi, func(key []byte, df int) bool {
 		// Byte length is a sound lower-bound prefilter (runes <= bytes), so
 		// short keys skip the rune count entirely.
 		if len(key) < len(word)-tau {
-			continue
+			return true
 		}
 		matched := len(pieces) == 0
 		for _, p := range pieces {
@@ -204,18 +201,18 @@ func contentFuzzyScanRange(idx *contentPostingIndex, word []rune, wordBytes []by
 			}
 		}
 		if !matched {
-			continue
+			return true
 		}
 		keyMask, keyASCII := contentFuzzyLetterMask(key)
 		if fuzzyLetterMaskMisses(wordMask, keyMask) > tau {
-			continue
+			return true
 		}
 		n := len(key)
 		if !keyASCII {
 			n = utf8.RuneCount(key)
 		}
 		if n < len(word)-tau || n > len(word)+tau {
-			continue
+			return true
 		}
 		// Only true candidates reach the DP. A pure-ASCII pair runs it on
 		// bytes directly, avoiding both rune conversions.
@@ -226,36 +223,21 @@ func contentFuzzyScanRange(idx *contentPostingIndex, word []rune, wordBytes []by
 			d = damerauLevenshteinBounded([]rune(string(key)), word, tau)
 		}
 		if d < 1 || d > tau {
-			continue
+			return true
 		}
-		keep[string(key)] += int(e.count)
-	}
+		keep[string(key)] += df
+		return true
+	})
 }
 
 // contentFuzzyDictCount binary-searches the sorted dictionary for term,
-// returning its document frequency. The encoder sorts keys, so membership is
-// logarithmic and costs microseconds.
-func contentFuzzyDictCount(idx *contentPostingIndex, term string) (int, bool) {
-	if idx == nil || term == "" {
+// returning its document frequency. The restart index positions the search,
+// so membership is logarithmic and costs microseconds.
+func contentFuzzyDictCount(dict *contentTermDict, term string) (int, bool) {
+	if dict == nil || term == "" {
 		return 0, false
 	}
-	i := sort.Search(len(idx.entries), func(i int) bool {
-		e := idx.entries[i]
-		end := int(e.keyOff) + int(e.keyLen)
-		if e.keyLen == 0 || end > len(idx.keyBlob) {
-			return true
-		}
-		return string(idx.keyBlob[e.keyOff:end]) >= term
-	})
-	if i >= len(idx.entries) {
-		return 0, false
-	}
-	e := idx.entries[i]
-	end := int(e.keyOff) + int(e.keyLen)
-	if e.keyLen == 0 || end > len(idx.keyBlob) || string(idx.keyBlob[e.keyOff:end]) != term {
-		return 0, false
-	}
-	return int(e.count), true
+	return dict.count(term)
 }
 
 // contentFuzzyVariantMembership adds dictionary terms reachable from the query
@@ -265,7 +247,7 @@ func contentFuzzyDictCount(idx *contentPostingIndex, term string) (int, bool) {
 // ("widhtcss" recovers "widthcss" only this way), while costing O(len*log n)
 // instead of a second full scan. Every added term is within tau by
 // construction.
-func contentFuzzyVariantMembership(dicts []*contentPostingIndex, deltaWords map[string]int, word string, tau int, keep map[string]int) {
+func contentFuzzyVariantMembership(dicts []*contentTermDict, deltaWords map[string]int, word string, tau int, keep map[string]int) {
 	wr := []rune(word)
 	seen := map[string]struct{}{word: {}}
 	add := func(v string) {
@@ -326,7 +308,7 @@ func contentFuzzyCorrections(readers []*contentReader, deltaWords map[string]int
 		pieces = append(pieces, []byte(p))
 	}
 	merged := make(map[string]int)
-	var dicts []*contentPostingIndex
+	var dicts []*contentTermDict
 	for _, r := range readers {
 		if r == nil || r.idx == nil {
 			continue

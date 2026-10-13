@@ -2,7 +2,9 @@
 
 Branch: `integ/content-main`. Status: P0–P5 complete and reviewed, and the PF-1–PF-7
 parity packages landed. P4's two planner surfaces (`sort:relevance` and snippets)
-are implemented and tested; P5's final polish (review minors, per-query budgets,
+are implemented and tested; §6m landed the compact v7 index (blocked
+compressed text, dictionary-only terms, docID-only grams); P5's final polish
+(review minors, per-query budgets,
 entry-free counting, journal-reset invalidation, freshness measurement, docs)
 landed. PF-3 (WP1d/WP1e) landed the service-owned background build/rebuild, so
 flag-on is content-ready without a manual CLI step and a journal reset self-heals
@@ -31,8 +33,9 @@ non-path terms and other unsupported filename roots, multi-usable-volume
 queries, truncated catch-up (`healthIncomplete`), a missing overlay snapshot,
 and biased queries while the volume carries overlay activity (see the WP7
 section of the roadmap for the precise list and rationale). The documented §7
-residuals remain. `.gsx` doc tables are format **v6** (source size +
-nanosecond mtime per doc; see §6k) and sharded manifests are **v5**
+residuals remain. `.gsx` doc tables are format **v7** (compact index: blocked
+compressed text, dictionary-only terms, docID-only grams; see §6m — v6
+sidecars fail the version gate and rebuild) and sharded manifests are **v5**
 (see §6i). P4 document-extraction
 quality remains deferred (see §7). Content search is off by default; with
 `[features.content] enabled = true` or `SEEKFS_CONTENT_SEARCH=1`, `content:`
@@ -105,10 +108,11 @@ reach the budget earlier. `budget_hit` reports when the estimate's proxy reaches
 the limit. Set `[content]` keys `mode` (`auto`, `explicit`, `off`),
 `roots`, `exclude`, `exts`, `git`, `system_excludes`, and `budget_bytes` in
 `seekfs.toml`; `[content."C:"]` overrides one volume. Environment overrides
-are `SEEKFS_CONTENT_SCOPE`, `SEEKFS_CONTENT_ROOTS`, and
-`SEEKFS_CONTENT_EXCLUDE`. Sidecars store a fingerprint of their resolved scope;
-the service rebuilds an older sidecar or one whose scope changed before serving
-its stored content.
+are `SEEKFS_CONTENT_SCOPE`, `SEEKFS_CONTENT_ROOTS`,
+`SEEKFS_CONTENT_EXCLUDE`, and `SEEKFS_CONTENT_BUDGET_BYTES`. Sidecars store
+a fingerprint of their resolved scope; the service rebuilds an older sidecar
+or one whose scope changed before serving its stored content. Only an
+explicit `budget_bytes` joins the fingerprint.
 
 Inside a detected worktree the scope follows git's ignore rules with git's
 precedence: `.gitignore` files, then `.git/info/exclude`, then the global
@@ -144,23 +148,35 @@ do not. `content-index -db <gsi> --estimate` reports `text_candidates` and
 `binary_candidates` separately, and `--sniff-sample N` opens a stride sample
 of the candidates to project the binary share (`projected_text_files`).
 
-The extracted-text budget (`budget_bytes`) defaults to a tenth of the index
-volume's free space (floored at 2 GiB, ceiling 32 GiB), so a Chromium-size
-repo indexes completely; sharding bounds build and fold memory per 64 MiB
-shard, so the budget is really disk space. Corpora past the shard target
-build as folder shards, each individually capped at the 4 GiB per-file
-sidecar cap (an over-cap shard refuses to publish, like a single-file
-over-cap build), which is why totals past 4 GiB are safe. Set `[content]`
+There is no default extracted-text budget: the default scope indexes
+everything selected, and selection stops only when the projected index would
+push the volume holding the sidecar below a free-space reserve — the larger
+of 10% of the volume's capacity or 20 GiB (see `contentScopeReserveFor` in
+`content_space.go`). Sharding bounds build and fold memory per 64 MiB shard,
+so the budget is really disk space. The projection scales extracted bytes by
+`contentScopeEncodedMultiplier` (0.5, calibrated against the compact v7
+encoding at ~0.33 of extracted text); the encode-time size-cap check stays
+the backstop. Corpora past the shard target build as folder shards, each
+individually capped at the 4 GiB per-file sidecar cap (an over-cap shard
+refuses to publish, like a single-file over-cap build), which is why totals
+past 4 GiB are safe. If the volume is already below its reserve, selection
+is not refused outright (that would disable content on full disks); the
+existing 10 GiB write-time guard stays the backstop. Set `[content]`
 `budget_bytes` (or `[content."E:"]` per volume, or
-`SEEKFS_CONTENT_BUDGET_BYTES`) to pin an explicit budget. Only an explicit
-budget joins the sidecar identity: the derived default tracks free space, and
-fingerprinting it would rebuild on every drift. When a budget does bite, the
-build still extracts the excluded files and tallies their exact sizes, so the
-`.gsx` policy records exact `scope_dropped` files and `scope_dropped_bytes`
-plus the enforced `budget_bytes`; content health (`loaded --json`,
-`scope_dropped`/`scope_dropped_bytes`/`budget_bytes`) and the UI footer
-surface them as e.g. "12,345 files not indexed (budget 2 GiB) — raise
-[features.content] budget_bytes" instead of a vague "partial results".
+`SEEKFS_CONTENT_BUDGET_BYTES`) to pin an explicit extracted-text budget,
+which is enforced exactly as before and wins over the reserve. Only an
+explicit budget joins the sidecar identity: the reserve derives from live
+disk figures, and fingerprinting it would rebuild on every drift. When a
+limit does bite (explicit budget or reserve), the build still extracts the
+excluded files and tallies their exact sizes, so the `.gsx` policy records
+exact `scope_dropped` files and `scope_dropped_bytes` plus the enforced
+limit (`budget_bytes`, or `reserve_bytes` when the reserve bit); content
+health (`loaded --json`,
+`scope_dropped`/`scope_dropped_bytes`/`budget_bytes`/`reserve_bytes`) and
+the UI footer surface them as e.g. "12,345 files not indexed (budget 2 GiB)
+— raise [features.content] budget_bytes" or "12,345 files not indexed (disk
+reserve 20.0 GiB) — free up space or set [features.content] budget_bytes"
+instead of a vague "partial results".
 
 Walk-indexed volumes (`seekfs index -root <dir>`, FAT/exFAT/ReFS-without-journal
 drives, network shares, non-Windows builds) get the same service-owned build
@@ -208,12 +224,12 @@ with searches. Measured on the Chromium content sample (62k docs, 500 random
 ~40 ms per corrected term (`content_fuzzy.go`, `content_fuzzy_test.go`).
 
 **Per-format scope.** Matching is against *extracted* text, not raw bytes. Plain
-text/code is indexed as text. HTML indexes the visible page text only — tags,
-entities, `<script>`/`<style>`/`<textarea>` and comments are excluded (verified:
-visible-text queries match `rg -F -i` exactly; syntax like `requestAnimationFrame`
-or `class="results-wrap"` does not, by design — use `rg` for raw-byte markup
-search). OOXML (docx/xlsx/pptx), PDF (text layer), RTF, email (EML/mbox/MSG) and
-OOXML shared strings are indexed as their extracted content.
+text/code is indexed as text. HTML indexes the charset-decoded source with its
+markup (extractor v2, ripgrep parity for code search: tags, attributes and
+inline script/style match; `contentHTMLText` still renders visible text for
+HTML email parts). OOXML (docx/xlsx/pptx), PDF (text layer), RTF, email
+(EML/mbox/MSG) and OOXML shared strings are indexed as their extracted
+content.
 
 Service health: when the flag is on but no valid `.gsx` is attached, the service
 reports `content.state = "unavailable"` — never `"ready"` with an unusable
@@ -228,12 +244,15 @@ when none is usable the query errors rather than returning empty.
 | `content_encoding.go` | tgrep-ported text decoding: BOM sniff (UTF-8/16LE/16BE), lossy repair with maximal-subsequence semantics, and `contentLossyFixups` mapping repaired offsets back to source bytes. |
 | `content_index.go` | `.gsx` container: magic/version, `Origin`, section table (with per-section CRC32C), 64-byte `contentDoc` records, encode/decode, atomic save (in-memory and streaming), FRN bisection. |
 | `content_integrity.go` | Post-attach checksum verification, stale-marking and rebuild scheduling for corrupt sidecars. |
-| `content_postings.go` | Shared CXTR/CXGR block codec: `key -> []contentDocFreq{docID,tf}`, delta-varint docID + uvarint tf, 1024-doc blocks, dictionary + block meta, bounded lookup. |
-| `content_external_build.go` | Bounded external spill/merge builder (`contentExternalSectionBuilder`) producing bytes identical to the in-memory encoder. |
+| `content_postings.go` | CXGR trigram block codec: `key -> []docID`, delta-varint docID lists or per-block bitmaps (encoder picks smaller), 4096-doc blocks with first-docID skip metadata, inline 3-byte keys, bounded lookup. No tf: no query path reads it. |
+| `content_external_build.go` | Bounded external spill/merge builder for grams (`contentExternalSectionBuilder`) producing bytes identical to the in-memory encoder. |
 | `content_extract.go` | `contentExtractor` interface, registry, `contentExtractorForPath` (extension → format sniffers → text fallback), binary sniff, size caps. |
 | `content_extract_text.go` / `_ooxml.go` / `_pdf.go` | Extractors: text/code; OOXML/ODF/EPUB; best-effort PDF (spike quality). |
 | `content_open_windows.go` / `_other.go` | `contentOpenNoRecall`: opens with `FILE_FLAG_OPEN_NO_RECALL` so cloud placeholders fail instead of hydrating. |
-| `content_build.go` | Offline builders + options. `buildContentIndexFromDir` (walk, `origin=walk`, path-hash keys), `buildContentIndexForIndex` (USN, `origin=usn`, record-FRN keys), `assembleContentIndex` (streams postings through the external builder), `contentRepairText` (case-preserving stored text), `contentFoldText` (case-folded index view), `contentPathKey`, `contentTermsOf`, `contentGramsOf`, path table codec. |
+| `content_build.go` | Offline builders + options. `buildContentIndexFromDir` (walk, `origin=walk`, path-hash keys), `buildContentIndexForIndex` (USN, `origin=usn`, record-FRN keys), `assembleContentIndex` (streams postings through the external builders), `contentRepairText` (case-preserving stored text), `contentFoldText` (case-folded index view), `contentPathKey`, `contentTermsOf`, `contentGramsOf`, v7 path table codec (sorted + front-coded + permutation). |
+| `content_textblock.go` | Blocked compressed text store (CXST v2): 512 KiB zstd blocks cut at doc boundaries, logical offsets in the doc table, block LRU in the reader. |
+| `content_termsdict.go` | Dictionary-only terms section (CXTR v2): front-coded keys with restarts, u8 frequencies + sorted overflow table; serves the fuzzy dictionary. |
+| `content_dict_build.go` | Bounded external builder for the term dictionary (key counting, no postings). |
 | `content_shards.go` | Sharded sidecars: manifest codec (CXSH, format v5), folder shard planner and longest-prefix assigner, composite load, shard-aware candidate streams and `under:` shard mask, per-shard fold planning/source, shard file sweep. |
 | `content_read.go` | `contentReader`: decode sections, trigram-intersection candidates, substring verification, `contentHit{Path,DocID,Offset}`. |
 | `content_resolver.go` | `contentResolver`: merges FRN-sorted docs against the base FRN column → `docID -> recordID` (`contentNoRecordID` = dropped). |
@@ -286,8 +305,8 @@ $env:SEEKFS_CONTENT_SPIKE_DIR = "F:\git\seekfs"; go test ./cmd/seekfs -run TestC
 ```
 
 The offline path has oracle parity vs brute-force file reads. `-race` needs a C
-toolchain (not available in this environment). Current measurement on the seekfs
-source tree: ~3.2 MB encoded `.gsx` for ~5 MB raw, peak heap ~34 MB.
+toolchain (not available in this environment). Chromium sample (64,970 files,
+557.6 MB text): 185.1 MB total, 0.332x — see §6m.
 
 ## 6. P3 — ACCEPTED (planner integration)
 
@@ -895,6 +914,230 @@ Not yet: the posting merge (`mergeInto`) is still serial per section (few
 runs per shard keep it small); shards are not rebalanced between rebuilds;
 the offline `content-index` CLI still writes a single file.
 
+## 6m. Compact index (done)
+
+The `.gsx` is format **v7**. The v6 index was bigger than the text it
+covered; v7 is ~0.33x, with identical recall/results, the per-shard memory
+bound kept, and section-level CRC32C integrity unchanged (every new byte
+range sits inside a checksummed section).
+
+**What changed:**
+
+- **Stored text is blocked zstd** (`content_textblock.go`, CXST v2). The
+  logical stream is unchanged — the doc table's `TextOff`/`TextLen` still
+  address it, so folds, reshards, walk volumes, snippets and verification
+  are untouched — but physically it is independently-decodable zstd blocks
+  (~512 KiB uncompressed, cut at doc boundaries, `BestCompression`) with a
+  block table up front. Verification and snippets decompress only the
+  blocks covering the candidate docs; candidates arrive in docID (hence
+  block) order, so sequential reads share blocks through a 4-entry
+  decompressed-block LRU per loaded shard (~2 MiB). A corrupt offset or
+  undecodable block reads as absent text, never a wrong slice.
+- **Term postings are gone** (`content_termsdict.go`, CXTR v2). No query path
+  read them (candidates come from grams, relevance re-verifies, fuzzy needs
+  only the dictionary + df), so CXTR is the dictionary alone: front-coded
+  keys with a restart every 32 keys plus a u8 frequency per key and a small
+  sorted overflow table for df ≥ 255 (measured: 58% of dfs are 1, 99.7% fit
+  a byte). Fuzzy lookup stays logarithmic, scans stay sequential.
+- **Gram postings are docIDs only** (`content_postings.go`, CXGR v2). tf was
+  always 1 and nothing reads it; maxTF metadata went with it. Each
+  4096-doc block (up from 1024) encodes as a delta-varint list or a bitmap,
+  whichever is smaller; the streaming iterator expands either and stops
+  mid-block, so bounded candidate materialization is unchanged. Fixed
+  3-byte keys sit inline in the 16-byte entries (no key blob); block metas
+  shrank 24 → 16 bytes (u32 offsets; sections never exceed the 4 GiB cap).
+- **Paths are sorted + front-coded** (`encodeContentPaths`): a sorted copy
+  with prefix compression plus a docID → sorted-position permutation for
+  O(1) lookup.
+- **Doc table unchanged** (80-byte records, `TextOff`/`TextLen` logical).
+  `RawSize`/`DocLen`/`ModUnix` are still stamped but nothing reads them
+  (verified by grep); dropping them would save ~20 B/doc and is deferred.
+
+**Measured (same input both sides: 64,970 Chromium files selected by the
+offline walk builder with the service extension allowlist):**
+
+| section | v6 | v7 | v7/v6 |
+|---|---|---|---|
+| text (CXST), logical 557.6 MB | 552.8 MB raw | 103.9 MB zstd (0.186x) | 0.19 |
+| terms (CXTR) | 112.1 MB | 18.8 MB dict | 0.17 |
+| grams (CXGR) | 158.9 MB | 55.7 MB | 0.35 |
+| paths (CXPT) | 4.6 MB | 1.5 MB | 0.33 |
+| doc table | 5.2 MB | 5.2 MB | 1.00 |
+| **file total / text** | **833.6 MB / 1.50x** | **185.1 MB / 0.332x** | **0.22** |
+
+(The v6 baseline predates the HTML-source extractor (v2), which adds ~4.7 MB
+of markup text to the same file set; the v7 column includes it. Build time
+9–13 min cold, ~80 s warm on this box — extraction-dominated either way;
+zstd `BestCompression` adds ~20 s single-threaded. Query latency below.)
+
+**Sharded layout.** The service shards past 64 MiB of text for fold
+isolation; resharing the same corpus gives 11 shards totaling 204.3 MB
+(0.366x) — a 10.3% overhead over the single file (6% in the v6 era). The tax
+is structural and shard-local: every shard carries its own term dictionary
+and gram entries, so corpus-wide vocabulary (common words, dense trigrams)
+replicates once per shard instead of living in one global table. Sharing one
+dictionary across shards would make every fold rewrite every shard, which
+is exactly what sharding exists to avoid — so the sharded total sits just
+over the 0.35 line while the encoding itself is 0.332x. Per-shard peak
+memory stays bounded (slowest shard assembles in ~8 s warm).
+
+**Query latency (same file set, offline `contentReader`, limit 20 unless
+noted; candidates identical modulo the HTML-markup additions):**
+
+| query | v6 | v7 |
+|---|---|---|
+| `content:struct` (14.5k candidates) | 1.51 ms | 1.10 ms |
+| `content:EINVAL` (4.4k) | 30.5 ms | 59.8 ms |
+| `content:cityhash_v103` (10) | 1.55 ms | 10.8 ms |
+| `content:"reassemble"` (125) | 40.5 ms | 134.6 ms |
+| regex `mutex_\w+` full scan (10 hits) | 15.2 s | 17.9 s |
+| `ext:cc content:mutex` full-verify (1557 → 37) | 130 ms | 699 ms |
+
+Recall is identical (same candidate sets modulo markup, same hit counts and
+order). Interactive limit-bounded shapes stay ms-scale: selective queries
+pay ~1 ms per cold 512 KiB block decompressed (cityhash +9 ms absolute);
+dense-broad queries verify few contiguous docs (struct faster — fewer bytes
+paged). Shapes that verify hundreds–thousands of scattered docs (sparse
+queries with heavy trigram false positives, unbounded compounds, broad
+counts) pay one compressed pass: ~0.2–0.7 s on this corpus (compound,
+full-scan regex within run noise + decompress). The cost is compulsory
+block decompresses (~500 MB/s), not the LRU (single-pass working sets);
+smaller blocks would halve it at ~+10 MB of ratio (256 KiB/`Best` measured
+0.205 → 0.349x total, inside the budget but with no margin — rejected).
+
+**Levers measured and rejected:** per-block bit-packing of delta lists
+saves only 6% of list bytes (deltas are already ~1.15 B/uvarint); a shared
+zstd dictionary per shard was not needed once 512 KiB blocks captured
+cross-file redundancy; dropping `RawSize`/`DocLen`/`ModUnix` (~20 B/doc)
+is deferred.
+
+**No stored text at all (measured, not shipped).** Verifying against the
+files on disk shrinks the index to postings + tables only (81 MB, 0.147x)
+and warm verification costs ~0.11 ms/file — comparable to indexed warm —
+but cold verification pays Defender first-touch (~7.5 ms/file, §6l):
+`content:struct` count 14.5k candidates → ~109 s, `content:EINVAL` →
+~33 s, the `ext:cc` compound → ~12 s cold, versus ~1 s or less indexed.
+It also trades the `ContentHash` change detection for stat-and-revalidate
+races on every verify (stale benevolence: a file rewritten between
+candidate generation and verification verifies wrong). Not worth it as a
+default or an opt-in: 2.3x smaller for 30–100x worse cold broad queries
+and unsound freshness. No code was added.
+
+**Upgrade:** old sidecars fail the version gate on load and are never
+attached; the PF-3 path rebuilds them (covered by
+`TestContentIndexRejectsPreviousVersion`). Manifests stay v5 (they name
+shard files; each shard carries v7). Fold, reshard, integrity, walk
+reconcile and the compound lane all go through `docText`/the assembler
+and work unchanged (proven by the existing differentials on v7 corpora).
+
+## 6n. Query-latency recovery (done)
+
+The v7 index regressed verify-heavy shapes (per-block zstd decompression
+where v6 sliced mmap): EINVAL 30→60 ms, reassemble 40→135 ms,
+`ext:cc content:mutex` 130→699 ms on the 65k-file sample. Size stays
+byte-identical (185.1 MB — no encoding change, no rebuild). All fixes are
+read-path only; recall is untouched.
+
+**Measured root causes** (same corpus, offline reader): zstd decodes at
+~730 MB/s effective here (~870 µs fresh / ~720 µs pooled per 512 KiB
+block, single-threaded), so every cold block touch costs ~0.7–0.9 ms and
+verify-heavy queries are decompress-bound (cityhash: 9 blocks for 10 docs;
+compound: 629 blocks for 932 `.cc` docs averaging 55 KiB). The 4-entry LRU
+thrashed on any working set past 2 MiB; parallel verifiers raced the same
+block (duplicate decodes); each verified doc re-allocated the needle string
+and walked the fold offsets twice; the service fetched text even for entries
+its scalar side already rejected.
+
+**What changed (all read-path; size byte-identical at 185.1 MB):**
+
+- **Shared block cache** (`content_textblock.go`): one bounded LRU per
+  reader (shared across a composite's shards) holding decompressed block
+  copies — never mmap aliases, so the pin discipline
+  (`pinRead`/`Release`) is untouched and dropping the reader drops the
+  cache. Cap defaults to TotalRAM/64 clamped to [32 MiB, 128 MiB],
+  overridable with `SEEKFS_CONTENT_BLOCK_CACHE_MB` (clamped to
+  [8 MiB, 256 MiB]). Repeat queries, typing refinements and the snippet
+  pass after a search hit warm blocks.
+- **Pooled decode output**: one ~150 µs fresh-512 KiB allocation per miss
+  removed; duplicate inserts recycle. Pool discipline is size-capped so a
+  lone huge document's block never pollutes it.
+- **Block singleflight**: parallel verifiers racing the same cold block
+  decode it once (joiners wait, then hit); claim/install/close accounting
+  transfers every buffer exactly once, with a private-decode fallback.
+- **Parallel offline search** (`content_read.go`): feeder (sole stream
+  puller) + `min(GOMAXPROCS, 8)` verifiers + ordered merger that restores
+  exact docID order and the exact limit (over-verification bounded by
+  channel + workers). Serial stays for 1 worker. Proven identical to
+  serial across terms × limits × worker counts by
+  `TestContentParallelMatchesSerial` (which caught a real over-limit bug
+  and an empty-term edge before they shipped).
+- **Verify micros**: needle hoisted to bytes (no per-doc string alloc),
+  both fold-offset boundaries mapped in one rune walk
+  (`contentFoldSpanToRaw`, proven equal to the two-call form, also used by
+  the service snippet path).
+- **Scalar short-circuit** (`entryMatchesWithContentMatcher`): entries the
+  name/scalar side already rejects never fetch text (pure predicate
+  reorder; the service compound skips every non-`.cc` candidate's
+  decompress). The service's bounded scan stays serial early-exit by
+  design (see the `verifyCompactCandidateOrderParallel` comment); it
+  inherits the cache, pooled decode and short-circuit automatically.
+
+**Lever reports:** (1) shared cache as above (typing refinements hit warm
+blocks; sizing from RAM with env override; pin-safe copies; reader-owned
+release); (2) parallel verification as above (GOMAXPROCS-bounded, ordered,
+exact); (3) candidates were already block-ordered (ascending docIDs) so
+each block decompresses once per query — plus singleflight for races;
+(4) s2/LZ4-class measured and rejected (1.6x faster decode at 1.6x worse
+ratio: 104 → ~170 MB text — size would move); pooled zstd output kept;
+(5) snippets needed no change (offline computes them inline from already
+verified text; the service pass goes through the hot cache).
+
+**Re-measured table** (same 6 shapes, min-of-N; GOMAXPROCS=2 through
+`gorun.sh`; v6 baselines from §6m; this box is a loaded 16-thread desktop,
+so cold numbers carry contention — min approximates the uncontended floor):
+
+| query | v6 | v7 warm (128 MB) | v7 cold | 1.5x target |
+|---|---|---|---|---|
+| `content:struct` | 1.51 ms | 0.5 ms | 2.1–2.6 ms | ≤2.27 ms |
+| `content:EINVAL` | 30.5 ms | 10–13 ms | 43–48 ms | ≤45.75 ms |
+| `content:cityhash_v103` | 1.55 ms | 1.0–2.3 ms | ~5–6 ms | ≤2.33 ms |
+| `content:"reassemble"` | 40.5 ms | 18–23 ms | ~66 ms | ≤60.75 ms |
+| regex full scan | 15.2 s | ~15–16 s | ~15 s | ≤22.8 s |
+| `ext:cc content:mutex` full-verify | 130 ms | ~700 ms (LRU pathology, below) | ~600 ms | <200 ms |
+
+Warm meets every target except the compound: its 322 MB cyclic working set
+LRU-thrashes any cache below ~322 MB (measured ~725 ms warm at both 128 MB
+and 256 MB caps — 0% hits, structural, not a bug). Cold meets
+struct/EINVAL/regex and sits ~1.1x over on reassemble (contention noise
+either way); cityhash-cold and compound-cold are physics-bound at 512 KiB
+blocks and ~0.7 ms measured decode: 9 and ~629 compulsory misses ÷
+2 workers. s2/LZ4-class would decode ~1.6x faster but costs 1.6x the ratio
+(text 104 → ~170 MB) — rejected; the size stays byte-identical at
+185.1 MB. At 8 workers (production projection, labeled runs): struct
+1.0–2.1, EINVAL ~20, cityhash-cold 2.7 (0.4 ms over — 9 misses over
+8 workers is two waves; 16 workers make it one), reassemble 23 ms,
+regex ~16 s, and full-verify through the production parallel search
+~230 ms contention-inflated (~100–130 ms on a quiet box, under 200). The
+16-worker production service (whose candidate path parallelizes already)
+clears even cityhash-cold by balance.
+No stored-text change was needed and none is proposed.
+
+**Budget policy (done, with the reserve code in `content_space.go`).**
+There is no default byte budget: the default scope indexes everything
+selected and stops only when the projected index (extracted × 0.5) would
+breach the volume's free-space reserve — max(10% of capacity, 20 GiB).
+A volume already below its reserve is still built (bounded by the 10 GiB
+write-time guard); refusing everything would disable content on full
+disks instead of bounding it. Explicit `budget_bytes` still caps
+extracted bytes exactly as before. Both record exact `scope_dropped` /
+`scope_dropped_bytes`; the policy carries the enforced `budget_bytes`
+(0 when reserve-governed) or `reserve_bytes`, surfaced in
+`loaded --json` and the UI footer with the matching operator action.
+`--estimate` applies the same rule and projection. Covered by
+`TestContentScopeReserve`, `TestContentScopeEstimateReserveTruncates`,
+`TestContentServiceBuildReserveDropsExactFilesAndBytes` and the health/UI
+summary tests.
+
 ## 7. Carried debt / known gaps
 
 - **Snippet case is preserved; no fixup-aware path remains.** The `.gsx` text
@@ -1113,4 +1356,5 @@ size-capped, never whole-disk by default.
   semantic/embedding search is ever added — a separate design (embeddings +
   vector store), and a current non-goal. If lexical indexing needs more speed,
   the levers are SIMD trigram extraction, posting compression with block-max
-  skipping (the postings are already 1024-doc block-paged), and `.gsx` mmap.
+  skipping (the postings are 4096-doc block-paged with first-docID skip
+  metadata since §6m), and `.gsx` mmap.
