@@ -306,20 +306,24 @@ func searchCompactWithCacheHidden(idx *Index, opts queryOptions, countOnly bool,
 	// only caps the merged output, so it is kept for the name/scalar path;
 	// the content verifier below merges in candidate order and stops at the
 	// limit like the serial walk, with over-verification bounded by the
-	// channel buffer plus one job per worker. The serial range walk stays
-	// for small candidate sets, where goroutine setup exceeds the win.
+	// channel buffer plus one job per worker. Two workers also parallelize
+	// a verify-heavy early-stop page (per-candidate decode/fold work spreads
+	// ~2x warm and cold); a collect-only page (skipEntryMatches, e.g. the
+	// pre-verified bounded scan) keeps the serial walk at two workers, where
+	// the feeder/merger sync has no verify work to amortize it. A query that
+	// must verify everything (limit beyond the candidate set, e.g. the
+	// relevance window) still scales at any worker count.
 	if usedCandidates && !countOnly {
 		// The filename lane keeps its historical threshold; the content
-		// lane has its own (verifies cost ~100x a name verify). With only
-		// two workers an early-stop query keeps the serial walk: the
-		// merge/sync overhead cancels the win, while a query that must
-		// verify everything (limit beyond the candidate set, e.g. the
-		// relevance window) still scales.
+		// lane has its own (verifies cost ~100x a name verify). The
+		// verify-heavy early-stop case is covered by the gate below; the
+		// serial range walk stays for small candidate sets, where goroutine
+		// setup exceeds the win.
 		if contentMatcher == nil && len(order) >= serviceTrigramParallelVerifyMinIDs {
 			return verifyCompactCandidateOrderParallel(idx, pq, order, pathCache, limit, skipEntryMatches, hidden, contentVol, contentMatcher)
 		}
 		if contentMatcher != nil && len(order) >= contentParallelVerifyMinIDs &&
-			(contentParallelWorkers() > 2 || limit >= len(order)) {
+			(contentParallelWorkers() > 2 || limit >= len(order) || !skipEntryMatches) {
 			return verifyCompactContentParallel(idx, pq, order, pathCache, limit, skipEntryMatches, hidden, contentVol, contentMatcher)
 		}
 	}
