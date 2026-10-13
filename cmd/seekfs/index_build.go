@@ -942,11 +942,12 @@ func cmdSearch(args []string, countOnly bool) error {
 		opts.CWDBias = cwd
 	}
 	if *useService || autoService {
-		if err := searchService(*pipeName, opts, countOnly, *jsonOut); err == nil {
+		svcErr := searchService(*pipeName, opts, countOnly, *jsonOut)
+		if svcErr == nil {
 			return nil
 		}
 		if *useService || len(dbs) == 0 {
-			return err
+			return svcErr
 		}
 		// Auto-service failed but configured DBs exist: fall back to a direct
 		// local search so the CLI still works without a running service.

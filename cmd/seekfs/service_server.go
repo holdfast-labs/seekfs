@@ -725,13 +725,24 @@ func snapshotServiceVolumeForSearch(vol *serviceVolumeIndex) *serviceVolumeIndex
 	return view
 }
 
+// serviceResponseError converts a !OK service response into a CLI error. The
+// message is never empty: a blank stderr line with a nonzero exit is nearly
+// as unreadable for operators (and as easy to misparse for scripts) as
+// silence, so a messageless rejection names itself instead.
+func serviceResponseError(resp serviceResponse) error {
+	if msg := strings.TrimSpace(resp.Message); msg != "" {
+		return errors.New(msg)
+	}
+	return errors.New("seekfs service rejected the request with an empty error message")
+}
+
 func searchService(pipeName string, opts queryOptions, countOnly bool, jsonOut bool) error {
 	resp, err := callService(pipeName, serviceRequestFromOptions(opts, countOnly))
 	if err != nil {
 		return err
 	}
 	if !resp.OK {
-		return errors.New(resp.Message)
+		return serviceResponseError(resp)
 	}
 	if jsonOut {
 		jsonResp := newJSONSearchResponse(resp, opts, countOnly)
