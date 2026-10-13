@@ -1045,8 +1045,11 @@ func forEachDerivedSection(idx *Index, nameTokens []string, emit func(indexSecti
 	if err := emitSection(indexSectionCHLD, encodeUint32Section(vol.childOffsets, vol.childIDs, vol.rootIDs)); err != nil {
 		return err
 	}
+	// The subtree start array is the exact inverse of the subtree order
+	// and is rebuilt at load (see decodeDerivedSection); persisting it
+	// would store the same permutation twice.
 	if err := emitSubtree(
-		vol.subtreeStart, vol.subtreeEnd, vol.subtreeOrder,
+		vol.subtreeEnd, vol.subtreeOrder,
 		vol.subtreeSizeRank, vol.subtreeModRank, vol.subtreeExtRank,
 		vol.subtreeTypeRank, vol.subtreePathRank,
 	); err != nil {
@@ -1319,13 +1322,25 @@ func encodeLowerSection(nameTokens []string) []byte {
 	return buf.Bytes()
 }
 
+// attrPostingMagic marks the delta-varint PATR layout ("PTR2"). A legacy
+// raw-u32 section never starts with this word (it would be a 1.3-billion
+// entry first part), so the decoder tells the two framings apart.
+const attrPostingMagic = 0x50545232
+
+// encodeAttrPostingSection serializes the per-attribute-bit record-ID lists.
+// Attribute lists are sorted record IDs with small gaps (an attribute covers
+// a large slice of the corpus), so delta-varint encoding roughly halves the
+// section versus the legacy raw-u32 parts. Layout: magic u32, part count
+// u32, then per part {count u32, encoded length u32, delta bytes}. Empty
+// input still encodes as nil (the section is omitted), matching history.
 func encodeAttrPostingSection(attrBits map[uint32][]uint32) []byte {
 	if len(attrBits) == 0 {
 		return nil
 	}
-	parts := make([][]uint32, 0, len(queryAttrBits()))
+	bits := queryAttrBits()
+	parts := make([][]uint32, 0, len(bits))
 	hasAny := false
-	for _, bit := range queryAttrBits() {
+	for _, bit := range bits {
 		ids := uniqueSortedUint32s(append([]uint32(nil), attrBits[bit]...))
 		if len(ids) > 0 {
 			hasAny = true
@@ -1335,10 +1350,22 @@ func encodeAttrPostingSection(attrBits map[uint32][]uint32) []byte {
 	if !hasAny {
 		return nil
 	}
-	return encodeUint32Section(parts...)
+	var buf bytes.Buffer
+	_ = binary.Write(&buf, binary.LittleEndian, uint32(attrPostingMagic))
+	_ = binary.Write(&buf, binary.LittleEndian, uint32(len(parts)))
+	for _, ids := range parts {
+		enc := encodeDeltaUvarint32(ids)
+		_ = binary.Write(&buf, binary.LittleEndian, uint32(len(ids)))
+		_ = binary.Write(&buf, binary.LittleEndian, uint32(len(enc)))
+		buf.Write(enc)
+	}
+	return buf.Bytes()
 }
 
 func decodeAttrPostingSection(data []byte) map[uint32][]uint32 {
+	if len(data) >= 8 && binary.LittleEndian.Uint32(data[:]) == attrPostingMagic {
+		return decodeAttrPostingSectionDelta(data)
+	}
 	parts := decodeUint32Section(data, len(queryAttrBits()))
 	if len(parts) != len(queryAttrBits()) {
 		return nil
@@ -1350,6 +1377,52 @@ func decodeAttrPostingSection(data []byte) map[uint32][]uint32 {
 		}
 	}
 	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// decodeAttrPostingSectionDelta decodes the magic-marked delta-varint
+// layout, yielding the same sorted unique ID lists the legacy form holds.
+// Any framing error yields nil (treated as a missing section, exactly like
+// a legacy section that fails its part-count check today).
+func decodeAttrPostingSectionDelta(data []byte) map[uint32][]uint32 {
+	bits := queryAttrBits()
+	off := 8
+	partCount := int(binary.LittleEndian.Uint32(data[4:]))
+	if partCount != len(bits) {
+		return nil
+	}
+	out := make(map[uint32][]uint32, partCount)
+	for _, bit := range bits {
+		if off+8 > len(data) {
+			return nil
+		}
+		count := int(binary.LittleEndian.Uint32(data[off:]))
+		encLen := int(binary.LittleEndian.Uint32(data[off+4:]))
+		off += 8
+		if count < 0 || encLen < 0 || off+encLen < off || off+encLen > len(data) {
+			return nil
+		}
+		if count == 0 {
+			if encLen != 0 {
+				return nil
+			}
+			continue
+		}
+		ids := decodeDeltaUvarint32(data[off:off+encLen], count)
+		if len(ids) != count {
+			return nil
+		}
+		for j := 1; j < len(ids); j++ {
+			if ids[j] <= ids[j-1] {
+				return nil
+			}
+		}
+		off += encLen
+		out[bit] = ids
+	}
+	if off != len(data) || len(out) == 0 {
 		return nil
 	}
 	return out

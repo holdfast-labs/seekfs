@@ -232,6 +232,20 @@ func decodeDerivedSection(out *indexDerivedSections, tag uint32, section []byte,
 			out.SubtreePathRank = parts[7]
 			break
 		}
+		// Compact 7-part form: the start array is the exact inverse of
+		// the order and is rebuilt here (writers omitted it; see
+		// forEachDerivedSection). A corrupt order drops the whole
+		// section, like a framing failure today.
+		parts = decodeUint32Section(section, 7)
+		if len(parts) == 7 {
+			if start := invertRankOrder(parts[1], recordCount); start != nil {
+				out.SubtreeStart, out.SubtreeEnd, out.SubtreeOrder = start, parts[0], parts[1]
+				out.SubtreeSizeRank, out.SubtreeModRank = parts[2], parts[3]
+				out.SubtreeExtRank, out.SubtreeTypeRank = parts[4], parts[5]
+				out.SubtreePathRank = parts[6]
+			}
+			break
+		}
 		parts = decodeUint32Section(section, 3)
 		if len(parts) == 3 {
 			out.SubtreeStart, out.SubtreeEnd, out.SubtreeOrder = parts[0], parts[1], parts[2]

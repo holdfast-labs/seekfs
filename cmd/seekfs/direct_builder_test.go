@@ -717,8 +717,8 @@ func TestDirectCanonicalDerivedParity(t *testing.T) {
 	vol := newServiceVolumeIndex(out, idx)
 
 	subt := directTestSectionData(t, out, indexSectionSUBT)
-	if parts := directTestUint32Parts(t, subt); len(parts) != 8 {
-		t.Fatalf("SUBT parts=%d, want canonical 8", len(parts))
+	if parts := directTestUint32Parts(t, subt); len(parts) != 7 {
+		t.Fatalf("SUBT parts=%d, want canonical 7 (end/order/5 minima; start is rebuilt at load)", len(parts))
 	}
 	for _, tc := range []struct {
 		name string
@@ -840,6 +840,94 @@ func TestDecodeUint32SectionRejectsTrailingSUBTPart(t *testing.T) {
 	}
 	if got := decodeUint32Section(encodeUint32Section(parts...), 8); got != nil {
 		t.Fatalf("decoded %d SUBT parts from a nine-part payload; want strict rejection", len(got))
+	}
+}
+
+// The compact 7-part SUBT (end/order/5 minima, start rebuilt at load)
+// decodes to the same arrays as the legacy 8-part form.
+func TestDecodeSubtreeSectionCompactAndLegacy(t *testing.T) {
+	// Four records: dir 0 with children 1,2; dir 3 with child... a flat
+	// chain 0 -> 1 -> 2 plus an orphan 3. start=[0 1 2 3], end=[3 3 3 4],
+	// order=[0 1 2 3].
+	start := []uint32{0, 1, 2, 3}
+	end := []uint32{3, 3, 3, 4}
+	order := []uint32{0, 1, 2, 3}
+	minima := [][]uint32{{0, 1, 2, 0}, {3, 1, 0, 2}, {1, 1, 1, 0}, {2, 0, 1, 3}, {0, 2, 1, 3}}
+	eight := [][]uint32{start, end, order}
+	eight = append(eight, minima...)
+	legacy := encodeUint32Section(eight...)
+	seven := [][]uint32{end, order}
+	seven = append(seven, minima...)
+	compact := encodeUint32Section(seven...)
+	var want indexDerivedSections
+	decodeDerivedSection(&want, indexSectionSUBT, legacy, 4)
+	var got indexDerivedSections
+	decodeDerivedSection(&got, indexSectionSUBT, compact, 4)
+	for _, tc := range []struct {
+		name string
+		a, b []uint32
+	}{
+		{"start", want.SubtreeStart, got.SubtreeStart},
+		{"end", want.SubtreeEnd, got.SubtreeEnd},
+		{"order", want.SubtreeOrder, got.SubtreeOrder},
+		{"size", want.SubtreeSizeRank, got.SubtreeSizeRank},
+		{"mod", want.SubtreeModRank, got.SubtreeModRank},
+		{"ext", want.SubtreeExtRank, got.SubtreeExtRank},
+		{"type", want.SubtreeTypeRank, got.SubtreeTypeRank},
+		{"path", want.SubtreePathRank, got.SubtreePathRank},
+	} {
+		if !equalUint32s(tc.a, tc.b) {
+			t.Fatalf("SUBT %s: legacy %v vs compact %v", tc.name, tc.a, tc.b)
+		}
+	}
+	if !equalUint32s(got.SubtreeStart, start) {
+		t.Fatalf("rebuilt start = %v; want %v", got.SubtreeStart, start)
+	}
+	// A corrupt order drops the whole section, never a half section.
+	bad := encodeUint32Section(end, []uint32{0, 1, 2, 9}, minima[0], minima[1], minima[2], minima[3], minima[4])
+	var corrupt indexDerivedSections
+	decodeDerivedSection(&corrupt, indexSectionSUBT, bad, 4)
+	if corrupt.SubtreeOrder != nil || corrupt.SubtreeEnd != nil || corrupt.SubtreeSizeRank != nil {
+		t.Fatal("corrupt compact SUBT must decode to nothing")
+	}
+}
+
+// PATR delta-varint sections decode to the same ID lists as the legacy
+// raw-u32 form at a fraction of the bytes.
+func TestAttrPostingSectionDeltaAndLegacy(t *testing.T) {
+	bits := queryAttrBits()
+	in := map[uint32][]uint32{
+		bits[0]: {1, 2, 3, 100, 1000, 100000},
+		bits[1]: {5, 5, 5},
+		bits[3]: {0, 1, 2, 3, 4, 5, 6, 7, 8, 9},
+	}
+	legacy := encodeUint32Section(in[bits[0]], in[bits[1]], nil, in[bits[3]], nil)
+	// The raw legacy framing carries no dedup contract; the encoder dedups.
+	if got := decodeAttrPostingSection(legacy); !reflect.DeepEqual(got[bits[0]], []uint32{1, 2, 3, 100, 1000, 100000}) || !equalUint32s(got[bits[1]], []uint32{5, 5, 5}) || !equalUint32s(got[bits[3]], []uint32{0, 1, 2, 3, 4, 5, 6, 7, 8, 9}) || len(got) != 3 {
+		t.Fatalf("legacy PATR decode = %v", got)
+	}
+	enc := encodeAttrPostingSection(in)
+	if len(enc) >= len(legacy) {
+		t.Fatalf("delta PATR = %d bytes; want smaller than legacy %d", len(enc), len(legacy))
+	}
+	got := decodeAttrPostingSection(enc)
+	if !equalUint32s(got[bits[0]], []uint32{1, 2, 3, 100, 1000, 100000}) || !equalUint32s(got[bits[1]], []uint32{5}) || !equalUint32s(got[bits[3]], []uint32{0, 1, 2, 3, 4, 5, 6, 7, 8, 9}) || len(got) != 3 {
+		t.Fatalf("delta PATR decode = %v", got)
+	}
+	// Corrupt framings yield nil, never a panic or a partial map.
+	bad := append([]byte(nil), enc...)
+	binary.LittleEndian.PutUint32(bad[8:], 99)
+	if decodeAttrPostingSection(bad) != nil {
+		t.Fatal("wrong part count must decode to nil")
+	}
+	if decodeAttrPostingSection(enc[:len(enc)-1]) != nil {
+		t.Fatal("truncated section must decode to nil")
+	}
+	if decodeAttrPostingSection(enc[:0]) != nil {
+		t.Fatal("empty section must decode to nil")
+	}
+	if encodeAttrPostingSection(nil) != nil || encodeAttrPostingSection(map[uint32][]uint32{}) != nil {
+		t.Fatal("empty input must encode as nil (section omitted)")
 	}
 }
 
