@@ -33,9 +33,10 @@ non-path terms and other unsupported filename roots, multi-usable-volume
 queries, truncated catch-up (`healthIncomplete`), a missing overlay snapshot,
 and biased queries while the volume carries overlay activity (see the WP7
 section of the roadmap for the precise list and rationale). The documented §7
-residuals remain. `.gsx` doc tables are format **v8** (compact index with
-64 KiB text blocks and a per-shard trained dictionary; see §6o — v7 and
-older sidecars fail the version gate and rebuild) and sharded manifests are
+residuals remain. `.gsx` doc tables are format **v9** (compact index with
+64 KiB text blocks and a per-shard trained dictionary, §6o, plus compact
+postings, terms and doc table with dense grams pruned, §6q — v8 and older
+sidecars fail the version gate and rebuild) and sharded manifests are
 **v5** (see §6i). P4 document-extraction
 quality remains deferred (see §7). Content search is off by default; with
 `[features.content] enabled = true` or `SEEKFS_CONTENT_SEARCH=1`, `content:`
