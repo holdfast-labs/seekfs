@@ -191,3 +191,19 @@ func TestPathUnderFastPathFires(t *testing.T) {
 		t.Fatalf("pathUnder(%q, %q) = false, want true", clean, root)
 	}
 }
+
+// TestNormalizeFilterPathCacheIsBounded keeps the resident service from
+// growing the root-normalization cache by one entry per typed under: root.
+func TestNormalizeFilterPathCacheIsBounded(t *testing.T) {
+	for i := 0; i < 3*filterPathNormCacheMax; i++ {
+		root := filepath.Join(`E:\bench\roots`, strings.Repeat("d", 1+i%7), filepath.Base(strings.Repeat("x", 1+i/7)))
+		if got, want := normalizeFilterPathCached(root), normalizeFilterPath(root); got != want {
+			t.Fatalf("cached(%q) = %q; want %q", root, got, want)
+		}
+	}
+	n := 0
+	filterPathNormCache.Range(func(_, _ any) bool { n++; return true })
+	if n > filterPathNormCacheMax {
+		t.Fatalf("cache holds %d roots; want at most %d", n, filterPathNormCacheMax)
+	}
+}

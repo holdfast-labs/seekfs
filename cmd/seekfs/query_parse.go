@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -726,7 +727,14 @@ func normalizeFilterPath(path string) string {
 // normalization of an absolute path is cwd-independent, so caching it turns
 // two Abs+Clean calls per candidate into a map lookup. Relative paths still
 // go through normalizeFilterPath every time (their Abs depends on cwd).
+//
+// The resident service sees a new root per typed `under:` prefix, so the
+// cache is bounded: past filterPathNormCacheMax entries it starts over.
 var filterPathNormCache sync.Map // map[string]string
+
+var filterPathNormCacheLen atomic.Int64
+
+const filterPathNormCacheMax = 1024
 
 func normalizeFilterPathCached(path string) string {
 	if path == "" || !filepath.IsAbs(path) {
@@ -736,6 +744,10 @@ func normalizeFilterPathCached(path string) string {
 		return v.(string)
 	}
 	norm := normalizeFilterPath(path)
+	if filterPathNormCacheLen.Add(1) > filterPathNormCacheMax {
+		filterPathNormCache.Clear()
+		filterPathNormCacheLen.Store(1)
+	}
 	filterPathNormCache.Store(path, norm)
 	return norm
 }
