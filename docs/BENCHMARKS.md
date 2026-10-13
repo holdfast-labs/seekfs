@@ -144,11 +144,81 @@ top-1 99.5% unchanged before/after per `E:\bench\scripts\chromium_eval.py`):
   verification surprise. `ext:cc sort:extension` drops 97% with 99.95%
   fewer allocations.
 
-Remaining hotspots: fuzzy queries (18–51 ms, 54–123k allocs, dominated by
-per-candidate `fuzzyNameDistance` DP allocation); `-path under:` component
-queries (~80–95 ms in subtree-iterator build plus per-candidate path
-reconstruction and verification); two-typo declines on short terms
-(~15 ms of variant work for no match).
+Remaining hotspots (after `perf/name-fuzzy` below): fuzzy queries
+(7–16 ms, ~0.2–0.9k allocs, now dominated by DP compute over trigram
+candidates plus posting expansion); `-path under:` component queries
+(~19–31 ms, ~2k allocs, now dominated by the scoped term-side build plus
+rank-ordered verification); short-term declines (~8 ms of posting + DP
+compute for no match, allocation-free).
+
+## Name-fuzzy follow-up (`perf/name-fuzzy`)
+
+2026-10-13 local profile, same chromium walk index (555,849 records),
+`GOMAXPROCS=2`, same harness. Before (S3, `perf/name-query` end) vs after
+(S4, all changes below), min/p50 ms with allocations per query (fixed
+37-query table; untouched lanes bounce ±20% run to run under parallel
+load, same as before):
+
+| query | before | after | allocs before → after |
+| --- | --- | --- | --- |
+| fuzzy 1-typo `chorme` | 24.02/27.73 | 8.97/10.15 | ~90k → ~0.5k |
+| fuzzy 1-typo `broswer` | 34.60/50.75 | 15.84/16.62 | ~122k → ~0.6k |
+| fuzzy 2-typo `chrmae` (no match, tau=1) | 14.60/15.69 | 7.40/8.59 | ~58k → ~0.3k |
+| fuzzy swap `browsre` | 36.18/45.54 | 13.36/14.95 | ~123k → ~0.6k |
+| fuzzy 2-typo long `doccumnet` | 18.34/19.39 | 7.46/8.19 | ~54k → ~0.9k |
+| `-path under:` (`blink render` under blink) | 81.37/96.40 | 18.69/20.85 | ~129k → ~2k |
+| `-path under:` (`core frame` under renderer) | 8.74/10.21 | 3.01/3.52 | ~4.9k → ~0.4k |
+
+Untouched lanes (exact/trigram/`-path` broad/regex/sort/count) measure
+flat within the usual noise. Recall 100% and typo top-1 (one-typo 99.5%
+N=200 seed 42, two-typo 93.0% N=100 seed 7, per-query identical before
+and after) unchanged per `E:\bench\scripts\chromium_eval.py`; result
+parity old-vs-new over `parity.py` (50 queries × search 20/300/count):
+0 differences (one intermediate revision differed on fuzzy `unitest`
+top-N selection and was fixed before merge — see below).
+
+What drove each win (four focused commits):
+
+- Distance buffer reuse (`fuzzy.go`): one `fuzzyDistanceScratch` per
+  query threads reusable DP rows plus the rune decode buffer through
+  every candidate; ASCII names run a byte DP with no rune conversion;
+  names shorter than `len(term)-tau` decline before any DP; the
+  persisted lower name replaces the per-candidate `ToLower` copy; the
+  whole-name and window checks reuse the same scratch.
+- Cheaper verifier + parallel scoring (`fuzzy.go`): triangular-banded
+  semi-global DP (columns `j < i-tau` provably exceed tau; validated
+  against the unbanded window oracle on 5000 random larger inputs),
+  fused letter-mask/ASCII scan, and chunked parallel candidate scoring
+  with ordered merge (identical output by construction, pinned by a
+  serial-vs-parallel test).
+- Lazy materialization (`fuzzy.go`, global components lane
+  `global_rank.go`): fuzzy survivors sort by path-free keys and only
+  winners build entries; the components top-N verifies iterator
+  candidates at the record level (scalar precheck plus parent-chain
+  term/dir walk, a strict superset of the entry gate), sorts
+  lightweight `(id, rank)` pairs, then materializes entries in rank
+  order with path-tied groups and the exact `entryMatches` gate.
+- Under-scoped iterators (`global_query_iterators.go`): each probe
+  term's component roots are partitioned against the under intervals
+  (inside/ancestor/outside); satisfied terms (covering every under
+  root) drop out of the conjunction, in-scope roots plus
+  scope-filtered name hits drive it, so the 225k-record blink subtree
+  is never materialized when a term side is smaller. Any doubt
+  declines to the legacy assembly.
+- Parity fix (`fuzzy.go`): the collection cap (`need*fuzzyCollectFactor`)
+  is checked only at variant boundaries like the original loop — the
+  in-flight variant always over-collects past the cap and that tail
+  participates in the final sort. Stopping mid-variant changed fuzzy
+  top-N selection (`unitest`); pinned by
+  `TestAppendFuzzyCollectsPastEnoughBoundary`.
+
+Tried and rejected: whole-name prefix/suffix and bigram-presence
+pre-filters for piece-driven decline candidates (unsound against
+mid-name windows, or vacuous on `chr*` names that already share the
+piece bigrams); pair-gram retrieval tightening for short variants
+(unnecessary once the verifier went allocation-free); capping DP
+verifications (cannot prove emptiness — recall risk); Myers
+bit-parallel distance (no transposition support — recall risk on swaps).
 
 ## R5 Lazy-Source Validation Notes
 
