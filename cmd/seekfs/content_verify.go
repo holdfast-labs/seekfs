@@ -89,6 +89,84 @@ type contentLeafMatcher struct {
 	caseSensitive bool
 	regex         map[int]*regexp.Regexp
 	needle        map[int][]byte
+	// needleASCII records, per term/phrase leaf, whether the folded needle
+	// is pure ASCII. An ASCII needle against an ASCII document matches
+	// exactly under ASCII case folding, so verification and snippets can
+	// test it without allocating the full fold (asciiCaseIndex); anything
+	// else takes the historical fold path with identical results.
+	needleASCII map[int]bool
+}
+
+// isASCIIBytes reports whether b has no byte >= 0x80.
+func isASCIIBytes(b []byte) bool {
+	for i := 0; i < len(b); i++ {
+		if b[i] >= 0x80 {
+			return false
+		}
+	}
+	return true
+}
+
+// asciiCaseIndex finds the folded ASCII needle in raw under ASCII case
+// folding, without allocating. The caller must guarantee needle is folded
+// and pure ASCII (needleASCII); raw may be anything.
+//
+// A non-negative return is always a true match at that raw byte offset
+// (ASCII folding preserves offsets, so no mapping is needed). ascii=false
+// means raw contains non-ASCII bytes: the caller must fall back to the
+// full fold, which decides (folding can only reveal matches involving
+// non-ASCII runes, e.g. İ folding to i̇, which imply non-ASCII raw).
+// ascii=true with -1 means raw is pure ASCII and needle is genuinely
+// absent. Either way the outcome equals fold-then-substring.
+func asciiCaseIndex(raw, needle []byte) (idx int, ascii bool) {
+	if len(needle) == 0 || len(raw) < len(needle) {
+		return -1, isASCIIBytes(raw)
+	}
+	first := needle[0]
+	upper := first
+	if first >= 'a' && first <= 'z' {
+		upper = first - ('a' - 'A')
+	}
+	ascii = true
+	for i := 0; i < len(raw); i++ {
+		c := raw[i]
+		if c >= 0x80 {
+			ascii = false
+			continue
+		}
+		if i+len(needle) > len(raw) {
+			// Past the last match start: no comparison, but the byte
+			// still counts for the ASCII verdict (checked above).
+			continue
+		}
+		if c != first && c != upper {
+			continue
+		}
+		match := true
+		for j := 1; j < len(needle); j++ {
+			d := raw[i+j]
+			if d >= 0x80 {
+				ascii = false
+				match = false
+				break
+			}
+			if d >= 'A' && d <= 'Z' {
+				d += 'a' - 'A'
+			}
+			if d != needle[j] {
+				match = false
+				break
+			}
+		}
+		if match {
+			// A true ASCII match — but the caller still needs the
+			// verdict: earlier non-ASCII bytes mean the fold could
+			// match even earlier (inside a fold expansion like İ→i̇),
+			// so only a clean scan authorizes the fast offset.
+			return i, ascii
+		}
+	}
+	return -1, ascii
 }
 
 func newContentLeafMatcher(pq parsedQuery) *contentLeafMatcher {
@@ -123,6 +201,10 @@ func newContentLeafMatcher(pq parsedQuery) *contentLeafMatcher {
 			b = contentFoldText(b)
 		}
 		m.needle[leaf.LeafID] = b
+		if m.needleASCII == nil {
+			m.needleASCII = make(map[int]bool)
+		}
+		m.needleASCII[leaf.LeafID] = isASCIIBytes(b)
 	}
 	return m
 }
@@ -166,11 +248,13 @@ func (m *contentLeafMatcher) match(raw, folded []byte, leaf contentLeaf) bool {
 
 // matchRawFirst is match with a lazy fold: a case-insensitive leaf whose
 // lowercased needle already appears verbatim in the raw text is a match without
-// folding, and only the first leaf that misses the raw fast path pays for the
-// once-per-entry fold (cached through folded/foldedReady). A corpus of
-// already-lowercase documents (the common case) then never folds at all. The
-// match decision is identical to match: folding then testing a superset cannot
-// introduce or drop a match.
+// folding. Otherwise, when both needle and text are ASCII, the match is
+// decided by asciiCaseIndex with no allocation at all; only text containing
+// non-ASCII bytes pays for the once-per-entry fold (cached through
+// folded/foldedReady). A corpus of already-lowercase documents (the common
+// case) then never folds at all. The match decision is identical to match:
+// asciiCaseIndex finds exactly the ASCII matches and defers to the fold
+// whenever non-ASCII bytes could hide one.
 func (m *contentLeafMatcher) matchRawFirst(raw []byte, folded *[]byte, foldedReady *bool, leaf contentLeaf) bool {
 	if leaf.Kind == contentLeafRegex {
 		re := m.regex[leaf.LeafID]
@@ -182,6 +266,11 @@ func (m *contentLeafMatcher) matchRawFirst(raw []byte, folded *[]byte, foldedRea
 	}
 	if m.caseSensitive {
 		return false
+	}
+	if m.needleASCII[leaf.LeafID] {
+		if idx, ascii := asciiCaseIndex(raw, needle); ascii {
+			return idx >= 0
+		}
 	}
 	if !*foldedReady {
 		*folded = contentFoldText(raw)
@@ -394,6 +483,17 @@ func contentSnippet(raw, folded []byte, positive []contentLeaf, m *contentLeafMa
 			continue
 		}
 		needle := m.needleOf(leaf)
+		// An ASCII needle in ASCII text windows the raw bytes directly:
+		// folding preserves ASCII offsets, so this renders exactly what
+		// the fold-and-map path below produces, with no allocation.
+		if !m.caseSensitive && m.needleASCII[leaf.LeafID] {
+			if off, ascii := asciiCaseIndex(raw, needle); ascii {
+				if off < 0 {
+					continue
+				}
+				return contentSnippetWindow(raw, off, len(needle))
+			}
+		}
 		hay := m.haystackFor(raw, folded)
 		off := contentLeafFirstOffset(hay, needle)
 		if off < 0 {
