@@ -91,15 +91,18 @@ func contentSectionEagerVerify(tag uint32) bool {
 // bump (compact index) replaces the raw CXST text store with blocked zstd,
 // drops the CXTR term postings to a front-coded dictionary, and stores CXGR
 // gram postings as docIDs only with bitmap dense blocks (see
-// content_textblock.go, content_termsdict.go and content_postings.go). A
-// sidecar whose version does not match is rejected on load, so it can never
-// be attached stale: the service sees no usable base and its PF-3 build path
-// rebuilds it. (05 is the sharded-manifest version, which carries no doc
-// table; manifests are unaffected by the 06/07 bumps: a manifest names shard
-// files, and each shard carries the doc-table version itself.)
+// content_textblock.go, content_termsdict.go and content_postings.go); the
+// 08 bump shrinks text blocks to 64 KiB and gives each shard a trained
+// zstd dictionary (CXTD, raw content; see content_textdict.go) that its
+// frames reference. A sidecar whose version does not match is rejected on
+// load, so it can never be attached stale: the service sees no usable base
+// and its PF-3 build path rebuilds it. (05 is the sharded-manifest version,
+// which carries no doc table; manifests are unaffected by the 06/07/08
+// bumps: a manifest names shard files, and each shard carries the doc-table
+// version itself.)
 var contentIndexMagic = [8]byte{'G', 'O', 'S', 'C', 'X', '0', '0', '4'}
 
-const contentIndexVersion = 7
+const contentIndexVersion = 8
 
 // contentOrigin records what the doc keys are, so a `.gsx` can never be
 // attached to a key space it does not join.

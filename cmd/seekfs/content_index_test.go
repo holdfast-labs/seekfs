@@ -68,8 +68,8 @@ func TestContentIndexRoundTrip(t *testing.T) {
 
 // A sidecar stamped with the previous doc-table version must fail the
 // version gate (never attach stale): the service sees no usable base and
-// its PF-3 build path rebuilds it. The v7 section decoders never see v6
-// bytes.
+// its PF-3 build path rebuilds it. The current section decoders never see
+// older bytes.
 func TestContentIndexRejectsPreviousVersion(t *testing.T) {
 	idx := newContentIndex()
 	idx.Docs = contentTestDocs()
@@ -80,7 +80,7 @@ func TestContentIndexRejectsPreviousVersion(t *testing.T) {
 	bad := append([]byte(nil), data...)
 	binary.LittleEndian.PutUint32(bad[8:], uint32(contentIndexVersion-1))
 	if _, err := contentIndexDecode(bad); err == nil {
-		t.Fatal("v6-stamped sidecar decoded without error")
+		t.Fatal("previous-version sidecar decoded without error")
 	}
 	// The manifest version still decodes (manifests carry no doc table).
 	if contentManifestVersion == contentIndexVersion {

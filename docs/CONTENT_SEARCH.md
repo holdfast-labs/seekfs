@@ -33,10 +33,10 @@ non-path terms and other unsupported filename roots, multi-usable-volume
 queries, truncated catch-up (`healthIncomplete`), a missing overlay snapshot,
 and biased queries while the volume carries overlay activity (see the WP7
 section of the roadmap for the precise list and rationale). The documented §7
-residuals remain. `.gsx` doc tables are format **v7** (compact index: blocked
-compressed text, dictionary-only terms, docID-only grams; see §6m — v6
-sidecars fail the version gate and rebuild) and sharded manifests are **v5**
-(see §6i). P4 document-extraction
+residuals remain. `.gsx` doc tables are format **v8** (compact index with
+64 KiB text blocks and a per-shard trained dictionary; see §6o — v7 and
+older sidecars fail the version gate and rebuild) and sharded manifests are
+**v5** (see §6i). P4 document-extraction
 quality remains deferred (see §7). Content search is off by default; with
 `[features.content] enabled = true` or `SEEKFS_CONTENT_SEARCH=1`, `content:`
 queries work through the service once the
@@ -150,18 +150,19 @@ of the candidates to project the binary share (`projected_text_files`).
 
 There is no default extracted-text budget: the default scope indexes
 everything selected, and selection stops only when the projected index would
-push the volume holding the sidecar below a free-space reserve — the larger
-of 10% of the volume's capacity or 20 GiB (see `contentScopeReserveFor` in
-`content_space.go`). Sharding bounds build and fold memory per 64 MiB shard,
+push the volume holding the sidecar below a free-space reserve — 5% of the
+volume's capacity clamped to [10 GiB, 20 GiB] (see `contentScopeReserveFor`
+in `content_space.go`). The same reserve governs selection and the
+write-time guard so the two agree, and it is monotonic: at or below the
+reserve the allowance is 0 and drops are counted, so it never grows as free
+space shrinks. Sharding bounds build and fold memory per 64 MiB shard,
 so the budget is really disk space. The projection scales extracted bytes by
-`contentScopeEncodedMultiplier` (0.5, calibrated against the compact v7
+`contentScopeEncodedMultiplier` (0.5, calibrated against the compact
 encoding at ~0.33 of extracted text); the encode-time size-cap check stays
 the backstop. Corpora past the shard target build as folder shards, each
 individually capped at the 4 GiB per-file sidecar cap (an over-cap shard
 refuses to publish, like a single-file over-cap build), which is why totals
-past 4 GiB are safe. If the volume is already below its reserve, selection
-is not refused outright (that would disable content on full disks); the
-existing 10 GiB write-time guard stays the backstop. Set `[content]`
+past 4 GiB are safe. Set `[content]`
 `budget_bytes` (or `[content."E:"]` per volume, or
 `SEEKFS_CONTENT_BUDGET_BYTES`) to pin an explicit extracted-text budget,
 which is enforced exactly as before and wins over the reserve. Only an
@@ -250,7 +251,8 @@ when none is usable the query errors rather than returning empty.
 | `content_extract_text.go` / `_ooxml.go` / `_pdf.go` | Extractors: text/code; OOXML/ODF/EPUB; best-effort PDF (spike quality). |
 | `content_open_windows.go` / `_other.go` | `contentOpenNoRecall`: opens with `FILE_FLAG_OPEN_NO_RECALL` so cloud placeholders fail instead of hydrating. |
 | `content_build.go` | Offline builders + options. `buildContentIndexFromDir` (walk, `origin=walk`, path-hash keys), `buildContentIndexForIndex` (USN, `origin=usn`, record-FRN keys), `assembleContentIndex` (streams postings through the external builders), `contentRepairText` (case-preserving stored text), `contentFoldText` (case-folded index view), `contentPathKey`, `contentTermsOf`, `contentGramsOf`, v7 path table codec (sorted + front-coded + permutation). |
-| `content_textblock.go` | Blocked compressed text store (CXST v2): 512 KiB zstd blocks cut at doc boundaries, logical offsets in the doc table, block LRU in the reader. |
+| `content_textblock.go` | Blocked compressed text store (CXST v2/v3): 64 KiB zstd blocks cut at doc boundaries, logical offsets in the doc table, shared block cache + pooled decoders in the reader; v8 frames reference the shard's CXTD dictionary. |
+| `content_textdict.go` | Per-shard trained text dictionary (CXTD, v8): line-frequency trainer, section codec. |
 | `content_termsdict.go` | Dictionary-only terms section (CXTR v2): front-coded keys with restarts, u8 frequencies + sorted overflow table; serves the fuzzy dictionary. |
 | `content_dict_build.go` | Bounded external builder for the term dictionary (key counting, no postings). |
 | `content_shards.go` | Sharded sidecars: manifest codec (CXSH, format v5), folder shard planner and longest-prefix assigner, composite load, shard-aware candidate streams and `under:` shard mask, per-shard fold planning/source, shard file sweep. |
@@ -1125,18 +1127,118 @@ No stored-text change was needed and none is proposed.
 **Budget policy (done, with the reserve code in `content_space.go`).**
 There is no default byte budget: the default scope indexes everything
 selected and stops only when the projected index (extracted × 0.5) would
-breach the volume's free-space reserve — max(10% of capacity, 20 GiB).
-A volume already below its reserve is still built (bounded by the 10 GiB
-write-time guard); refusing everything would disable content on full
-disks instead of bounding it. Explicit `budget_bytes` still caps
-extracted bytes exactly as before. Both record exact `scope_dropped` /
-`scope_dropped_bytes`; the policy carries the enforced `budget_bytes`
-(0 when reserve-governed) or `reserve_bytes`, surfaced in
-`loaded --json` and the UI footer with the matching operator action.
-`--estimate` applies the same rule and projection. Covered by
+breach the volume's free-space reserve — 5% of capacity clamped to
+[10 GiB, 20 GiB], shared by selection and the write-time guard, monotonic
+(allowance 0 at or below the reserve, with drops counted). Explicit
+`budget_bytes` still caps extracted bytes exactly as before. Both record
+exact `scope_dropped` / `scope_dropped_bytes`; the policy carries the
+enforced `budget_bytes` (0 when reserve-governed) or `reserve_bytes`,
+surfaced in `loaded --json` and the UI footer with the matching operator
+action. `--estimate` applies the same rule and projection. Covered by
 `TestContentScopeReserve`, `TestContentScopeEstimateReserveTruncates`,
 `TestContentServiceBuildReserveDropsExactFilesAndBytes` and the health/UI
 summary tests.
+
+## 6o. Small blocks + trained dictionaries (done)
+
+Format **v8**: 64 KiB doc-aligned text blocks (docs larger than a block get
+their own frames) plus one zstd dictionary trained per shard at build time,
+stored as a CRC-covered CXTD section. Small blocks cut the compulsory
+decompression per scattered candidate ~8x (a 55 KiB doc touches one 64 KiB
+block, ~170 µs, instead of one 512 KiB block, ~0.9 ms); the dictionary
+recovers most of the ratio small blocks lose. The verify working set itself
+shrinks ~5x (a broad compound's blocks go from ~322 MB toward ~60 MB),
+which is what fits it back under the shared cache.
+
+**Dictionary design.** No in-process zstd trainer exists in the module set,
+so the trainer (`contentTrainTextDict`) produces dictionary *content* only —
+whole repeated source lines by (−count, line) total order to a 96 KiB
+budget — and stores it raw: klauspost supports raw-content dicts on both
+sides (`WithEncoderDictRaw`/`WithDecoderDictRaw`), which need no entropy
+tables (content is initial history). Training is deterministic (doc order
+in, total order out): the assembler samples the first 8 MiB of stored text
+riding the normal emit path (no buffering, no reorder) and trains once at
+the cap or the exhausted source; below 2 MiB logical (a var for tests) or
+with no repeats it stays plain. The encoder level follows the dict
+(BetterCompression, which has a dict path — BestCompression ignores dicts)
+with a 1 MiB window; sidecars with dict and plain frames coexist
+decodably, and missing CXTD fails closed (no text, never wrong text).
+Pooled decoders each own a private copy of the dict content, so there is no
+lifetime coupling to the mapped section beyond the section CRC. Fold,
+reshard, walk reconcile, integrity and the compound lane all funnel through
+the assembler/reader and work unchanged.
+
+**Curve** (same 65k-file sample, frames-only ratios; dict rows pair Better
+with the line trainer, plain rows are Best):
+
+| block | none | dict 32K | dict 64K | dict 96K |
+|---|---|---|---|---|
+| 64 KiB | 0.2117 | 0.2083 | 0.2050 | **0.2030** |
+| 128 KiB | 0.2020 | 0.2037 | 0.2009 | 0.1992 |
+| 256 KiB | 0.1941 | 0.1999 | 0.1977 | 0.1962 |
+| 512 KiB | 0.1874 | 0.1967 | 0.1949 | 0.1938 |
+
+The dictionary helps most where blocks are smallest (64 KiB: −0.0087; at
+256 KiB+ the weaker Better level costs more than the dict returns, so those
+cells lose to plain Best). Dict decode runs ~380–430 MB/s vs ~480–650 plain
+(longer history matches); per touch still wins 4–5x (170 µs vs 790 µs).
+Training costs ~40 ms; the dict encoder is actually faster than Best
+(~9 s vs ~20 s per 553 MB — noise next to extraction either way). A shared
+(per-shard, not global) dictionary was chosen for fold isolation; per-block
+bit-packing re-measured at 6% and stayed rejected.
+
+**Shipped point: 64 KiB + 96 KiB dict.** Same 64,970-file input
+(logical 557.6 MB): text 110.0 MB (0.197x), terms 18.8 MB, grams 55.7 MB,
+paths 1.5 MB, doctable 5.2 MB, dict ~0.1 MB, file **191.3 MB (0.343x)** —
+targets ≤0.36× single-file and ≤0.40× sharded both hold (sharded reshare:
+11 shards, 212.2 MB, 0.381x, +10.9% shard-independence tax as in §6m).
+Build time is extraction-dominated as before (~9 min cold here).
+
+Query table, same 6 shapes, min-of-N, GOMAXPROCS=2 (v6 baselines §6m):
+
+| query | v6 | v8 warm (128 MB) | v8 cold |
+|---|---|---|---|---|
+| `content:struct` | 1.51 ms | 1.0 ms | 1.5 ms |
+| `content:EINVAL` | 30.5 ms | 10.2 ms | 36.8 ms |
+| `content:cityhash_v103` | 1.55 ms | 2.2 ms | 2.6 ms |
+| `content:"reassemble"` | 40.5 ms | 23.4 ms | 52.7 ms |
+| regex full scan | 15.2 s | 15.2 s | 15.5 s |
+| `ext:cc content:mutex` full-verify | 130 ms | 353 ms (128 MB) / 143.8 ms (256 MB) | 372 ms |
+| `mutex` unlimited (production parallel) | — | ~367 ms | 375 ms (G2) |
+
+Warm meets 1.5x everywhere except the serial compound at the default
+128 MB cap: its ~110 MB block set fits, but once prior queries' blocks are
+also resident it thrashes exactly like the 322 MB set did at 512 KiB
+blocks. A 256 MB run measures compound warm at 143.8 ms (under 200 ms) —
+the small-block working set is what makes the top of the allowed cache
+range sufficient. Cold meets struct,
+EINVAL, reassemble and regex; cityhash-cold (2.64 vs 2.33) misses by
+0.3 ms — 10 scattered docs over 9 compulsory 64 KiB misses — and the
+serial compound (372 ms) by the straddle math below. At 8 workers
+(production projection, labeled runs on the same file): struct ~0,
+EINVAL 11.0/3.9, cityhash 2.11/2.03, reassemble 15.5/7.5 ms, regex
+~16–17 s, serial compound unchanged (~377 ms, serial loop), and
+full-verify through the production parallel search 103 ms — every
+production shape under its target. The 16-worker service clears the rest
+by balance.
+
+Why the serial compound lands at 372 ms: the 932 `.cc` docs average
+55 KiB, so ~86% straddle two 64 KiB blocks (~1700 touches × ~170 µs dict
+decode ≈ 290 ms) plus ~100 ms of folds v6 also pays plus intersection.
+Folds + intersection alone are ~105 ms, so serial needs ~95 ms of
+decompression for ~1700 touches (56 µs/touch ≈ 1.1 GB/s) — past this
+loaded box (~380 MB/s dict) but reachable on a quiet one, warm with a
+≥140 MB-effective cache (~125 ms), or parallel (~40–135 ms at 8–16
+workers). No block size fixes it serially on this box (per-touch floor);
+no ratio budget exists to buy back with (see curve).
+
+Covered by `TestContentTrainTextDict*`, `TestContentTextDictBuild*`
+(mid-stream train, determinism, tiny-skips-dict, missing-CXTD-fails-closed)
+and the full suite; `TestContentIndexRejectsPreviousVersion` now guards
+v7. The v8 work keeps the §6m budget policy, reserve semantics (§6m,
+monotonic 5%/[10,20] GiB shared by selection and writes), pin discipline
+(dict decoders own private copies), fold/reshard/walk paths (all funnel
+through the sampling assembler and the dict-aware reader) green.
 
 ## 7. Carried debt / known gaps
 

@@ -34,16 +34,17 @@ import (
 	"github.com/klauspost/compress/zstd"
 )
 
-// contentTextBlockTarget is the uncompressed size a text block is cut at. A
-// block holds whole documents (~60 average docs at the measured 8.5 KB
-// mean), so one 512 KiB decompress (~1 ms) typically serves a run of
-// candidates, and sequential scans (fold, regex fallback) share each block
-// across its docs through the LRU. Larger blocks compress better; smaller
-// ones reduce read amplification for selective queries (one cold block per
-// verified doc run). Measured on the 553 MB Chromium sample (ratio at
-// Better/BestCompression): 128 KiB .223/.212, 256 KiB .205/.193,
-// 512 KiB .199/.186.
-const contentTextBlockTarget = 512 << 10
+// contentTextBlockTarget is the uncompressed size a text block is cut at.
+// Blocks hold whole documents (~8 average docs at the measured 8.5 KB
+// mean). Small blocks touch ~64 KiB per cold block (~170 µs with a
+// dictionary) instead of ~512 KiB (~0.9 ms without), so a scattered
+// verify-heavy query's working set itself shrinks ~8x — which is what fits
+// a broad compound's blocks back under the shared cache. Measured on the
+// 553 MB Chromium sample (Better/BestCompression; dict rows pair Better
+// with a 96 KiB trained dict): 64 KiB .203/.212, 128 KiB .199/.202,
+// 256 KiB .196/.194, 512 KiB .194/.187. v8 ships 64 KiB with a per-shard
+// trained dictionary.
+const contentTextBlockTarget = 64 << 10
 
 // contentBlockCacheDefaultMB sizes the shared cache when neither the
 // environment nor a platform memory figure says otherwise.
@@ -247,14 +248,20 @@ var contentZstdDecPool = sync.Pool{New: func() any {
 	return dec
 }}
 
-// contentTextStore is a decoded CXST v2 section: the block table plus the
+// contentTextStore is a decoded CXST section: the block table plus the
 // frames they address. frames aliases the mapped section (or a heap copy);
 // blocks decode on demand through the owning reader's shared block cache
-// (nil cache decodes direct, for store-level tests).
+// (nil cache decodes direct, for store-level tests). dict, when present, is
+// the shard's CXTD content the frames were encoded against (v8); pooled
+// decoders each own a private copy, so there is no lifetime coupling to the
+// mapped section beyond the section CRC that verified it.
 type contentTextStore struct {
-	blocks []contentTextBlockMeta
-	frames []byte
-	cache  *contentBlockCache
+	blocks   []contentTextBlockMeta
+	frames   []byte
+	cache    *contentBlockCache
+	dictID   uint32
+	dict     []byte
+	dictPool sync.Pool
 }
 
 // openContentTextStore decodes a CXST v2 payload. A v6 (raw-concatenation)
@@ -349,7 +356,7 @@ func (st *contentTextStore) fetchMiss(b contentTextBlockMeta, in int, room []byt
 			}
 			continue
 		}
-		data, err := contentDecodeBlock(frame, int(b.rawLen))
+		data, err := st.decodeBlock(frame, int(b.rawLen))
 		if err != nil {
 			// Release joiners on failure: remove the claim without an
 			// install so they decode themselves instead of hanging.
@@ -364,7 +371,7 @@ func (st *contentTextStore) fetchMiss(b contentTextBlockMeta, in int, room []byt
 		return c.installAndCopy(st, b.logicalStart, in, data, room), true
 	}
 	// Pathological churn: decode privately, cache nothing.
-	data, err := contentDecodeBlock(frame, int(b.rawLen))
+	data, err := st.decodeBlock(frame, int(b.rawLen))
 	if err != nil {
 		return 0, false
 	}
@@ -446,6 +453,36 @@ func contentDecodeBlock(frame []byte, rawLen int) ([]byte, error) {
 	return out, nil
 }
 
+// decodeBlock decodes one frame with the store's dictionary when it has one
+// (v8, from the pooled dict decoders) or plain otherwise. Ownership rules
+// match contentDecodeBlock.
+func (st *contentTextStore) decodeBlock(frame []byte, rawLen int) ([]byte, error) {
+	if len(st.dict) == 0 || st.dictID == 0 {
+		return contentDecodeBlock(frame, rawLen)
+	}
+	dec, ok := st.dictPool.Get().(*zstd.Decoder)
+	if !ok || dec == nil {
+		// First use (or a zero pool in store-level tests): build a decoder
+		// over a private copy of the dict content, so pooled decoders never
+		// alias the mapped CXTD section.
+		dictCopy := append([]byte(nil), st.dict...)
+		var err error
+		dec, err = zstd.NewReader(nil, zstd.WithDecoderDictRaw(st.dictID, dictCopy))
+		if err != nil {
+			return nil, fmt.Errorf("content text store dict decoder: %w", err)
+		}
+	}
+	out, err := dec.DecodeAll(frame, contentBlockBufGet(rawLen))
+	st.dictPool.Put(dec)
+	if err != nil {
+		return nil, fmt.Errorf("content text store block: %w", err)
+	}
+	if len(out) != rawLen {
+		return nil, errors.New("content text store block length mismatch")
+	}
+	return out, nil
+}
+
 // textFor returns a fresh copy of length bytes at logical offset off,
 // stitching across block boundaries for documents that span them. ok is false
 // when the span is out of range or a block fails to decode: callers treat it
@@ -486,7 +523,7 @@ func (st *contentTextStore) textFor(off uint64, length uint32) (out []byte, ok b
 			}
 		} else {
 			frame := st.frames[b.compOff : b.compOff+uint64(b.compLen)]
-			data, err := contentDecodeBlock(frame, int(b.rawLen))
+			data, err := st.decodeBlock(frame, int(b.rawLen))
 			if err != nil {
 				return nil, false
 			}
@@ -504,12 +541,21 @@ func (st *contentTextStore) textFor(off uint64, length uint32) (out []byte, ok b
 }
 
 // contentTextBlockWriter compresses the logical text stream into blocked CXST
-// v2 during assembly. Append buffers whole documents and cuts a block at the
+// during assembly. Append buffers whole documents and cuts a block at the
 // first document boundary at or past the target; FinishFile writes the final
 // section file (header + table + frames). Peak heap is one target block plus
 // one document plus the encoder workspace.
+//
+// The optional dictionary (v8, setDict anytime before FinishFile) is trained
+// per shard from the shard head and stored as its own CXTD section: frames
+// cut after it reference it. Without a dictionary the writer encodes plain
+// at BestCompression; with one it encodes at BetterCompression (Best ignores
+// dictionaries), which the dictionary more than repays on small blocks. The
+// encoder is built lazily at the first flush so the level follows the dict.
 type contentTextBlockWriter struct {
 	enc     *zstd.Encoder
+	dict    []byte
+	dictID  uint32
 	frames  *os.File
 	framesW *bufio.Writer
 	blocks  []contentTextBlockMeta
@@ -524,22 +570,64 @@ type contentTextBlockWriter struct {
 }
 
 func newContentTextBlockWriter(tmpDir string) (*contentTextBlockWriter, error) {
-	// BestCompression costs ~20 s per 553 MB single-threaded (noise next
-	// to extraction) for ~1.5 points of ratio over BetterCompression.
-	enc, err := zstd.NewWriter(nil, zstd.WithEncoderLevel(zstd.SpeedBestCompression))
-	if err != nil {
-		return nil, err
-	}
 	f, err := os.CreateTemp(tmpDir, "cxframes-*.bin")
 	if err != nil {
-		_ = enc.Close()
 		return nil, err
 	}
 	return &contentTextBlockWriter{
-		enc:     enc,
 		frames:  f,
 		framesW: bufio.NewWriterSize(f, contentSectionFileBufSize),
 	}, nil
+}
+
+// setDict installs the shard's trained dictionary, anytime before FinishFile.
+// Blocks cut before it stay plain, later ones reference it; frames are
+// self-describing per dict ID so a mixed store decodes either way, and the
+// same input always trains the same dict at the same point, so output stays
+// byte-identical. (Training mid-stream keeps the assembler single-pass: the
+// first ~sample bytes encode plain, the rest with the dictionary.)
+func (w *contentTextBlockWriter) setDict(id uint32, dict []byte) error {
+	if w.closed {
+		return errors.New("content text block writer closed")
+	}
+	if len(dict) == 0 || id == 0 {
+		return nil
+	}
+	// A plain encoder may already exist (blocks cut before training); swap
+	// it so later blocks use the dictionary. Frames are independent, so
+	// mixing is safe and deterministic.
+	if w.enc != nil {
+		_ = w.enc.Close()
+		w.enc = nil
+	}
+	w.dict = dict
+	w.dictID = id
+	return nil
+}
+
+// ensureEncoder builds the frame encoder for the configured mode: plain at
+// BestCompression (~20 s per 553 MB single-threaded, noise next to
+// extraction), or at BetterCompression with the dictionary and a 1 MiB
+// window covering dict plus block (BestCompression has no dict path).
+func (w *contentTextBlockWriter) ensureEncoder() error {
+	if w.enc != nil {
+		return nil
+	}
+	var enc *zstd.Encoder
+	var err error
+	if len(w.dict) > 0 {
+		enc, err = zstd.NewWriter(nil,
+			zstd.WithEncoderLevel(zstd.SpeedBetterCompression),
+			zstd.WithEncoderDictRaw(w.dictID, w.dict),
+			zstd.WithWindowSize(1<<20))
+	} else {
+		enc, err = zstd.NewWriter(nil, zstd.WithEncoderLevel(zstd.SpeedBestCompression))
+	}
+	if err != nil {
+		return err
+	}
+	w.enc = enc
+	return nil
 }
 
 // logicalSize reports the logical stream length so far: the doc table's
@@ -565,6 +653,9 @@ func (w *contentTextBlockWriter) Append(doc []byte) error {
 func (w *contentTextBlockWriter) flush() error {
 	if len(w.pending) == 0 {
 		return nil
+	}
+	if err := w.ensureEncoder(); err != nil {
+		return err
 	}
 	w.scratch = w.enc.EncodeAll(w.pending, w.scratch[:0])
 	n, err := w.framesW.Write(w.scratch)
@@ -597,7 +688,10 @@ func (w *contentTextBlockWriter) abort() {
 		_ = os.Remove(name)
 		w.frames = nil
 	}
-	_ = w.enc.Close()
+	if w.enc != nil {
+		_ = w.enc.Close()
+		w.enc = nil
+	}
 }
 
 // FinishFile flushes the tail block and writes the final CXST section file at
@@ -608,7 +702,13 @@ func (w *contentTextBlockWriter) FinishFile(path string) error {
 		return errors.New("content text block writer closed")
 	}
 	w.closed = true
-	defer w.enc.Close()
+	// The encoder is lazy (nil on an empty corpus); flush builds it only
+	// when a block actually needs encoding.
+	defer func() {
+		if w.enc != nil {
+			w.enc.Close()
+		}
+	}()
 	if err := w.flush(); err != nil {
 		w.abortFiles()
 		return err
@@ -685,5 +785,9 @@ func (w *contentTextBlockWriter) abortFiles() {
 		_ = w.frames.Close()
 		_ = os.Remove(name)
 		w.frames = nil
+	}
+	if w.enc != nil {
+		_ = w.enc.Close()
+		w.enc = nil
 	}
 }
