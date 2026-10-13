@@ -19,6 +19,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 	"unicode/utf8"
 )
 
@@ -534,11 +535,17 @@ func assembleContentIndexStreamed(source contentBuildSource, tmpDir string) (*co
 
 	// The text store compresses incrementally as docs arrive; the writer
 	// spools compressed frames and finalizes the section file at the end,
-	// so peak heap stays one block plus one document.
+	// so peak heap stays one block plus one document. Encoding runs on the
+	// pipe thread (see content_textpipe.go) while emit keeps doing posting
+	// work; frames, cuts and offsets are byte-identical to serial assembly.
 	textWriter, err := newContentTextBlockWriter(tmpDir)
 	if err != nil {
 		return nil, err
 	}
+	textPipe := startContentTextPipe(textWriter)
+	// textLogical mirrors the writer's logical size on the emit thread: the
+	// doc table's TextOff assignments, which must stay in send order.
+	var textLogical uint64
 
 	built := &contentStreamedBuild{}
 	var docs []contentDoc
@@ -554,16 +561,24 @@ func assembleContentIndexStreamed(source contentBuildSource, tmpDir string) (*co
 	var dictForSection []byte
 	var dictID uint32
 	trainAndSet := func() error {
+		t0 := time.Now()
+		defer func() {
+			if pc := contentAssemblePhaseCapture; pc != nil {
+				contentPhaseAdd(&pc.train, time.Since(t0))
+			}
+		}()
 		sampling = false
-		if textWriter.logicalSize() < contentDictMinLogical {
+		if textLogical < contentDictMinLogical {
 			sample = nil
 			return nil
 		}
 		if trained := contentTrainTextDict(sample, contentDictBudget); len(trained) > 0 {
-			if err := textWriter.setDict(contentTextDictID, trained); err != nil {
-				sample = nil
-				return err
-			}
+			// Ordered with the appended docs: blocks cut before this
+			// point encode plain, later ones with the dictionary,
+			// exactly as the serial setDict. A pipe-side failure
+			// surfaces at finish instead of here; either way the
+			// build fails rather than publishing mixed output.
+			textPipe.sendSetDict(contentTextDictID, trained)
 			dictForSection = trained
 			dictID = contentTextDictID
 		}
@@ -615,6 +630,7 @@ func assembleContentIndexStreamed(source contentBuildSource, tmpDir string) (*co
 				break
 			}
 			toks := make([]contentTokenizedDoc, len(raws))
+			tokStart := time.Now()
 			if len(raws) == 1 || workers == 1 {
 				for i := range raws {
 					toks[i] = contentTokenizeDocForBuild(raws[i].text)
@@ -636,6 +652,10 @@ func assembleContentIndexStreamed(source contentBuildSource, tmpDir string) (*co
 				}
 				wg.Wait()
 			}
+			if pc := contentAssemblePhaseCapture; pc != nil {
+				contentPhaseAdd(&pc.tokenize, time.Since(tokStart))
+			}
+			emitStart := time.Now()
 			for i := range raws {
 				d := &raws[i]
 				t := &toks[i]
@@ -663,22 +683,25 @@ func assembleContentIndexStreamed(source contentBuildSource, tmpDir string) (*co
 				//
 				// TextOff/TextLen address the logical (decompressed) stream, so
 				// the doc table is identical with or without block compression;
-				// only the CXST section bytes change.
-				textOff := textWriter.logicalSize()
-				if err := textWriter.Append(t.stored); err != nil {
-					return err
-				}
+				// only the CXST section bytes change. Offsets come from the
+				// emit-side running sum (identical to the writer's logical
+				// size); the bytes move to the pipe thread, which encodes
+				// while emit continues with posting Adds.
+				textOff := textLogical
+				storedLen := len(t.stored)
+				textLogical += uint64(storedLen)
+				textPipe.sendAppend(t.stored)
 				docs = append(docs, contentDoc{
 					DocID:            docID,
 					FRN:              d.frn,
 					ContentType:      d.class,
 					ExtractorVersion: d.version,
 					DocLen:           t.docLen,
-					RawSize:          int64(len(t.stored)),
+					RawSize:          int64(storedLen),
 					ModUnix:          d.modUnix,
 					ContentHash:      t.hash,
 					TextOff:          textOff,
-					TextLen:          uint32(len(t.stored)),
+					TextLen:          uint32(storedLen),
 					FileSize:         d.fileSize,
 					FileModNano:      d.fileModNano,
 				})
@@ -696,6 +719,9 @@ func assembleContentIndexStreamed(source contentBuildSource, tmpDir string) (*co
 				}
 				contentAssembleStreamHook(int(docID))
 			}
+			if pc := contentAssemblePhaseCapture; pc != nil {
+				contentPhaseAdd(&pc.emit, time.Since(emitStart))
+			}
 			// The source ended mid-batch with sampling still open: train on
 			// the whole accumulation now (a per-doc exhausted check would
 			// train on one doc — the pull phase already knows the stream
@@ -710,7 +736,7 @@ func assembleContentIndexStreamed(source contentBuildSource, tmpDir string) (*co
 	}()
 	textPath := filepath.Join(tmpDir, "cxtext.sec")
 	if asmErr != nil {
-		textWriter.abort()
+		textPipe.abort()
 		return nil, asmErr
 	}
 	termPath := filepath.Join(tmpDir, "cxterm.sec")
@@ -722,7 +748,7 @@ func assembleContentIndexStreamed(source contentBuildSource, tmpDir string) (*co
 	var finishWG sync.WaitGroup
 	var textErr, termErr, gramErr, dictErr error
 	finishWG.Add(4)
-	go func() { defer finishWG.Done(); textErr = textWriter.FinishFile(textPath) }()
+	go func() { defer finishWG.Done(); textErr = textPipe.finish(textPath) }()
 	go func() { defer finishWG.Done(); termErr = dictBuilder.FinishFile(termPath) }()
 	go func() { defer finishWG.Done(); gramErr = gramBuilder.FinishFile(gramPath) }()
 	go func() {
@@ -769,7 +795,7 @@ func assembleContentIndexStreamed(source contentBuildSource, tmpDir string) (*co
 	// textSize stays the logical (decompressed) stream length: shard
 	// planning and the reshard threshold budget memory and work by corpus
 	// size, not by compressed bytes.
-	built.textSize = textWriter.logicalSize()
+	built.textSize = textLogical
 	if st, err := os.Stat(termPath); err == nil && st.Size() > 0 {
 		built.termPath = termPath
 	}
@@ -1124,6 +1150,12 @@ func contentGramsOf(text []byte) map[string]struct{} {
 const contentPathsRestartInterval = 64
 
 func encodeContentPaths(paths []string) []byte {
+	t0 := time.Now()
+	defer func() {
+		if pc := contentAssemblePhaseCapture; pc != nil {
+			contentPhaseAdd(&pc.pathsEncode, time.Since(t0))
+		}
+	}()
 	n := len(paths)
 	if n == 0 {
 		return nil

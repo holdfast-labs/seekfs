@@ -184,7 +184,7 @@ func scanContentScope(idx *Index, scope contentScope, volume string, maxFiles in
 		if resolved.SniffText {
 			// Cheap binary rejections are tallied apart from scope
 			// exclusions; the build never opens them.
-			if contentBinaryExtension(ext) && !contentRegistryClaimsExt(ext) {
+			if contentBinaryRejected(ext) {
 				est.Excluded["binary"]++
 				est.BinaryCandidates++
 				continue

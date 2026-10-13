@@ -28,6 +28,7 @@ import (
 	"io"
 	"os"
 	"sort"
+	"time"
 )
 
 // contentSectionFileBufSize is the buffered-I/O size for spilling a finished
@@ -37,8 +38,23 @@ const contentSectionFileBufSize = 1 << 20
 const contentExternalRecordOverhead = 6 // keyLen(2)+docID(4)
 
 // contentExternalRunBufSize bounds each open run's read buffer. The merge holds
-// one buffer per run, so keeping it small keeps the heap near the arena size.
-const contentExternalRunBufSize = 2048
+// one buffer per run: 8 KiB keeps the bounded-buffer test's transient heap
+// (runs x this) far below the arena while quartering run-read syscalls vs
+// the historical 2 KiB.
+const contentExternalRunBufSize = 8 << 10
+
+// contentExternalRunWriteBufSize buffers spill-run writes: one 8-byte record
+// per posting, so 64 KiB batches ~8k records per flush. Writers are
+// sequential (one spill at a time), so this never multiplies by run count.
+const contentExternalRunWriteBufSize = 64 << 10
+
+// contentExternalRecordSize is the fixed on-disk run record: the 3-byte gram
+// key, one zero pad, and the LE uint32 docID. All builder keys are 3-byte
+// grams (the contract since v7), so the historical uvarint length prefix and
+// uvarint docID only cost per-record encode/decode branches; the fixed form
+// reads with one ReadFull and no varint parsing. Run files are temp-only
+// (never shipped); the merged sections are unaffected.
+const contentExternalRecordSize = 8
 
 type contentExternalRecord struct {
 	key   string
@@ -125,6 +141,13 @@ func (b *contentExternalSectionBuilder) spill() error {
 	if len(b.buf) == 0 {
 		return nil
 	}
+	t0 := time.Now()
+	defer func() {
+		if pc := contentAssemblePhaseCapture; pc != nil {
+			contentPhaseAdd(&pc.spillSort, time.Since(t0))
+			contentPhaseAdd(&pc.spills, time.Duration(1))
+		}
+	}()
 	if contentExternalSortWorkers(len(b.buf)) < 2 {
 		sort.Sort(contentExternalRecordSlice(b.buf))
 		return b.spillSorted()
@@ -213,13 +236,13 @@ func (b *contentExternalSectionBuilder) spillRadix() error {
 	return nil
 }
 
-// runFileWriter streams sorted records into one run file with the exact
-// historical encoding (uvarint keyLen, key bytes, uvarint docID).
+// runFileWriter streams sorted records into one run file in the fixed
+// 8-byte form (3-byte key, zero pad, LE docID).
 type runFileWriter struct {
 	f       *os.File
 	bw      *bufio.Writer
 	path    string
-	scratch [binary.MaxVarintLen64]byte
+	scratch [contentExternalRecordSize]byte
 }
 
 func createRunFileWriter(tmpDir string) (*runFileWriter, error) {
@@ -227,22 +250,15 @@ func createRunFileWriter(tmpDir string) (*runFileWriter, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &runFileWriter{f: f, bw: bufio.NewWriterSize(f, 1<<16), path: f.Name()}, nil
+	return &runFileWriter{f: f, bw: bufio.NewWriterSize(f, contentExternalRunWriteBufSize), path: f.Name()}, nil
 }
 
 func (w *runFileWriter) writeOne(r *contentExternalRecord) error {
-	n := binary.PutUvarint(w.scratch[:], uint64(len(r.key)))
-	if _, err := w.bw.Write(w.scratch[:n]); err != nil {
-		return err
-	}
-	if _, err := w.bw.WriteString(r.key); err != nil {
-		return err
-	}
-	n = binary.PutUvarint(w.scratch[:], uint64(r.docID))
-	if _, err := w.bw.Write(w.scratch[:n]); err != nil {
-		return err
-	}
-	return nil
+	w.scratch[0], w.scratch[1], w.scratch[2] = r.key[0], r.key[1], r.key[2]
+	w.scratch[3] = 0
+	binary.LittleEndian.PutUint32(w.scratch[4:], r.docID)
+	_, err := w.bw.Write(w.scratch[:])
+	return err
 }
 
 func (w *runFileWriter) writeRecords(recs []contentExternalRecord) error {
@@ -283,25 +299,14 @@ func (b *contentExternalSectionBuilder) spillSorted() error {
 		return err
 	}
 	path := f.Name()
-	bw := bufio.NewWriterSize(f, 1<<16)
-	var scratch [binary.MaxVarintLen64]byte
+	bw := bufio.NewWriterSize(f, contentExternalRunWriteBufSize)
+	var scratch [contentExternalRecordSize]byte
 	for i := range b.buf {
 		r := &b.buf[i]
-		n := binary.PutUvarint(scratch[:], uint64(len(r.key)))
-		if _, err := bw.Write(scratch[:n]); err != nil {
-			bw.Flush()
-			f.Close()
-			os.Remove(path)
-			return err
-		}
-		if _, err := bw.WriteString(r.key); err != nil {
-			bw.Flush()
-			f.Close()
-			os.Remove(path)
-			return err
-		}
-		n = binary.PutUvarint(scratch[:], uint64(r.docID))
-		if _, err := bw.Write(scratch[:n]); err != nil {
+		scratch[0], scratch[1], scratch[2] = r.key[0], r.key[1], r.key[2]
+		scratch[3] = 0
+		binary.LittleEndian.PutUint32(scratch[4:], r.docID)
+		if _, err := bw.Write(scratch[:]); err != nil {
 			bw.Flush()
 			f.Close()
 			os.Remove(path)
@@ -372,12 +377,16 @@ func (b *contentExternalSectionBuilder) removeRuns() error {
 }
 
 // contentRunReader streams records from one spilled run, one at a time.
+// The key lives in a fixed array (never appended to, never reallocated);
+// key views it for the merge heap.
 type contentRunReader struct {
-	f     *os.File
-	br    *bufio.Reader
-	key   []byte
-	docID uint32
-	done  bool
+	f       *os.File
+	br      *bufio.Reader
+	keyBuf  [3]byte
+	key     []byte
+	recBuf  [contentExternalRecordSize]byte
+	docID   uint32
+	done    bool
 }
 
 func newContentRunReader(path string) (*contentRunReader, error) {
@@ -386,6 +395,7 @@ func newContentRunReader(path string) (*contentRunReader, error) {
 		return nil, err
 	}
 	r := &contentRunReader{f: f, br: bufio.NewReaderSize(f, contentExternalRunBufSize)}
+	r.key = r.keyBuf[:]
 	if err := r.advance(); err != nil {
 		f.Close()
 		return nil, err
@@ -393,32 +403,21 @@ func newContentRunReader(path string) (*contentRunReader, error) {
 	return r, nil
 }
 
-// advance loads the next record. io.EOF at a record boundary means the run is
-// exhausted; any other read error is returned.
+// advance loads the next fixed-size record. io.EOF at a record boundary
+// means the run is exhausted; any other read error is returned.
 func (r *contentRunReader) advance() error {
-	keyLen, err := binary.ReadUvarint(r.br)
-	if err == io.EOF {
-		r.done = true
-		return nil
-	}
-	if err != nil {
+	buf := r.recBuf[:]
+	if _, err := io.ReadFull(r.br, buf); err != nil {
+		// io.EOF means zero bytes (a clean record boundary); a short
+		// tail is a torn run and errors rather than truncating silently.
+		if err == io.EOF {
+			r.done = true
+			return nil
+		}
 		return err
 	}
-	key := r.key[:0]
-	if cap(key) < int(keyLen) {
-		key = make([]byte, keyLen)
-	} else {
-		key = key[:keyLen]
-	}
-	if _, err := io.ReadFull(r.br, key); err != nil {
-		return err
-	}
-	docID, err := binary.ReadUvarint(r.br)
-	if err != nil {
-		return err
-	}
-	r.key = key
-	r.docID = uint32(docID)
+	copy(r.keyBuf[:], buf[:3])
+	r.docID = binary.LittleEndian.Uint32(buf[4:])
 	return nil
 }
 
@@ -482,7 +481,11 @@ func (b *contentExternalSectionBuilder) FinishFile(path string) error {
 	if err != nil {
 		return err
 	}
+	tMerge := time.Now()
 	asm, cleanup, err := b.mergeInto(blocks)
+	if pc := contentAssemblePhaseCapture; pc != nil {
+		contentPhaseAdd(&pc.mergeGram, time.Since(tMerge))
+	}
 	if cleanup != nil {
 		defer cleanup()
 	}
@@ -492,7 +495,12 @@ func (b *contentExternalSectionBuilder) FinishFile(path string) error {
 	if asm == nil {
 		return nil
 	}
-	if err := asm.writeFile(path); err != nil {
+	tWrite := time.Now()
+	err = asm.writeFile(path)
+	if pc := contentAssemblePhaseCapture; pc != nil {
+		contentPhaseAdd(&pc.writeGram, time.Since(tWrite))
+	}
+	if err != nil {
 		return err
 	}
 	b.removeRuns()

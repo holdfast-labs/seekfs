@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -187,6 +188,81 @@ func TestContentParallelAssembleIsByteIdentical(t *testing.T) {
 	wide := encode(16, 7)
 	if string(serial) != string(wide) {
 		t.Fatal("batch-7 assembly differs from serial")
+	}
+}
+
+// The text pipe must stay byte-identical with the dictionary engaged
+// (sendSetDict mid-stream) and fail (not hang) when the source errors.
+func TestContentTextPipeWithDictMatchesDirect(t *testing.T) {
+	oldSample, oldMin := contentDictSampleBytes, contentDictMinLogical
+	contentDictSampleBytes = 16 << 10
+	contentDictMinLogical = 0
+	defer func() { contentDictSampleBytes, contentDictMinLogical = oldSample, oldMin }()
+	build := func() []contentBuildDoc {
+		var docs []contentBuildDoc
+		for i := 0; i < 200; i++ {
+			docs = append(docs, contentBuildDoc{
+				frn:  uint64(2000 + i),
+				path: "src/pipefile.txt",
+				text: []byte("repeated dictionary line for pipe training\n" +
+					"unique tail content " + string(rune('a'+i%26)) + "\n"),
+			})
+		}
+		sort.Slice(docs, func(i, j int) bool { return docs[i].frn < docs[j].frn })
+		return docs
+	}
+	assemble := func(workers int) *contentStreamedBuild {
+		restore := contentBuildWorkers
+		contentBuildWorkers = workers
+		defer func() { contentBuildWorkers = restore }()
+		docs := build()
+		i := 0
+		built, err := assembleContentIndexStreamed(func() (contentBuildDoc, bool, error) {
+			if i >= len(docs) {
+				return contentBuildDoc{}, false, nil
+			}
+			d := docs[i]
+			i++
+			return d, true, nil
+		}, t.TempDir())
+		if err != nil {
+			t.Fatal(err)
+		}
+		return built
+	}
+	one, multi := assemble(1), assemble(4)
+	if one.dictPath == "" || multi.dictPath == "" {
+		t.Fatal("expected a trained dictionary section")
+	}
+	a, err := os.ReadFile(one.textPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(multi.textPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(a) != string(b) {
+		t.Fatal("text section differs across worker counts with dict engaged")
+	}
+	da, _ := os.ReadFile(one.dictPath)
+	db, _ := os.ReadFile(multi.dictPath)
+	if string(da) != string(db) {
+		t.Fatal("dict section differs across worker counts")
+	}
+}
+
+func TestContentTextPipeAbortOnSourceError(t *testing.T) {
+	i := 0
+	_, err := assembleContentIndexStreamed(func() (contentBuildDoc, bool, error) {
+		i++
+		if i > 10 {
+			return contentBuildDoc{}, false, errors.New("boom")
+		}
+		return contentBuildDoc{frn: uint64(i), path: "a.txt", text: []byte("hello")}, true, nil
+	}, t.TempDir())
+	if err == nil {
+		t.Fatal("expected the source error")
 	}
 }
 

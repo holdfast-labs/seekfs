@@ -30,6 +30,7 @@ import (
 	"sort"
 	"strconv"
 	"sync"
+	"time"
 
 	"github.com/klauspost/compress/zstd"
 )
@@ -654,6 +655,12 @@ func (w *contentTextBlockWriter) flush() error {
 	if len(w.pending) == 0 {
 		return nil
 	}
+	t0 := time.Now()
+	defer func() {
+		if pc := contentAssemblePhaseCapture; pc != nil {
+			contentPhaseAdd(&pc.encodeText, time.Since(t0))
+		}
+	}()
 	if err := w.ensureEncoder(); err != nil {
 		return err
 	}
@@ -704,9 +711,13 @@ func (w *contentTextBlockWriter) FinishFile(path string) error {
 	w.closed = true
 	// The encoder is lazy (nil on an empty corpus); flush builds it only
 	// when a block actually needs encoding.
+	t0 := time.Now()
 	defer func() {
 		if w.enc != nil {
 			w.enc.Close()
+		}
+		if pc := contentAssemblePhaseCapture; pc != nil {
+			contentPhaseAdd(&pc.finishText, time.Since(t0))
 		}
 	}()
 	if err := w.flush(); err != nil {

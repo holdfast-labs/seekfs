@@ -19,6 +19,7 @@ import (
 	"io"
 	"os"
 	"sort"
+	"time"
 )
 
 // contentDictRecordOverhead estimates a buffered key's resident cost.
@@ -70,6 +71,13 @@ func (b *contentExternalDictBuilder) spill() error {
 	if len(b.buf) == 0 {
 		return nil
 	}
+	t0 := time.Now()
+	defer func() {
+		if pc := contentAssemblePhaseCapture; pc != nil {
+			contentPhaseAdd(&pc.spillSort, time.Since(t0))
+			contentPhaseAdd(&pc.spills, time.Duration(1))
+		}
+	}()
 	sort.Strings(b.buf)
 	f, err := os.CreateTemp(b.tmpDir, "cxdict-*.run")
 	if err != nil {
@@ -210,6 +218,7 @@ func (b *contentExternalDictBuilder) FinishFile(path string) error {
 		_ = os.Remove(path)
 		return nil
 	}
+	tMerge := time.Now()
 	sort.Strings(b.buf)
 	readers := make([]*contentDictRunReader, 0, len(b.runs))
 	for _, rp := range b.runs {
@@ -309,12 +318,20 @@ func (b *contentExternalDictBuilder) FinishFile(path string) error {
 	// Duplicate Adds within one document would inflate df; the assembler adds
 	// each term once per doc, so counts are exact document frequencies.
 	enc := encodeContentTermDict(sortedKeys, df)
+	if pc := contentAssemblePhaseCapture; pc != nil {
+		contentPhaseAdd(&pc.mergeTerm, time.Since(tMerge))
+	}
 	if len(enc) == 0 {
 		_ = os.Remove(path)
 		b.removeRuns()
 		return nil
 	}
-	if err := os.WriteFile(path, enc, 0o600); err != nil {
+	tWrite := time.Now()
+	err := os.WriteFile(path, enc, 0o600)
+	if pc := contentAssemblePhaseCapture; pc != nil {
+		contentPhaseAdd(&pc.writeTerm, time.Since(tWrite))
+	}
+	if err != nil {
 		return err
 	}
 	b.removeRuns()
