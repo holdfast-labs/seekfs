@@ -462,9 +462,9 @@ func (s *goSearchService) snapshotContentBuildItems(vol *serviceVolumeIndex, opt
 		return s.snapshotContentBuildItemsLegacy(vol, opts, idx, isWalk, journalID, checkpoint, gen, count)
 	}
 	cfg := contentScopeScanConfig{
-		scope:  opts.Scope,
-		idx:    idx,
-		isWalk: isWalk,
+		scope:    opts.Scope,
+		idx:      idx,
+		isWalk:   isWalk,
 		maxFiles: opts.MaxFiles,
 		prog: func(scanned, total int) {
 			vol.content.setBuildProgress(scanned, total)
