@@ -30,6 +30,7 @@ import (
 	"sort"
 	"strconv"
 	"sync"
+	"sync/atomic"
 
 	"github.com/klauspost/compress/zstd"
 )
@@ -92,6 +93,46 @@ type contentBlockCache struct {
 	ix        map[contentBlockKey]*list.Element
 	data      map[contentBlockKey][]byte
 	inflight  map[contentBlockKey]chan struct{}
+	// Lifetime decode counters (atomics: updated on paths both inside
+	// and outside mu). hits counts copyBlock hits; misses counts block
+	// decodes performed (a duplicate install still decoded, so it still
+	// counts); decodedBytes sums the decoded lengths. They exist so
+	// query profiling can attribute "N block touches x ~M us" per
+	// shape without perturbing the hot path; resetStats zeroes them.
+	hits         atomic.Uint64
+	misses       atomic.Uint64
+	decodedBytes atomic.Uint64
+}
+
+// contentBlockCacheStats is one snapshot of a block cache's lifetime
+// decode counters; see contentBlockCache.
+type contentBlockCacheStats struct {
+	Hits         uint64
+	Misses       uint64
+	DecodedBytes uint64
+}
+
+// stats snapshots the lifetime decode counters.
+func (c *contentBlockCache) stats() contentBlockCacheStats {
+	if c == nil {
+		return contentBlockCacheStats{}
+	}
+	return contentBlockCacheStats{
+		Hits:         c.hits.Load(),
+		Misses:       c.misses.Load(),
+		DecodedBytes: c.decodedBytes.Load(),
+	}
+}
+
+// resetStats zeroes the lifetime decode counters (drop does not: entries
+// are released but the counts describe the reader's lifetime).
+func (c *contentBlockCache) resetStats() {
+	if c == nil {
+		return
+	}
+	c.hits.Store(0)
+	c.misses.Store(0)
+	c.decodedBytes.Store(0)
 }
 
 // contentBlockCacheCap returns the shared-cache byte cap: TotalRAM/64
@@ -152,6 +193,7 @@ func (c *contentBlockCache) copyBlock(store *contentTextStore, start uint64, off
 		return 0, false
 	}
 	n = copy(dst, data[off:])
+	c.hits.Add(1)
 	return n, true
 }
 
@@ -375,6 +417,8 @@ func (st *contentTextStore) fetchMiss(b contentTextBlockMeta, in int, room []byt
 	if err != nil {
 		return 0, false
 	}
+	c.misses.Add(1)
+	c.decodedBytes.Add(uint64(len(data)))
 	n := copySpan(data, in, room)
 	contentBlockBufPut(data)
 	return n, n > 0
@@ -388,6 +432,11 @@ func (st *contentTextStore) fetchMiss(b contentTextBlockMeta, in int, room []byt
 func (c *contentBlockCache) installAndCopy(store *contentTextStore, start uint64, off int, data []byte, dst []byte) int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	// The caller decoded this block (a duplicate install still paid the
+	// decode; only the buffer is recycled), so it counts as a miss with
+	// its decoded bytes either way.
+	c.misses.Add(1)
+	c.decodedBytes.Add(uint64(len(data)))
 	key := contentBlockKey{store: store, start: start}
 	if _, dup := c.ix[key]; dup {
 		n := copySpan(c.data[key], off, dst)

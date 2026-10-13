@@ -152,6 +152,48 @@ func TestContentBlockCacheConcurrent(t *testing.T) {
 // is a bug. (Kept as a named predicate for readability.)
 func clearedForReuse(b byte, w int) bool { return false }
 
+func TestContentBlockCacheStats(t *testing.T) {
+	c := testBlockCacheTiny()
+	st := &contentTextStore{}
+	dst := make([]byte, 1024)
+	if got := c.stats(); got != (contentBlockCacheStats{}) {
+		t.Fatalf("fresh stats = %+v; want zero", got)
+	}
+	if _, ok := c.copyBlock(st, 0, 0, dst); ok {
+		t.Fatal("empty cache hit")
+	}
+	// A miss (copyBlock) leaves the counters alone: only decodes count.
+	if got := c.stats(); got.Hits != 0 || got.Misses != 0 || got.DecodedBytes != 0 {
+		t.Fatalf("after miss stats = %+v; want zero", got)
+	}
+	c.installAndCopy(st, 0, 0, bytes.Repeat([]byte{'q'}, 1024), dst)
+	c.installAndCopy(st, 1024, 0, bytes.Repeat([]byte{'w'}, 2048), dst[:0])
+	if _, ok := c.copyBlock(st, 0, 0, dst); !ok {
+		t.Fatal("installed block misses")
+	}
+	if _, ok := c.copyBlock(st, 0, 0, dst); !ok {
+		t.Fatal("installed block misses on repeat")
+	}
+	got := c.stats()
+	if got.Hits != 2 || got.Misses != 2 || got.DecodedBytes != 1024+2048 {
+		t.Fatalf("stats = %+v; want hits=2 misses=2 decoded=3072", got)
+	}
+	c.resetStats()
+	if got := c.stats(); got != (contentBlockCacheStats{}) {
+		t.Fatalf("after reset stats = %+v; want zero", got)
+	}
+	// A duplicate install still decoded, so it still counts as a miss.
+	c.installAndCopy(st, 0, 0, bytes.Repeat([]byte{'z'}, 1024), dst)
+	if got := c.stats(); got.Misses != 1 || got.DecodedBytes != 1024 {
+		t.Fatalf("after dup install stats = %+v; want misses=1 decoded=1024", got)
+	}
+	var nilCache *contentBlockCache
+	if got := nilCache.stats(); got != (contentBlockCacheStats{}) {
+		t.Fatalf("nil stats = %+v; want zero", got)
+	}
+	nilCache.resetStats() // must not panic
+}
+
 func TestContentBlockCacheEndToEnd(t *testing.T) {
 	// A reader built over real sections serves identical bytes through the
 	// shared cache on repeat reads (second read is a cache hit).
