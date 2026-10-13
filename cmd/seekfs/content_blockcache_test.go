@@ -11,8 +11,8 @@ func TestContentBlockCacheCap(t *testing.T) {
 	// Default derives from TotalRAM; only the bounds are asserted here so
 	// the test holds on any machine.
 	got := contentBlockCacheCap()
-	if got < 32<<20 || got > 128<<20 {
-		t.Fatalf("default cap = %d; want within [32 MiB, 128 MiB]", got)
+	if got < 32<<20 || got > 256<<20 {
+		t.Fatalf("default cap = %d; want within [32 MiB, 256 MiB]", got)
 	}
 	t.Setenv("SEEKFS_CONTENT_BLOCK_CACHE_MB", "1")
 	if got := contentBlockCacheCap(); got != contentBlockCacheMinMB<<20 {
@@ -27,7 +27,7 @@ func TestContentBlockCacheCap(t *testing.T) {
 		t.Fatalf("64 MiB override cap = %d", got)
 	}
 	t.Setenv("SEEKFS_CONTENT_BLOCK_CACHE_MB", "bogus")
-	if got := contentBlockCacheCap(); got < 32<<20 || got > 128<<20 {
+	if got := contentBlockCacheCap(); got < 32<<20 || got > 256<<20 {
 		t.Fatalf("bogus override cap = %d; want the default range", got)
 	}
 }

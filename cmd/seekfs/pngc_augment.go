@@ -472,25 +472,32 @@ func freeDiskBytes(path string) (uint64, error) {
 	return free, nil
 }
 
+// memoryStatusEx mirrors Win32 MEMORYSTATUSEX: two DWORDs followed by seven
+// DWORDLONGs, 64 bytes total (package scope so tests can pin the size: a
+// wrong size makes GlobalMemoryStatusEx fail and every consumer silently
+// fall back).
+type memoryStatusEx struct {
+	length               uint32
+	memoryLoad           uint32
+	totalPhys            uint64
+	availPhys            uint64
+	totalPageFile        uint64
+	availPageFile        uint64
+	totalVirtual         uint64
+	availVirtual         uint64
+	availExtendedVirtual uint64
+}
+
 // totalRamBytes reports total physical memory via kernel32's
 // GlobalMemoryStatusEx (x/sys has no wrapper for it in this version). Only
 // TotalPhys is read; an error means unknown.
 func totalRamBytes() (uint64, error) {
-	type memoryStatusEx struct {
-		length               uint32
-		_                    uint32
-		memoryLoad           uint32
-		_                    uint32
-		totalPhys            uint64
-		availPhys            uint64
-		totalPageFile        uint64
-		availPageFile        uint64
-		totalVirtual         uint64
-		availVirtual         uint64
-		availExtendedVirtual uint64
-	}
 	proc := windows.NewLazySystemDLL("kernel32.dll").NewProc("GlobalMemoryStatusEx")
 	var st memoryStatusEx
+	// MEMORYSTATUSEX is 64 bytes (two DWORDs + seven DWORDLONGs); the
+	// length field must say so or the call fails. There is no padding
+	// between dwMemoryLoad and ullTotalPhys: 4+4 already aligns the
+	// 8-byte fields.
 	st.length = uint32(unsafe.Sizeof(st))
 	r1, _, _ := proc.Call(uintptr(unsafe.Pointer(&st)))
 	if r1 == 0 {
