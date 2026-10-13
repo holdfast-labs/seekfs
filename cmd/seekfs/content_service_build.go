@@ -413,6 +413,10 @@ func (s *goSearchService) snapshotContentBuildItems(vol *serviceVolumeIndex, opt
 	if s == nil || vol == nil {
 		return nil, 0, 0, contentBuildSnapshotUnavailable
 	}
+	// Hold background persists for the copy: each one swaps vol.index and
+	// would restart the snapshot (see contentSnapshotHold).
+	vol.contentSnapshotHold.Add(1)
+	defer vol.contentSnapshotHold.Add(-1)
 	s.indexMu.RLock()
 	if vol.index == nil || (vol.index.Source != "usn" && vol.index.Source != "walk") {
 		s.indexMu.RUnlock()
@@ -712,14 +716,14 @@ func (s *goSearchService) runContentBuild(vol *serviceVolumeIndex, reuseSidecar 
 	// Selection extracts in scope priority order. A single spool keeps memory
 	// bounded while the assembler later consumes selected docs in FRN order.
 	type selectedDoc struct {
-		item         contentBuildItem
-		offset       int64
-		length       int
-		modUnix      int64
-		class        uint16
-		version      uint16
-		fileSize     int64
-		fileModNano  int64
+		item        contentBuildItem
+		offset      int64
+		length      int
+		modUnix     int64
+		class       uint16
+		version     uint16
+		fileSize    int64
+		fileModNano int64
 	}
 	selected := make([]selectedDoc, 0, 1024)
 	total := len(items)

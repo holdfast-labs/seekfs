@@ -96,3 +96,36 @@ func TestContentServiceBuildStopsAtDiskReserve(t *testing.T) {
 		}
 	}
 }
+
+// A content snapshot holds background persists for its duration (each persist
+// swaps vol.index and would restart the copy) and releases the hold after.
+func TestContentSnapshotHoldsBackgroundPersist(t *testing.T) {
+	t.Setenv("SEEKFS_CONTENT_SEARCH", "1")
+	stubContentCatchUpSync(t)
+	stubContentBuildSync(t)
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "a.txt"), []byte("hello needle"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	stubContentCatchUpJournal(t, usnJournalDataV0{UsnJournalID: 7, FirstUsn: 1, LowestValidUsn: 1, NextUsn: 100})
+	vol, _ := contentBuildTestVolume(t, dir, 7, 100, []CompactRecord{{FRN: 10, ParentFRN: 10, Parent: -1, Name: "a.txt", Size: 12}})
+	held := false
+	contentBuildSnapshotBatchHook = func(*goSearchService, *serviceVolumeIndex) {
+		held = held || vol.contentSnapshotHold.Load() > 0
+	}
+	s := contentTestService(t)
+	s.ensureContentBuild(vol)
+	if !held {
+		t.Fatal("snapshot did not hold background persists")
+	}
+	if got := vol.contentSnapshotHold.Load(); got != 0 {
+		t.Fatalf("persist hold not released after the snapshot: %d", got)
+	}
+	vol.dirty = true
+	vol.contentSnapshotHold.Add(1)
+	s.persistVolumeIfDue(vol, false) // must return without persisting
+	vol.contentSnapshotHold.Add(-1)
+	if !vol.dirty {
+		t.Fatal("background persist ran while a content snapshot held it")
+	}
+}

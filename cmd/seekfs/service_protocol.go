@@ -507,15 +507,15 @@ type serviceVolumeIndex struct {
 	ownedDynamicDirFRNs map[uint64]struct{}
 	ownedDirMu          sync.RWMutex
 
-	frnToID           map[uint64]int
-	frns              []uint64
-	frnRecordIDs      []uint32
+	frnToID      map[uint64]int
+	frns         []uint64
+	frnRecordIDs []uint32
 	// walkKeys is the cached content join column for walk-indexed volumes:
 	// the stable path-hash key of every live file record, sorted with
 	// record IDs parallel. Walk record FRNs are positional and renumber on
 	// every rescan, so content joins on these keys instead. Rebuilt whenever
 	// the index pointer moves; guarded by indexMu like the index itself.
-	walkKeys *walkKeySet
+	walkKeys          *walkKeySet
 	children          map[uint64]map[int]struct{}
 	childOffsets      []uint32
 	childIDs          []uint32
@@ -550,24 +550,31 @@ type serviceVolumeIndex struct {
 	recentSeq         uint64
 	replayGen         atomic.Uint64
 	persistGen        atomic.Uint64
-	underCache        map[int]postingCacheEntry
-	underRootCache    map[string]postingCacheEntry
-	dirty             bool
-	lastPersist       time.Time
-	persistFailures   int
-	persistRetryAfter time.Time
-	lastPersistErr    string
-	lastReplayAt      time.Time
-	lastReplayErr     string
-	lastReplayNext    int64
-	replayStrikes     int
-	stallObservedCp   int64
-	stallObservedAt   time.Time
-	recovering        atomic.Bool
-	searchCount       uint64
-	overlay           *overlaySegment
-	snap              atomic.Pointer[volumeSnapshot]
-	snapshotGen       atomic.Uint64
+	// contentSnapshotHold is held while a content build copies the record
+	// metadata it builds from. Background persists swap vol.index, which
+	// invalidates that copy; on a busy volume they come every few seconds, so
+	// without the hold a large snapshot never finishes and the build gives
+	// up. Persists skip their tick while it is held (the WAL keeps changes
+	// durable).
+	contentSnapshotHold atomic.Int32
+	underCache          map[int]postingCacheEntry
+	underRootCache      map[string]postingCacheEntry
+	dirty               bool
+	lastPersist         time.Time
+	persistFailures     int
+	persistRetryAfter   time.Time
+	lastPersistErr      string
+	lastReplayAt        time.Time
+	lastReplayErr       string
+	lastReplayNext      int64
+	replayStrikes       int
+	stallObservedCp     int64
+	stallObservedAt     time.Time
+	recovering          atomic.Bool
+	searchCount         uint64
+	overlay             *overlaySegment
+	snap                atomic.Pointer[volumeSnapshot]
+	snapshotGen         atomic.Uint64
 }
 
 type overlaySegment struct {
