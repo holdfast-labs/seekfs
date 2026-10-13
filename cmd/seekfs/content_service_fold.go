@@ -141,7 +141,7 @@ func (s *goSearchService) runContentFold(vol *serviceVolumeIndex) {
 	base := reader.idx
 	contentFoldSnapshotHook(vol)
 
-	tmpDir, err := os.MkdirTemp("", "seekfs-content-fold-*")
+	tmpDir, err := contentMkdirWork(contentIndexPathForDB(vol.dbPath))
 	if err != nil {
 		vol.contentCoord.foldFailed(contentFoldRetryBackoff)
 		return
@@ -189,6 +189,11 @@ func (s *goSearchService) runContentFold(vol *serviceVolumeIndex) {
 		}
 		built, err := assembleContentIndexStreamed(guarded, tmpDir)
 		if err != nil {
+			return nil, nil, err
+		}
+		if err := contentCheckDiskReserve(tmpDir); err != nil {
+			// Surface it: a fold that cannot write keeps the delta growing.
+			vol.content.setFoldError(err.Error())
 			return nil, nil, err
 		}
 		shard := contentShardHeader(header, built)

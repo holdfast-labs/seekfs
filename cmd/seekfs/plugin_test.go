@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -329,4 +330,100 @@ func TestPluginReloadQueuesLatestConfiguration(t *testing.T) {
 	if s.pluginApplying.Load() || s.features.Load().content || s.pluginSettings.Load().Definitions["content"].Installed {
 		t.Fatal("latest queued settings were not applied")
 	}
+}
+
+// Changing the content plugin's settings on a running service (plugin config
+// --budget-bytes) restarts content; the restarted volume must build again
+// instead of sitting unavailable until a manual plugin reload.
+func TestPluginContentReconfigureRebuilds(t *testing.T) {
+	preservePluginSelection(t)
+	t.Setenv("SEEKFS_CONTENT_SEARCH", "0")
+	stubContentBuildSync(t)
+	stubContentCatchUpSync(t)
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "note.txt"), []byte("hello plugin needle"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	stubContentCatchUpJournal(t, usnJournalDataV0{UsnJournalID: 7, FirstUsn: 1, LowestValidUsn: 1, NextUsn: 100})
+	vol, _ := contentBuildTestVolume(t, dir, 7, 100, []CompactRecord{{FRN: 10, ParentFRN: 10, Parent: -1, Name: "note.txt", Size: 19}})
+	s := &goSearchService{stop: make(chan struct{}), indexes: []*Index{vol.index}, volumes: []*serviceVolumeIndex{vol}}
+	defer s.signalServiceStop()
+	def := func(budget int64) map[string]pluginDefinition {
+		return map[string]pluginDefinition{"content": {Installed: true, Feature: featureConfig{Enabled: true},
+			Content: contentScopeConfig{Mode: "explicit", Roots: []string{dir}, BudgetBytes: budget}}}
+	}
+	s.applyPluginDefinitions(def(1 << 30))
+	if vol.content == nil || vol.content.stateOf() != contentStateReady {
+		t.Fatalf("initial build state = %v; want ready", vol.content)
+	}
+	s.applyPluginDefinitions(def(2 << 30))
+	if vol.content == nil {
+		t.Fatal("reconfigure left content detached")
+	}
+	if got := vol.content.stateOf(); got != contentStateReady {
+		t.Fatalf("state after reconfigure = %q; want ready (rebuilt)", got)
+	}
+	matches, err := searchServiceVolumes(snapshotServiceVolumesForSearch(s.volumes), queryOptions{Query: "content:needle", Limit: 10}, false)
+	if err != nil || len(matches) != 1 {
+		t.Fatalf("content query after reconfigure = %v, %v", matches, err)
+	}
+}
+
+// The same reconfigure while a build is in flight: the canceled build must not
+// leave the restarted volume without a scheduled replacement build.
+func TestPluginContentReconfigureDuringBuildRebuilds(t *testing.T) {
+	preservePluginSelection(t)
+	t.Setenv("SEEKFS_CONTENT_SEARCH", "0")
+	stubContentBuildSync(t)
+	stubContentCatchUpSync(t)
+	contentBuildRun = func(fn func()) { go fn() }
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "note.txt"), []byte("hello plugin needle"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	stubContentCatchUpJournal(t, usnJournalDataV0{UsnJournalID: 7, FirstUsn: 1, LowestValidUsn: 1, NextUsn: 100})
+	vol, _ := contentBuildTestVolume(t, dir, 7, 100, []CompactRecord{{FRN: 10, ParentFRN: 10, Parent: -1, Name: "note.txt", Size: 19}})
+	s := &goSearchService{stop: make(chan struct{}), indexes: []*Index{vol.index}, volumes: []*serviceVolumeIndex{vol}}
+	defer s.signalServiceStop()
+	def := func(budget int64) map[string]pluginDefinition {
+		return map[string]pluginDefinition{"content": {Installed: true, Feature: featureConfig{Enabled: true},
+			Content: contentScopeConfig{Mode: "explicit", Roots: []string{dir}, BudgetBytes: budget}}}
+	}
+	entered := make(chan struct{}, 4)
+	release := make(chan struct{})
+	var blockFirst atomic.Bool
+	blockFirst.Store(true)
+	contentBuildSnapshotHook = func(*goSearchService, *serviceVolumeIndex) {
+		if blockFirst.CompareAndSwap(true, false) {
+			entered <- struct{}{}
+			<-release
+		}
+	}
+	s.applyPluginDefinitions(def(1 << 30))
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("first build never started")
+	}
+	done := make(chan struct{})
+	go func() { s.applyPluginDefinitions(def(2 << 30)); close(done) }()
+	time.Sleep(50 * time.Millisecond) // let the reconfigure cancel the in-flight build
+	close(release)
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("reconfigure hung")
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if vol.content != nil && vol.content.stateOf() == contentStateReady {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	state := "detached"
+	if vol.content != nil {
+		state = vol.content.stateOf()
+	}
+	t.Fatalf("state after reconfigure during build = %q; want ready (rebuilt)", state)
 }

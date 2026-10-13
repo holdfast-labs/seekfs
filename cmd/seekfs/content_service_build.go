@@ -685,12 +685,23 @@ func (s *goSearchService) runContentBuild(vol *serviceVolumeIndex, reuseSidecar 
 		}
 	}()
 
-	tmpDir, err := os.MkdirTemp("", "seekfs-content-*")
+	gsx := contentIndexPathForDB(vol.dbPath)
+	if gsx == "" {
+		vol.content.markBuildFailed("no content sidecar path")
+		return
+	}
+	// Scratch lives next to the sidecar, on the volume the output goes to,
+	// not in the service account's temp directory on the system drive.
+	tmpDir, err := contentMkdirWork(gsx)
 	if err != nil {
 		vol.content.markBuildFailed(err.Error())
 		return
 	}
 	defer os.RemoveAll(tmpDir)
+	if err := contentCheckDiskReserve(tmpDir); err != nil {
+		vol.content.markBuildFailed(err.Error())
+		return
+	}
 	spool, err := os.Create(filepath.Join(tmpDir, "text.spool"))
 	if err != nil {
 		vol.content.markBuildFailed(err.Error())
@@ -714,6 +725,7 @@ func (s *goSearchService) runContentBuild(vol *serviceVolumeIndex, reuseSidecar 
 	total := len(items)
 	done := 0
 	var used, skipped, truncated, binary int64
+	var sinceDiskCheck int64
 	// overBudget latches once the scope byte budget bites; see the tally below.
 	overBudget := false
 	abortReason := ""
@@ -797,6 +809,13 @@ func (s *goSearchService) runContentBuild(vol *serviceVolumeIndex, reuseSidecar 
 		}
 		selected = append(selected, selectedDoc{item: item, offset: offset, length: len(doc.text), modUnix: doc.modUnix, class: doc.class, version: doc.version, fileSize: doc.fileSize, fileModNano: doc.fileModNano})
 		used += n
+		if sinceDiskCheck += n; sinceDiskCheck >= contentDiskCheckEvery {
+			sinceDiskCheck = 0
+			if err := contentCheckDiskReserve(tmpDir); err != nil {
+				vol.content.markBuildFailed(err.Error())
+				return
+			}
+		}
 	}
 	if abortReason != "" {
 		vol.content.markBuildCanceled(abortReason)
@@ -866,11 +885,6 @@ func (s *goSearchService) runContentBuild(vol *serviceVolumeIndex, reuseSidecar 
 	if opts.Scope != nil {
 		header.ScopeHash = opts.Scope.fingerprint()
 	}
-	gsx := contentIndexPathForDB(vol.dbPath)
-	if gsx == "" {
-		vol.content.markBuildFailed("no content sidecar path")
-		return
-	}
 	// assemble runs the streaming assembler over the selected docs at the given
 	// positions and returns the spooled shard plus a header index carrying the
 	// doc table and sidecar identity for the streaming save. The spooled
@@ -911,6 +925,9 @@ func (s *goSearchService) runContentBuild(vol *serviceVolumeIndex, reuseSidecar 
 			if !s.contentBuildCurrent(vol, gen, journalID) {
 				return errContentBuildStale
 			}
+			if err := contentCheckDiskReserve(gsx); err != nil {
+				return err
+			}
 			return contentSaveAssembled(gsx, shard, contentBuildFiles(built))
 		}
 		paths := make([]string, len(selected))
@@ -928,6 +945,9 @@ func (s *goSearchService) runContentBuild(vol *serviceVolumeIndex, reuseSidecar 
 			for _, g := range groups {
 				built, shard, err := assemble(g.docs)
 				if err != nil {
+					return err
+				}
+				if err := contentCheckDiskReserve(dir); err != nil {
 					return err
 				}
 				info, err := contentSaveShard(dir, shard, contentBuildFiles(built), g.prefixes)
@@ -952,6 +972,9 @@ func (s *goSearchService) runContentBuild(vol *serviceVolumeIndex, reuseSidecar 
 					sem <- struct{}{}
 					defer func() { <-sem }()
 					built, shard, err := assemble(groups[gi].docs)
+					if err == nil {
+						err = contentCheckDiskReserve(dir)
+					}
 					if err == nil {
 						var info contentShardInfo
 						info, err = contentSaveShard(dir, shard, contentBuildFiles(built), groups[gi].prefixes)
@@ -983,6 +1006,9 @@ func (s *goSearchService) runContentBuild(vol *serviceVolumeIndex, reuseSidecar 
 	err = save()
 	vol.content.setBuildProgress(done, total)
 	if err != nil {
+		// Delete shard files this attempt wrote: no manifest names them, so a
+		// failed build must not leave gigabytes behind on the volume.
+		contentSweepShards(gsx)
 		var sizeErr *contentGSXSizeError
 		switch {
 		case errors.Is(err, errContentBuildAborted):
