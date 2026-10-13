@@ -1266,21 +1266,46 @@ func (vol *serviceVolumeIndex) sortCandidateIDsByScanOrder(ids []int, pq parsedQ
 		return
 	}
 	recordCount := vol.index.compactRecordCount()
-	pos := make([]int, recordCount)
-	for i := range pos {
-		pos[i] = -1
-	}
-	for p, id32 := range order {
-		if id := int(id32); id >= 0 && id < recordCount && pos[id] < 0 {
-			pos[id] = p
+	// Positions come from the resident rank array when it is the order's
+	// inverse for every candidate (the common case): a prefiltered set is
+	// small, while a position array costs 8 bytes per record per query
+	// (~190 MB on a 23.7M-entry index). Any candidate the rank does not place
+	// at its own order slot (a deleted or delta ID, or a volume whose rank
+	// and scan orders differ) falls back to the exact position array.
+	var rankOf func(id int) [2]int
+	if rank := vol.rankForQuery(pq); len(rank) == recordCount {
+		inverse := true
+		for _, id := range ids {
+			if id < 0 || id >= recordCount {
+				inverse = false
+				break
+			}
+			if r := int(rank[id]); r >= len(order) || int(order[r]) != id {
+				inverse = false
+				break
+			}
+		}
+		if inverse {
+			rankOf = func(id int) [2]int { return [2]int{0, int(rank[id])} }
 		}
 	}
-	// An ID outside the order sorts after every ordered ID, by record ID.
-	rankOf := func(id int) [2]int {
-		if id >= 0 && id < recordCount && pos[id] >= 0 {
-			return [2]int{0, pos[id]}
+	if rankOf == nil {
+		pos := make([]int, recordCount)
+		for i := range pos {
+			pos[i] = -1
 		}
-		return [2]int{1, id}
+		for p, id32 := range order {
+			if id := int(id32); id >= 0 && id < recordCount && pos[id] < 0 {
+				pos[id] = p
+			}
+		}
+		// An ID outside the order sorts after every ordered ID, by record ID.
+		rankOf = func(id int) [2]int {
+			if id >= 0 && id < recordCount && pos[id] >= 0 {
+				return [2]int{0, pos[id]}
+			}
+			return [2]int{1, id}
+		}
 	}
 	sort.SliceStable(ids, func(i, j int) bool {
 		ai, bj := rankOf(ids[i]), rankOf(ids[j])

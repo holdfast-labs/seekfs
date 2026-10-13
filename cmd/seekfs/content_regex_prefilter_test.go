@@ -256,6 +256,25 @@ func TestSortCandidateIDsByScanOrder(t *testing.T) {
 	if ids[0] != 2 || ids[1] != 0 || ids[2] != 9 {
 		t.Fatalf("unknown-id order = %v; want [2 0 9]", ids)
 	}
+	// A resident rank that inverts the order answers positions without the
+	// per-query position array; the result is the same scan order.
+	vol.index.Derived.NameRank = []uint32{2, 1, 0}
+	if rank := vol.rankForQuery(pq); len(rank) != 3 {
+		t.Fatalf("rankForQuery = %v; want the resident name rank", rank)
+	}
+	ids = []int{0, 1, 2}
+	vol.sortCandidateIDsByScanOrder(ids, pq)
+	if ids[0] != 2 || ids[1] != 1 || ids[2] != 0 {
+		t.Fatalf("rank-inverse scan order = %v; want [2 1 0]", ids)
+	}
+	// A rank that disagrees with the scan order (not its inverse) must not
+	// be trusted: the exact position array decides.
+	vol.index.Derived.NameRank = []uint32{0, 1, 2}
+	ids = []int{0, 1, 2}
+	vol.sortCandidateIDsByScanOrder(ids, pq)
+	if ids[0] != 2 || ids[1] != 1 || ids[2] != 0 {
+		t.Fatalf("inconsistent-rank scan order = %v; want [2 1 0] from the order", ids)
+	}
 }
 
 // TestContentRegexPrefilterDeclines proves the hopeless shapes stay on the
