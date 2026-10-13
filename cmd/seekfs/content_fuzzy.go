@@ -21,6 +21,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"unicode/utf8"
 )
 
@@ -146,6 +147,70 @@ func damerauLevenshteinBoundedBytes(a, b []byte, max int) int {
 // fill the GOMAXPROCS=2 budget gorun.sh grants without oversubscribing.
 const contentFuzzyScanWorkers = 2
 
+// contentFuzzyScanCacheEntries bounds the scan memo below: repeated typos
+// (interactive refinements, retries, parallel agents) skip the O(dict) scan.
+const contentFuzzyScanCacheEntries = 64
+
+// contentFuzzyScanCacheMaxTerms bounds one memo entry: a hostile word matching
+// thousands of terms is rescanned rather than hoarded.
+const contentFuzzyScanCacheMaxTerms = 2048
+
+// contentFuzzyScanKey identifies one memoized dictionary scan: the dict's
+// content generation (unique per decode, so a hit is exact-equivalent to a
+// rescan even across address reuse) plus the word and threshold.
+type contentFuzzyScanKey struct {
+	gen  uint64
+	word string
+	tau  int
+}
+
+// contentFuzzyScanCache memoizes per-dictionary within-tau term sets. A
+// dictionary is immutable after decode, so entries never go stale; the
+// resident delta vocabulary (mutable) is deliberately not cached and merges
+// fresh on every call. Cached maps are never mutated after insert: callers
+// merge-summate copies into their own map, and concurrent readers only read.
+var contentFuzzyScanCache = struct {
+	sync.Mutex
+	order []contentFuzzyScanKey
+	items map[contentFuzzyScanKey]map[string]int
+	hits  atomic.Uint64
+}{items: make(map[contentFuzzyScanKey]map[string]int)}
+
+// contentFuzzyScanCacheEnabled is a var so differential tests can run the
+// scan memoized and raw and require identical corrections.
+var contentFuzzyScanCacheEnabled = true
+
+func contentFuzzyScanCacheLookup(key contentFuzzyScanKey) (map[string]int, bool) {
+	if !contentFuzzyScanCacheEnabled {
+		return nil, false
+	}
+	contentFuzzyScanCache.Lock()
+	defer contentFuzzyScanCache.Unlock()
+	m, ok := contentFuzzyScanCache.items[key]
+	if ok {
+		contentFuzzyScanCache.hits.Add(1)
+	}
+	return m, ok
+}
+
+func contentFuzzyScanCacheStore(key contentFuzzyScanKey, m map[string]int) {
+	if !contentFuzzyScanCacheEnabled || len(m) > contentFuzzyScanCacheMaxTerms {
+		return
+	}
+	contentFuzzyScanCache.Lock()
+	defer contentFuzzyScanCache.Unlock()
+	if _, dup := contentFuzzyScanCache.items[key]; dup {
+		return
+	}
+	if len(contentFuzzyScanCache.order) >= contentFuzzyScanCacheEntries {
+		oldest := contentFuzzyScanCache.order[0]
+		contentFuzzyScanCache.order = contentFuzzyScanCache.order[1:]
+		delete(contentFuzzyScanCache.items, oldest)
+	}
+	contentFuzzyScanCache.order = append(contentFuzzyScanCache.order, key)
+	contentFuzzyScanCache.items[key] = m
+}
+
 // contentFuzzyScanMinEntries is the dictionary size above which the scan
 // parallelizes; small corpora (every unit test) stay single-threaded.
 const contentFuzzyScanMinEntries = 10000
@@ -154,32 +219,48 @@ func contentFuzzyScanIndex(dict *contentTermDict, word []rune, wordBytes []byte,
 	if dict == nil || dict.keyCount() == 0 {
 		return
 	}
-	if dict.keyCount() < contentFuzzyScanMinEntries {
-		contentFuzzyScanRange(dict, word, wordBytes, wordASCII, wordMask, pieces, tau, 0, dict.keyCount(), keep)
-		return
-	}
-	// Each worker fills its own map over a disjoint entry range; the merge
-	// sums frequencies, so the result is identical to a serial scan.
-	type shardResult struct {
-		m map[string]int
-	}
-	results := make([]shardResult, contentFuzzyScanWorkers)
-	var wg sync.WaitGroup
-	for w := 0; w < contentFuzzyScanWorkers; w++ {
-		lo := w * dict.keyCount() / contentFuzzyScanWorkers
-		hi := (w + 1) * dict.keyCount() / contentFuzzyScanWorkers
-		results[w].m = make(map[string]int)
-		wg.Add(1)
-		go func(w, lo, hi int) {
-			defer wg.Done()
-			contentFuzzyScanRange(dict, word, wordBytes, wordASCII, wordMask, pieces, tau, lo, hi, results[w].m)
-		}(w, lo, hi)
-	}
-	wg.Wait()
-	for _, r := range results {
-		for k, v := range r.m {
+	// Memoize the per-dictionary scan: it is a pure function of immutable
+	// dict content, and the merge into keep is additive, so a hit merges
+	// exactly what a rescan would. The memo key carries the dict's content
+	// generation, never its address.
+	key := contentFuzzyScanKey{gen: dict.gen, word: string(wordBytes), tau: tau}
+	if cached, ok := contentFuzzyScanCacheLookup(key); ok {
+		for k, v := range cached {
 			keep[k] += v
 		}
+		return
+	}
+	found := make(map[string]int)
+	if dict.keyCount() < contentFuzzyScanMinEntries {
+		contentFuzzyScanRange(dict, word, wordBytes, wordASCII, wordMask, pieces, tau, 0, dict.keyCount(), found)
+	} else {
+		// Each worker fills its own map over a disjoint entry range; the merge
+		// sums frequencies, so the result is identical to a serial scan.
+		type shardResult struct {
+			m map[string]int
+		}
+		results := make([]shardResult, contentFuzzyScanWorkers)
+		var wg sync.WaitGroup
+		for w := 0; w < contentFuzzyScanWorkers; w++ {
+			lo := w * dict.keyCount() / contentFuzzyScanWorkers
+			hi := (w + 1) * dict.keyCount() / contentFuzzyScanWorkers
+			results[w].m = make(map[string]int)
+			wg.Add(1)
+			go func(w, lo, hi int) {
+				defer wg.Done()
+				contentFuzzyScanRange(dict, word, wordBytes, wordASCII, wordMask, pieces, tau, lo, hi, results[w].m)
+			}(w, lo, hi)
+		}
+		wg.Wait()
+		for _, r := range results {
+			for k, v := range r.m {
+				found[k] += v
+			}
+		}
+	}
+	contentFuzzyScanCacheStore(key, found)
+	for k, v := range found {
+		keep[k] += v
 	}
 }
 
@@ -187,10 +268,29 @@ func contentFuzzyScanRange(dict *contentTermDict, word []rune, wordBytes []byte,
 	if dict == nil {
 		return
 	}
+	loLen, hiLen := len(word)-tau, len(word)+tau
 	dict.scanRange(lo, hi, func(key []byte, df int) bool {
 		// Byte length is a sound lower-bound prefilter (runes <= bytes), so
-		// short keys skip the rune count entirely.
-		if len(key) < len(word)-tau {
+		// short keys skip everything below entirely.
+		if len(key) < loLen {
+			return true
+		}
+		// The letter bitmap is a single cheap pass that also reports ASCII.
+		// It runs before the piece-substring tests (the scan's hottest cost):
+		// most keys miss on bits alone, and ASCII keys additionally get
+		// their exact rune length for free, so out-of-range lengths reject
+		// before any substring search. Every gate below is sound (it only
+		// rejects terms provably farther than tau), so the order changes
+		// cost, never the kept set.
+		keyMask, keyASCII := contentFuzzyLetterMask(key)
+		if fuzzyLetterMaskMisses(wordMask, keyMask) > tau {
+			return true
+		}
+		if keyASCII {
+			if len(key) > hiLen {
+				return true
+			}
+		} else if n := utf8.RuneCount(key); n < loLen || n > hiLen {
 			return true
 		}
 		matched := len(pieces) == 0
@@ -201,17 +301,6 @@ func contentFuzzyScanRange(dict *contentTermDict, word []rune, wordBytes []byte,
 			}
 		}
 		if !matched {
-			return true
-		}
-		keyMask, keyASCII := contentFuzzyLetterMask(key)
-		if fuzzyLetterMaskMisses(wordMask, keyMask) > tau {
-			return true
-		}
-		n := len(key)
-		if !keyASCII {
-			n = utf8.RuneCount(key)
-		}
-		if n < len(word)-tau || n > len(word)+tau {
 			return true
 		}
 		// Only true candidates reach the DP. A pure-ASCII pair runs it on

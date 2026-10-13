@@ -37,6 +37,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"sort"
+	"sync/atomic"
 )
 
 // contentTermDictRestartInterval is the restart spacing: every Nth key is
@@ -54,7 +55,16 @@ type contentTermDict struct {
 	dfLo      []byte   // numKeys frequency bytes, aliased to the section
 	ovIx      []uint32 // overflow key indexes, sorted
 	ovDf      []uint32 // overflow frequencies parallel to ovIx
+	// gen identifies the dict's content for the fuzzy scan memo: dicts are
+	// immutable after decode, and the generator never repeats, so equal
+	// gens mean equal content (a value copy shares its gen correctly).
+	gen uint64
 }
+
+// contentTermDictGen issues content identities: one per decoded dict, never
+// reused, so a memoized scan keyed by gen can never alias a different dict
+// even if an address is recycled after release.
+var contentTermDictGen atomic.Uint64
 
 // dfAt returns the document frequency of the i-th key: the Lo byte unless
 // it is 255, which marks an overflow entry carrying the exact value.
@@ -146,7 +156,7 @@ func decodeContentTermDict(data []byte) (*contentTermDict, error) {
 		if restartCount != 0 || blobLen != 0 || overflowCount != 0 || len(data) != 20 {
 			return nil, errors.New("content term dict length mismatch")
 		}
-		return &contentTermDict{}, nil
+		return &contentTermDict{gen: contentTermDictGen.Add(1)}, nil
 	}
 	if restartCount != (keyCount+interval-1)/interval {
 		return nil, errors.New("content term dict restart count mismatch")
@@ -157,6 +167,7 @@ func decodeContentTermDict(data []byte) (*contentTermDict, error) {
 		interval:  interval,
 		restarts:  make([]string, 0, restartCount),
 		restartIx: make([]int, 0, restartCount),
+		gen:       contentTermDictGen.Add(1),
 	}
 	for r := 0; r < restartCount; r++ {
 		if off+8 > len(data) {
