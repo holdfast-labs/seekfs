@@ -185,6 +185,11 @@ func (s *goSearchService) scopeReconcile(vol *serviceVolumeIndex, idx *contentIn
 		return false
 	}
 	defer endContentTask(vol)
+	// Hold background persists for the selection scan: a persist swaps
+	// vol.index, which reads as a moved base, and a moved base here means a
+	// rebuild (see reconcileMetadataPass for the same hold).
+	release, _ := s.holdBackgroundPersists(vol)
+	defer release()
 	s.indexMu.RLock()
 	if vol.index == nil || (needReady && vol.state != "ready") {
 		s.indexMu.RUnlock()

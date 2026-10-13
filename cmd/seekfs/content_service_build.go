@@ -124,6 +124,24 @@ var errContentBuildStale = errors.New("content build stale")
 // volume) before starting its copy.
 var contentSnapshotPersistWait = 3 * time.Minute
 
+// holdBackgroundPersists keeps background persists from swapping vol.index
+// while a content task reads the whole record index (a build snapshot or a
+// reconcile selection scan): it raises contentSnapshotHold, then waits out a
+// persist that started before the hold. settled is false when that persist
+// did not finish within contentSnapshotPersistWait or the volume stopped.
+// Callers must call release, settled or not.
+func (s *goSearchService) holdBackgroundPersists(vol *serviceVolumeIndex) (release func(), settled bool) {
+	vol.contentSnapshotHold.Add(1)
+	release = func() { vol.contentSnapshotHold.Add(-1) }
+	for deadline := time.Now().Add(contentSnapshotPersistWait); vol.persistActive.Load() > 0; {
+		if s.contentStopped(vol) || time.Now().After(deadline) {
+			return release, false
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	return release, true
+}
+
 // contentBuildSnapshotResult tells runContentBuild what a metadata snapshot
 // produced.
 type contentBuildSnapshotResult int
@@ -420,15 +438,10 @@ func (s *goSearchService) snapshotContentBuildItems(vol *serviceVolumeIndex, opt
 	}
 	// Hold background persists for the copy: each one swaps vol.index and
 	// would restart the snapshot (see contentSnapshotHold).
-	vol.contentSnapshotHold.Add(1)
-	defer vol.contentSnapshotHold.Add(-1)
-	// A persist that started before the hold still swaps vol.index when it
-	// finishes; wait it out so the copy starts on the index that stays.
-	for deadline := time.Now().Add(contentSnapshotPersistWait); vol.persistActive.Load() > 0; {
-		if s.contentStopped(vol) || time.Now().After(deadline) {
-			return nil, 0, 0, contentBuildSnapshotChanged
-		}
-		time.Sleep(50 * time.Millisecond)
+	release, settled := s.holdBackgroundPersists(vol)
+	defer release()
+	if !settled {
+		return nil, 0, 0, contentBuildSnapshotChanged
 	}
 	s.indexMu.RLock()
 	if vol.index == nil || (vol.index.Source != "usn" && vol.index.Source != "walk") {

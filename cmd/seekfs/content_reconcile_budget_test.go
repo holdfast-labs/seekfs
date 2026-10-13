@@ -100,3 +100,55 @@ func TestContentWrapReconcileHonorsReserveForNewFiles(t *testing.T) {
 		t.Fatalf("file new to the base indexed past the reserve: %v", hits)
 	}
 }
+
+// Both reconcile scans hold background persists: a persist swaps vol.index,
+// which reads as a moved base, and on a busy volume persists outpace a full
+// selection scan, so without the hold every metadata reconcile gave up and
+// silently rebuilt (real E: index, 2026-10-13).
+func TestContentReconcileScansHoldBackgroundPersists(t *testing.T) {
+	restore := contentBuildSnapshotBatchHook
+	t.Cleanup(func() { contentBuildSnapshotBatchHook = restore })
+
+	t.Run("wrap", func(t *testing.T) {
+		f := newWrapReconFixture(t)
+		stubContentBuildSchedule(t)
+		scanned, unheld := 0, 0
+		contentBuildSnapshotBatchHook = func(_ *goSearchService, v *serviceVolumeIndex) {
+			if v == f.vol {
+				scanned++
+				if v.contentSnapshotHold.Load() == 0 {
+					unheld++
+				}
+			}
+		}
+		f.s.attachContentForVolume(f.vol)
+		if scanned == 0 || unheld != 0 {
+			t.Fatalf("metadata reconcile scanned %d batches, %d without the persist hold; want all held", scanned, unheld)
+		}
+		if got := f.vol.contentSnapshotHold.Load(); got != 0 {
+			t.Fatalf("persist hold not released after reconcile: %d", got)
+		}
+	})
+	t.Run("scope", func(t *testing.T) {
+		f := newScopeReconFixture(t, "drop.txt\n")
+		f.writeScopeReconBase(t, f.keepDocs(t))
+		stubContentBuildSchedule(t)
+		f.rewriteIgnore(t, "")
+		scanned, unheld := 0, 0
+		contentBuildSnapshotBatchHook = func(_ *goSearchService, v *serviceVolumeIndex) {
+			if v == f.vol {
+				scanned++
+				if v.contentSnapshotHold.Load() == 0 {
+					unheld++
+				}
+			}
+		}
+		f.s.attachContentForVolume(f.vol)
+		if scanned == 0 || unheld != 0 {
+			t.Fatalf("scope reconcile scanned %d batches, %d without the persist hold; want all held", scanned, unheld)
+		}
+		if got := f.vol.contentSnapshotHold.Load(); got != 0 {
+			t.Fatalf("persist hold not released after reconcile: %d", got)
+		}
+	})
+}
