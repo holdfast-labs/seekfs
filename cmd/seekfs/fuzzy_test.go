@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"math/rand"
 	"strings"
 	"testing"
@@ -680,6 +681,80 @@ func TestDamerauBoundedReuseMatchesWrapper(t *testing.T) {
 				t.Fatalf("reuse(%q, %q, %d) = %d, want %d", p[0], p[1], max, got, want)
 			}
 		}
+	}
+}
+
+// TestAppendFuzzyCollectsPastEnoughBoundary pins the collection-cap
+// semantics: the in-flight variant always over-collects past the
+// need*fuzzyCollectFactor cap, and that tail participates in the final
+// sort. Stopping mid-variant would change which survivors reach a small
+// top-N. The fixture lines up 30 equidistant typo matches with ranks
+// opposing id order, so a mid-variant cutoff picks the wrong winner.
+func TestAppendFuzzyCollectsPastEnoughBoundary(t *testing.T) {
+	idx := &Index{Source: "usn", Volume: "Q:", Compact: true, DBPath: ""}
+	add := func(name string) {
+		idx.Records = append(idx.Records, CompactRecord{
+			FRN:       uint64(len(idx.Records) + 10),
+			ParentFRN: uint64(10),
+			Parent:    0,
+			Name:      name,
+		})
+	}
+	add(".")
+	// Insertion order opposes name order: ids ascend while names descend,
+	// so collection order and rank order disagree.
+	for i := 29; i >= 0; i-- {
+		add(fmt.Sprintf("unittest_%02d.txt", i))
+	}
+	buildOrders(idx)
+	vol := newServiceVolumeIndex("", idx)
+	vol.volume = "Q:"
+	vol.rebuildNameTrigramsLocked()
+	volumes := []*serviceVolumeIndex{vol}
+	opts := queryOptions{Query: "unitest", Limit: 1}
+	// Independent expectation: every file is a distance-1 survivor, so the
+	// winner is the rank-minimum under the full ranking keys.
+	pq, err := parseQuery(opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pqNoTerms := pq
+	pqNoTerms.Terms = nil
+	rankVec := vol.rankForQuery(pqNoTerms)
+	term := "unitest"
+	termRunes := []rune(term)
+	var sc fuzzyDistanceScratch
+	bestRank := -1
+	bestPath := ""
+	n := vol.index.compactRecordCount()
+	for id := 0; id < n; id++ {
+		rec := vol.index.compactRecord(id)
+		if rec.Deleted {
+			continue
+		}
+		nameLower := foldFuzzyText(strings.ToLower(rec.Name))
+		dist, _, _, ok := fuzzyNameDistanceScratch(nameLower, termRunes, true, 1, &sc)
+		if !ok || dist == 0 {
+			continue
+		}
+		var rank uint64
+		if id < len(rankVec) {
+			rank = uint64(rankVec[id])
+		}
+		if bestRank < 0 || rank < uint64(bestRank) {
+			bestRank = int(rank)
+			bestPath = rec.Name
+		}
+	}
+	if bestPath == "" {
+		t.Fatal("no distance-1 survivors in fixture")
+	}
+	matches, added := appendFuzzyServiceMatches(volumes, opts, nil)
+	if !added || len(matches) != 1 {
+		t.Fatalf("added=%v matches=%v, want exactly one fuzzy winner", added, len(matches))
+	}
+	if matches[0].Name != bestPath {
+		t.Fatalf("winner = %q, want rank-minimum %q", matches[0].Name, bestPath)
 	}
 }
 

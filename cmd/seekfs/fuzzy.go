@@ -664,13 +664,9 @@ func fuzzyCandidateRankLess(a, b fuzzyScoredCandidate) bool {
 	return false
 }
 
-// fuzzyScoreChunkIDs bounds one scoring chunk: large piece postings split
-// into parallel-friendly pieces without changing survivor order.
-const fuzzyScoreChunkIDs = 4096
-
-// fuzzyParallelScoreMinIDs is the chunk size above which candidate scoring
-// fans out across GOMAXPROCS workers. Below it the goroutine fan-out costs
-// more than the DP it would parallelize.
+// fuzzyParallelScoreMinIDs is the candidate count above which scoring fans
+// out across GOMAXPROCS workers. Below it the goroutine fan-out costs more
+// than the DP it would parallelize.
 const fuzzyParallelScoreMinIDs = 1024
 
 // fuzzyRefScore is the per-candidate verdict of scoreFuzzyRefs, aligned with
@@ -830,9 +826,12 @@ func appendFuzzyServiceMatches(volumes []*serviceVolumeIndex, opts queryOptions,
 		rankVec := vol.rankForQuery(pqNoTerms)
 		seen := make(map[int]struct{})
 		var pending []int
-		// flush scores the pending chunk and appends survivors in chunk
-		// order, so the survivor sequence (and the enough cutoff below)
-		// is identical to a fully serial loop.
+		// flush scores one variant's pending ids and appends every
+		// survivor in order. The enough cutoff is checked only at variant
+		// boundaries exactly like the original serial loop: the in-flight
+		// variant always over-collects past enough, and that tail
+		// participates in the final sort, so stopping mid-variant would
+		// change which survivors reach the top-N.
 		flush := func() {
 			if len(pending) == 0 {
 				return
@@ -844,9 +843,6 @@ func appendFuzzyServiceMatches(volumes []*serviceVolumeIndex, opts queryOptions,
 					continue
 				}
 				out = append(out, fuzzyScoredCandidate{vol: volIndex, id: id, dist: s.dist, wholeDist: s.wholeDist, prefix: s.prefix, windowPos: s.windowPos, lenDiff: s.lenDiff, rank: s.rank})
-				if len(out) >= enough {
-					break
-				}
 			}
 			pending = pending[:0]
 		}
@@ -865,18 +861,11 @@ func appendFuzzyServiceMatches(volumes []*serviceVolumeIndex, opts queryOptions,
 				}
 				pending = append(pending, id)
 			}
-			// Score in bounded chunks: large piece postings still split
-			// into parallel-friendly pieces, while the enough cutoff keeps
-			// its exact serial meaning (at most one chunk of overshoot,
-			// all of it discarded identically to the serial loop).
-			if len(pending) >= fuzzyScoreChunkIDs {
-				flush()
-				if len(out) >= enough {
-					break
-				}
+			flush()
+			if len(out) >= enough {
+				break
 			}
 		}
-		flush()
 		if len(out) >= enough {
 			break
 		}
