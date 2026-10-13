@@ -11,8 +11,8 @@ func TestContentBlockCacheCap(t *testing.T) {
 	// Default derives from TotalRAM; only the bounds are asserted here so
 	// the test holds on any machine.
 	got := contentBlockCacheCap()
-	if got < 32<<20 || got > 128<<20 {
-		t.Fatalf("default cap = %d; want within [32 MiB, 128 MiB]", got)
+	if got < 32<<20 || got > 256<<20 {
+		t.Fatalf("default cap = %d; want within [32 MiB, 256 MiB]", got)
 	}
 	t.Setenv("SEEKFS_CONTENT_BLOCK_CACHE_MB", "1")
 	if got := contentBlockCacheCap(); got != contentBlockCacheMinMB<<20 {
@@ -27,7 +27,7 @@ func TestContentBlockCacheCap(t *testing.T) {
 		t.Fatalf("64 MiB override cap = %d", got)
 	}
 	t.Setenv("SEEKFS_CONTENT_BLOCK_CACHE_MB", "bogus")
-	if got := contentBlockCacheCap(); got < 32<<20 || got > 128<<20 {
+	if got := contentBlockCacheCap(); got < 32<<20 || got > 256<<20 {
 		t.Fatalf("bogus override cap = %d; want the default range", got)
 	}
 }
@@ -151,6 +151,48 @@ func TestContentBlockCacheConcurrent(t *testing.T) {
 // with copy-under-lock there is no benign torn state, so any foreign byte
 // is a bug. (Kept as a named predicate for readability.)
 func clearedForReuse(b byte, w int) bool { return false }
+
+func TestContentBlockCacheStats(t *testing.T) {
+	c := testBlockCacheTiny()
+	st := &contentTextStore{}
+	dst := make([]byte, 1024)
+	if got := c.stats(); got != (contentBlockCacheStats{}) {
+		t.Fatalf("fresh stats = %+v; want zero", got)
+	}
+	if _, ok := c.copyBlock(st, 0, 0, dst); ok {
+		t.Fatal("empty cache hit")
+	}
+	// A miss (copyBlock) leaves the counters alone: only decodes count.
+	if got := c.stats(); got.Hits != 0 || got.Misses != 0 || got.DecodedBytes != 0 {
+		t.Fatalf("after miss stats = %+v; want zero", got)
+	}
+	c.installAndCopy(st, 0, 0, bytes.Repeat([]byte{'q'}, 1024), dst)
+	c.installAndCopy(st, 1024, 0, bytes.Repeat([]byte{'w'}, 2048), dst[:0])
+	if _, ok := c.copyBlock(st, 0, 0, dst); !ok {
+		t.Fatal("installed block misses")
+	}
+	if _, ok := c.copyBlock(st, 0, 0, dst); !ok {
+		t.Fatal("installed block misses on repeat")
+	}
+	got := c.stats()
+	if got.Hits != 2 || got.Misses != 2 || got.DecodedBytes != 1024+2048 {
+		t.Fatalf("stats = %+v; want hits=2 misses=2 decoded=3072", got)
+	}
+	c.resetStats()
+	if got := c.stats(); got != (contentBlockCacheStats{}) {
+		t.Fatalf("after reset stats = %+v; want zero", got)
+	}
+	// A duplicate install still decoded, so it still counts as a miss.
+	c.installAndCopy(st, 0, 0, bytes.Repeat([]byte{'z'}, 1024), dst)
+	if got := c.stats(); got.Misses != 1 || got.DecodedBytes != 1024 {
+		t.Fatalf("after dup install stats = %+v; want misses=1 decoded=1024", got)
+	}
+	var nilCache *contentBlockCache
+	if got := nilCache.stats(); got != (contentBlockCacheStats{}) {
+		t.Fatalf("nil stats = %+v; want zero", got)
+	}
+	nilCache.resetStats() // must not panic
+}
 
 func TestContentBlockCacheEndToEnd(t *testing.T) {
 	// A reader built over real sections serves identical bytes through the

@@ -446,6 +446,18 @@ func (vol *serviceVolumeIndex) boundedScanCandidatesFiltered(pq parsedQuery, fil
 		if biased {
 			biasRoot = firstNonEmpty(pq.CWDBias, pq.RootBias)
 		}
+		// A content scan that may stop at the page fans out to an ordered
+		// parallel walk: the feeder streams record order, workers verify,
+		// and the merger emits the first limit matches in order, stopping
+		// there like the serial walk (over-verification past an early
+		// limit is bounded by the channel buffer plus one job per
+		// worker). Biased queries keep the serial deferred-partition
+		// walk, and name/scalar scans keep theirs; both are unchanged.
+		if contentQuery && contentMatcher != nil && biasRoot == "" &&
+			contentParallelWorkers() > 1 &&
+			compactUint32OrderLen(order, recordCount) >= contentParallelVerifyMinIDs {
+			return vol.boundedScanCandidatesParallel(pq, order, recordCount, limit, filter, contentMatcher)
+		}
 		out := make([]int, 0, min(limit, 1024))
 		var deferred []int
 		cache := make(map[int]string)
@@ -603,6 +615,138 @@ func (vol *serviceVolumeIndex) boundedScanCandidatesFiltered(pq parsedQuery, fil
 		out = append(out, part...)
 	}
 	return out, true
+}
+
+// boundedScanCandidatesParallel is the parallel form of the bounded scan's
+// early-stop walk (canStopAtLimit without bias): the first limit matches in
+// scan order, verified across workers. The feeder is the only goroutine
+// that walks the order (applying the membership pre-filter and the
+// visited-record budget, marking the trace incomplete past it); workers
+// run the full scan predicate; the merger emits in order and stops at the
+// limit. Proven identical to the serial walk by
+// TestContentParallelScanMatchesSerial across shapes x limits.
+func (vol *serviceVolumeIndex) boundedScanCandidatesParallel(pq parsedQuery, order []uint32, recordCount, limit int, filter *boundedScanMembershipFilter, matcher *contentLeafMatcher) ([]int, bool) {
+	orderLen := compactUint32OrderLen(order, recordCount)
+	workers := contentParallelWorkers()
+	if workers < 2 || orderLen == 0 || limit <= 0 {
+		return nil, false
+	}
+	visitBudget := contentScanVisitBudgetOf(pq)
+	quit := make(chan struct{})
+	var quitOnce sync.Once
+	stop := func() { quitOnce.Do(func() { close(quit) }) }
+	defer stop()
+	type scanJob struct {
+		seq uint64
+		pos int
+	}
+	type scanResult struct {
+		seq uint64
+		id  int
+		ok  bool
+	}
+	work := make(chan scanJob, 64)
+	out := make(chan scanResult, 64)
+	var wg sync.WaitGroup
+	var visited atomic.Int64
+	var canceled atomic.Bool
+	// Feeder: the only goroutine that walks the order.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		defer close(work)
+		var seq uint64
+		for pos := 0; pos < orderLen; pos++ {
+			if pos&1023 == 0 && queryCanceled(pq) {
+				canceled.Store(true)
+				return
+			}
+			id := compactUint32OrderAt(order, pos)
+			if filter != nil && !filter.contains(id) {
+				continue
+			}
+			if visited.Add(1) > int64(visitBudget) {
+				pq.Trace.setContentIncomplete()
+				return
+			}
+			select {
+			case work <- scanJob{seq: seq, pos: pos}:
+				seq++
+			case <-quit:
+				return
+			}
+		}
+	}()
+	// Workers: verify only; no ordering, no limits here.
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			localCache := make(map[int]string)
+			var done int
+			for {
+				select {
+				case job, ok := <-work:
+					if !ok {
+						return
+					}
+					done++
+					if done&1023 == 0 && queryCanceled(pq) {
+						canceled.Store(true)
+						return
+					}
+					id := compactUint32OrderAt(order, job.pos)
+					localCache = boundPathCache(localCache)
+					res := scanResult{seq: job.seq, id: id}
+					if scanCandidateMatches(vol, vol.index, pq, id, localCache, matcher) {
+						res.ok = true
+					}
+					select {
+					case out <- res:
+					case <-quit:
+						return
+					}
+				case <-quit:
+					return
+				}
+			}
+		}()
+	}
+	// Closer: once the feeder and every worker are done, no more results.
+	go func() {
+		wg.Wait()
+		close(out)
+	}()
+	// Merger (this goroutine): emit in scan order, stopping at exactly
+	// the limit like the serial walk.
+	ids := make([]int, 0, min(limit, 1024))
+	pending := make(map[uint64]scanResult)
+	var expect uint64
+	emit := func() bool {
+		for limit <= 0 || len(ids) < limit {
+			res, ok := pending[expect]
+			if !ok {
+				return true
+			}
+			delete(pending, expect)
+			expect++
+			if res.ok {
+				ids = append(ids, res.id)
+			}
+		}
+		return false
+	}
+	for res := range out {
+		pending[res.seq] = res
+		if !emit() {
+			return ids, true
+		}
+	}
+	emit()
+	if canceled.Load() {
+		return nil, false
+	}
+	return ids, true
 }
 
 func (vol *serviceVolumeIndex) boundedScanCandidatesHiddenTop(pq parsedQuery, hidden hiddenBaseIDs, limit int) ([]int, bool) {

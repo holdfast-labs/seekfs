@@ -8,6 +8,7 @@ package main
 // FRNs would hide a misjoin.
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
@@ -709,6 +710,79 @@ func TestContentWalkSharded(t *testing.T) {
 	reader = vol.content.readerView()
 	if reader == nil || reader.idx.Origin != contentOriginWalk {
 		t.Fatal("folded sharded base lost its walk origin")
+	}
+}
+
+// A regex query on a walk volume must find its matches through both the
+// trigram-prefiltered candidates (literal regex) and the bounded scan (a
+// literal-free regex has no prefilter and always scans).
+func TestContentWalkRegexScanFindsMatch(t *testing.T) {
+	stubContentBuildSync(t)
+	stubContentCatchUpSync(t)
+	dir := t.TempDir()
+	root := filepath.Join(dir, "root")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "alpha.txt"), []byte("alpha needleone here"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "beta.txt"), []byte("nothing relevant 12345"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	vol, _ := newContentWalkTestVolume(t, root)
+	s := contentTestService(t)
+	s.ensureContentBuild(vol)
+	if got := vol.content.stateOf(); got != contentStateReady {
+		t.Fatalf("precondition state = %q; want ready", got)
+	}
+	// Literal regex: trigram-prefiltered candidates, full entry verify.
+	if got := contentWalkNames(contentWalkSearch(t, vol, `content:/needleone/`)); len(got) != 1 || got[0] != "alpha.txt" {
+		t.Fatalf(`content:/needleone/ = %v; want [alpha.txt]`, got)
+	}
+	// Literal-free regex: no prefilter exists, so the bounded scan decides.
+	if got := contentWalkNames(contentWalkSearch(t, vol, `content:/\d+/`)); len(got) != 1 || got[0] != "beta.txt" {
+		t.Fatalf(`content:/\d+/ = %v; want [beta.txt]`, got)
+	}
+}
+
+// The bounded scan verifies path-free when the query reads no path, but
+// walk content resolution keys on the entry path: with more matching docs
+// than the relevance window, the posting superset caps and the rank-ordered
+// scan decides, so the scan (and the entry-free count) must still find the
+// matches. Catches a total-miss regression (0 results instead of the page).
+func TestContentWalkCappedScanFindsMatch(t *testing.T) {
+	stubContentBuildSync(t)
+	stubContentCatchUpSync(t)
+	dir := t.TempDir()
+	root := filepath.Join(dir, "root")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	const files = 4200 // past the limit-20 relevance window (4096)
+	for i := 0; i < files; i++ {
+		name := filepath.Join(root, fmt.Sprintf("f%04d.txt", i))
+		if err := os.WriteFile(name, []byte(fmt.Sprintf("commonword file %d", i)), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	vol, _ := newContentWalkTestVolume(t, root)
+	s := contentTestService(t)
+	s.ensureContentBuild(vol)
+	if got := vol.content.stateOf(); got != contentStateReady {
+		t.Fatalf("precondition state = %q; want ready", got)
+	}
+	trace := &searchTrace{}
+	got, err := searchServiceVolumes([]*serviceVolumeIndex{vol}, queryOptions{Query: "content:commonword", Limit: 20, Trace: trace}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 20 || trace.Source != "content-scan" {
+		t.Fatalf("capped walk scan = %d results via %q; want 20 via content-scan", len(got), trace.Source)
+	}
+	n, ok, err := countServiceVolumes([]*serviceVolumeIndex{vol}, queryOptions{Query: "content:commonword", Trace: &searchTrace{}})
+	if err != nil || !ok || n != files {
+		t.Fatalf("walk count = %d, %v, %v; want %d, true, nil", n, ok, err, files)
 	}
 }
 

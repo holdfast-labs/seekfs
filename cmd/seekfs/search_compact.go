@@ -301,13 +301,36 @@ func searchCompactWithCacheHidden(idx *Index, opts queryOptions, countOnly bool,
 	if contentMatcher != nil && !countOnly && pq.contentCandidateMeta.verified {
 		skipEntryMatches = true
 	}
-	// Content verification is inline and must stop at the limit: the parallel
-	// verifier runs every worker over its full range and only caps the merged
-	// output, so it verifies the whole candidate order. The serial range walk
-	// below stops as soon as the limit is reached, which keeps a broad content
-	// query's work proportional to the window rather than the candidate set.
-	if usedCandidates && !countOnly && contentMatcher == nil && len(order) >= serviceTrigramParallelVerifyMinIDs {
-		return verifyCompactCandidateOrderParallel(idx, pq, order, pathCache, limit, skipEntryMatches, hidden, contentVol, contentMatcher)
+	// Content verification is inline and must stop at the limit. The
+	// filename parallel verifier runs every worker over its full range and
+	// only caps the merged output, so it is kept for the name/scalar path;
+	// the content verifier below merges in candidate order and stops at the
+	// limit like the serial walk, with over-verification bounded by the
+	// channel buffer plus one job per worker. The serial range walk stays
+	// for small candidate sets, where goroutine setup exceeds the win.
+	if usedCandidates && !countOnly {
+		// The filename lane keeps its historical threshold; the content
+		// lane has its own (verifies cost ~100x a name verify). With only
+		// two workers an early-stop query keeps the serial walk: the
+		// merge/sync overhead cancels the win, while a query that must
+		// verify everything (limit beyond the candidate set, e.g. the
+		// relevance window) still scales.
+		if contentMatcher == nil && len(order) >= serviceTrigramParallelVerifyMinIDs {
+			return verifyCompactCandidateOrderParallel(idx, pq, order, pathCache, limit, skipEntryMatches, hidden, contentVol, contentMatcher)
+		}
+		if contentMatcher != nil && len(order) >= contentParallelVerifyMinIDs &&
+			(contentParallelWorkers() > 2 || limit >= len(order)) {
+			return verifyCompactContentParallel(idx, pq, order, pathCache, limit, skipEntryMatches, hidden, contentVol, contentMatcher)
+		}
+	}
+	// A content count tallies every candidate with no ordering to preserve,
+	// so a large candidate set fans out to sharded tallies.
+	if opts.contentCount != nil && contentVol != nil && contentMatcher != nil &&
+		contentParallelWorkers() > 1 && compactOrderLen(order, idx.compactRecordCount()) >= contentParallelVerifyMinIDs {
+		if err := countCompactContentParallel(idx, pq, order, hidden, contentVol, contentMatcher, opts.contentCount); err != nil {
+			return nil, err
+		}
+		return []Entry{}, nil
 	}
 	for pos := 0; pos < compactOrderLen(order, idx.compactRecordCount()); pos++ {
 		if pos&1023 == 0 && queryCanceled(pq) {
@@ -339,9 +362,11 @@ func searchCompactWithCacheHidden(idx *Index, opts queryOptions, countOnly bool,
 		}
 		// Counting mode skips path reconstruction when the query has no path
 		// constraint, and tallies the match instead of retaining an Entry.
+		// Walk-origin volumes always keep the path: their content
+		// resolution keys on it (see scanCandidateMatches).
 		withPath := true
 		if opts.contentCount != nil {
-			withPath = queryNeedsEntryPath(pq)
+			withPath = queryNeedsEntryPath(pq) || contentVol.contentWalkOriginAttached()
 		}
 		entry := compactEntryFromRecordPath(idx, recIndex, rec, pathCache, true, withPath)
 		if entryMatchesWithContentMatcher(contentVol, entry, pq, pq.MatchPath, contentMatcher) {
@@ -510,6 +535,219 @@ func verifyCompactCandidateOrderRange(idx *Index, pq parsedQuery, order []int, p
 	return out, nil
 }
 
+// contentParallelVerifyMinIDs gates the parallel content verifier: below
+// this many candidates the feeder/channel setup exceeds the win. Content
+// verifies cost ~100x a name verify (block decompress + fold + substring),
+// so the gate is far below the filename parallel threshold.
+const contentParallelVerifyMinIDs = 256
+
+// contentParallelWorkers sizes the content verify fan-out: GOMAXPROCS
+// workers up to contentSearchMaxWorkers (past that the shared block cache
+// contends instead of helping); 1 keeps the zero-overhead serial path.
+func contentParallelWorkers() int {
+	w := runtime.GOMAXPROCS(0)
+	if w < 1 {
+		w = 1
+	}
+	if w > contentSearchMaxWorkers {
+		w = contentSearchMaxWorkers
+	}
+	return w
+}
+
+// contentVerifyJob is one candidate for the parallel content verifier: seq
+// numbers the candidate order, so the merger restores the exact serial
+// order regardless of which worker finishes first.
+type contentVerifyJob struct {
+	seq uint64
+	id  int
+}
+
+// contentVerifyResult is one verified candidate: ok=false is a miss, but
+// every job reports so the merger can advance past it.
+type contentVerifyResult struct {
+	seq   uint64
+	entry Entry
+	ok    bool
+}
+
+// verifyCompactContentParallel verifies content candidates across workers
+// and merges matches in candidate order with the exact serial limit: the
+// first limit matches in candidate order, no more, no fewer. Verification
+// is CPU-bound (block decompress + fold + substring), so workers scale;
+// the feeder, the merger and the limit accounting stay single-threaded.
+// Over-verification past an early limit is bounded by the channel buffer
+// plus one job per worker. Proven identical to the serial walk by
+// TestContentParallelContentMatchesSerial across terms x limits x workers.
+func verifyCompactContentParallel(idx *Index, pq parsedQuery, order []int, pathCache map[int]string, limit int, skipEntryMatches bool, hidden hiddenBaseIDs, contentVol *serviceVolumeIndex, matcher *contentLeafMatcher) ([]Entry, error) {
+	if len(order) == 0 || limit <= 0 {
+		return nil, nil
+	}
+	workers := contentParallelWorkers()
+	if workers < 2 {
+		return verifyCompactCandidateOrderRange(idx, pq, order, pathCache, limit, skipEntryMatches, hidden, contentVol, matcher)
+	}
+	// Workers keep local path memos (like the filename parallel lane); the
+	// passed-in memo stays with the serial path.
+	quit := make(chan struct{})
+	var quitOnce sync.Once
+	stop := func() { quitOnce.Do(func() { close(quit) }) }
+	defer stop()
+	work := make(chan contentVerifyJob, 64)
+	out := make(chan contentVerifyResult, 64)
+	var wg sync.WaitGroup
+	// Feeder: the only goroutine that walks the candidate order.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		defer close(work)
+		var seq uint64
+		for pos, recIndex := range order {
+			if pos&1023 == 0 && queryCanceled(pq) {
+				return
+			}
+			select {
+			case work <- contentVerifyJob{seq: seq, id: recIndex}:
+				seq++
+			case <-quit:
+				return
+			}
+		}
+	}()
+	// Workers: verify only; no ordering, no limits here. Each drops hidden
+	// IDs exactly like the serial walk, so a hidden-filled page still
+	// backfills from later candidates.
+	var canceled atomic.Bool
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			localCache := make(map[int]string)
+			var done int
+			for {
+				select {
+				case job, ok := <-work:
+					if !ok {
+						return
+					}
+					done++
+					if done&1023 == 0 && queryCanceled(pq) {
+						canceled.Store(true)
+						return
+					}
+					var res contentVerifyResult
+					res.seq = job.seq
+					if !hidden.contains(job.id) {
+						localCache = boundPathCache(localCache)
+						if entry, ok := compactCandidateEntryIfMatchIn(contentVol, idx, pq, job.id, localCache, true, skipEntryMatches, matcher); ok {
+							res.entry, res.ok = entry, true
+						}
+					}
+					select {
+					case out <- res:
+					case <-quit:
+						return
+					}
+				case <-quit:
+					return
+				}
+			}
+		}()
+	}
+	// Closer: once the feeder and every worker are done, no more results.
+	go func() {
+		wg.Wait()
+		close(out)
+	}()
+	// Merger (this goroutine): emit in candidate order, stopping at exactly
+	// the limit like the serial walk.
+	hits := make([]Entry, 0, min(limit, 1024))
+	pending := make(map[uint64]contentVerifyResult)
+	var expect uint64
+	emit := func() bool {
+		for limit <= 0 || len(hits) < limit {
+			res, ok := pending[expect]
+			if !ok {
+				return true
+			}
+			delete(pending, expect)
+			expect++
+			if res.ok {
+				hits = append(hits, res.entry)
+			}
+		}
+		return false
+	}
+	for res := range out {
+		pending[res.seq] = res
+		if !emit() {
+			return hits, nil
+		}
+	}
+	emit()
+	if canceled.Load() {
+		return nil, errQueryCanceled
+	}
+	return hits, nil
+}
+
+// countCompactContentParallel tallies content matches over sharded record
+// ranges: a count keeps no order and no entries, so ranges are independent
+// and the partial tallies sum exactly. Each worker runs the same predicate
+// as the serial count loop (prechecks, then the content-aware match over a
+// path-free entry unless the query reads paths), so the total equals the
+// serial count by construction.
+func countCompactContentParallel(idx *Index, pq parsedQuery, order []int, hidden hiddenBaseIDs, contentVol *serviceVolumeIndex, matcher *contentLeafMatcher, count *int) error {
+	total := compactOrderLen(order, idx.compactRecordCount())
+	workers := contentParallelWorkers()
+	if workers > total {
+		workers = total
+	}
+	if workers < 1 {
+		return nil
+	}
+	tallies := make([]int, workers)
+	var canceled atomic.Bool
+	var wg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		start := w * total / workers
+		end := (w + 1) * total / workers
+		wg.Add(1)
+		go func(worker, start, end int) {
+			defer wg.Done()
+			localCache := make(map[int]string)
+			n := 0
+			for pos := start; pos < end; pos++ {
+				if pos&1023 == 0 && queryCanceled(pq) {
+					canceled.Store(true)
+					return
+				}
+				recIndex := compactOrderAt(order, pos)
+				if hidden.contains(recIndex) {
+					continue
+				}
+				localCache = boundPathCache(localCache)
+				// The same predicate as the serial count loop: prechecks,
+				// then the content-aware match over a path-free entry
+				// unless the query reads paths (see scanCandidateMatches;
+				// walk volumes always keep the path there too).
+				if scanCandidateMatches(contentVol, idx, pq, recIndex, localCache, matcher) {
+					n++
+				}
+			}
+			tallies[worker] = n
+		}(w, start, end)
+	}
+	wg.Wait()
+	if canceled.Load() {
+		return errQueryCanceled
+	}
+	for _, n := range tallies {
+		*count += n
+	}
+	return nil
+}
+
 func compactCandidateEntryIfMatch(idx *Index, pq parsedQuery, recIndex int, pathCache map[int]string, usedCandidates bool, skipEntryMatches bool) (Entry, bool) {
 	return compactCandidateEntryIfMatchIn(nil, idx, pq, recIndex, pathCache, usedCandidates, skipEntryMatches, nil)
 }
@@ -544,8 +782,10 @@ func compactCandidateEntryIfMatchIn(vol *serviceVolumeIndex, idx *Index, pq pars
 // query), it verifies against a path-free Entry: the scan discards the Entry,
 // and the returned candidate reconstructs its path downstream, so building one
 // here would be wasted work. Any query that reads a path keeps the full entry.
+// Walk-origin volumes always keep the full entry: their content resolution
+// keys on the entry path, so a path-free entry would miss every document.
 func scanCandidateMatches(vol *serviceVolumeIndex, idx *Index, pq parsedQuery, recIndex int, pathCache map[int]string, matcher *contentLeafMatcher) bool {
-	if matcher != nil && !queryNeedsEntryPath(pq) {
+	if matcher != nil && !queryNeedsEntryPath(pq) && !vol.contentWalkOriginAttached() {
 		rec := idx.compactRecord(recIndex)
 		if rec.Deleted || !compactRecordPrecheck(rec, pq, pq.MatchPath) {
 			return false
@@ -779,8 +1019,20 @@ func (vol *serviceVolumeIndex) nameTermCandidates(pq parsedQuery) ([]int, bool) 
 					// explicit sorts), so order the content posting set the same
 					// way. sort:relevance keeps its own post-verify ranking and
 					// is left in candidate (docID) order here.
+					//
+					// Pure-regex queries are the exception: they were full
+					// scans before the regex prefilter, so their candidates
+					// keep the scan's walk order (orderForQuery position,
+					// record order when nil). Verifying the prefiltered set
+					// in that relative order emits exactly the historical
+					// sequence; the rank-ordered path would visibly reorder
+					// results on volumes whose rank and scan orders differ.
 					if pq.SortColumn != "relevance" {
-						sortCandidateIDs(candidates, pq, vol.index, vol.rankForQuery(pq))
+						if contentLeavesAllRegex(pq) {
+							vol.sortCandidateIDsByScanOrder(candidates, pq)
+						} else {
+							sortCandidateIDs(candidates, pq, vol.index, vol.rankForQuery(pq))
+						}
 					}
 					pq.Trace.setSource("content-candidates", len(candidates))
 					return candidates, true
@@ -998,6 +1250,70 @@ func (vol *serviceVolumeIndex) nameTermCandidates(pq parsedQuery) ([]int, bool) 
 	}
 	pq.Trace.setSource("name-term-posting", len(candidates))
 	return candidates, true
+}
+
+// sortCandidateIDsByScanOrder orders candidates in the bounded scan's walk
+// order: orderForQuery position, record order when the volume has no order.
+// A pure-regex query answered from trigram-prefiltered candidates verifies
+// that subset in the same relative order the historical full scan walked,
+// so the emitted matches (sets, order, counts, snippets) are identical
+// while most records are never touched. Record IDs the order does not know
+// (delta additions, or a short order) sort last by record ID, deterministically.
+func (vol *serviceVolumeIndex) sortCandidateIDsByScanOrder(ids []int, pq parsedQuery) {
+	order := vol.orderForQuery(pq)
+	if len(order) == 0 {
+		sort.Ints(ids)
+		return
+	}
+	recordCount := vol.index.compactRecordCount()
+	// Positions come from the resident rank array when it is the order's
+	// inverse for every candidate (the common case): a prefiltered set is
+	// small, while a position array costs 8 bytes per record per query
+	// (~190 MB on a 23.7M-entry index). Any candidate the rank does not place
+	// at its own order slot (a deleted or delta ID, or a volume whose rank
+	// and scan orders differ) falls back to the exact position array.
+	var rankOf func(id int) [2]int
+	if rank := vol.rankForQuery(pq); len(rank) == recordCount {
+		inverse := true
+		for _, id := range ids {
+			if id < 0 || id >= recordCount {
+				inverse = false
+				break
+			}
+			if r := int(rank[id]); r >= len(order) || int(order[r]) != id {
+				inverse = false
+				break
+			}
+		}
+		if inverse {
+			rankOf = func(id int) [2]int { return [2]int{0, int(rank[id])} }
+		}
+	}
+	if rankOf == nil {
+		pos := make([]int, recordCount)
+		for i := range pos {
+			pos[i] = -1
+		}
+		for p, id32 := range order {
+			if id := int(id32); id >= 0 && id < recordCount && pos[id] < 0 {
+				pos[id] = p
+			}
+		}
+		// An ID outside the order sorts after every ordered ID, by record ID.
+		rankOf = func(id int) [2]int {
+			if id >= 0 && id < recordCount && pos[id] >= 0 {
+				return [2]int{0, pos[id]}
+			}
+			return [2]int{1, id}
+		}
+	}
+	sort.SliceStable(ids, func(i, j int) bool {
+		ai, bj := rankOf(ids[i]), rankOf(ids[j])
+		if ai[0] != bj[0] {
+			return ai[0] < bj[0]
+		}
+		return ai[1] < bj[1]
+	})
 }
 
 func (vol *serviceVolumeIndex) overlayAwareNameTermCandidates(pq parsedQuery) ([]int, bool) {

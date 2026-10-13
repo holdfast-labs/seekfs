@@ -89,6 +89,84 @@ type contentLeafMatcher struct {
 	caseSensitive bool
 	regex         map[int]*regexp.Regexp
 	needle        map[int][]byte
+	// needleASCII records, per term/phrase leaf, whether the folded needle
+	// is pure ASCII. An ASCII needle against an ASCII document matches
+	// exactly under ASCII case folding, so verification and snippets can
+	// test it without allocating the full fold (asciiCaseIndex); anything
+	// else takes the historical fold path with identical results.
+	needleASCII map[int]bool
+}
+
+// isASCIIBytes reports whether b has no byte >= 0x80.
+func isASCIIBytes(b []byte) bool {
+	for i := 0; i < len(b); i++ {
+		if b[i] >= 0x80 {
+			return false
+		}
+	}
+	return true
+}
+
+// asciiCaseIndex finds the folded ASCII needle in raw under ASCII case
+// folding, without allocating. The caller must guarantee needle is folded
+// and pure ASCII (needleASCII); raw may be anything.
+//
+// A non-negative return is always a true match at that raw byte offset
+// (ASCII folding preserves offsets, so no mapping is needed). ascii=false
+// means raw contains non-ASCII bytes: the caller must fall back to the
+// full fold, which decides (folding can only reveal matches involving
+// non-ASCII runes, e.g. İ folding to i̇, which imply non-ASCII raw).
+// ascii=true with -1 means raw is pure ASCII and needle is genuinely
+// absent. Either way the outcome equals fold-then-substring.
+func asciiCaseIndex(raw, needle []byte) (idx int, ascii bool) {
+	if len(needle) == 0 || len(raw) < len(needle) {
+		return -1, isASCIIBytes(raw)
+	}
+	first := needle[0]
+	upper := first
+	if first >= 'a' && first <= 'z' {
+		upper = first - ('a' - 'A')
+	}
+	ascii = true
+	for i := 0; i < len(raw); i++ {
+		c := raw[i]
+		if c >= 0x80 {
+			ascii = false
+			continue
+		}
+		if i+len(needle) > len(raw) {
+			// Past the last match start: no comparison, but the byte
+			// still counts for the ASCII verdict (checked above).
+			continue
+		}
+		if c != first && c != upper {
+			continue
+		}
+		match := true
+		for j := 1; j < len(needle); j++ {
+			d := raw[i+j]
+			if d >= 0x80 {
+				ascii = false
+				match = false
+				break
+			}
+			if d >= 'A' && d <= 'Z' {
+				d += 'a' - 'A'
+			}
+			if d != needle[j] {
+				match = false
+				break
+			}
+		}
+		if match {
+			// A true ASCII match — but the caller still needs the
+			// verdict: earlier non-ASCII bytes mean the fold could
+			// match even earlier (inside a fold expansion like İ→i̇),
+			// so only a clean scan authorizes the fast offset.
+			return i, ascii
+		}
+	}
+	return -1, ascii
 }
 
 func newContentLeafMatcher(pq parsedQuery) *contentLeafMatcher {
@@ -123,6 +201,10 @@ func newContentLeafMatcher(pq parsedQuery) *contentLeafMatcher {
 			b = contentFoldText(b)
 		}
 		m.needle[leaf.LeafID] = b
+		if m.needleASCII == nil {
+			m.needleASCII = make(map[int]bool)
+		}
+		m.needleASCII[leaf.LeafID] = isASCIIBytes(b)
 	}
 	return m
 }
@@ -166,11 +248,13 @@ func (m *contentLeafMatcher) match(raw, folded []byte, leaf contentLeaf) bool {
 
 // matchRawFirst is match with a lazy fold: a case-insensitive leaf whose
 // lowercased needle already appears verbatim in the raw text is a match without
-// folding, and only the first leaf that misses the raw fast path pays for the
-// once-per-entry fold (cached through folded/foldedReady). A corpus of
-// already-lowercase documents (the common case) then never folds at all. The
-// match decision is identical to match: folding then testing a superset cannot
-// introduce or drop a match.
+// folding. Otherwise, when both needle and text are ASCII, the match is
+// decided by asciiCaseIndex with no allocation at all; only text containing
+// non-ASCII bytes pays for the once-per-entry fold (cached through
+// folded/foldedReady). A corpus of already-lowercase documents (the common
+// case) then never folds at all. The match decision is identical to match:
+// asciiCaseIndex finds exactly the ASCII matches and defers to the fold
+// whenever non-ASCII bytes could hide one.
 func (m *contentLeafMatcher) matchRawFirst(raw []byte, folded *[]byte, foldedReady *bool, leaf contentLeaf) bool {
 	if leaf.Kind == contentLeafRegex {
 		re := m.regex[leaf.LeafID]
@@ -182,6 +266,11 @@ func (m *contentLeafMatcher) matchRawFirst(raw []byte, folded *[]byte, foldedRea
 	}
 	if m.caseSensitive {
 		return false
+	}
+	if m.needleASCII[leaf.LeafID] {
+		if idx, ascii := asciiCaseIndex(raw, needle); ascii {
+			return idx >= 0
+		}
 	}
 	if !*foldedReady {
 		*folded = contentFoldText(raw)
@@ -394,6 +483,17 @@ func contentSnippet(raw, folded []byte, positive []contentLeaf, m *contentLeafMa
 			continue
 		}
 		needle := m.needleOf(leaf)
+		// An ASCII needle in ASCII text windows the raw bytes directly:
+		// folding preserves ASCII offsets, so this renders exactly what
+		// the fold-and-map path below produces, with no allocation.
+		if !m.caseSensitive && m.needleASCII[leaf.LeafID] {
+			if off, ascii := asciiCaseIndex(raw, needle); ascii {
+				if off < 0 {
+					continue
+				}
+				return contentSnippetWindow(raw, off, len(needle))
+			}
+		}
 		hay := m.haystackFor(raw, folded)
 		off := contentLeafFirstOffset(hay, needle)
 		if off < 0 {
@@ -598,11 +698,28 @@ func (vol *serviceVolumeIndex) contentCandidatesBounded(pq parsedQuery, cap int)
 	// A sharded base only reads the shards that can hold docs under the
 	// query's folder scope.
 	mask := reader.shardMaskUnder(pq.Under)
+	// pureRegex gates the regex prefilter: it engages only when every
+	// positive content leaf in the tree is a regex. Mixed term+regex
+	// queries keep the historical behavior exactly (regex leaves
+	// unconstrained, term postings driving), so only shapes that were
+	// full scans before can change source — and those keep scan order
+	// below, so their results stay byte-identical.
+	pureRegex := contentLeavesAllRegex(pq)
 	if len(pq.Content) > 0 {
 		// A top-level Content leaf is a conjunct, so its postings alone are a
 		// superset of the whole query; OR groups only narrow it further.
 		for _, leaf := range pq.Content {
 			if leaf.Kind == contentLeafRegex {
+				// A regex match must contain one disjunct's required
+				// literals (see contentRegexLeafStream); intersecting
+				// them only narrows the superset, so verification still
+				// decides exactly. A regex with no provable literals
+				// stays unconstrained, as before.
+				if pureRegex {
+					if s := contentRegexLeafStream(reader, leaf, mask); s != nil {
+						streams = append(streams, s)
+					}
+				}
 				continue
 			}
 			term := string(contentFoldText([]byte(leaf.Text)))
@@ -619,7 +736,7 @@ func (vol *serviceVolumeIndex) contentCandidatesBounded(pq parsedQuery, cap int)
 		// content, so no postings superset exists; fall back.
 		driven := false
 		for _, group := range pq.OrGroups {
-			groupStream, groupDriven, ok := contentOrGroupCandidateStream(reader, group, mask)
+			groupStream, groupDriven, ok := contentOrGroupCandidateStream(reader, group, mask, pureRegex)
 			if !ok {
 				return nil, false, false
 			}
@@ -707,13 +824,15 @@ func (vol *serviceVolumeIndex) contentCandidatesBounded(pq parsedQuery, cap int)
 // lazy ascending stream over the distinct docIDs of the group's alternatives,
 // capped only by the caller's collector budget. ok=false means a non-content
 // alternative makes the group unbounded; a nil stream with driven=true means
-// the union is unconstrained (a regex alternative). It is the same k-way union
-// as the historical pairwise unionSortedDocIDs merge, but it materializes no
-// alternative: the caller's budget+1 cap stops it before any full list decodes.
-func contentOrGroupCandidateStream(reader *contentReader, group []parsedQuery, mask []bool) (stream func() (uint32, bool), driven, ok bool) {
+// the union is unconstrained (a regex alternative with no prefilter, or one
+// whose prefilter is gated off by pureRegex=false). It is the same k-way
+// union as the historical pairwise unionSortedDocIDs merge, but it
+// materializes no alternative: the caller's budget+1 cap stops it before any
+// full list decodes.
+func contentOrGroupCandidateStream(reader *contentReader, group []parsedQuery, mask []bool, pureRegex bool) (stream func() (uint32, bool), driven, ok bool) {
 	var streams []func() (uint32, bool)
 	for i := range group {
-		altStream, altDriven, altOK := contentAltCandidateStream(reader, group[i], mask)
+		altStream, altDriven, altOK := contentAltCandidateStream(reader, group[i], mask, pureRegex)
 		if !altOK {
 			return nil, false, false
 		}
@@ -738,11 +857,87 @@ func contentOrGroupCandidateStream(reader *contentReader, group []parsedQuery, m
 // constraint at all; a nil stream with driven=true means the constraint is
 // unconstrained (a regex leaf). Every source is a posting-backed stream, so an
 // alternative is never materialized in full.
-func contentAltCandidateStream(reader *contentReader, alt parsedQuery, mask []bool) (stream func() (uint32, bool), driven, ok bool) {
+// contentLeavesAllRegex reports whether every positive content leaf in the
+// query tree is a regex leaf: top-level Content and OR-nested alternatives.
+// NOT leaves are exclusion and contribute no candidates, so they do not
+// affect the verdict. The regex prefilter engages only on a pure verdict,
+// so mixed term+regex queries keep the historical term-driven behavior
+// exactly.
+func contentLeavesAllRegex(pq parsedQuery) bool {
+	found := false
+	var walk func(q parsedQuery) bool
+	walk = func(q parsedQuery) bool {
+		for _, leaf := range q.Content {
+			if leaf.Kind != contentLeafRegex {
+				return false
+			}
+			found = true
+		}
+		for _, g := range q.OrGroups {
+			for i := range g {
+				if !walk(g[i]) {
+					return false
+				}
+			}
+		}
+		return true
+	}
+	return walk(pq) && found
+}
+
+// contentRegexLeafStream returns a lazy candidate stream for a regex leaf's
+// required literals (see regexRequiredLiteralAlternatives): per disjunct,
+// the intersection of its runs' trigram streams, unioned across disjuncts.
+// A match must take one disjunct and contain every run of that disjunct, so
+// the union is an exact superset of the match set and the unchanged
+// verification still decides. Nil when no sound prefilter exists (a
+// disjunct with no trigram-safe run, an unrelaxable construct, or too many
+// disjuncts): the leaf stays unconstrained, exactly as before.
+func contentRegexLeafStream(reader *contentReader, leaf contentLeaf, mask []bool) func() (uint32, bool) {
+	if reader == nil || leaf.Kind != contentLeafRegex {
+		return nil
+	}
+	disjuncts := regexRequiredLiteralAlternatives(leaf.Text)
+	if len(disjuncts) == 0 {
+		return nil
+	}
+	var alts []func() (uint32, bool)
+	for _, runs := range disjuncts {
+		var runStreams []func() (uint32, bool)
+		for _, run := range runs {
+			if !contentTermTrigramSafe(run) {
+				// A gram the builder skipped (control byte) cannot
+				// constrain; the disjunct's remaining runs still do.
+				continue
+			}
+			// Runs arrive lowercased from the extractor, matching the
+			// folded grams the builder indexed.
+			runStreams = append(runStreams, reader.candidateStreamIn(run, mask))
+		}
+		if len(runStreams) == 0 {
+			// This disjunct is unconstrained: a match may take it while
+			// containing none of the other disjuncts' runs, so no sound
+			// prefilter exists for the leaf.
+			return nil
+		}
+		alts = append(alts, intersectDocIDStreams(runStreams))
+	}
+	if len(alts) == 1 {
+		return alts[0]
+	}
+	return unionDocIDStreams(alts)
+}
+
+func contentAltCandidateStream(reader *contentReader, alt parsedQuery, mask []bool, pureRegex bool) (stream func() (uint32, bool), driven, ok bool) {
 	var streams []func() (uint32, bool)
 	for _, leaf := range alt.Content {
 		driven = true
 		if leaf.Kind == contentLeafRegex {
+			if pureRegex {
+				if s := contentRegexLeafStream(reader, leaf, mask); s != nil {
+					streams = append(streams, s)
+				}
+			}
 			continue
 		}
 		term := string(contentFoldText([]byte(leaf.Text)))
@@ -752,7 +947,7 @@ func contentAltCandidateStream(reader *contentReader, alt parsedQuery, mask []bo
 		streams = append(streams, reader.candidateStreamIn(term, mask))
 	}
 	for _, group := range alt.OrGroups {
-		groupStream, groupDriven, groupOK := contentOrGroupCandidateStream(reader, group, mask)
+		groupStream, groupDriven, groupOK := contentOrGroupCandidateStream(reader, group, mask, pureRegex)
 		if !groupOK {
 			return nil, false, false
 		}

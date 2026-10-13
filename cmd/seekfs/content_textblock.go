@@ -30,6 +30,7 @@ import (
 	"sort"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/klauspost/compress/zstd"
@@ -70,7 +71,7 @@ type contentBlockKey struct {
 // every reader of one index (a composite shares one across its shards), so
 // repeated and adjacent queries, typing refinements, and the snippet pass
 // after a search all hit warm blocks. The cap is bytes, defaulting to
-// TotalRAM/64 clamped to [32 MiB, 128 MiB] and overridable with
+// TotalRAM/64 clamped to [32 MiB, 256 MiB] and overridable with
 // SEEKFS_CONTENT_BLOCK_CACHE_MB (clamped to [8 MiB, 256 MiB]).
 //
 // Lifetime and pins: entries are decompressed COPIES owned by the cache, so
@@ -93,11 +94,58 @@ type contentBlockCache struct {
 	ix        map[contentBlockKey]*list.Element
 	data      map[contentBlockKey][]byte
 	inflight  map[contentBlockKey]chan struct{}
+	// Lifetime decode counters (atomics: updated on paths both inside
+	// and outside mu). hits counts copyBlock hits; misses counts block
+	// decodes performed (a duplicate install still decoded, so it still
+	// counts); decodedBytes sums the decoded lengths. They exist so
+	// query profiling can attribute "N block touches x ~M us" per
+	// shape without perturbing the hot path; resetStats zeroes them.
+	hits         atomic.Uint64
+	misses       atomic.Uint64
+	decodedBytes atomic.Uint64
+}
+
+// contentBlockCacheStats is one snapshot of a block cache's lifetime
+// decode counters; see contentBlockCache.
+type contentBlockCacheStats struct {
+	Hits         uint64
+	Misses       uint64
+	DecodedBytes uint64
+}
+
+// stats snapshots the lifetime decode counters.
+func (c *contentBlockCache) stats() contentBlockCacheStats {
+	if c == nil {
+		return contentBlockCacheStats{}
+	}
+	return contentBlockCacheStats{
+		Hits:         c.hits.Load(),
+		Misses:       c.misses.Load(),
+		DecodedBytes: c.decodedBytes.Load(),
+	}
+}
+
+// resetStats zeroes the lifetime decode counters (drop does not: entries
+// are released but the counts describe the reader's lifetime).
+func (c *contentBlockCache) resetStats() {
+	if c == nil {
+		return
+	}
+	c.hits.Store(0)
+	c.misses.Store(0)
+	c.decodedBytes.Store(0)
 }
 
 // contentBlockCacheCap returns the shared-cache byte cap: TotalRAM/64
-// clamped to [32 MiB, 128 MiB], overridden by
+// clamped to [32 MiB, 256 MiB], overridden by
 // SEEKFS_CONTENT_BLOCK_CACHE_MB (megabytes, clamped to [8 MiB, 256 MiB]).
+// The 256 MiB ceiling (raised from 128 in §6s) fits one broad query's
+// working set on a large corpus: a relevance window over the 76k-doc v8
+// sample touches ~135 MB of blocks, which thrashed perpetually (75%
+// miss rate, every op re-decoding ~100 MB) under 128 and goes to ~0
+// misses under 256. Small machines keep their TotalRAM/64 value down to
+// the 32 MiB floor; the cap only retains touched blocks, never
+// pre-allocates.
 func contentBlockCacheCap() int64 {
 	capBytes := int64(contentBlockCacheDefaultMB) << 20
 	if total, err := contentTotalRamBytes(); err == nil && total > 0 {
@@ -105,8 +153,8 @@ func contentBlockCacheCap() int64 {
 		if capBytes < 32<<20 {
 			capBytes = 32 << 20
 		}
-		if capBytes > 128<<20 {
-			capBytes = 128 << 20
+		if capBytes > 256<<20 {
+			capBytes = 256 << 20
 		}
 	}
 	if v := os.Getenv("SEEKFS_CONTENT_BLOCK_CACHE_MB"); v != "" {
@@ -153,6 +201,7 @@ func (c *contentBlockCache) copyBlock(store *contentTextStore, start uint64, off
 		return 0, false
 	}
 	n = copy(dst, data[off:])
+	c.hits.Add(1)
 	return n, true
 }
 
@@ -376,6 +425,8 @@ func (st *contentTextStore) fetchMiss(b contentTextBlockMeta, in int, room []byt
 	if err != nil {
 		return 0, false
 	}
+	c.misses.Add(1)
+	c.decodedBytes.Add(uint64(len(data)))
 	n := copySpan(data, in, room)
 	contentBlockBufPut(data)
 	return n, n > 0
@@ -389,6 +440,11 @@ func (st *contentTextStore) fetchMiss(b contentTextBlockMeta, in int, room []byt
 func (c *contentBlockCache) installAndCopy(store *contentTextStore, start uint64, off int, data []byte, dst []byte) int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	// The caller decoded this block (a duplicate install still paid the
+	// decode; only the buffer is recycled), so it counts as a miss with
+	// its decoded bytes either way.
+	c.misses.Add(1)
+	c.decodedBytes.Add(uint64(len(data)))
 	key := contentBlockKey{store: store, start: start}
 	if _, dup := c.ix[key]; dup {
 		n := copySpan(c.data[key], off, dst)

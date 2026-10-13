@@ -254,6 +254,22 @@ func (r *contentReader) verifyDocContent(id uint32, needle []byte) *contentHit {
 	if len(text) == 0 {
 		return nil
 	}
+	// Fast path: an ASCII needle in ASCII text matches under ASCII case
+	// folding with no allocation, at identical raw offsets. Anything else
+	// takes the historical fold path below.
+	if isASCIIBytes(needle) {
+		if off, ascii := asciiCaseIndex(text, needle); ascii {
+			if off < 0 {
+				return nil
+			}
+			return &contentHit{
+				Path:    r.docPath(id),
+				DocID:   id,
+				Offset:  off,
+				Snippet: contentSnippetWindow(text, off, len(needle)),
+			}
+		}
+	}
 	// The stored text preserves case (PF-6a), so fold it for the
 	// case-insensitive match; the window is still taken from the original.
 	lower := contentFoldText(text)

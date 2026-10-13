@@ -12,7 +12,30 @@ import (
 	"path/filepath"
 	"runtime"
 	"testing"
+	"unsafe"
 )
+
+// TestTotalRamBytesProbesPhysicalMemory pins the MEMORYSTATUSEX interop the
+// content block-cache sizing depends on: the struct must be 64 bytes (a
+// padded 72-byte struct makes GlobalMemoryStatusEx fail, silently dropping
+// every default cache cap to the 64 MiB fallback) and the probe must report
+// a plausible physical size on a real machine.
+func TestTotalRamBytesProbesPhysicalMemory(t *testing.T) {
+	if got := unsafe.Sizeof(memoryStatusEx{}); got != 64 {
+		t.Fatalf("sizeof(memoryStatusEx) = %d; want 64 (Win32 MEMORYSTATUSEX)", got)
+	}
+	total, err := totalRamBytes()
+	if err != nil {
+		t.Fatalf("totalRamBytes: %v", err)
+	}
+	const (
+		minPlausible = 512 << 20
+		maxPlausible = 16 << 50
+	)
+	if total < minPlausible || total > maxPlausible {
+		t.Fatalf("totalRamBytes = %d; want within [512 MiB, 16 PiB]", total)
+	}
+}
 
 func TestPNGCAugmentPreservesSectionsAndQueryParity(t *testing.T) {
 	t.Setenv("SEEKFS_LOW_MEMORY_TRIGRAM_MAX_POSTING", "1")
