@@ -1039,9 +1039,10 @@ func TestContentServiceBuildReserveDropsExactFilesAndBytes(t *testing.T) {
 	stubContentBuildSync(t)
 	oldFree, oldTotal := contentFreeBytesFn, contentTotalBytesFn
 	defer func() { contentFreeBytesFn, contentTotalBytesFn = oldFree, oldTotal }()
-	// 50 GiB reserve, 9 bytes of headroom: allowance is 18 extracted bytes.
+	// 20 GiB reserve (5% of 500 GiB, capped), 9 bytes of headroom: allowance
+	// is 18 extracted bytes.
 	contentTotalBytesFn = func(_ string) (uint64, error) { return 500 << 30, nil }
-	contentFreeBytesFn = func(_ string) (uint64, error) { return (50 << 30) + 9, nil }
+	contentFreeBytesFn = func(_ string) (uint64, error) { return (20 << 30) + 9, nil }
 	dir := t.TempDir()
 	bodies := map[string]string{
 		"a.txt": "alpha",
@@ -1076,11 +1077,11 @@ func TestContentServiceBuildReserveDropsExactFilesAndBytes(t *testing.T) {
 	if built.Policy.ScopeDroppedBytes != int64(len("charlie?")) {
 		t.Fatalf("reserve index policy = %+v; want dropped_bytes=%d", built.Policy, len("charlie?"))
 	}
-	if built.Policy.BudgetBytes != 0 || built.Policy.ReserveBytes != 50<<30 {
-		t.Fatalf("reserve index policy = %+v; want budget=0 reserve=50GiB", built.Policy)
+	if built.Policy.BudgetBytes != 0 || built.Policy.ReserveBytes != 20<<30 {
+		t.Fatalf("reserve index policy = %+v; want budget=0 reserve=20GiB", built.Policy)
 	}
 	h := vol.content.healthSnapshot(0)
-	if h.ScopeDropped != 1 || h.ReserveBytes != 50<<30 || h.BudgetBytes != 0 {
+	if h.ScopeDropped != 1 || h.ReserveBytes != 20<<30 || h.BudgetBytes != 0 {
 		t.Fatalf("reserve health = %+v; want exact dropped files and the reserve", h)
 	}
 	if !h.Incomplete {

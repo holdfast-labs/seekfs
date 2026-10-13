@@ -429,47 +429,56 @@ func TestContentScopeReserve(t *testing.T) {
 	defer func() {
 		contentFreeBytesFn, contentTotalBytesFn, contentDiskReserveBytes = oldFree, oldTotal, oldReserve
 	}()
-	// A 500 GiB volume: reserve is 10% (50 GiB), above the 20 GiB floor.
-	contentTotalBytesFn = func(_ string) (uint64, error) { return 500 << 30, nil }
+	vol := `E:\`
+	// A 300 GiB volume: reserve is 5% (15 GiB), inside [10, 20] GiB.
+	contentTotalBytesFn = func(_ string) (uint64, error) { return 300 << 30, nil }
 	contentFreeBytesFn = func(_ string) (uint64, error) { return 100 << 30, nil }
-	if got := contentScopeReserveFor("E:\\"); got != 50<<30 {
-		t.Fatalf("reserve(500GiB) = %d; want 50 GiB", got)
+	if got := contentScopeReserveFor(vol); got != 15<<30 {
+		t.Fatalf("reserve(300GiB) = %d; want 15 GiB", got)
 	}
-	// A 100 GiB volume: 10% (10 GiB) loses to the 20 GiB floor.
+	// A 100 GiB volume: 5% (5 GiB) is raised to the 10 GiB floor.
 	contentTotalBytesFn = func(_ string) (uint64, error) { return 100 << 30, nil }
-	if got := contentScopeReserveFor("E:\\"); got != contentScopeReserveMinBytes {
-		t.Fatalf("reserve(100GiB) = %d; want the 20 GiB floor", got)
+	if got := contentScopeReserveFor(vol); got != contentScopeReserveMinBytes {
+		t.Fatalf("reserve(100GiB) = %d; want the 10 GiB floor", got)
+	}
+	// A 2 TiB volume: 5% (~102 GiB) is capped at 20 GiB.
+	contentTotalBytesFn = func(_ string) (uint64, error) { return 2 << 40, nil }
+	if got := contentScopeReserveFor(vol); got != contentScopeReserveMaxBytes {
+		t.Fatalf("reserve(2TiB) = %d; want the 20 GiB cap", got)
 	}
 	// Unknown capacity falls back to the fixed reserve (0 in the test
 	// suite, which disables the reserve there).
 	contentTotalBytesFn = func(_ string) (uint64, error) { return 0, errTestReserve }
 	contentDiskReserveBytes = 7
-	if got := contentScopeReserveFor("E:\\"); got != 7 {
+	if got := contentScopeReserveFor(vol); got != 7 {
 		t.Fatalf("reserve(unknown) = %d; want the fixed fallback", got)
 	}
 	contentDiskReserveBytes = 0
-	// Allowance: (free - reserve) / multiplier.
-	contentTotalBytesFn = func(_ string) (uint64, error) { return 500 << 30, nil }
+	// Allowance: (free - reserve) / multiplier, on a 2 TiB volume (20 GiB
+	// reserve) with 100 GiB free.
+	contentTotalBytesFn = func(_ string) (uint64, error) { return 2 << 40, nil }
 	contentFreeBytesFn = func(_ string) (uint64, error) { return 100 << 30, nil }
-	if got, want := contentScopeAllowance("E:\\"), int64(float64(50<<30)/contentScopeEncodedMultiplier); got != want {
+	if got, want := contentScopeAllowance(vol), int64(float64(80<<30)/contentScopeEncodedMultiplier); got != want {
 		t.Fatalf("allowance = %d; want %d", got, want)
 	}
-	// Below the reserve the allowance is unlimited (fail-open): the
-	// write-time guard stays the backstop.
+	// At or below the reserve nothing more is selected: less free space
+	// never means more indexing.
 	contentFreeBytesFn = func(_ string) (uint64, error) { return 1 << 30, nil }
-	if got := contentScopeAllowance("E:\\"); got != int64(^uint64(0)>>1) {
-		t.Fatalf("allowance below reserve = %d; want unlimited", got)
+	if got := contentScopeAllowance(vol); got != 0 {
+		t.Fatalf("allowance below reserve = %d; want 0", got)
 	}
-	// The fits check agrees: under the allowance it passes, over it stops.
-	// 100 GiB free, 50 GiB reserve: 60 GiB extracted projects to 30 GiB
-	// encoded, leaving 70 GiB free (fits); 120 GiB projects to 60 GiB,
-	// leaving 40 GiB (breaches).
+	if contentScopeFitsReserve(vol, 1) {
+		t.Fatal("below the reserve nothing fits")
+	}
+	// The fits check agrees with the allowance: 100 GiB free, 20 GiB
+	// reserve: 120 GiB extracted projects to 60 GiB, leaving 40 GiB (fits);
+	// 200 GiB projects to 100 GiB, leaving nothing (breaches).
 	contentFreeBytesFn = func(_ string) (uint64, error) { return 100 << 30, nil }
-	if !contentScopeFitsReserve("E:\\", 60<<30) {
-		t.Fatal("60 GiB extracted must fit: projected 30 GiB leaves 70 GiB free of the 50 GiB reserve")
+	if !contentScopeFitsReserve(vol, 120<<30) {
+		t.Fatal("120 GiB extracted must fit: projected 60 GiB leaves 40 GiB of a 20 GiB reserve")
 	}
-	if contentScopeFitsReserve("E:\\", 120<<30) {
-		t.Fatal("120 GiB extracted must not fit: projected 60 GiB leaves 40 GiB free under the 50 GiB reserve")
+	if contentScopeFitsReserve(vol, 200<<30) {
+		t.Fatal("200 GiB extracted must not fit: projected 100 GiB leaves nothing")
 	}
 	// Anchors: bare volumes anchor at the root, absolute paths at themselves,
 	// anything else anchors nowhere.
@@ -487,9 +496,10 @@ func TestContentScopeReserve(t *testing.T) {
 func TestContentScopeEstimateReserveTruncates(t *testing.T) {
 	oldFree, oldTotal := contentFreeBytesFn, contentTotalBytesFn
 	defer func() { contentFreeBytesFn, contentTotalBytesFn = oldFree, oldTotal }()
-	// 50 GiB reserve, 9 bytes of headroom: allowance is 18 extracted bytes.
+	// 20 GiB reserve (5% of 500 GiB, capped), 9 bytes of headroom: allowance
+	// is 18 extracted bytes.
 	contentTotalBytesFn = func(_ string) (uint64, error) { return 500 << 30, nil }
-	contentFreeBytesFn = func(_ string) (uint64, error) { return (50 << 30) + 9, nil }
+	contentFreeBytesFn = func(_ string) (uint64, error) { return (20 << 30) + 9, nil }
 	d := uint32(os.ModeDir)
 	recs := []CompactRecord{
 		{FRN: 1, Parent: -1, Mode: d, Name: "."},

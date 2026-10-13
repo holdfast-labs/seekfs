@@ -665,21 +665,21 @@ func snapshotServiceVolumeForSearch(vol *serviceVolumeIndex) *serviceVolumeIndex
 		idx = snap.base
 	}
 	view := &serviceVolumeIndex{
-		dbPath:            vol.dbPath,
-		index:             idx,
-		volume:            vol.volume,
-		journalID:         vol.journalID,
-		checkpoint:        vol.checkpoint,
-		state:             vol.state,
-		staleReason:       vol.staleReason,
-		content:           vol.content,
-		frnToID:           vol.frnToID,
-		frns:              vol.frns,
-		frnRecordIDs:      vol.frnRecordIDs,
+		dbPath:       vol.dbPath,
+		index:        idx,
+		volume:       vol.volume,
+		journalID:    vol.journalID,
+		checkpoint:   vol.checkpoint,
+		state:        vol.state,
+		staleReason:  vol.staleReason,
+		content:      vol.content,
+		frnToID:      vol.frnToID,
+		frns:         vol.frns,
+		frnRecordIDs: vol.frnRecordIDs,
 		// The walk join column is immutable and keyed by index pointer
 		// (walkKeySet.idx); the view always shares the volume's index
 		// (snap.base == vol.index), so sharing the set is exact.
-		walkKeys: vol.walkKeys,
+		walkKeys:          vol.walkKeys,
 		children:          vol.children,
 		childOffsets:      vol.childOffsets,
 		childIDs:          vol.childIDs,

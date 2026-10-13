@@ -415,12 +415,12 @@ type goSearchService struct {
 	// handler and servePrivileged never run the teardown twice.
 	shutdownOnce sync.Once
 	dbs          []string
-	indexes     []*Index
-	volumes     []*serviceVolumeIndex
-	loading     bool
-	loadErr     string
-	indexMu     sync.RWMutex
-	requestSeq  atomic.Int64
+	indexes      []*Index
+	volumes      []*serviceVolumeIndex
+	loading      bool
+	loadErr      string
+	indexMu      sync.RWMutex
+	requestSeq   atomic.Int64
 	// lastTempSweep holds the unix-nano time of the last stale index temp sweep,
 	// so the periodic sweep runs once per interval no matter how many volume
 	// loops call it.

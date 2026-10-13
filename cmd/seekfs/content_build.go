@@ -1019,11 +1019,12 @@ func contentGramsOf(text []byte) map[string]struct{} {
 // 4.56 MB raw -> 1.15 MB blob + 0.26 MB permutation.
 //
 // Layout:
-//   u32 count | u32 restartInterval | u32 restartCount | u32 blobLen
-//   restarts: restartCount x {blobOff u32, pathLen u32, path bytes}
-//   blob: count x {[prefixLen uvarint][suffixLen uvarint][suffix bytes]}
-//     over paths in sorted order (restart records self-contained)
-//   perm: count x u32 LE (perm[docID] = index into the sorted paths)
+//
+//	u32 count | u32 restartInterval | u32 restartCount | u32 blobLen
+//	restarts: restartCount x {blobOff u32, pathLen u32, path bytes}
+//	blob: count x {[prefixLen uvarint][suffixLen uvarint][suffix bytes]}
+//	  over paths in sorted order (restart records self-contained)
+//	perm: count x u32 LE (perm[docID] = index into the sorted paths)
 const contentPathsRestartInterval = 64
 
 func encodeContentPaths(paths []string) []byte {

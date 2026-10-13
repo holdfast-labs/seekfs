@@ -34,6 +34,9 @@ func TestMain(m *testing.M) {
 	// free-space reserve would fail them on machines with little free disk.
 	// Tests that exercise the reserve set it explicitly.
 	contentDiskReserveBytes = 0
+	// Nor may the content budget read this machine's disks: with capacity
+	// unknown, the reserve falls back to contentDiskReserveBytes (0 above).
+	contentTotalBytesFn = func(string) (uint64, error) { return 0, fmt.Errorf("disk capacity not used in tests") }
 
 	realDir := ""
 	if base, ok := os.LookupEnv("ProgramData"); ok && strings.TrimSpace(base) != "" {
@@ -156,4 +159,3 @@ func findTestMarker(haystack []byte, markers []string) string {
 	}
 	return ""
 }
-
