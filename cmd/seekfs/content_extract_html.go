@@ -1,14 +1,14 @@
 package main
 
-// The HTML extractor: the first rich format, and the one that stops the service
-// from indexing markup (tags, entities, script/style) as raw text.
+// The HTML extractor: charset-aware decoding of .html/.htm/.xhtml source. It
+// indexes the source with its markup (like ripgrep); the tokenizer walk below
+// (contentHTMLText) extracts rendered text for HTML email parts.
 //
 // It walks golang.org/x/net/html's *tokenizer*, not its DOM parser. The DOM is
 // O(document) memory and html.Parse recurses per nesting level, so a deeply
 // nested document can exhaust the stack; the tokenizer is O(current token) and
 // bounded by SetMaxBuf. Entity decoding comes free with the tokenizer's Text()
-// on TextToken. The extension match wins over the raw-text fallback, so
-// `.html/.htm/.xhtml` are no longer indexed as markup.
+// on TextToken.
 
 import (
 	"bytes"
@@ -17,6 +17,7 @@ import (
 	"io"
 	"mime"
 	"strings"
+	"unicode/utf8"
 
 	"golang.org/x/net/html"
 	"golang.org/x/net/html/charset"
@@ -42,7 +43,7 @@ const contentHTMLCharsetPeek = 1024
 type contentHTMLExtractor struct{}
 
 func (contentHTMLExtractor) Name() string    { return "html" }
-func (contentHTMLExtractor) Version() uint16 { return 1 }
+func (contentHTMLExtractor) Version() uint16 { return 2 }
 func (contentHTMLExtractor) Class() uint16   { return contentClassHTML }
 
 func (contentHTMLExtractor) Extensions() []string {
@@ -187,11 +188,17 @@ func (contentHTMLExtractor) Extract(ctx context.Context, r io.ReaderAt, size int
 	// declared <meta> charset is honored when the shared policy has no stronger
 	// signal (BOM / explicit override / BOM-less UTF-16).
 	decoded := contentDecodeForIndex(raw, contentHTMLDecodeMode(raw, s.encoding), truncated)
-	text, textTruncated, err := contentHTMLText(ctx, decoded, s.maxText)
-	if err != nil {
-		return contentExtractResult{}, err
+	// Version 2 indexes the decoded source, markup included, rather than
+	// the rendered page text: seekfs is a code search tool, and matches in
+	// tags, attributes, inline script and style are what ripgrep finds (the
+	// Chromium recall test missed ~3.4k of ~4k "struct" files with rendered
+	// text only). The charset detection above is what this extractor still
+	// adds over plain text. contentHTMLText remains for email HTML parts.
+	text := decoded
+	if int64(len(text)) > s.maxText {
+		text = contentTruncateUTF8(text, int(s.maxText))
+		truncated = true
 	}
-	truncated = truncated || textTruncated
 	if len(text) == 0 {
 		return contentExtractResult{Class: contentClassHTML, Truncated: truncated}, nil
 	}
@@ -306,3 +313,14 @@ func contentHTMLSeparate(out *bytes.Buffer) {
 }
 
 func init() { contentRegisterExtractor(contentHTMLExtractor{}) }
+
+// contentTruncateUTF8 cuts s to at most n bytes on a rune boundary.
+func contentTruncateUTF8(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	for n > 0 && n < len(s) && !utf8.RuneStart(s[n]) {
+		n--
+	}
+	return s[:n]
+}

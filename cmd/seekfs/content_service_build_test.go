@@ -935,8 +935,8 @@ func TestContentServiceBuildBudgetUsesExtractedTextAndPriority(t *testing.T) {
 		t.Fatal(err)
 	}
 	for path, body := range map[string]string{
-		filepath.Join(dir, "a.html"):  "<html><body>rootword</body></html>",
-		filepath.Join(repo, "z.html"): "<html><body>repoword</body></html>",
+		filepath.Join(dir, "a.txt"):  "rootword",
+		filepath.Join(repo, "z.txt"): "repoword",
 	} {
 		if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
 			t.Fatal(err)
@@ -946,10 +946,10 @@ func TestContentServiceBuildBudgetUsesExtractedTextAndPriority(t *testing.T) {
 	const cp = int64(100)
 	stubContentCatchUpJournal(t, usnJournalDataV0{UsnJournalID: journal, FirstUsn: 1, LowestValidUsn: 1, NextUsn: cp})
 	vol, gsx := contentBuildTestVolume(t, dir, journal, uint64(cp), []CompactRecord{
-		{FRN: 1, Parent: -1, Name: "a.html", Size: 34},
+		{FRN: 1, Parent: -1, Name: "a.txt", Size: 8},
 		{FRN: 2, Parent: -1, Name: "repo", Mode: uint32(os.ModeDir)},
 		{FRN: 3, Parent: 1, ParentFRN: 2, Name: ".git", Mode: uint32(os.ModeDir)},
-		{FRN: 4, Parent: 1, ParentFRN: 2, Name: "z.html", Size: 34},
+		{FRN: 4, Parent: 1, ParentFRN: 2, Name: "z.txt", Size: 8},
 	})
 	s := contentTestService(t)
 	s.contentCfg.Content.BudgetBytes = 16
