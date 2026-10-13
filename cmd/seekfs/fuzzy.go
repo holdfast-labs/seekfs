@@ -2,8 +2,10 @@ package main
 
 import (
 	"math/bits"
+	"runtime"
 	"sort"
 	"strings"
+	"sync"
 	"unicode"
 	"unicode/utf8"
 
@@ -278,6 +280,34 @@ func fuzzyLetterMaskMisses(termMask, nameMask uint64) int {
 	return bits.OnesCount64(termMask &^ nameMask)
 }
 
+// fuzzyLetterMaskASCII is fuzzyLetterMask fused with the ASCII test: the mask
+// loop already visits every byte, so it reports whether any byte is non-ASCII
+// for free. Hot callers use this to skip the separate asciiOnlyString scan.
+func fuzzyLetterMaskASCII(s string) (mask uint64, ascii bool) {
+	ascii = true
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c >= 'a' && c <= 'z':
+			mask |= 1 << (c - 'a')
+		case c >= '0' && c <= '9':
+			mask |= 1 << (26 + c - '0')
+		case c == '.':
+			mask |= 1 << 36
+		case c == '_':
+			mask |= 1 << 37
+		case c == '-':
+			mask |= 1 << 38
+		case c < 0x80:
+			mask |= 1 << 39
+		default:
+			mask |= 1 << 39
+			ascii = false
+		}
+	}
+	return mask, ascii
+}
+
 // foldFuzzyText normalizes text for fuzzy comparison: fullwidth forms fold to
 // their ASCII equivalents and combining marks are stripped so "sodanco"
 // matches "Só Danço". Comparison-side only; index data is untouched.
@@ -389,8 +419,16 @@ func fuzzyNameDistance(nameLower, term string, tau int) (dist int, prefix bool, 
 // A name shorter than len(termRunes)-tau cannot hold a qualifying window and
 // is declined before any DP work.
 func fuzzyNameDistanceScratch(nameLower string, termRunes []rune, termASCII bool, tau int, sc *fuzzyDistanceScratch) (dist int, prefix bool, windowPos int, ok bool) {
+	_, nameASCII := fuzzyLetterMaskASCII(nameLower)
+	return fuzzyNameDistanceScratchKnown(nameLower, termRunes, termASCII, nameASCII, tau, sc)
+}
+
+// fuzzyNameDistanceScratchKnown is fuzzyNameDistanceScratch with both ASCII
+// flags caller-provided, so the per-candidate scan inside the mask computation
+// doubles as the ASCII test and no second scan is needed.
+func fuzzyNameDistanceScratchKnown(nameLower string, termRunes []rune, termASCII, nameASCII bool, tau int, sc *fuzzyDistanceScratch) (dist int, prefix bool, windowPos int, ok bool) {
 	lt := len(termRunes)
-	if asciiOnlyString(nameLower) {
+	if nameASCII {
 		if termASCII {
 			if len(nameLower) == 0 {
 				return tau + 1, false, 0, false
@@ -448,11 +486,30 @@ func fuzzyNameDistanceBytes(name string, t []rune, tau int, sc *fuzzyDistanceScr
 		prev[j] = 0
 		prevS[j] = j
 	}
+	lastJ0 := 1
 	for i := 1; i <= len(t); i++ {
 		cur[0], curS[0] = i, 0
 		rowMin := cur[0]
 		ti := byte(t[i-1])
-		for j := 1; j <= ln; j++ {
+		// Triangular band: aligning t[:i] to a window ending at j needs a
+		// window of length within tau of i, so columns j < i-tau can never
+		// reach tau and are skipped. Their only in-band reader is the left
+		// neighbor of the band edge, which sees INF instead (its true cost
+		// provably exceeds tau). Values above tau are exact-threshold only;
+		// callers ignore them on decline. Columns below the band keep stale
+		// rotated values, so the best scan below stays inside the band too.
+		j0 := i - tau
+		if j0 <= 1 {
+			j0 = 1
+		} else {
+			// Out-of-band left neighbor: unread anywhere else (the next
+			// row's band starts one column later), so the scribble is
+			// safe. j0 == 1 keeps cur[0] == i, the exact empty-window
+			// cost the band edge legitimately reads.
+			cur[j0-1] = fuzzyBandINF
+		}
+		lastJ0 = j0
+		for j := j0; j <= ln; j++ {
 			cost := 1
 			if ti == name[j-1] {
 				cost = 0
@@ -480,8 +537,11 @@ func fuzzyNameDistanceBytes(name string, t []rune, tau int, sc *fuzzyDistanceScr
 		prev2, prev, cur = prev, cur, prev2
 		prev2S, prevS, curS = prevS, curS, prev2S
 	}
+	// Columns below the last band hold stale rotated values; their true
+	// cost exceeds tau, so the best window (when one reaches tau) always
+	// ends inside the band.
 	best, bestStart := tau+1, ln
-	for j := 1; j <= ln; j++ {
+	for j := lastJ0; j <= ln; j++ {
 		if prev[j] < best || (prev[j] == best && prevS[j] < bestStart) {
 			best, bestStart = prev[j], prevS[j]
 		}
@@ -491,6 +551,10 @@ func fuzzyNameDistanceBytes(name string, t []rune, tau int, sc *fuzzyDistanceScr
 	}
 	return best, bestStart == 0, bestStart, true
 }
+
+// fuzzyBandINF stands in for out-of-band cells, whose true cost provably
+// exceeds any tau callers pass (small ints keep +1 arithmetic exact).
+const fuzzyBandINF = 1 << 30
 
 // fuzzyNameDistanceRunes runs the semi-global DP over rune slices with
 // scratch rows.
@@ -505,10 +569,20 @@ func fuzzyNameDistanceRunes(name, t []rune, tau int, sc *fuzzyDistanceScratch) (
 		prev[j] = 0
 		prevS[j] = j
 	}
+	lastJ0 := 1
 	for i := 1; i <= len(t); i++ {
 		cur[0], curS[0] = i, 0
 		rowMin := cur[0]
-		for j := 1; j <= ln; j++ {
+		// Same triangular band as the byte path: columns j < i-tau can
+		// never reach tau, so they are skipped with an INF left edge.
+		j0 := i - tau
+		if j0 <= 1 {
+			j0 = 1
+		} else {
+			cur[j0-1] = fuzzyBandINF
+		}
+		lastJ0 = j0
+		for j := j0; j <= ln; j++ {
 			cost := 1
 			if t[i-1] == name[j-1] {
 				cost = 0
@@ -536,8 +610,11 @@ func fuzzyNameDistanceRunes(name, t []rune, tau int, sc *fuzzyDistanceScratch) (
 		prev2, prev, cur = prev, cur, prev2
 		prev2S, prevS, curS = prevS, curS, prev2S
 	}
+	// Columns below the last band hold stale rotated values; their true
+	// cost exceeds tau, so the best window (when one reaches tau) always
+	// ends inside the band.
 	best, bestStart := tau+1, ln
-	for j := 1; j <= ln; j++ {
+	for j := lastJ0; j <= ln; j++ {
 		if prev[j] < best || (prev[j] == best && prevS[j] < bestStart) {
 			best, bestStart = prev[j], prevS[j]
 		}
@@ -585,6 +662,103 @@ func fuzzyCandidateRankLess(a, b fuzzyScoredCandidate) bool {
 		return a.rank < b.rank
 	}
 	return false
+}
+
+// fuzzyScoreChunkIDs bounds one scoring chunk: large piece postings split
+// into parallel-friendly pieces without changing survivor order.
+const fuzzyScoreChunkIDs = 4096
+
+// fuzzyParallelScoreMinIDs is the chunk size above which candidate scoring
+// fans out across GOMAXPROCS workers. Below it the goroutine fan-out costs
+// more than the DP it would parallelize.
+const fuzzyParallelScoreMinIDs = 1024
+
+// fuzzyRefScore is the per-candidate verdict of scoreFuzzyRefs, aligned with
+// its input ids so parallel scoring merges deterministically.
+type fuzzyRefScore struct {
+	ok        bool
+	dist      int
+	wholeDist int
+	prefix    bool
+	windowPos int
+	lenDiff   int
+	rank      uint64
+}
+
+// scoreFuzzyRefs verifies candidate ids against the term: persisted-lower
+// name, fused letter-mask prefilter, scratch distance DP, rank and whole-name
+// distance for survivors. Results align with ids; chunks above
+// fuzzyParallelScoreMinIDs score across workers (each with its own scratch)
+// and merge in order, so parallel and serial runs produce identical output.
+func scoreFuzzyRefs(vol *serviceVolumeIndex, rankVec []uint32, ids []int, termRunes []rune, termASCII bool, termMask uint64, tau int, serialSC *fuzzyDistanceScratch) []fuzzyRefScore {
+	scores := make([]fuzzyRefScore, len(ids))
+	workers := 1
+	if len(ids) >= fuzzyParallelScoreMinIDs {
+		workers = min(runtime.GOMAXPROCS(0), max(1, len(ids)/fuzzyParallelScoreMinIDs))
+	}
+	if workers <= 1 {
+		scoreFuzzyRefRange(vol, rankVec, ids, scores, termRunes, termASCII, termMask, tau, serialSC)
+		return scores
+	}
+	var wg sync.WaitGroup
+	for worker := 0; worker < workers; worker++ {
+		start := worker * len(ids) / workers
+		end := (worker + 1) * len(ids) / workers
+		wg.Add(1)
+		go func(start, end int) {
+			defer wg.Done()
+			var sc fuzzyDistanceScratch
+			scoreFuzzyRefRange(vol, rankVec, ids[start:end], scores[start:end], termRunes, termASCII, termMask, tau, &sc)
+		}(start, end)
+	}
+	wg.Wait()
+	return scores
+}
+
+// scoreFuzzyRefRange scores one index range; every read (record, persisted
+// lower name, rank vector) is immutable during a query, matching the existing
+// parallel trigram verifiers.
+func scoreFuzzyRefRange(vol *serviceVolumeIndex, rankVec []uint32, ids []int, scores []fuzzyRefScore, termRunes []rune, termASCII bool, termMask uint64, tau int, sc *fuzzyDistanceScratch) {
+	for k, id := range ids {
+		rec := vol.index.compactRecord(id)
+		if rec.Deleted {
+			continue
+		}
+		// Score the name before building the entry: path reconstruction
+		// dominates per-candidate cost, and piece postings bring in many
+		// candidates that miss on distance. The persisted lower name avoids
+		// the per-candidate ToLower copy whenever the index carries it. The
+		// fused mask scan doubles as the ASCII test, so folding and the
+		// distance fast-path choice need no second pass over the name.
+		nameLower := vol.index.compactLowerNameOf(id, rec)
+		nameMask, nameASCII := fuzzyLetterMaskASCII(nameLower)
+		if !nameASCII {
+			nameLower = foldFuzzyText(nameLower)
+			nameMask, nameASCII = fuzzyLetterMaskASCII(nameLower)
+		}
+		if fuzzyLetterMaskMisses(termMask, nameMask) > tau {
+			continue
+		}
+		dist, prefix, windowPos, okDist := fuzzyNameDistanceScratchKnown(nameLower, termRunes, termASCII, nameASCII, tau, sc)
+		if !okDist || dist == 0 {
+			continue
+		}
+		var rank uint64
+		if id < len(rankVec) {
+			rank = uint64(rankVec[id])
+		}
+		lenDiff := utf8.RuneCountInString(rec.Name) - len(termRunes)
+		if lenDiff < 0 {
+			lenDiff = -lenDiff
+		}
+		wholeDist := tau + 1
+		if lenDiff <= tau {
+			// sc.nameRunes still holds this candidate's decoded folded
+			// name from the distance call above.
+			wholeDist = damerauLevenshteinBoundedReuse(sc.nameRunes, termRunes, tau, sc)
+		}
+		scores[k] = fuzzyRefScore{ok: true, dist: dist, wholeDist: wholeDist, prefix: prefix, windowPos: windowPos, lenDiff: lenDiff, rank: rank}
+	}
 }
 
 func fuzzyCandidateRankEqual(a, b fuzzyScoredCandidate) bool {
@@ -655,6 +829,27 @@ func appendFuzzyServiceMatches(volumes []*serviceVolumeIndex, opts queryOptions,
 		}
 		rankVec := vol.rankForQuery(pqNoTerms)
 		seen := make(map[int]struct{})
+		var pending []int
+		// flush scores the pending chunk and appends survivors in chunk
+		// order, so the survivor sequence (and the enough cutoff below)
+		// is identical to a fully serial loop.
+		flush := func() {
+			if len(pending) == 0 {
+				return
+			}
+			scores := scoreFuzzyRefs(vol, rankVec, pending, termRunes, termASCII, termMask, tau, &sc)
+			for k, id := range pending {
+				s := scores[k]
+				if !s.ok {
+					continue
+				}
+				out = append(out, fuzzyScoredCandidate{vol: volIndex, id: id, dist: s.dist, wholeDist: s.wholeDist, prefix: s.prefix, windowPos: s.windowPos, lenDiff: s.lenDiff, rank: s.rank})
+				if len(out) >= enough {
+					break
+				}
+			}
+			pending = pending[:0]
+		}
 		for _, variant := range variants {
 			ids, ok := vol.nameTrigramNameTermPostingLimited(variant, fuzzyCandidateCap)
 			if !ok {
@@ -668,43 +863,20 @@ func appendFuzzyServiceMatches(volumes []*serviceVolumeIndex, opts queryOptions,
 				if id < 0 || id >= vol.index.compactRecordCount() {
 					continue
 				}
-				rec := vol.index.compactRecord(id)
-				if rec.Deleted {
-					continue
-				}
-				// Score the name before building the entry: path
-				// reconstruction dominates per-candidate cost, and piece
-				// postings bring in many candidates that miss on distance.
-				// The persisted lower name avoids the per-candidate ToLower
-				// copy whenever the index carries it.
-				nameLower := foldFuzzyText(vol.index.compactLowerNameOf(id, rec))
-				if fuzzyLetterMaskMisses(termMask, fuzzyLetterMask(nameLower)) > tau {
-					continue
-				}
-				dist, prefix, windowPos, okDist := fuzzyNameDistanceScratch(nameLower, termRunes, termASCII, tau, &sc)
-				if !okDist || dist == 0 {
-					continue
-				}
-				var rank uint64
-				if id < len(rankVec) {
-					rank = uint64(rankVec[id])
-				}
-				lenDiff := utf8.RuneCountInString(rec.Name) - len(termRunes)
-				if lenDiff < 0 {
-					lenDiff = -lenDiff
-				}
-				wholeDist := tau + 1
-				if lenDiff <= tau {
-					// sc.nameRunes still holds this candidate's decoded
-					// folded name from the distance call above.
-					wholeDist = damerauLevenshteinBoundedReuse(sc.nameRunes, termRunes, tau, &sc)
-				}
-				out = append(out, fuzzyScoredCandidate{vol: volIndex, id: id, dist: dist, wholeDist: wholeDist, prefix: prefix, windowPos: windowPos, lenDiff: lenDiff, rank: rank})
+				pending = append(pending, id)
 			}
-			if len(out) >= enough {
-				break
+			// Score in bounded chunks: large piece postings still split
+			// into parallel-friendly pieces, while the enough cutoff keeps
+			// its exact serial meaning (at most one chunk of overshoot,
+			// all of it discarded identically to the serial loop).
+			if len(pending) >= fuzzyScoreChunkIDs {
+				flush()
+				if len(out) >= enough {
+					break
+				}
 			}
 		}
+		flush()
 		if len(out) >= enough {
 			break
 		}
@@ -988,11 +1160,16 @@ func fuzzyPieceWindowVariants(volumes []*serviceVolumeIndex, termLower string, t
 				if rec.Deleted {
 					continue
 				}
-				nameLower := foldFuzzyText(vol.index.compactLowerNameOf(id, rec))
-				if fuzzyLetterMaskMisses(termMask, fuzzyLetterMask(nameLower)) > tau {
+				nameLower := vol.index.compactLowerNameOf(id, rec)
+				nameMask, nameASCII := fuzzyLetterMaskASCII(nameLower)
+				if !nameASCII {
+					nameLower = foldFuzzyText(nameLower)
+					nameMask, nameASCII = fuzzyLetterMaskASCII(nameLower)
+				}
+				if fuzzyLetterMaskMisses(termMask, nameMask) > tau {
 					continue
 				}
-				dist, _, pos, ok := fuzzyNameDistanceScratch(nameLower, termRunes, termASCII, tau, &sc)
+				dist, _, pos, ok := fuzzyNameDistanceScratchKnown(nameLower, termRunes, termASCII, nameASCII, tau, &sc)
 				if !ok || dist == 0 {
 					continue
 				}

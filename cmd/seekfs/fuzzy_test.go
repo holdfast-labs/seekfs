@@ -636,6 +636,34 @@ func TestFuzzyDistanceScratchMatchesWrapper(t *testing.T) {
 	}
 }
 
+func TestFuzzyDistanceScratchRandomVsOracle(t *testing.T) {
+	// The banded scratch DP must agree with the unbanded per-window oracle
+	// on larger inputs too (long names, tau 2), sharing one scratch across
+	// all calls to also cover buffer growth and rotation staleness.
+	rng := rand.New(rand.NewSource(7))
+	alpha := "abcdefg._-xyz"
+	word := func(n int) string {
+		b := make([]byte, n)
+		for i := range b {
+			b[i] = alpha[rng.Intn(len(alpha))]
+		}
+		return string(b)
+	}
+	var sc fuzzyDistanceScratch
+	for i := 0; i < 5000; i++ {
+		name := word(1 + rng.Intn(40))
+		term := word(3 + rng.Intn(10))
+		tau := 1 + rng.Intn(2)
+		termRunes := []rune(term)
+		sd, sp, sw, sok := fuzzyNameDistanceScratch(name, termRunes, asciiOnlyString(term), tau, &sc)
+		wd, wp, ww, wok := fuzzyNameDistanceWindows(name, term, tau)
+		if sok != wok || (sok && (sd != wd || sp != wp || sw != ww)) {
+			t.Fatalf("scratch(%q, %q, %d) = %d/%v/%d/%v, oracle %d/%v/%d/%v",
+				name, term, tau, sd, sp, sw, sok, wd, wp, ww, wok)
+		}
+	}
+}
+
 func TestDamerauBoundedReuseMatchesWrapper(t *testing.T) {
 	pairs := [][2]string{
 		{"", ""}, {"a", ""}, {"", "abc"}, {"kitten", "sitting"},
@@ -651,6 +679,40 @@ func TestDamerauBoundedReuseMatchesWrapper(t *testing.T) {
 			if got != want {
 				t.Fatalf("reuse(%q, %q, %d) = %d, want %d", p[0], p[1], max, got, want)
 			}
+		}
+	}
+}
+
+func TestScoreFuzzyRefsParallelMatchesSerial(t *testing.T) {
+	// Parallel scoring must merge deterministically: repeating the fixture
+	// ids past the parallel threshold has to score every repetition exactly
+	// like the small (serial) run. Needs GOMAXPROCS > 1 to exercise the
+	// parallel path; the serial path is always correct by construction.
+	vol := buildFuzzyTestVolume(t)
+	pq, err := parseQuery(queryOptions{Query: "tonics", Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pqNoTerms := pq
+	pqNoTerms.Terms = nil
+	rankVec := vol.rankForQuery(pqNoTerms)
+	term := "tonics"
+	termRunes := []rune(term)
+	termMask := fuzzyLetterMask(term)
+	base := []int{1, 2, 3, 4, 5, 6}
+	var scSerial, scParallel fuzzyDistanceScratch
+	serial := scoreFuzzyRefs(vol, rankVec, base, termRunes, true, termMask, 1, &scSerial)
+	if len(serial) != len(base) {
+		t.Fatalf("serial scores = %d, want %d", len(serial), len(base))
+	}
+	big := make([]int, 0, 2*fuzzyParallelScoreMinIDs)
+	for len(big) < 2*fuzzyParallelScoreMinIDs {
+		big = append(big, base...)
+	}
+	parallel := scoreFuzzyRefs(vol, rankVec, big, termRunes, true, termMask, 1, &scParallel)
+	for i, s := range parallel {
+		if want := serial[i%len(base)]; s != want {
+			t.Fatalf("parallel score[%d] (id %d) = %+v, want %+v", i, big[i], s, want)
 		}
 	}
 }
