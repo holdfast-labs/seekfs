@@ -450,7 +450,13 @@ func freeDiskBytes(path string) (uint64, error) {
 		return 0, err
 	}
 	for {
-		if _, err := os.Stat(path); err == nil {
+		if st, err := os.Stat(path); err == nil {
+			// GetDiskFreeSpaceEx takes a directory: an existing file (a
+			// published sidecar, say) anchors at its parent instead of
+			// failing, which callers read as unknown free space.
+			if !st.IsDir() {
+				path = filepath.Dir(path)
+			}
 			break
 		} else if !errors.Is(err, os.ErrNotExist) {
 			return 0, err
@@ -511,7 +517,13 @@ func totalDiskBytes(path string) (uint64, error) {
 		return 0, err
 	}
 	for {
-		if _, err := os.Stat(path); err == nil {
+		if st, err := os.Stat(path); err == nil {
+			// GetDiskFreeSpaceEx takes a directory: an existing file (a
+			// published sidecar, say) anchors at its parent instead of
+			// failing, which callers read as unknown free space.
+			if !st.IsDir() {
+				path = filepath.Dir(path)
+			}
 			break
 		} else if !errors.Is(err, os.ErrNotExist) {
 			return 0, err
