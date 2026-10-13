@@ -277,8 +277,27 @@ func contentLaneScopeVolume(t *testing.T, volume string, recs []contentVolRecord
 func TestContentGlobalLaneScopeDifferential(t *testing.T) {
 	t.Setenv("SEEKFS_CONTENT_SEARCH", "1")
 	queries := contentLaneScopeQueries()
+	// Soak tier (SEEKFS_TEST_SOAK=1, run by CI) exercises the full
+	// seed x scope x query x sort x limit matrix below; the default tier
+	// runs a reduced but representative subset with the SAME assertions on
+	// every subtest it runs (entry sets, order, snippets, partial/
+	// completeness, engagement, count parity). Coverage is preserved
+	// because every dropped dimension value still runs in the soak tier:
+	//   seeds: the second corpus guards against corpus luck; one fixed
+	//     seed still drives every query/scope shape.
+	//   sorts: default order plus one numeric rank plus path order; the
+	//     remaining rank sections differ only in which rank column orders.
+	//   limits: the sharpest early-stop edge (1) plus the full set (5000);
+	//     7 and 20 are intermediate windows over the same probe logic.
 	sorts := []string{"", "sort:size", "sort:modified", "sort:extension", "sort:type", "sort:path"}
 	limits := []int{1, 7, 20, 5000}
+	seeds := []int64{7, 42}
+	if !testSoakEnabled() {
+		sorts = []string{"", "sort:size", "sort:path"}
+		limits = []int{1, 5000}
+		seeds = []int64{7}
+	}
+	t.Logf("lane scope matrix: soak=%v seeds=%d sorts=%d limits=%d", testSoakEnabled(), len(seeds), len(sorts), len(limits))
 	// Scope dimensions: under roots (volume root, top dir, sub dir, missing
 	// dir), bias (none, real subdir, missing), overlays. A foreign-volume
 	// under: is covered by the declined-shapes test (single-via-under):
@@ -309,14 +328,30 @@ func TestContentGlobalLaneScopeDifferential(t *testing.T) {
 		{"add-under", `C:\beta`, "", "", "add-match"},
 		{"add-bias", "", `C:\beta`, "", "add-match"},
 	}
-	// One volume per (seed, scope): the 600-doc content index builds once
-	// (~40s on this machine) and every query × sort × limit runs against it.
-	// Rebuilding per subtest would multiply that by 70 queries × 6 sorts.
-	for _, seed := range []int64{7, 42} {
+	// One volume per (seed, mutation): the 600-doc content index build is
+	// the fixed cost here, and under:/bias are query options, not index
+	// state, so the 16 scopes collapse onto the 3 distinct mutations
+	// (none/delete-match/add-match). Scopes sharing a mutation read the
+	// same volume the old per-scope build produced bit-for-bit (same
+	// records, same mutation), so every subtest compares the same pair of
+	// arms as before; only the redundant rebuilds are gone. Volumes are
+	// read-only after setup, and subtests run sequentially, so sharing is
+	// safe. (Rebuilding per subtest would multiply the build by 70
+	// queries × 6 sorts.)
+	for _, seed := range seeds {
 		recs := contentLaneScopeCorpus("C:", seed, 600)
+		volsByMutation := make(map[string]*serviceVolumeIndex)
+		volFor := func(mutate string) *serviceVolumeIndex {
+			if v, ok := volsByMutation[mutate]; ok {
+				return v
+			}
+			v := contentLaneScopeVolume(t, "C:", recs)
+			contentLaneScopeMutations(t, v, recs, mutate)
+			volsByMutation[mutate] = v
+			return v
+		}
 		for _, sc := range scopes {
-			scVol := contentLaneScopeVolume(t, "C:", recs)
-			contentLaneScopeMutations(t, scVol, recs, sc.mutate)
+			scVol := volFor(sc.mutate)
 			scVols := []*serviceVolumeIndex{scVol}
 			for _, q := range queries {
 				for _, s := range sorts {
@@ -366,15 +401,26 @@ func TestContentGlobalLaneScopeDifferential(t *testing.T) {
 							// count, so compare against the untrimmed lane set
 							// (limit 0 normalizes to the 100 default; pass an
 							// explicit over-large limit for the true full set).
+							// When the limit already covers the whole corpus
+							// (records plus their directory records), laneSig IS
+							// the full set, so the count asserts against it
+							// directly with no extra search; the property
+							// checked is identical.
 							if sc.under == "" && len(laneSig) > 1 {
-								fullOpts := opts
-								fullOpts.Limit = 1 << 30
-								fullSig, _, err := contentLaneRunOne(vols, fullOpts, true)
-								if err != nil {
-									t.Fatalf("full lane search %q: %v", label, err)
-								}
-								if slowCount != len(fullSig)-1 {
-									t.Fatalf("%s: count %d != len(search) %d", label, slowCount, len(fullSig)-1)
+								if opts.Limit >= len(recs) {
+									if slowCount != len(laneSig)-1 {
+										t.Fatalf("%s: count %d != len(search) %d", label, slowCount, len(laneSig)-1)
+									}
+								} else {
+									fullOpts := opts
+									fullOpts.Limit = 1 << 30
+									fullSig, _, err := contentLaneRunOne(vols, fullOpts, true)
+									if err != nil {
+										t.Fatalf("full lane search %q: %v", label, err)
+									}
+									if slowCount != len(fullSig)-1 {
+										t.Fatalf("%s: count %d != len(search) %d", label, slowCount, len(fullSig)-1)
+									}
 								}
 							}
 							if (sc.under != "") != laneCountTrace.ContentCountDivergent {
