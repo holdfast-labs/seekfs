@@ -49,13 +49,22 @@ func searchServiceVolumesGlobalNameSnapshot(snapshot globalQuerySnapshot, opts q
 	if !ok {
 		return nil, false, nil
 	}
-	ranked, err := rankedEntriesFromGlobalIDs(snapshot.volumes, ids, pq, nil)
-	if err != nil {
-		return nil, true, err
-	}
 	limit := normalizedLimit(opts.Limit, countOnly)
 	if countOnly {
 		limit = 0
+	}
+	var ranked []globalRankedEntry
+	if top, ok, err := rankedEntriesFromGlobalIDsTopN(snapshot.volumes, ids, pq, nil, snapshot.overlays, limit); ok || err != nil {
+		if err != nil {
+			return nil, true, err
+		}
+		ranked = top
+	} else {
+		var err error
+		ranked, err = rankedEntriesFromGlobalIDs(snapshot.volumes, ids, pq, nil)
+		if err != nil {
+			return nil, true, err
+		}
 	}
 	ranked = mergeGlobalVerifiedEntries(snapshot, ranked, pq, limit)
 	if len(ids) == 0 && globalNameAllExactEmpty(snapshot, pq) && opts.Trace != nil {

@@ -2,6 +2,7 @@ package main
 
 import (
 	"cmp"
+	"container/heap"
 	"os"
 	"path/filepath"
 	"slices"
@@ -448,6 +449,62 @@ func countVerifiedGlobalIDsContent(volumes []*serviceVolumeIndex, ids []globalRe
 		}
 	}
 	return count, nil
+}
+
+// rankedEntriesFromGlobalIDsTopN is rankedEntriesFromGlobalIDs that
+// materializes only the top-N by rank instead of every candidate. Candidate
+// ID sets from posting lanes are already exact (substring-verified,
+// subtree-intersected, hidden-filtered), so verification of the winners is
+// a formality: any winner that still drops (a predicate outside the lane's
+// contract, a raced delete) falls back to the exhaustive path instead of
+// underfilling. Multi-volume queries and overlay-active volumes keep the
+// exhaustive path (global order there compares entries, not local ranks).
+func rankedEntriesFromGlobalIDsTopN(volumes []*serviceVolumeIndex, ids []globalRecordID, pq parsedQuery, matcher *contentLeafMatcher, snapshots []*volumeSnapshot, limit int) ([]globalRankedEntry, bool, error) {
+	if limit <= 0 || len(volumes) != 1 || len(ids) <= limit ||
+		globalSnapshotsHaveHidden(snapshots) || globalSnapshotsHaveOverlayRecords(snapshots) {
+		return nil, false, nil
+	}
+	vol := volumes[0]
+	if vol == nil || vol.index == nil {
+		return nil, false, nil
+	}
+	volumePQ := pq
+	dropSatisfiedVolumeTerms(&volumePQ, vol.index.Volume)
+	if queryNeedsPath(volumePQ) {
+		return nil, false, nil
+	}
+	rankOf := candidateRanker(vol.index, vol.rankForQuery(volumePQ))
+	h := make(candidateRankMaxHeap, 0, limit)
+	for _, id := range ids {
+		if id.volume != 0 || id.local < 0 || id.local >= vol.index.compactRecordCount() {
+			continue
+		}
+		item := candidateRankItem{id: id.local, rank: rankOf(id.local)}
+		if len(h) < limit {
+			heap.Push(&h, item)
+			continue
+		}
+		if item.rank < h[0].rank {
+			h[0] = item
+			heap.Fix(&h, 0)
+		}
+	}
+	winners := make([]int, len(h))
+	for i := range h {
+		winners[i] = h[i].id
+	}
+	sortIDsByRank(winners, rankOf)
+	pathCache := make(map[int]string)
+	skipVerify := compactCandidateCanSkipEntryMatches(volumePQ, matcher == nil)
+	ranked := make([]globalRankedEntry, 0, len(winners))
+	for _, id := range winners {
+		entry, ok := compactCandidateEntryIfMatchIn(vol, vol.index, volumePQ, id, pathCache, true, skipVerify, matcher)
+		if !ok {
+			return nil, false, nil
+		}
+		ranked = append(ranked, globalRankedEntry{entry: entry, rank: rankOf(id), volume: 0, tie: entry.Path})
+	}
+	return ranked, true, nil
 }
 
 func rankedEntriesFromGlobalIDs(volumes []*serviceVolumeIndex, ids []globalRecordID, pq parsedQuery, matcher *contentLeafMatcher) ([]globalRankedEntry, error) {

@@ -10,6 +10,8 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -568,7 +570,10 @@ func entryMatchesScalar(entry Entry, pq parsedQuery, matchPath bool) bool {
 			return false
 		}
 	}
-	path := filepath.Clean(entry.Path)
+	// Index-reconstructed paths are already clean; cleanPathIfNeeded skips
+	// the Clean allocation for them while preserving exact semantics for
+	// anything else (overlay/filesystem entries).
+	path := cleanPathIfNeeded(entry.Path)
 	name := entry.Name
 	if name == "" {
 		name = filepath.Base(path)
@@ -717,17 +722,178 @@ func normalizeFilterPath(path string) string {
 	return filepath.Clean(path)
 }
 
-func pathUnder(path, root string) bool {
-	path = normalizeFilterPath(path)
-	root = normalizeFilterPath(root)
-	if strings.EqualFold(path, root) {
+// filterPathNormCache memoizes normalizeFilterPath for absolute paths.
+// Under/bias roots are re-normalized per candidate inside pathUnder; the
+// normalization of an absolute path is cwd-independent, so caching it turns
+// two Abs+Clean calls per candidate into a map lookup. Relative paths still
+// go through normalizeFilterPath every time (their Abs depends on cwd).
+//
+// The resident service sees a new root per typed `under:` prefix, so the
+// cache is bounded: past filterPathNormCacheMax entries it starts over.
+var filterPathNormCache sync.Map // map[string]string
+
+var filterPathNormCacheLen atomic.Int64
+
+const filterPathNormCacheMax = 1024
+
+func normalizeFilterPathCached(path string) string {
+	if path == "" || !filepath.IsAbs(path) {
+		return normalizeFilterPath(path)
+	}
+	if v, ok := filterPathNormCache.Load(path); ok {
+		return v.(string)
+	}
+	norm := normalizeFilterPath(path)
+	if filterPathNormCacheLen.Add(1) > filterPathNormCacheMax {
+		filterPathNormCache.Clear()
+		filterPathNormCacheLen.Store(1)
+	}
+	filterPathNormCache.Store(path, norm)
+	return norm
+}
+
+// pathLooksClean reports whether filepath.Clean(path) is the identity, without
+// allocating. Anything doubtful returns false and the caller runs Clean.
+// Windows Clean only reacts to forward slashes, duplicate or trailing
+// separators, and exact "." / ".." elements, so the absence of all of those
+// (plus the verbatim-prefix guard) proves Clean is a no-op.
+func pathLooksClean(path string) bool {
+	if path == "" {
+		// Clean("") is ".", not the identity.
+		return false
+	}
+	n := len(path)
+	// A bare drive-relative volume (`C:`) cleans to `C:.`, not the identity.
+	if n == 2 && path[1] == ':' {
+		return false
+	}
+	// Verbatim/extended prefixes go through Clean's special cases; let Clean
+	// handle them rather than reproduce them here.
+	if strings.HasPrefix(path, `\\?\`) || strings.HasPrefix(path, `\\.\`) {
+		return false
+	}
+	unc := n >= 2 && path[0] == '\\' && path[1] == '\\'
+	for i := 0; i < n; i++ {
+		c := path[i]
+		if c == '/' {
+			return false
+		}
+		if c == '\\' {
+			// Duplicate separator (except the UNC lead) or a trailing
+			// separator past a bare root: Clean would collapse/strip it.
+			if i+1 < n && path[i+1] == '\\' {
+				if !(i == 0 && unc) {
+					return false
+				}
+			} else if i+1 == n {
+				// Trailing separator: Clean keeps it only on a bare
+				// root (drive `E:\` or UNC `\\host\share\`).
+				if !isBareRootPath(path) {
+					return false
+				}
+			}
+		} else if c == '.' {
+			// An exact "." or ".." element: Clean would resolve it.
+			prev := i == 0 || path[i-1] == '\\' || path[i-1] == '/'
+			if prev {
+				next := i + 1
+				if next >= n || path[next] == '\\' || path[next] == '/' {
+					return false
+				}
+				if path[next] == '.' {
+					after := next + 1
+					if after >= n || path[after] == '\\' || path[after] == '/' {
+						return false
+					}
+				}
+			}
+		}
+	}
+	return true
+}
+
+// isBareRootPath reports whether path is a bare filesystem root whose
+// trailing separator survives Clean: a drive root like `E:\` or a UNC root
+// like `\\host\share\`.
+func isBareRootPath(path string) bool {
+	if len(path) == 3 && path[1] == ':' && (path[2] == '\\' || path[2] == '/') {
 		return true
 	}
+	if len(path) >= 2 && path[0] == '\\' && path[1] == '\\' {
+		rest := path[2:]
+		// UNC root: exactly server + share and nothing deeper.
+		parts := strings.Split(strings.TrimRight(rest, `\/`), `\`)
+		if len(parts) == 2 {
+			return true
+		}
+		// Tolerate forward slashes inside the UNC body the same way.
+		parts = strings.Split(strings.TrimRight(rest, `\/`), `/`)
+		if len(parts) == 2 {
+			return true
+		}
+	}
+	return false
+}
+
+// cleanPathIfNeeded is filepath.Clean that returns the input unchanged (no
+// allocation) when Clean would be the identity. Index-reconstructed paths are
+// built from components and are almost always already clean.
+func cleanPathIfNeeded(path string) string {
+	if pathLooksClean(path) {
+		return path
+	}
+	return filepath.Clean(path)
+}
+
+func pathUnder(path, root string) bool {
+	// Fast path for the hot case (both absolute, e.g. index entries tested
+	// against a normalized under/bias root): an exact separator-bounded
+	// prefix of two clean absolute paths is exactly what Rel would report
+	// as contained, without Abs/Clean/Rel per candidate. Anything else
+	// (case-only differences, relative paths) falls through to the exact
+	// slow path so semantics never change.
+	if filepath.IsAbs(path) && filepath.IsAbs(root) {
+		// For absolute inputs normalizeFilterPath is Abs+Clean == Clean,
+		// so these are exactly the normalized forms the slow path would
+		// compare; the Rel check below then decides with identical
+		// semantics.
+		normRoot := normalizeFilterPathCached(root)
+		clean := cleanPathIfNeeded(path)
+		if strings.EqualFold(clean, normRoot) {
+			return true
+		}
+		if len(clean) > len(normRoot) && strings.HasPrefix(clean, normRoot) {
+			if normRoot[len(normRoot)-1] == '\\' || normRoot[len(normRoot)-1] == '/' {
+				// A separator-terminated root (drive/UNC root) contains
+				// every longer path with that prefix.
+				return true
+			}
+			if rest := clean[len(normRoot):]; rest[0] == '\\' || rest[0] == '/' {
+				return true
+			}
+		}
+		return pathUnderCleaned(clean, normRoot)
+	}
+	return pathUnderSlow(path, root)
+}
+
+// pathUnderCleaned is the Rel containment check on already-normalized
+// absolute paths.
+func pathUnderCleaned(path, root string) bool {
 	rel, err := filepath.Rel(root, path)
 	if err != nil {
 		return false
 	}
 	return rel != "." && rel != "" && !strings.HasPrefix(rel, "..") && !filepath.IsAbs(rel)
+}
+
+func pathUnderSlow(path, root string) bool {
+	path = normalizeFilterPath(path)
+	root = normalizeFilterPathCached(root)
+	if strings.EqualFold(path, root) {
+		return true
+	}
+	return pathUnderCleaned(path, root)
 }
 
 func parseTimeValue(value string) (time.Time, error) {

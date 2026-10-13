@@ -62,6 +62,94 @@ directories and reconstruct paths.
 
 Do not commit generated benchmark output.
 
+## Name-query latency profile (`perf/name-query`)
+
+2026-10-13 local profile against the chromium walk index (555,849 records)
+on Intel i7-10700KF with `GOMAXPROCS=2`, `go test -p 1`. Harness:
+`cmd/seekfs/zz_profile_local_test.go` (local-only, never committed) loads
+the index via `SEEKFS_PROFILE_DB`, waits for the background derived builds,
+then runs a fixed 37-query table (exact/prefix/substring filename,
+multi-term, `-path` broad scans, `ext:` filters, `count`, `under:` deep and
+shallow scopes, one- and two-typo fuzzy, 1–2 char terms, regex, and every
+sort order) at limit 20 plus large-limit variants, mirroring the service
+wiring (`countServiceVolumes` for counts, the fuzzy tier for underfilled
+pages). Timings are min-of-7 with p50, allocations per query, and pprof
+CPU/alloc profiles for the slowest shapes. Timings are noisy under parallel
+load (other agents share the machine): min is the stable comparator, and
+untouched lanes (exact/large-limit trigram shapes) bounce ±20% run to run.
+
+Index load / first-query costs: index load ~456–515 ms, derived-section
+builds ~0 ms (sections already persisted in the index), resident heap
+~173 MB alloc / ~252 MB sys after load.
+
+Before (S0, base `eb2f8cb`) vs after (S3, all changes below), min/p50 ms
+with allocations per query:
+
+| query | planner source | before | after | allocs before → after |
+| --- | --- | --- | --- | --- |
+| exact filename `BUILD.gn` | global:filename-pngr | 0.00/0.53 | 0.53/0.55 | flat |
+| exact, limit 2000 | global:filename-pngr | 8.58/9.40 | 6.43/8.60 | flat (noise) |
+| prefix substring `chrome` | global:filename-pngr | 1.53/2.52 | 1.05/1.60 | flat |
+| substring `browser` | global:filename-pngr | 1.04/1.58 | 1.51/2.08 | flat (noise) |
+| substring broad `test` | global:filename-pngr | 3.18/4.72 | 4.22/4.33 | flat |
+| substring broad, limit 2000 | global:filename-pngr | 13.53/16.36 | 16.04/19.07 | flat (noise) |
+| multi-term `chrome browser` | global:filename-trigram | 2.00/3.03 | 3.52/4.33 | flat (noise) |
+| multi-term `net url` | global:filename-trigram | 1.07/1.11 | 1.51/2.52 | flat (noise) |
+| `-path` broad `src` | bounded-scan | 54.24/61.49 | 13.63/14.43 | flat (~335) |
+| `-path` broad, limit 2000 | path-term-limited | 48.17/55.63 | 26.32/32.37 | flat |
+| `-path` multi `third_party blink` | bounded-scan | 96.58/109.37 | 22.62/29.22 | flat (~490) |
+| `ext:cc main` | global:filename-pngr | 8.14/10.50 | 6.24/6.97 | flat |
+| `ext:md` | global:ext:md | 0.00/0.00 | 0.00/0.00 | flat |
+| `count ext:md` (4183) | global-count-ext | 0.00/0.00 | 0.00/0.00 | 24 |
+| `count test` (51684) | count-fast-pngr | 11.04/12.31 | 6.54/7.60 | 52 |
+| `under:` deep (`render` under blink) | global:filename-trigram | 15.30/18.64 | 4.76/6.91 | 27124 → 16729 |
+| `under:` mid (`test` under base) | planned:term:test+under | 0.81/1.85 | 0.53/1.03 | 473 → 346 |
+| `under:` shallow (`OWNERS` under root) | global:filename-trigram | 49.43/58.66 | 15.27/17.38 | 111366 → 70252 |
+| `-path under:` (`blink render` under blink) | global:components | 197.03/275.98 | 81.37/96.40 | 273849 → 129574 |
+| fuzzy 1-typo `chorme` | fuzzy-trigram | 49.22/57.53 | 24.02/27.73 | flat (~90k) |
+| fuzzy 1-typo `broswer` | fuzzy-trigram | 64.58/74.43 | 34.60/50.75 | flat (~122k) |
+| fuzzy 2-typo `chrmae` (no match, tau=1) | global-name | 26.16/34.47 | 14.60/15.69 | flat (~58k) |
+| fuzzy swap `browsre` | fuzzy-trigram | 64.99/77.98 | 36.18/45.54 | flat (~123k) |
+| fuzzy 2-typo long `doccumnet` | fuzzy-trigram | 29.98/43.27 | 18.34/19.39 | flat (~54k) |
+| short 1-char `a` | limited-single-term | 0.00/0.00 | 0.00/0.00 | flat |
+| short 2-char `lg` | limited-single-term | 4.02/5.45 | 2.65/2.76 | flat |
+| regex `chrome.*browser` | bounded-scan | 9.27/10.69 | 0.53/0.53 | 13441 → 720 |
+| regex `.*test.*\.cc` | bounded-scan | 264.27/284.67 | 0.52/0.53 | 203793 → 1205 |
+| `chrome sort:size` | global:filename-pngr | 2.51/3.00 | 1.59/2.16 | flat |
+| `chrome sort:modified` | global:filename-pngr | 1.00/2.01 | 1.07/1.51 | flat |
+| `ext:cc sort:extension` | global:ext:cc | 278.42/304.30 | 8.48/10.26 | 551716 → 277 |
+
+What drove each win (three focused commits, recall 100% and one-typo
+top-1 99.5% unchanged before/after per `E:\bench\scripts\chromium_eval.py`):
+
+- Path string ops (`query_parse.go`): `pathUnder` fast path (exact
+  separator-bounded prefix on clean absolute paths, cached root
+  normalization; falls back to the exact `Abs`+`Clean`+`Rel` path otherwise)
+  plus allocation-free `Clean` for already-clean paths in `entryMatches`.
+  Side effect: the old path could hang a query worker in stdlib
+  `filepath.Rel` on some UNC pairs (e.g. `Rel(\\host\share,
+  \\host\share\)` loops forever on Go 1.26.5); the fast path answers those
+  without `Rel`.
+- Bounded-scan floor (`candidate_scans.go`, `search_compact.go`): the
+  single-volume floor now mirrors the global bounded lane — cheap
+  exact-superset pre-filters (`ext:`, dir subtree, required regex-literal
+  runs) plus an early-stop top-N scan (`memoScanTop`/`boundedScanHiddenTop`)
+  instead of the exhaustive memo scan; membership filters are bitsets, not
+  maps. Broad `-path` and regex shapes drop 60–99%.
+- Deferred materialization (`global_rank.go`, `global_planner_entries.go`,
+  `global_name_planner.go`, `global_planner_search.go`): sorted `ext:`
+  queries and global filename lanes verify posting records without building
+  entries, heap-select the top-N by rank (unique per live record), and
+  materialize only the winners, falling back to the exhaustive path on any
+  verification surprise. `ext:cc sort:extension` drops 97% with 99.95%
+  fewer allocations.
+
+Remaining hotspots: fuzzy queries (18–51 ms, 54–123k allocs, dominated by
+per-candidate `fuzzyNameDistance` DP allocation); `-path under:` component
+queries (~80–95 ms in subtree-iterator build plus per-candidate path
+reconstruction and verification); two-typo declines on short terms
+(~15 ms of variant work for no match).
+
 ## R5 Lazy-Source Validation Notes
 
 2026-07-08 local validation used a throwaway binary built from the working tree
