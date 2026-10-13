@@ -158,12 +158,14 @@ func (s *goSearchService) reconcileMetadataPass(vol *serviceVolumeIndex, idx *co
 		return false
 	}
 	live := make(map[uint64]contentFilePrint)
+	ranks := make(map[uint64]contentScopeMember)
 	for _, l := range lists {
 		for _, m := range l {
 			if contentScopeMemberIgnored(&scope, m.path) {
 				continue
 			}
 			live[m.frn] = contentFilePrint{size: m.size, mod: m.mod}
+			ranks[m.frn] = m
 		}
 	}
 	if len(live) == 0 && len(idx.Docs) > 0 {
@@ -202,6 +204,14 @@ func (s *goSearchService) reconcileMetadataPass(vol *serviceVolumeIndex, idx *co
 				continue
 			}
 			live[frn] = contentFilePrint{size: rec.Size, mod: rec.ModUnix}
+			if m, ok := ranks[frn]; ok {
+				m.size = rec.Size
+				ranks[frn] = m
+			} else {
+				// Created in the wrapped range: no scan priority, so it ranks
+				// after every scanned file for the reconcile budget.
+				ranks[frn] = contentScopeMember{frn: frn, size: rec.Size, priority: int(^uint(0) >> 1)}
+			}
 		}
 	}
 	target := vol.checkpoint
@@ -221,7 +231,7 @@ func (s *goSearchService) reconcileMetadataPass(vol *serviceVolumeIndex, idx *co
 			basePrints[idx.Docs[i].FRN] = contentFilePrint{size: idx.Docs[i].FileSize, mod: idx.Docs[i].FileModNano}
 		}
 	}
-	var enqueue, drop []uint64
+	var enqueue, fresh, drop []uint64
 	for key, want := range live {
 		if doc, ok := delta.docFor(key); ok && !doc.Deleted &&
 			doc.FileSize == want.size && doc.FileModNano == want.mod {
@@ -233,13 +243,21 @@ func (s *goSearchService) reconcileMetadataPass(vol *serviceVolumeIndex, idx *co
 		got, inBase := basePrints[key]
 		if !inBase {
 			if want.size != 0 {
-				enqueue = append(enqueue, key)
+				fresh = append(fresh, key)
 			}
 			continue
 		}
 		if got != want {
 			enqueue = append(enqueue, key)
 		}
+	}
+	// Changed base docs always re-extract; files new to the base are held to
+	// the budget the build used (see content_reconcile_budget.go), so a
+	// reserve-truncated base does not re-enqueue everything it dropped.
+	admitted, leftOut, leftOutBytes := contentReconcileTrimNew(fresh, ranks, contentReconcileNewAllowance(vol, idx, &scope))
+	enqueue = append(enqueue, admitted...)
+	if leftOut > 0 {
+		serviceLog("content metadata reconcile volume=%s left out %d files (%d bytes) past the budget", vol.volume, leftOut, leftOutBytes)
 	}
 	for key := range basePrints {
 		if _, ok := live[key]; !ok {
