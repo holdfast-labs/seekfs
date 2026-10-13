@@ -201,6 +201,22 @@ func TestContentAttachCheckpointBranches(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	// writeBasePrints stamps the v6 file fingerprint (source size + mtime)
+	// so a metadata reconcile can diff the doc instead of rebuilding it.
+	writeBasePrints := func(t *testing.T, gsx string, journal, cp uint64) {
+		t.Helper()
+		cidx, err := assembleContentIndex([]contentBuildDoc{{path: `C:\a.txt`, frn: 10, text: []byte("alpha"), class: contentClassText, version: 1, fileSize: 10}}, t.TempDir())
+		if err != nil {
+			t.Fatal(err)
+		}
+		cidx.Origin = contentOriginUSN
+		cidx.JournalID = journal
+		cidx.CheckpointUSN = cp
+		stampContentTestScope("C:", cidx)
+		if err := contentSaveFile(gsx, cidx); err != nil {
+			t.Fatal(err)
+		}
+	}
 	trackCalls := func(t *testing.T) *int {
 		t.Helper()
 		calls := new(int)
@@ -273,19 +289,27 @@ func TestContentAttachCheckpointBranches(t *testing.T) {
 
 	t.Run("below-lowest-valid", func(t *testing.T) {
 		vol, gsx := newVolume(t, 7, 50)
-		writeBase(t, gsx, 7, 50)
+		writeBasePrints(t, gsx, 7, 50)
 		// The journal wrapped: the base checkpoint is below the first valid USN.
+		// The same generation keeps FRN identity, so content reconciles its
+		// metadata against the live index instead of going stale — and stays
+		// usable throughout. The journal itself is never re-read.
 		stubContentCatchUpJournal(t, usnJournalDataV0{UsnJournalID: 7, FirstUsn: 100, LowestValidUsn: 100, NextUsn: 200})
 		calls := trackCalls(t)
+		t.Setenv("SEEKFS_CONTENT_SCOPE", "explicit")
+		t.Setenv("SEEKFS_CONTENT_ROOTS", `C:\`)
 		attach(t, vol)
-		if got := vol.content.stateOf(); got != contentStateStale {
-			t.Fatalf("state = %q; want stale for a checkpoint below LowestValidUsn", got)
+		if got := vol.content.stateOf(); got != contentStateReady {
+			t.Fatalf("state = %q; want ready (reconciled, still serving)", got)
 		}
-		if vol.content.usableForQuery() {
-			t.Fatal("a wrapped-journal base must not be usable")
+		if !vol.content.usableForQuery() {
+			t.Fatal("a wrap-reconciled base must stay usable")
 		}
 		if *calls != 0 {
-			t.Fatalf("catch-up read %d times for a wrapped journal; want 0", *calls)
+			t.Fatalf("catch-up read %d times for a wrapped journal; want 0", calls)
+		}
+		if got := vol.content.healthSnapshot(0); got.State != contentStateReady && got.State != contentStateReconciling {
+			t.Fatalf("health state = %q; want ready or reconciling", got.State)
 		}
 	})
 

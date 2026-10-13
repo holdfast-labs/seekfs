@@ -97,6 +97,126 @@ type contentScopeResolved struct {
 	// files it reads so a sidecar built under other rules is rebuilt.
 	Ignore       *contentGitIgnore
 	IgnoreDigest [32]byte
+	// prefix holds the trailing-separator form of each entry in a path
+	// list, parallel to it: matching an already-normalized path is one
+	// HasPrefix per entry, with no per-file Clean/ToLower. Built once by
+	// resolve(); read-only afterwards.
+	repoPrefix     []string
+	rootPrefix     []string
+	excludePrefix  []string
+	explicitPrefix []string
+	// rootExact maps a normalized path that exactly equals a root to it, for
+	// the corner where a root names the file itself while its parent matches
+	// no root (the only way a file joins without its parent joining).
+	rootExact map[string]string
+	// explicitSet marks ExplicitRoots for O(1) priority derivation.
+	explicitSet map[string]struct{}
+}
+
+// contentScopePrefix returns the separator-terminated form of a normalized
+// path for prefix matching with a separator boundary (so `sub` never
+// matches `submarine`).
+func contentScopePrefix(p string) string {
+	if strings.HasSuffix(p, string(filepath.Separator)) {
+		return p
+	}
+	return p + string(filepath.Separator)
+}
+
+// contentPrefixUnder reports contentPathUnder for an already-normalized
+// path p against an already-normalized prefix u with its precomputed
+// separator-terminated form uSep: exact equality or a boundary prefix.
+// Identical to contentPathUnder on normalized inputs, without cleaning.
+func contentPrefixUnder(p, u, uSep string) bool {
+	return p == u || strings.HasPrefix(p, uSep)
+}
+
+// buildScopePrefixes precomputes the prefix forms resolve() derived. It runs
+// once per resolution; every per-file matcher below reuses them.
+func (r *contentScopeResolved) buildScopePrefixes() {
+	r.repoPrefix = r.repoPrefix[:0]
+	for _, root := range r.Repos {
+		r.repoPrefix = append(r.repoPrefix, contentScopePrefix(root))
+	}
+	r.rootPrefix = r.rootPrefix[:0]
+	for _, root := range r.Roots {
+		r.rootPrefix = append(r.rootPrefix, contentScopePrefix(root))
+	}
+	r.excludePrefix = r.excludePrefix[:0]
+	for _, ex := range r.Excludes {
+		r.excludePrefix = append(r.excludePrefix, contentScopePrefix(ex))
+	}
+	r.explicitPrefix = r.explicitPrefix[:0]
+	for _, root := range r.ExplicitRoots {
+		r.explicitPrefix = append(r.explicitPrefix, contentScopePrefix(root))
+	}
+	// Rebuilt unconditionally (not merged): resolve() runs on a fresh struct
+	// each time, and a reused struct must not retain removed roots.
+	r.rootExact = make(map[string]string, len(r.Roots))
+	for _, root := range r.Roots {
+		r.rootExact[root] = root
+	}
+	r.explicitSet = make(map[string]struct{}, len(r.ExplicitRoots))
+	for _, root := range r.ExplicitRoots {
+		r.explicitSet[root] = struct{}{}
+	}
+}
+
+// explicitPrefixAt is the ExplicitRoots counterpart of repoPrefixAt.
+func (r contentScopeResolved) explicitPrefixAt(i int) string {
+	if i < len(r.explicitPrefix) {
+		return r.explicitPrefix[i]
+	}
+	return contentScopePrefix(r.ExplicitRoots[i])
+}
+
+// matchRepo returns the deepest worktree containing normalized path p.
+// Repos resolve deepest-first, so the first prefix hit wins — the same rule
+// as contentGitIgnore.repoFor over the same list.
+func (r *contentScopeResolved) matchRepo(p string) (string, bool) {
+	for i, root := range r.Repos {
+		if contentPrefixUnder(p, root, r.repoPrefixAt(i)) {
+			return root, true
+		}
+	}
+	return "", false
+}
+
+// matchRoot returns the include root containing normalized path p, preferring
+// repos exactly like allows(): a repo hit wins, else the first root hit.
+// Equality is covered by the prefix check (a root naming the file itself
+// matches even when its parent matches no root).
+func (r *contentScopeResolved) matchRoot(p string) (unit, kind string, ok bool) {
+	for i, repo := range r.Repos {
+		if contentPrefixUnder(p, repo, r.repoPrefixAt(i)) {
+			return repo, "repo", true
+		}
+	}
+	for i, root := range r.Roots {
+		if contentPrefixUnder(p, root, r.rootPrefixAt(i)) {
+			return root, "root", true
+		}
+	}
+	return "", "", false
+}
+
+// matchExcluded reports whether normalized path p falls under any exclude
+// prefix (separator-boundary, like contentPathUnder).
+func (r *contentScopeResolved) matchExcluded(p string) bool {
+	for i, ex := range r.Excludes {
+		if contentPrefixUnder(p, ex, r.excludePrefixAt(i)) {
+			return true
+		}
+	}
+	return false
+}
+
+// excludePrefixAt is the Excludes counterpart of repoPrefixAt.
+func (r *contentScopeResolved) excludePrefixAt(i int) string {
+	if i < len(r.excludePrefix) {
+		return r.excludePrefix[i]
+	}
+	return contentScopePrefix(r.Excludes[i])
 }
 
 // resolve computes the effective roots/excludes. repoRoots are the detected git
@@ -137,6 +257,7 @@ func (s contentScope) resolve(volume string, repoRoots []string) contentScopeRes
 		}
 	}
 	r.Excludes = dedupeContentPaths(r.Excludes)
+	r.buildScopePrefixes()
 	return r
 }
 
@@ -144,22 +265,40 @@ func (s contentScope) resolve(volume string, repoRoots []string) contentScopeRes
 // configured roots next, then automatically detected known folders.
 func (r contentScopeResolved) priority(path string) int {
 	p := contentNormPath(path)
-	for _, repo := range r.Repos {
-		if contentPathUnder(p, repo) {
+	for i, repo := range r.Repos {
+		if contentPrefixUnder(p, repo, r.repoPrefixAt(i)) {
 			return 0
 		}
 	}
-	for _, root := range r.ExplicitRoots {
-		if contentPathUnder(p, root) {
+	for i, root := range r.ExplicitRoots {
+		if contentPrefixUnder(p, root, r.explicitPrefixAt(i)) {
 			return 1
 		}
 	}
-	for _, root := range r.Roots {
-		if contentPathUnder(p, root) {
+	for i, root := range r.Roots {
+		if contentPrefixUnder(p, root, r.rootPrefixAt(i)) {
 			return 2
 		}
 	}
 	return 3
+}
+
+// repoPrefixAt returns the precomputed separator-terminated form of
+// Repos[i], falling back to computing it when the scope was hand-built
+// without buildScopePrefixes (tests). Production scopes always precompute.
+func (r contentScopeResolved) repoPrefixAt(i int) string {
+	if i < len(r.repoPrefix) {
+		return r.repoPrefix[i]
+	}
+	return contentScopePrefix(r.Repos[i])
+}
+
+// rootPrefixAt is the Roots counterpart of repoPrefixAt.
+func (r contentScopeResolved) rootPrefixAt(i int) string {
+	if i < len(r.rootPrefix) {
+		return r.rootPrefix[i]
+	}
+	return contentScopePrefix(r.Roots[i])
 }
 
 // allows decides whether path is in scope, returning the matching include unit
@@ -183,10 +322,8 @@ func (r contentScopeResolved) allows(path string) (unit, kind string, ok bool) {
 	} else if _, ok := r.ExtSet[ext]; !ok {
 		return "", "", false
 	}
-	for _, ex := range r.Excludes {
-		if contentPathUnder(p, ex) {
-			return "", "", false
-		}
+	if r.matchExcluded(p) {
+		return "", "", false
 	}
 	if _, inRepo := r.Ignore.repoFor(p); inRepo {
 		// Inside a worktree git decides: tracked "build" or "vendor"
@@ -199,17 +336,7 @@ func (r contentScopeResolved) allows(path string) (unit, kind string, ok bool) {
 	} else if r.SystemExcludes && contentPathHasExcludedSegment(p, contentSystemExcludeSegments) {
 		return "", "", false
 	}
-	for _, repo := range r.Repos {
-		if contentPathUnder(p, repo) {
-			return repo, "repo", true
-		}
-	}
-	for _, root := range r.Roots {
-		if contentPathUnder(p, root) {
-			return root, "root", true
-		}
-	}
-	return "", "", false
+	return r.matchRoot(p)
 }
 
 // contentKnownFolders returns the user's Documents/Desktop/Downloads when the

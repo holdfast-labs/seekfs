@@ -54,7 +54,7 @@ func contentWalkDrainTick(t *testing.T, s *goSearchService, vol *serviceVolumeIn
 	t.Helper()
 	s.contentReconcileWalkVolume(vol, true)
 	vol.contentCoord.declined = func(key uint64, size, modNano int64) {
-		vol.content.walkDeclinedNote(key, contentWalkPrint{size: size, mod: modNano})
+		vol.content.walkDeclinedNote(key, contentFilePrint{size: size, mod: modNano})
 	}
 	defer func() { vol.contentCoord.declined = nil }()
 	s.indexMu.RLock()

@@ -110,11 +110,29 @@ func (s *goSearchService) attachContentForVolume(vol *serviceVolumeIndex) {
 		return
 	}
 	resolvedScope, ok := s.resolvedContentScope(vol)
-	if !ok || idx.ScopeHash == ([32]byte{}) || idx.ScopeHash != resolvedScope.fingerprint() {
-		reason := "content scope changed or sidecar predates scope identity"
-		serviceLog("content index for volume %s %s; rebuilding", vol.volume, reason)
+	if !ok {
+		reason := "content scope unresolvable"
+		serviceLog("content index for volume %s %s; leaving stale", vol.volume, reason)
 		vol.content.markStale(reason)
 		return
+	}
+	if idx.ScopeHash == ([32]byte{}) || idx.ScopeHash != resolvedScope.fingerprint() {
+		// The scope moved under a finished sidecar (a repo appeared or
+		// vanished, an ignore rule changed, roots/exts/budget edited) —
+		// or the sidecar predates scope identity. Reconcile the selection
+		// difference incrementally instead of discarding the build; only
+		// a wholesale change rebuilds from scratch.
+		if !s.attachScopeMismatchedBase(vol, idx, resolvedScope, isWalk) {
+			reason := "content scope changed beyond reconcile; rebuilding"
+			serviceLog("content index for volume %s %s", vol.volume, reason)
+			vol.content.markStale(reason)
+			return
+		}
+	} else {
+		// A matching sidecar converges any earlier reconcile tracking.
+		vol.content.mu.Lock()
+		vol.content.clearScopeReconcileLocked()
+		vol.content.mu.Unlock()
 	}
 	// P1/WP11: a base whose docs were produced by an older/other extractor
 	// version (or written before the class was populated) would serve stale
@@ -440,6 +458,15 @@ func (s *goSearchService) contentCatchUpAfterAttach(vol *serviceVolumeIndex, idx
 	}
 	probe := &serviceVolumeIndex{journalID: idx.JournalID, checkpoint: from}
 	if err := validateUSNCheckpoint(probe, journal); err != nil {
+		// A wrapped journal of the same generation keeps FRN identity: the
+		// filename side rebuilds or replays around it, and content follows
+		// with a metadata reconcile instead of dropping a good base. Only
+		// a new journal generation (or a checkpoint past the head) rebuilds.
+		if isSameJournalWrap(journal, idx.JournalID, from) {
+			serviceLog("content catch-up journal wrapped volume=%s from=%d; reconciling metadata", vol.volume, from)
+			s.contentCatchUpReconcileMetadata(vol, idx)
+			return
+		}
 		serviceLog("content catch-up checkpoint invalid volume=%s from=%d err=%v", vol.volume, from, err)
 		vol.content.markStale(err.Error())
 		return
@@ -477,6 +504,13 @@ func (s *goSearchService) contentCatchUpAfterAttach(vol *serviceVolumeIndex, idx
 		}
 		next, changes, err := contentCatchUpUSNRead(vol.volume, idx.JournalID, cur, buffer)
 		if err != nil {
+			// The journal may have wrapped under a long catch-up: same
+			// generation still joins, so reconcile instead of rebuilding.
+			if _, wrapped := contentCatchUpWrapCheck(vol.volume, idx.JournalID, cur); wrapped {
+				serviceLog("content catch-up journal wrapped mid-read volume=%s from=%d; reconciling metadata", vol.volume, cur)
+				s.contentCatchUpReconcileMetadata(vol, idx)
+				return
+			}
 			serviceLog("content catch-up read error volume=%s from=%d err=%v", vol.volume, cur, err)
 			s.contentCatchUpFailed(vol, "read error")
 			return
@@ -664,6 +698,12 @@ func (s *goSearchService) contentDrainLoop(vol *serviceVolumeIndex) {
 			// cadence, so a service that lost the startup race acquires it once
 			// the CLI build releases it.
 			s.retryContentVolumeLock(vol)
+			// Steady-state scope drift (config/env/ignore edits move the
+			// selection without moving the filename generation): reconcile
+			// instead of rebuilding. Throttled to the drift period; the
+			// generation-gated re-resolve above covers rebuild-driven
+			// drift, and ignore edits force a check below.
+			s.contentScopeDriftCheck(vol, false)
 			// Walk volumes have no USN stream: reconcile the filename index
 			// against the content base first (a no-op unless the filename
 			// generation moved or the safety-net period elapsed), so changed
@@ -673,13 +713,13 @@ func (s *goSearchService) contentDrainLoop(vol *serviceVolumeIndex) {
 			s.indexMu.RUnlock()
 			if isWalkDrain {
 				s.contentReconcileWalkVolume(vol, false)
-				// Feed deterministic declines into the walk skip-set, so
-				// unindexable files are not retried every reconcile. The
-				// coordinator is per-volume, so no other volume's drain
-				// can observe this.
-				vol.contentCoord.declined = func(key uint64, size, modNano int64) {
-					vol.content.walkDeclinedNote(key, contentWalkPrint{size: size, mod: modNano})
-				}
+			}
+			// Feed deterministic declines into the unindexable skip-set, so
+			// files that extract to nothing are not retried every pass. The
+			// coordinator is per-volume, so no other volume's drain
+			// can observe this.
+			vol.contentCoord.declined = func(key uint64, size, modNano int64) {
+				vol.content.walkDeclinedNote(key, contentFilePrint{size: size, mod: modNano})
 			}
 			vol.contentCoord.promoteAll()
 			// A private path cache: the drain must not touch vol.pathCache,
@@ -721,13 +761,13 @@ func (s *goSearchService) contentDrainLoop(vol *serviceVolumeIndex) {
 			}
 			if ignoreChanged {
 				// Files the edit newly ignores or un-ignores are not in the
-				// change stream, so only a rebuild under the new rules (and
-				// a re-resolved scope fingerprint) brings the sidecar back in
-				// line.
-				serviceLog("content ignore rules changed volume=%s; rebuilding", vol.volume)
+				// change stream; reconcile the selection difference under
+				// the new rules instead of rebuilding the sidecar. The
+				// fold persists the reconciled fingerprint.
+				serviceLog("content ignore rules changed volume=%s; reconciling", vol.volume)
 				scope.Ignore.invalidate()
 				scope = nil
-				s.scheduleContentRebuild(vol)
+				s.contentScopeDriftCheck(vol, true)
 			}
 			vol.contentCoord.declined = nil
 			// M1: after the tick's extractions, fold if the delta has grown

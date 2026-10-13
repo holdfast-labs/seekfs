@@ -47,9 +47,10 @@ import (
 // the delay.
 var contentWalkReconcilePeriod = 60 * time.Second
 
-// contentWalkPrint is the (size, nanosecond mtime) fingerprint a walk
-// reconcile diffs. Named so the delta skip-set and the live/base maps share it.
-type contentWalkPrint struct {
+// contentFilePrint is the (size, nanosecond mtime) fingerprint reconciles
+// diff: the walk reconcile, the scope-reconcile diff, and the unindexable
+// skip-set all share it.
+type contentFilePrint struct {
 	size int64
 	mod  int64
 }
@@ -254,8 +255,8 @@ func (s *goSearchService) contentReconcileWalkVolume(vol *serviceVolumeIndex, fo
 		return
 	}
 	// Index-side fingerprint: key -> (size, modNano) for every live file.
-	live := make(map[uint64]contentWalkPrint, len(keys))
-	changed := make(map[uint64]contentWalkPrint)
+	live := make(map[uint64]contentFilePrint, len(keys))
+	changed := make(map[uint64]contentFilePrint)
 	pathCache := make(map[int]string, 1024)
 	var scoped []uint64
 	for n, key := range keys {
@@ -279,14 +280,14 @@ func (s *goSearchService) contentReconcileWalkVolume(vol *serviceVolumeIndex, fo
 			// it would plant a phantom entry the folds reprocess forever.
 			continue
 		}
-		live[key] = contentWalkPrint{size: rec.Size, mod: rec.ModUnix}
+		live[key] = contentFilePrint{size: rec.Size, mod: rec.ModUnix}
 	}
 	// Base-side fingerprint from the attached doc table.
-	base := make(map[uint64]contentWalkPrint, len(reader.idx.Docs))
+	base := make(map[uint64]contentFilePrint, len(reader.idx.Docs))
 	for i := range reader.idx.Docs {
 		d := &reader.idx.Docs[i]
 		if d.FRN != 0 {
-			base[d.FRN] = contentWalkPrint{size: d.FileSize, mod: d.FileModNano}
+			base[d.FRN] = contentFilePrint{size: d.FileSize, mod: d.FileModNano}
 		}
 	}
 	delta := vol.content.deltaView()
@@ -352,15 +353,32 @@ func (s *goSearchService) contentReconcileWalkVolume(vol *serviceVolumeIndex, fo
 			delta.rescind(key)
 		}
 	}
+	// Deduplicate the tombstone set before the threshold gate so a wholesale
+	// selection change rebuilds instead of churning the delta.
+	seen := make(map[uint64]struct{}, len(scoped))
+	var drops []uint64
+	for _, key := range scoped {
+		if _, dup := seen[key]; dup {
+			continue
+		}
+		seen[key] = struct{}{}
+		drops = append(drops, key)
+	}
+	if n := len(changed) + len(drops); len(base) > 0 && float64(n) > contentScopeReconcileRebuildFrac*float64(len(base)) {
+		// A wholesale change is cheaper as a clean rebuild; the usable
+		// base stays attached while it runs (never drop good content for
+		// a scope change alone).
+		serviceLog("content walk reconcile volume=%s changed=%d dropped=%d base=%d exceeds rebuild fraction; rebuilding",
+			vol.volume, len(changed), len(drops), len(base))
+		vol.content.markScopeReconcile(scope.fingerprint(), 0)
+		vol.content.walkReconcileDone(gen)
+		s.scheduleContentRebuild(vol)
+		return
+	}
 	// Tombstones first, so a path that moved between keys never briefly
 	// serves both copies.
-	seen := make(map[uint64]struct{}, len(scoped))
 	if delta != nil {
-		for _, key := range scoped {
-			if _, dup := seen[key]; dup {
-				continue
-			}
-			seen[key] = struct{}{}
+		for _, key := range drops {
 			delta.delete(key)
 		}
 	}
@@ -371,8 +389,9 @@ func (s *goSearchService) contentReconcileWalkVolume(vol *serviceVolumeIndex, fo
 		}
 		vol.contentCoord.enqueueFRNs(list)
 	}
+	vol.content.markScopeReconcile(scope.fingerprint(), len(changed)+len(drops))
 	vol.content.walkReconcileDone(gen)
-	if len(changed) > 0 || len(seen) > 0 {
-		serviceLog("content walk reconcile volume=%s changed=%d dropped=%d", vol.volume, len(changed), len(seen))
+	if len(changed) > 0 || len(drops) > 0 {
+		serviceLog("content walk reconcile volume=%s changed=%d dropped=%d", vol.volume, len(changed), len(drops))
 	}
 }

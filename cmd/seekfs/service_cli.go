@@ -443,6 +443,17 @@ func contentHealthSummary(h *contentHealth) string {
 	if h.Docs > 0 {
 		fmt.Fprintf(&b, " docs=%d", h.Docs)
 	}
+	if h.State == contentStateIndexing || h.State == contentStateReconciling {
+		if h.BuildPhase != "" {
+			fmt.Fprintf(&b, " phase=%s", h.BuildPhase)
+		}
+		if h.BuildTotal > 0 {
+			fmt.Fprintf(&b, " progress=%d/%d", h.BuildDone, h.BuildTotal)
+		}
+	}
+	if h.ScopeReconcile {
+		fmt.Fprintf(&b, " scope_reconcile_pending=%d", h.ScopeReconcilePending)
+	}
 	if h.ScopeDropped > 0 {
 		fmt.Fprintf(&b, " scope_dropped_files=%d scope_dropped_bytes=%d budget=%s (raise [features.content] budget_bytes)",
 			h.ScopeDropped, h.ScopeDroppedBytes, contentBudgetLabel(h.BudgetBytes))

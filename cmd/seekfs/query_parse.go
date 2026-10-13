@@ -1022,7 +1022,12 @@ func (idx *Index) reconstructCompactPathCached(i int, cache map[int]string) stri
 	for p := len(parts) - 1; p >= 0; p-- {
 		if path == "" {
 			path = parts[p]
-		} else if rootName != "" && p == len(parts)-1 && parts[p] == rootName && len(parts) > 1 {
+		} else if rootName != "" && p == len(parts)-1 && parts[p] == rootName {
+			// The chain top names the walk root itself: it is already the
+			// path prefix, so re-appending it would double it. This holds
+			// for the root record too (single-element chain): its path is
+			// the root, and every cache entry below it stays consistent
+			// no matter which ancestor a later lookup hits first.
 			continue
 		} else {
 			path += `\` + parts[p]

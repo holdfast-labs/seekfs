@@ -169,6 +169,13 @@ func (s *goSearchService) runContentFold(vol *serviceVolumeIndex) {
 			header.CheckpointUSN = now
 		}
 	}
+	// A scope reconcile converges here: persist the reconciled fingerprint
+	// instead of the stale build-time one, so the sidecar restamps to the
+	// selection it now represents. Without a reconcile the header keeps the
+	// base hash, as before.
+	if fp, ok := vol.content.scopeReconciledFP(); ok {
+		header.ScopeHash = fp
+	}
 	gsx := contentIndexPathForDB(vol.dbPath)
 	if gsx == "" {
 		vol.contentCoord.foldFailed(contentFoldRetryBackoff)
@@ -295,6 +302,16 @@ func (s *goSearchService) runContentFold(vol *serviceVolumeIndex) {
 	}
 	vol.contentCoord.commitFold(snap)
 	vol.contentCoord.foldSucceeded()
+	// The fold just persisted every reconciled change (the queue drains
+	// before a fold may run): converge the scope-reconcile tracking. The
+	// stamped header already carries the fingerprint.
+	vol.content.mu.Lock()
+	vol.content.clearScopeReconcileLocked()
+	vol.content.mu.Unlock()
+	// ...and a wrap reconcile that forced this fold: the new checkpoint is
+	// durable, so the reconciling display converges (the next drain returns
+	// health to ready).
+	vol.content.clearReconcileActive()
 	contentSweepShards(gsx)
 	serviceLog("content fold volume=%s rewritten_docs=%d checkpoint=%d", vol.volume, rewritten, checkpoint)
 }
