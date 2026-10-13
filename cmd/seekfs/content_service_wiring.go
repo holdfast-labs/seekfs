@@ -548,6 +548,7 @@ func (s *goSearchService) contentCatchUpFailed(vol *serviceVolumeIndex, reason s
 		return
 	}
 	vol.content.markCatchUpIncomplete()
+	serviceLog("content catch-up failed volume=%s: %s; scheduling a rebuild", vol.volume, reason)
 	if vol.contentBuildAttempts.Add(1) > contentBuildMaxAttempts {
 		vol.content.markBuildFailed(fmt.Sprintf("content catch-up %s; rebuild gave up after %d attempts", reason, contentBuildMaxAttempts))
 		return

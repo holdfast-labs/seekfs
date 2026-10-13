@@ -1344,6 +1344,14 @@ rebuild fraction weighs only the trimmed diff. Covered by
 fail without the gate (stale + rebuild; the new file extracted past the
 reserve).
 
+Both reconcile scans also hold background persists for their duration
+(`holdBackgroundPersists`, the build snapshot's hold from §6p). A persist
+swaps `vol.index`, which reads as a moved base; on the busy E: volume
+persists ran every 15-30 s, faster than a full selection scan, so every
+metadata reconcile gave up after three attempts and silently scheduled a
+rebuild. `contentCatchUpFailed` now logs its reason. Covered by
+`TestContentReconcileScansHoldBackgroundPersists` (fails without the hold).
+
 ## 7. Carried debt / known gaps
 
 - **Snippet case is preserved; no fixup-aware path remains.** The `.gsx` text

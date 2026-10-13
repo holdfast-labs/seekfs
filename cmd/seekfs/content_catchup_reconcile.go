@@ -120,6 +120,14 @@ func (s *goSearchService) reconcileMetadataPass(vol *serviceVolumeIndex, idx *co
 		return true
 	}
 	defer endContentTask(vol)
+	// Hold background persists for the pass, like a build snapshot does:
+	// each persist swaps vol.index, and on a busy volume they run every
+	// 15-30 s, faster than a full selection scan, so without the hold every
+	// attempt reads as a moved base and the reconcile falls back to a
+	// rebuild (real E: index, 2026-10-13). The WAL keeps changes durable.
+	// An unsettled in-flight persist just costs this attempt (moved base).
+	release, _ := s.holdBackgroundPersists(vol)
+	defer release()
 	s.indexMu.RLock()
 	if vol.index == nil || vol.index.Source != "usn" {
 		s.indexMu.RUnlock()
