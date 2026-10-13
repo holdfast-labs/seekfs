@@ -277,9 +277,9 @@ func directWriteSubtreeSection(ctx context.Context, cw *countingWriter, parentPa
 		_, err := cw.Write(uint32SliceBytes(values))
 		return err
 	}
-	if err := writePart(start); err != nil {
-		return nil, nil, nil, err
-	}
+	// The start array is the exact inverse of the order and is rebuilt at
+	// load (see decodeDerivedSection); only end and order persist. start
+	// stays live as the traversal's visited set above.
 	if err := writePart(end); err != nil {
 		return nil, nil, nil, err
 	}
@@ -322,8 +322,10 @@ func directWriteSubtreeSection(ctx context.Context, cw *countingWriter, parentPa
 		}
 		*owned = append(*owned, bestPath)
 		subtreeRankPaths = append(subtreeRankPaths, bestPath)
-		// Canonical SUBT stores no name-rank part: start/end/order are followed
-		// by size, modified, extension, type, and path subtree minima.
+		// Canonical SUBT stores no name-rank part and no start part (the
+		// exact inverse of the order, rebuilt at load): end/order are
+		// followed by size, modified, extension, type, and path subtree
+		// minima.
 		if rankIndex > 0 {
 			if err := writePart(best); err != nil {
 				return nil, nil, nil, err

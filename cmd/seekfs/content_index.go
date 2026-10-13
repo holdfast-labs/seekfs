@@ -94,15 +94,19 @@ func contentSectionEagerVerify(tag uint32) bool {
 // content_textblock.go, content_termsdict.go and content_postings.go); the
 // 08 bump shrinks text blocks to 64 KiB and gives each shard a trained
 // zstd dictionary (CXTD, raw content; see content_textdict.go) that its
-// frames reference. A sidecar whose version does not match is rejected on
-// load, so it can never be attached stale: the service sees no usable base
-// and its PF-3 build path rebuilds it. (05 is the sharded-manifest version,
-// which carries no doc table; manifests are unaffected by the 06/07/08
-// bumps: a manifest names shard files, and each shard carries the doc-table
-// version itself.)
+// frames reference; the 09 bump slims the CXGR gram entries (12-byte rows,
+// singleton entries, prefix-summed block offsets; see content_postings.go),
+// nibble-packs the CXTR front-code lengths (see content_termsdict.go), and
+// drops the unread RawSize/DocLen/ModUnix doc fields from the wire
+// (80 -> 60 byte records). A sidecar whose version does not match is
+// rejected on load, so it can never be attached stale: the service sees no
+// usable base and its PF-3 build path rebuilds it. (05 is the
+// sharded-manifest version, which carries no doc table; manifests are
+// unaffected by the 06/07/08/09 bumps: a manifest names shard files, and
+// each shard carries the doc-table version itself.)
 var contentIndexMagic = [8]byte{'G', 'O', 'S', 'C', 'X', '0', '0', '4'}
 
-const contentIndexVersion = 8
+const contentIndexVersion = 9
 
 // contentOrigin records what the doc keys are, so a `.gsx` can never be
 // attached to a key space it does not join.
@@ -144,6 +148,7 @@ const (
 	contentSectionPaths    uint32 = 'C'<<24 | 'X'<<16 | 'P'<<8 | 'T'
 	contentSectionPolicy   uint32 = 'C'<<24 | 'X'<<16 | 'P'<<8 | 'L'
 	contentSectionScope    uint32 = 'C'<<24 | 'X'<<16 | 'S'<<8 | 'C'
+	contentSectionPruned   uint32 = 'C'<<24 | 'X'<<16 | 'G'<<8 | 'P'
 )
 
 // contentBuildPolicy is the extraction policy a `.gsx` was built with and the
@@ -443,9 +448,10 @@ func contentDocTableBytes(docs []contentDoc) []byte {
 		_ = binary.Write(&buf, binary.LittleEndian, d.ContentType)
 		_ = binary.Write(&buf, binary.LittleEndian, d.ExtractorVersion)
 		buf.Write(d.ContentHash[:])
-		_ = binary.Write(&buf, binary.LittleEndian, d.RawSize)
-		_ = binary.Write(&buf, binary.LittleEndian, d.DocLen)
-		_ = binary.Write(&buf, binary.LittleEndian, d.ModUnix)
+		// v9 drops RawSize/DocLen/ModUnix from the wire: no query path reads
+		// them (they are stamped in memory and carried through folds, but the
+		// persisted record omits them). FileSize/FileModNano stay: the walk
+		// reconcile diffs them for change detection without a journal.
 		_ = binary.Write(&buf, binary.LittleEndian, d.TextOff)
 		_ = binary.Write(&buf, binary.LittleEndian, d.TextLen)
 		_ = binary.Write(&buf, binary.LittleEndian, d.FileSize)
@@ -455,8 +461,8 @@ func contentDocTableBytes(docs []contentDoc) []byte {
 }
 
 // contentDocFixedSize is the encoded width of one doc record:
-// docID(4)+frn(8)+type(2)+extractor(2)+hash(16)+rawSize(8)+docLen(4)+modUnix(8)+textOff(8)+textLen(4)+fileSize(8)+fileModNano(8)
-const contentDocFixedSize = 80
+// docID(4)+frn(8)+type(2)+extractor(2)+hash(16)+textOff(8)+textLen(4)+fileSize(8)+fileModNano(8)
+const contentDocFixedSize = 60
 
 func contentDecodeDocTable(data []byte) ([]contentDoc, error) {
 	if len(data) < 4 {
@@ -476,13 +482,12 @@ func contentDecodeDocTable(data []byte) ([]contentDoc, error) {
 		d.ExtractorVersion = binary.LittleEndian.Uint16(data[off+14:])
 		copy(d.ContentHash[:], data[off+16:off+16+contentHashLen])
 		p := off + 16 + contentHashLen
-		d.RawSize = int64(binary.LittleEndian.Uint64(data[p:]))
-		d.DocLen = binary.LittleEndian.Uint32(data[p+8:])
-		d.ModUnix = int64(binary.LittleEndian.Uint64(data[p+12:]))
-		d.TextOff = binary.LittleEndian.Uint64(data[p+20:])
-		d.TextLen = binary.LittleEndian.Uint32(data[p+28:])
-		d.FileSize = int64(binary.LittleEndian.Uint64(data[p+32:]))
-		d.FileModNano = int64(binary.LittleEndian.Uint64(data[p+40:]))
+		// RawSize/DocLen/ModUnix are v8 wire fields, absent since v9: they
+		// decode as zero (see contentDocTableBytes).
+		d.TextOff = binary.LittleEndian.Uint64(data[p:])
+		d.TextLen = binary.LittleEndian.Uint32(data[p+8:])
+		d.FileSize = int64(binary.LittleEndian.Uint64(data[p+12:]))
+		d.FileModNano = int64(binary.LittleEndian.Uint64(data[p+20:]))
 		off += contentDocFixedSize
 	}
 	return docs, nil

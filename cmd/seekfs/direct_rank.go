@@ -311,16 +311,10 @@ func directComputeRankFamily(ctx context.Context, tag uint32, runs []directRunFi
 			return 0, readErr
 		}
 	}
-	if err := binary.Write(sw, binary.LittleEndian, uint32(recordCount)); err != nil {
-		_ = section.Close()
-		return 0, err
-	}
-	written += 4
-	if _, err := sw.Write(ranks); err != nil {
-		_ = section.Close()
-		return 0, err
-	}
-	written += int64(len(ranks))
+	// The section carries the order alone: the rank-by-id vector is the
+	// exact inverse and is rebuilt at load (see decodeRankSection), halving
+	// the six rank sections. The rank-by-id array still goes to rankPath
+	// for the subtree minima and posting bounds built later.
 	if err := sw.Flush(); err != nil {
 		_ = section.Close()
 		return 0, err

@@ -6,6 +6,7 @@ import (
 	"math/rand"
 	"os"
 	"runtime"
+	"sort"
 	"sync"
 	"testing"
 	"time"
@@ -117,6 +118,90 @@ func TestContentExternalMultiBlock(t *testing.T) {
 	if !bytes.Equal(uint32SliceBytes(want), uint32SliceBytes(postingDocIDs(got))) {
 		t.Fatal("decoded docIDs differ from input")
 	}
+}
+
+// With pruning active the streaming assembler drops the same dense keys
+// the in-memory encoder drops, byte-identically, and reports exactly those
+// keys as pruned.
+func TestContentExternalPruneParity(t *testing.T) {
+	old := contentGramPruneDF
+	contentGramPruneDF = 100
+	defer func() { contentGramPruneDF = old }()
+	keys, postings := randomPostingSet(7, 60, 300)
+	want := encodeContentPostingSection(postings)
+	var wantPruned []string
+	for _, k := range keys {
+		if len(postings[k]) > contentGramPruneDF {
+			wantPruned = append(wantPruned, k)
+		}
+	}
+	sort.Strings(wantPruned)
+
+	build := func(arena int) ([]byte, []string) {
+		b, err := newContentExternalSectionBuilder(t.TempDir(), arena)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer b.Close()
+		for _, k := range keys {
+			for _, p := range postings[k] {
+				b.Add(k, p.docID)
+			}
+		}
+		out, err := b.Finish()
+		if err != nil {
+			t.Fatal(err)
+		}
+		return out, b.PrunedKeys()
+	}
+	first, firstPruned := build(2048)
+	second, secondPruned := build(65536)
+	if !bytes.Equal(first, second) {
+		t.Fatal("pruned builds with different arenas produced different bytes")
+	}
+	if !bytes.Equal(first, want) {
+		t.Fatal("pruned streaming build differs from in-memory encode")
+	}
+	if !equalStrings(firstPruned, wantPruned) || !equalStrings(secondPruned, wantPruned) {
+		t.Fatalf("pruned keys = %q/%q; want %q", firstPruned, secondPruned, wantPruned)
+	}
+	if len(wantPruned) == 0 {
+		t.Fatal("prune test corpus pruned nothing; want dense keys")
+	}
+	// The pruned set encodes and constrains the reader: dropped keys are
+	// reported pruned, kept keys decode.
+	sec := encodeContentPrunedGrams(firstPruned)
+	set, err := decodeContentPrunedGrams(sec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(set) != len(wantPruned) {
+		t.Fatalf("pruned set size = %d; want %d", len(set), len(wantPruned))
+	}
+	idx, err := decodeContentPostingIndex(first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, k := range wantPruned {
+		if _, ok := idx.lookup(k); ok {
+			t.Fatalf("pruned key %q still indexed", k)
+		}
+		if _, ok := set[contentGramU32Of(k)]; !ok {
+			t.Fatalf("pruned key %q missing from set", k)
+		}
+	}
+}
+
+func equalStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func TestContentExternalEmpty(t *testing.T) {

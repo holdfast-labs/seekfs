@@ -422,6 +422,13 @@ func assembleContentIndexStream(source contentBuildSource, tmpDir string) (*cont
 		}
 		idx.Sections[contentSectionGrams] = grams
 	}
+	if built.prunePath != "" {
+		pruned, err := os.ReadFile(built.prunePath)
+		if err != nil {
+			return nil, err
+		}
+		idx.Sections[contentSectionPruned] = pruned
+	}
 	if built.dictPath != "" {
 		dict, err := os.ReadFile(built.dictPath)
 		if err != nil {
@@ -456,6 +463,9 @@ type contentStreamedBuild struct {
 	// the corpus has no terms/grams.
 	termPath string
 	gramPath string
+	// prunePath holds the exact CXGP pruned-gram section bytes, or "" when
+	// no gram exceeded contentGramPruneDF.
+	prunePath string
 	// dictPath holds the exact CXTD section bytes (the shard's trained
 	// text dictionary), or "" when the shard encodes plain.
 	dictPath string
@@ -788,6 +798,19 @@ func assembleContentIndexStreamed(source contentBuildSource, tmpDir string) (*co
 		_ = os.Remove(termPath)
 		_ = os.Remove(gramPath)
 		return nil, dictErr
+	}
+	// The pruned-gram set rides its own section file, written once the gram
+	// merge (which decides the prunes) is done.
+	prunePath := filepath.Join(tmpDir, "cxprune.sec")
+	if sec := encodeContentPrunedGrams(gramBuilder.PrunedKeys()); len(sec) > 0 {
+		if err := os.WriteFile(prunePath, sec, 0o600); err != nil {
+			_ = os.Remove(textPath)
+			_ = os.Remove(termPath)
+			_ = os.Remove(gramPath)
+			_ = os.Remove(dictPath)
+			return nil, err
+		}
+		built.prunePath = prunePath
 	}
 	built.docs = docs
 	built.paths = paths
@@ -1189,6 +1212,11 @@ func encodeContentPaths(paths []string) []byte {
 				shared++
 			}
 		}
+		// Paths keep the legacy two-uvarint framing: repository paths share
+		// long directory prefixes and carry long file names, so both
+		// lengths almost always exceed the term dictionary's one-byte
+		// header and an escape marker would only add a byte per path
+		// (measured +1 B/doc on the Chromium sample).
 		var tmp [binary.MaxVarintLen64]byte
 		m := binary.PutUvarint(tmp[:], uint64(shared))
 		blob.Write(tmp[:m])
@@ -1270,7 +1298,7 @@ func decodeContentPaths(data []byte, docCount int) ([]string, error) {
 				return nil, errors.New("content paths restart offset mismatch")
 			}
 		}
-		key, next, ok := decodeFrontCodedKey(blob, pos, prev)
+		key, next, ok := decodeLegacyFrontCodedKey(blob, pos, prev)
 		if !ok {
 			return nil, errors.New("content paths key truncated")
 		}

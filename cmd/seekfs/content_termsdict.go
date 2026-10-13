@@ -10,11 +10,15 @@ package main
 // a restart index every 32 keys for logarithmic lookup) plus a u32 document
 // frequency per key in key order.
 //
-// Layout:
+// Layout (v9; v8 sections never meet this decoder):
 //   u32 keyCount | u32 restartInterval | u32 restartCount | u32 keyBlobLen
 //     | u32 overflowCount
 //   restarts: restartCount x {blobOff u32, keyLen u32, key bytes}
-//   keyBlob: keyCount x {[prefixLen uvarint][suffixLen uvarint][suffix bytes]}
+//   keyBlob: keyCount x {length header + suffix bytes}, where the header is
+//     one byte (shared-prefix length in the high nibble, suffix length in
+//     the low nibble) when both fit in 14, else 0xFF followed by the two
+//     uvarints (the legacy framing). Code words share short stems, so the
+//     one-byte form covers the large majority of keys.
 //   dfLo: keyCount bytes (document frequency when < 255)
 //   overflow: overflowCount x {index u32, df u32} (exact df for keys with
 //     df >= 255, sorted by index)
@@ -87,12 +91,7 @@ func encodeContentTermDict(sortedKeys []string, df map[string]uint32) []byte {
 				shared++
 			}
 		}
-		var tmp [binary.MaxVarintLen64]byte
-		n := binary.PutUvarint(tmp[:], uint64(shared))
-		blob.Write(tmp[:n])
-		n = binary.PutUvarint(tmp[:], uint64(len(k)-shared))
-		blob.Write(tmp[:n])
-		blob.WriteString(k[shared:])
+		appendFrontCodedKey(&blob, k, shared)
 		prev = k
 	}
 
@@ -245,9 +244,54 @@ func (d *contentTermDict) verify() error {
 	return nil
 }
 
-// decodeFrontCodedKey decodes one key at blob[pos] with the previous key for
-// its shared prefix. ok is false on truncation or a bad prefix length.
-func decodeFrontCodedKey(blob []byte, pos int, prev string) (key string, next int, ok bool) {
+// contentFrontCodedEscape marks a two-uvarint length header: shared or
+// suffix length above 14 does not fit the one-byte form.
+const contentFrontCodedEscape = 0xFF
+
+// appendFrontCodedKey writes one front-coded key record: shared is the byte
+// prefix shared with the previous key. Both lengths ride one header byte
+// when they fit in 14; otherwise the escape byte plus the two uvarints.
+func appendFrontCodedKey(blob *bytes.Buffer, k string, shared int) {
+	suffix := len(k) - shared
+	if shared <= 14 && suffix <= 14 {
+		blob.WriteByte(byte(shared<<4 | suffix))
+	} else {
+		var tmp [binary.MaxVarintLen64]byte
+		blob.WriteByte(contentFrontCodedEscape)
+		n := binary.PutUvarint(tmp[:], uint64(shared))
+		blob.Write(tmp[:n])
+		n = binary.PutUvarint(tmp[:], uint64(suffix))
+		blob.Write(tmp[:n])
+	}
+	blob.WriteString(k[shared:])
+}
+
+// decodeFrontCodedLens parses one record's length header at blob[pos].
+// next is the offset of the suffix bytes. ok is false on truncation.
+func decodeFrontCodedLens(blob []byte, pos int) (shared, suffixLen, next int, ok bool) {
+	if pos >= len(blob) {
+		return 0, 0, 0, false
+	}
+	if blob[pos] != contentFrontCodedEscape {
+		return int(blob[pos] >> 4), int(blob[pos] & 15), pos + 1, true
+	}
+	pos++
+	s, n := binary.Uvarint(blob[pos:])
+	if n <= 0 {
+		return 0, 0, 0, false
+	}
+	pos += n
+	l, n := binary.Uvarint(blob[pos:])
+	if n <= 0 {
+		return 0, 0, 0, false
+	}
+	pos += n
+	return int(s), int(l), pos, true
+}
+
+// decodeLegacyFrontCodedKey decodes one two-uvarint front-coded key record
+// (the CXPT paths framing). ok is false on truncation or a bad prefix length.
+func decodeLegacyFrontCodedKey(blob []byte, pos int, prev string) (key string, next int, ok bool) {
 	shared, n := binary.Uvarint(blob[pos:])
 	if n <= 0 {
 		return "", 0, false
@@ -262,6 +306,19 @@ func decodeFrontCodedKey(blob []byte, pos int, prev string) (key string, next in
 		return "", 0, false
 	}
 	return prev[:shared] + string(blob[pos:pos+int(suffixLen)]), pos + int(suffixLen), true
+}
+
+// decodeFrontCodedKey decodes one key at blob[pos] with the previous key for
+// its shared prefix. ok is false on truncation or a bad prefix length.
+func decodeFrontCodedKey(blob []byte, pos int, prev string) (key string, next int, ok bool) {
+	shared, suffixLen, spos, ok := decodeFrontCodedLens(blob, pos)
+	if !ok {
+		return "", 0, false
+	}
+	if shared > len(prev) || spos+suffixLen > len(blob) {
+		return "", 0, false
+	}
+	return prev[:shared] + string(blob[spos:spos+suffixLen]), spos + suffixLen, true
 }
 
 // keyAt decodes the i-th key (for tests and range-scan positioning).
@@ -337,21 +394,16 @@ func (d *contentTermDict) scanRange(lo, hi int, fn func(key []byte, df int) bool
 	var buf []byte
 	pos := d.restartIx[r]
 	for i := r * d.interval; i < hi; i++ {
-		shared, n := binary.Uvarint(d.blob[pos:])
-		if n <= 0 {
+		shared, suffixLen, spos, ok := decodeFrontCodedLens(d.blob, pos)
+		if !ok {
 			return
 		}
-		pos += n
-		suffixLen, n := binary.Uvarint(d.blob[pos:])
-		if n <= 0 {
+		pos = spos
+		if shared > len(buf) || pos+suffixLen > len(d.blob) {
 			return
 		}
-		pos += n
-		if int(shared) > len(buf) || pos+int(suffixLen) > len(d.blob) {
-			return
-		}
-		buf = append(buf[:shared], d.blob[pos:pos+int(suffixLen)]...)
-		pos += int(suffixLen)
+		buf = append(buf[:shared], d.blob[pos:pos+suffixLen]...)
+		pos += suffixLen
 		if i >= lo {
 			if !fn(buf, d.dfAt(i)) {
 				return

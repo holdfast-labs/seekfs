@@ -219,6 +219,49 @@ func TestContentServiceDisabledAndUnavailable(t *testing.T) {
 	}
 }
 
+// A service volume built over pruned postings answers identically to an
+// unpruned one through the full search/count path: shared dense terms scan,
+// rare terms intersect, absent terms stay empty.
+func TestContentServicePrunedIndexParity(t *testing.T) {
+	files := []contentFixtureFile{
+		{2, "a.txt", "common shared filler text here pinpointalpha"},
+		{3, "b.txt", "common shared filler text here pinpointbeta"},
+		{4, "c.txt", "common shared filler text here"},
+		{5, "d.txt", "common shared filler text here pinpointdelta"},
+		{6, "e.txt", "common shared filler text here"},
+		{7, "f.txt", "common shared filler text here pinpointphi"},
+		{8, "g.txt", "common shared filler text here"},
+		{9, "h.txt", "common shared filler text here pinpointeta"},
+	}
+	old := contentGramPruneDF
+	contentGramPruneDF = 4
+	prunedVol := newContentQueryVolume(t, files)
+	contentGramPruneDF = 1 << 30
+	plainVol := newContentQueryVolume(t, files)
+	contentGramPruneDF = old
+	for _, q := range []string{"content:common", "content:filler", "content:pinpointbeta", "content:zzznope", "content:\"shared filler\""} {
+		want, err := contentServiceSearch(t, plainVol, q, false)
+		if err != nil {
+			t.Fatalf("plain %s: %v", q, err)
+		}
+		got, err := contentServiceSearch(t, prunedVol, q, false)
+		if err != nil {
+			t.Fatalf("pruned %s: %v", q, err)
+		}
+		if len(got) != len(want) {
+			t.Fatalf("%s: pruned=%d plain=%d", q, len(got), len(want))
+		}
+		for i := range want {
+			if got[i].Name != want[i].Name || got[i].FRN != want[i].FRN {
+				t.Fatalf("%s hit %d: pruned %v, want %v", q, i, got[i], want[i])
+			}
+		}
+		if c := contentServiceCount(t, []*serviceVolumeIndex{prunedVol}, q); c != len(want) {
+			t.Fatalf("%s: pruned count=%d, want %d", q, c, len(want))
+		}
+	}
+}
+
 // TestContentServiceCandidatesSuperset is the consistency check: for a small
 // fixture the candidate set from contentCandidates must contain every record
 // the post-filtered search returns, and an empty candidate set must be a real
