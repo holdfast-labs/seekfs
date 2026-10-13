@@ -339,9 +339,11 @@ func searchCompactWithCacheHidden(idx *Index, opts queryOptions, countOnly bool,
 		}
 		// Counting mode skips path reconstruction when the query has no path
 		// constraint, and tallies the match instead of retaining an Entry.
+		// Walk-origin volumes always keep the path: their content
+		// resolution keys on it (see scanCandidateMatches).
 		withPath := true
 		if opts.contentCount != nil {
-			withPath = queryNeedsEntryPath(pq)
+			withPath = queryNeedsEntryPath(pq) || contentVol.contentWalkOriginAttached()
 		}
 		entry := compactEntryFromRecordPath(idx, recIndex, rec, pathCache, true, withPath)
 		if entryMatchesWithContentMatcher(contentVol, entry, pq, pq.MatchPath, contentMatcher) {
@@ -544,8 +546,10 @@ func compactCandidateEntryIfMatchIn(vol *serviceVolumeIndex, idx *Index, pq pars
 // query), it verifies against a path-free Entry: the scan discards the Entry,
 // and the returned candidate reconstructs its path downstream, so building one
 // here would be wasted work. Any query that reads a path keeps the full entry.
+// Walk-origin volumes always keep the full entry: their content resolution
+// keys on the entry path, so a path-free entry would miss every document.
 func scanCandidateMatches(vol *serviceVolumeIndex, idx *Index, pq parsedQuery, recIndex int, pathCache map[int]string, matcher *contentLeafMatcher) bool {
-	if matcher != nil && !queryNeedsEntryPath(pq) {
+	if matcher != nil && !queryNeedsEntryPath(pq) && !vol.contentWalkOriginAttached() {
 		rec := idx.compactRecord(recIndex)
 		if rec.Deleted || !compactRecordPrecheck(rec, pq, pq.MatchPath) {
 			return false
