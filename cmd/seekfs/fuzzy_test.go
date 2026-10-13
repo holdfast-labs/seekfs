@@ -596,6 +596,85 @@ func TestFuzzyNameDistanceMatchesWindowOracle(t *testing.T) {
 	}
 }
 
+func TestFuzzyDistanceScratchMatchesWrapper(t *testing.T) {
+	// The scratch (buffer-reuse + ASCII fast path + length prefilter) entry
+	// must agree with the allocating wrapper on every shape, including
+	// non-ASCII names, empty inputs, and the short-name decline. One scratch
+	// is reused across the whole corpus, so this also catches buffer aliasing
+	// between consecutive candidates.
+	names := []string{
+		"", "a", "ab", "chrome.exe", "browser_test.cc", "BUILD.gn",
+		"render_frame_sink_manager.cc", "x", "chrom", "chromebook",
+		"sodanco.txt", "Só Danço mix.mp3", "ｃｈｒｏｍｅ.txt", "mmm",
+		"a_b-c.d", "repeatedrepeatedrepeatedname",
+	}
+	terms := []string{"", "a", "chorme", "broswer", "chrome", "chrmae", "doccumnet", "sodanco", "mmm", "build"}
+	var sc fuzzyDistanceScratch
+	for _, name := range names {
+		for _, term := range terms {
+			for _, tau := range []int{1, 2} {
+				termRunes := []rune(term)
+				gd, gp, gw, gok := fuzzyNameDistance(name, term, tau)
+				sd, sp, sw, sok := fuzzyNameDistanceScratch(name, termRunes, asciiOnlyString(term), tau, &sc)
+				if gok != sok || (gok && (gd != sd || gp != sp || gw != sw)) {
+					t.Fatalf("scratch(%q, %q, %d) = %d/%v/%d/%v, wrapper %d/%v/%d/%v",
+						name, term, tau, sd, sp, sw, sok, gd, gp, gw, gok)
+				}
+				// The scratch must also agree with the window oracle on
+				// non-degenerate inputs (empty terms never reach fuzzy
+				// search: terms under 3 runes are declined up front, and
+				// the oracle disagrees with the wrapper there).
+				if term != "" {
+					wd, wp, ww, wok := fuzzyNameDistanceWindows(name, term, tau)
+					if gok != wok || (gok && (gd != wd || gp != wp || gw != ww)) {
+						t.Fatalf("wrapper(%q, %q, %d) = %d/%v/%d/%v, oracle %d/%v/%d/%v",
+							name, term, tau, gd, gp, gw, gok, wd, wp, ww, wok)
+					}
+				}
+			}
+		}
+	}
+}
+
+func TestDamerauBoundedReuseMatchesWrapper(t *testing.T) {
+	pairs := [][2]string{
+		{"", ""}, {"a", ""}, {"", "abc"}, {"kitten", "sitting"},
+		{"chrome", "chorme"}, {"chrome", "chrmae"}, {"abcdef", "abcfed"},
+		{"sodanco", "sodanco"}, {" Tocantins", "tocantins"},
+	}
+	var sc fuzzyDistanceScratch
+	for _, p := range pairs {
+		a, b := []rune(p[0]), []rune(p[1])
+		for _, max := range []int{0, 1, 2, 3} {
+			want := damerauLevenshteinBounded(a, b, max)
+			got := damerauLevenshteinBoundedReuse(a, b, max, &sc)
+			if got != want {
+				t.Fatalf("reuse(%q, %q, %d) = %d, want %d", p[0], p[1], max, got, want)
+			}
+		}
+	}
+}
+
+func TestFuzzyBestWindowAtReuseMatchesWrapper(t *testing.T) {
+	names := []string{"chrome.exe", "browser_test.cc", "render_frame.cc", "ab", "xochromey"}
+	terms := []string{"chorme", "broswer", "frame", "ab"}
+	var sc fuzzyDistanceScratch
+	for _, name := range names {
+		for _, term := range terms {
+			for _, tau := range []int{1, 2} {
+				for _, start := range []int{0, 1, 3} {
+					want := fuzzyBestWindowAt(name, term, start, tau)
+					got := fuzzyBestWindowAtReuse([]rune(name), []rune(term), start, tau, &sc)
+					if got != want {
+						t.Fatalf("reuse(%q, %q, start=%d, %d) = %q, want %q",
+							name, term, start, tau, got, want)
+					}
+				}
+			}
+		}
+	}
+}
+
 func TestFuzzyNameDistancePrefixPreference(t *testing.T) {
 	// Equal distance: prefix alignment wins.
 	dist, prefix, _, ok := fuzzyNameDistance("tonic.txt", "tonicx", 1)
