@@ -56,9 +56,10 @@ func contentScopeMemberIgnored(scope *contentScopeResolved, path string) bool {
 }
 
 // scopeSelectionKeys runs one fast selection scan and returns the selected
-// key fingerprints. ok is false when the base moved mid-scan (caller
-// reschedules) or the scan stopped.
-func (s *goSearchService) scopeSelectionKeys(vol *serviceVolumeIndex, scope *contentScopeResolved, idx *Index, gen uint64, isWalk bool) (map[uint64]contentFilePrint, bool) {
+// key fingerprints, plus each key's scan member (build priority, path and
+// size) for the reconcile budget. ok is false when the base moved mid-scan
+// (caller reschedules) or the scan stopped.
+func (s *goSearchService) scopeSelectionKeys(vol *serviceVolumeIndex, scope *contentScopeResolved, idx *Index, gen uint64, isWalk bool) (map[uint64]contentFilePrint, map[uint64]contentScopeMember, bool) {
 	cfg := contentScopeScanConfig{
 		scope:  scope,
 		idx:    idx,
@@ -73,18 +74,20 @@ func (s *goSearchService) scopeSelectionKeys(vol *serviceVolumeIndex, scope *con
 	}
 	lists, ok := scanScopeMembers(s, vol, cfg)
 	if !ok {
-		return nil, false
+		return nil, nil, false
 	}
 	out := make(map[uint64]contentFilePrint)
+	ranks := make(map[uint64]contentScopeMember)
 	for _, l := range lists {
 		for _, m := range l {
 			if contentScopeMemberIgnored(scope, m.path) {
 				continue
 			}
 			out[m.frn] = contentFilePrint{size: m.size, mod: m.mod}
+			ranks[m.frn] = m
 		}
 	}
-	return out, true
+	return out, ranks, true
 }
 
 // scopeDiffSelection diffs the current selection against a base doc table
@@ -191,11 +194,20 @@ func (s *goSearchService) scopeReconcile(vol *serviceVolumeIndex, idx *contentIn
 	gen := vol.replayGen.Load()
 	s.indexMu.RUnlock()
 	fp := scope.fingerprint()
-	selected, ok := s.scopeSelectionKeys(vol, &scope, base, gen, isWalk)
+	selected, ranks, ok := s.scopeSelectionKeys(vol, &scope, base, gen, isWalk)
 	if !ok {
 		return false
 	}
 	diff := scopeDiffSelection(selected, idx.Docs, vol.content.deltaView(), vol.content.walkDeclinedSkipped)
+	// Every enqueue here is new to the base: hold them to the budget the build
+	// used, so a reserve-truncated base does not read its own drops as drift.
+	// The threshold then weighs only what will actually be applied.
+	var leftOut int
+	var leftOutBytes int64
+	diff.enqueue, leftOut, leftOutBytes = contentReconcileTrimNew(diff.enqueue, ranks, contentReconcileNewAllowance(vol, idx, &scope))
+	if leftOut > 0 {
+		serviceLog("content scope reconcile volume=%s left out %d files (%d bytes) past the budget", vol.volume, leftOut, leftOutBytes)
+	}
 	if scopeDiffOverThreshold(diff, len(idx.Docs)) {
 		serviceLog("content scope diff volume=%s enqueue=%d drop=%d base=%d exceeds rebuild fraction; rebuilding",
 			vol.volume, len(diff.enqueue), len(diff.drop), len(idx.Docs))

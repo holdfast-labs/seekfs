@@ -1321,6 +1321,29 @@ write-time guard and its monotonic reserve are unchanged. Covered by
 `TestContentScopeReserve` (peak allowance, spool credit, fits/allowance
 agreement).
 
+## 6u. Reconcile honors the budget (done)
+
+Right after the §6t fix let the real E: index publish a reserve-truncated
+base (41,724 docs; 877,932 files / 11.9 GB dropped), the build's own drops
+came back as drift. The journal had wrapped during the build, and the
+metadata reconcile enqueued 925,450 files (every in-scope file without a
+doc). An ignore-file change then sent the scope reconcile past the rebuild
+fraction, which rebuilt and truncated the same way: a loop on any busy
+volume.
+
+Both reconciles now hold keys new to the base to the budget the build used
+(`content_reconcile_budget.go`): the explicit `budget_bytes` minus the text
+the base holds, or the reserve allowance on the sidecar volume. They are
+admitted in the build's priority order (`contentBuildItemLess`) while their
+file sizes fit, with the same latch as the build (once one misses, the rest
+stay out). Changed docs already in the base always re-extract. The scope
+rebuild fraction weighs only the trimmed diff. Covered by
+`TestContentReconcileTrimNew`,
+`TestContentScopeReconcileHonorsReserveForNewFiles` and
+`TestContentWrapReconcileHonorsReserveForNewFiles`; both reconcile tests
+fail without the gate (stale + rebuild; the new file extracted past the
+reserve).
+
 ## 7. Carried debt / known gaps
 
 - **Snippet case is preserved; no fixup-aware path remains.** The `.gsx` text
