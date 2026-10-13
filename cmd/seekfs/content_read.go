@@ -4,9 +4,12 @@ package main
 // generation, and substring verification against the stored text.
 
 import (
+	"bytes"
 	"errors"
+	"runtime"
 	"sort"
 	"strings"
+	"sync"
 	"unicode/utf8"
 )
 
@@ -80,13 +83,17 @@ func contentSnippetWindow(text []byte, off, matchLen int) string {
 	return string(window)
 }
 
-// contentReader is a decoded `.gsx` ready to query.
+// contentReader is a decoded `.gsx` ready to query. cache is the shared
+// decompressed-block cache: one per reader, shared across a composite's
+// shards, dropped with the reader. See contentBlockCache for lifetime and
+// pin-safety notes.
 type contentReader struct {
 	idx   *contentIndex
 	terms *contentTermDict
 	grams *contentPostingIndex
 	store *contentTextStore
 	paths []string
+	cache *contentBlockCache
 }
 
 // openContentReader decodes the queryable sections of idx.
@@ -95,7 +102,18 @@ func openContentReader(idx *contentIndex) (*contentReader, error) {
 		return nil, errors.New("nil content index")
 	}
 	if idx.shards != nil {
-		return &contentReader{idx: idx}, nil
+		// One cache for the whole composite: every shard reader shares
+		// it, so a query touching many shards still warms once.
+		r := &contentReader{idx: idx, cache: newContentBlockCache()}
+		for _, sh := range idx.shards {
+			if sh != nil && sh.reader != nil {
+				sh.reader.cache = r.cache
+				if sh.reader.store != nil {
+					sh.reader.store.cache = r.cache
+				}
+			}
+		}
+		return r, nil
 	}
 	r := &contentReader{
 		idx:   idx,
@@ -131,6 +149,10 @@ func openContentReader(idx *contentIndex) (*contentReader, error) {
 			return nil, err
 		}
 		r.store = st
+	}
+	r.cache = newContentBlockCache()
+	if r.store != nil {
+		r.store.cache = r.cache
 	}
 	return r, nil
 }
@@ -184,6 +206,53 @@ func (r *contentReader) search(term string, limit int) []contentHit {
 	if t == "" {
 		return nil
 	}
+	if contentSearchWorkers() < 2 {
+		return r.searchSerial(t, limit)
+	}
+	return r.searchParallel(t, limit, contentSearchWorkers())
+}
+
+// verifyDocContent tests one candidate document and builds its hit (nil when
+// the document does not match). It is the single verification both the
+// serial and parallel searches share, so their results are identical by
+// construction: same needle, same fold, same offset mapping, same window.
+// needle is the pre-folded query bytes, hoisted by the caller so a broad
+// query does not re-allocate it per document; matching runs on bytes, never
+// through a string conversion.
+func (r *contentReader) verifyDocContent(id uint32, needle []byte) *contentHit {
+	text := r.docText(id)
+	if len(text) == 0 {
+		return nil
+	}
+	// The stored text preserves case (PF-6a), so fold it for the
+	// case-insensitive match; the window is still taken from the original.
+	lower := contentFoldText(text)
+	off := bytes.Index(lower, needle)
+	if off < 0 {
+		return nil
+	}
+	// Folding preserves the rune index but not the byte offset: a
+	// byte-length-changing fold rune (İ 2->1, ẞ 3->2, KELVIN 3->1)
+	// shifts every later offset. Map both window boundaries back to
+	// the raw text in one pass, exactly as contentSnippet does, so the
+	// snippet windows the real bytes and Offset points at the raw match
+	// start.
+	rawOff, rawEnd := contentFoldSpanToRaw(text, lower, off, off+len(needle))
+	return &contentHit{
+		Path:    r.docPath(id),
+		DocID:   id,
+		Offset:  rawOff,
+		Snippet: contentSnippetWindow(text, rawOff, rawEnd-rawOff),
+	}
+}
+
+// searchSerial is the historical streaming search: candidates verify one at
+// a time in docID order, stopping at the limit.
+func (r *contentReader) searchSerial(t string, limit int) []contentHit {
+	if t == "" {
+		return nil
+	}
+	needle := []byte(t)
 	next := r.candidateStream(t)
 	var hits []contentHit
 	for {
@@ -191,32 +260,146 @@ func (r *contentReader) search(term string, limit int) []contentHit {
 		if !ok {
 			break
 		}
-		text := r.docText(id)
-		if len(text) == 0 {
-			continue
-		}
-		// The stored text preserves case (PF-6a), so fold it for the
-		// case-insensitive match; the window is still taken from the original.
-		lower := contentFoldText(text)
-		if off := strings.Index(string(lower), t); off >= 0 {
-			// Folding preserves the rune index but not the byte offset: a
-			// byte-length-changing fold rune (İ 2->1, ẞ 3->2, KELVIN 3->1)
-			// shifts every later offset. Map both window boundaries back to
-			// the raw text, exactly as contentSnippet does, so the snippet
-			// windows the real bytes and Offset points at the raw match start.
-			rawOff := contentFoldOffsetToRaw(text, lower, off)
-			rawEnd := contentFoldOffsetToRaw(text, lower, off+len(t))
-			hits = append(hits, contentHit{
-				Path:    r.docPath(id),
-				DocID:   id,
-				Offset:  rawOff,
-				Snippet: contentSnippetWindow(text, rawOff, rawEnd-rawOff),
-			})
+		if hit := r.verifyDocContent(id, needle); hit != nil {
+			hits = append(hits, *hit)
 			if limit > 0 && len(hits) >= limit {
 				break
 			}
 		}
 	}
+	return hits
+}
+
+// contentSearchMaxWorkers caps the parallel search fan-out: decode-bound
+// verification scales with cores, and past a handful of workers the ordered
+// merge and the shared block cache contend instead of helping.
+var contentSearchMaxWorkers = 8
+
+// contentSearchWorkers sizes the parallel search: GOMAXPROCS workers up to
+// the cap (1 keeps the zero-overhead serial path). A var-free func so tests
+// exercise both arms by pinning GOMAXPROCS.
+func contentSearchWorkers() int {
+	n := runtime.GOMAXPROCS(0)
+	if n < 1 {
+		n = 1
+	}
+	if n > contentSearchMaxWorkers {
+		n = contentSearchMaxWorkers
+	}
+	return n
+}
+
+// contentSearchJob is one candidate for the parallel verifier: seq numbers
+// the candidateStream order (ascending docIDs), so the merger restores the
+// exact serial order regardless of which worker finishes first.
+type contentSearchJob struct {
+	seq uint64
+	id  uint32
+}
+
+// contentSearchResult is one verified candidate: hit is nil for a miss, but
+// every job reports (hit or miss) so the merger can advance past it.
+type contentSearchResult struct {
+	seq uint64
+	hit *contentHit
+}
+
+// searchParallel verifies candidates across workers (bounded by
+// contentSearchWorkers) and merges hits in candidate order with the exact
+// serial limit. Verification is CPU-bound (block decompress + fold +
+// substring), so workers scale near-linearly; the feeder, the merger and the
+// limit accounting stay single-threaded. Over-verification past an early
+// limit is bounded by the channel buffer plus one job per worker.
+func (r *contentReader) searchParallel(t string, limit int, workers int) []contentHit {
+	if t == "" {
+		return nil
+	}
+	if workers < 2 {
+		return r.searchSerial(t, limit)
+	}
+	needle := []byte(t)
+	next := r.candidateStream(t)
+	quit := make(chan struct{})
+	var quitOnce sync.Once
+	stop := func() { quitOnce.Do(func() { close(quit) }) }
+	defer stop()
+	work := make(chan contentSearchJob, 64)
+	out := make(chan contentSearchResult, 64)
+	var wg sync.WaitGroup
+	// Feeder: the only goroutine that pulls the candidate stream.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		defer close(work)
+		var seq uint64
+		for {
+			id, ok := next()
+			if !ok {
+				return
+			}
+			select {
+			case work <- contentSearchJob{seq: seq, id: id}:
+				seq++
+			case <-quit:
+				return
+			}
+		}
+	}()
+	// Workers: verify only; no ordering, no limits here.
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case job, ok := <-work:
+					if !ok {
+						return
+					}
+					hit := r.verifyDocContent(job.id, needle)
+					select {
+					case out <- contentSearchResult{seq: job.seq, hit: hit}:
+					case <-quit:
+						return
+					}
+				case <-quit:
+					return
+				}
+			}
+		}()
+	}
+	// Closer: once the feeder and every worker are done, no more results.
+	go func() {
+		wg.Wait()
+		close(out)
+	}()
+	// Merger (this goroutine): emit in stream order, stopping at exactly
+	// the limit like the serial path (one emit batch can hold several
+	// ready hits, so the limit is enforced inside emit, not after it).
+	var hits []contentHit
+	pending := make(map[uint64]*contentHit)
+	var expect uint64
+	emit := func() bool {
+		for limit <= 0 || len(hits) < limit {
+			hit, ok := pending[expect]
+			if !ok {
+				return true
+			}
+			delete(pending, expect)
+			expect++
+			if hit != nil {
+				hits = append(hits, *hit)
+			}
+		}
+		return false
+	}
+	for res := range out {
+		pending[res.seq] = res.hit
+		if !emit() {
+			return hits
+		}
+	}
+	emit()
 	return hits
 }
 

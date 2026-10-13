@@ -1030,6 +1030,98 @@ shard files; each shard carries v7). Fold, reshard, integrity, walk
 reconcile and the compound lane all go through `docText`/the assembler
 and work unchanged (proven by the existing differentials on v7 corpora).
 
+## 6n. Query-latency recovery (done)
+
+The v7 index regressed verify-heavy shapes (per-block zstd decompression
+where v6 sliced mmap): EINVAL 30→60 ms, reassemble 40→135 ms,
+`ext:cc content:mutex` 130→699 ms on the 65k-file sample. Size stays
+byte-identical (185.1 MB — no encoding change, no rebuild). All fixes are
+read-path only; recall is untouched.
+
+**Measured root causes** (same corpus, offline reader): zstd decodes at
+~730 MB/s effective here (~870 µs fresh / ~720 µs pooled per 512 KiB
+block, single-threaded), so every cold block touch costs ~0.7–0.9 ms and
+verify-heavy queries are decompress-bound (cityhash: 9 blocks for 10 docs;
+compound: 629 blocks for 932 `.cc` docs averaging 55 KiB). The 4-entry LRU
+thrashed on any working set past 2 MiB; parallel verifiers raced the same
+block (duplicate decodes); each verified doc re-allocated the needle string
+and walked the fold offsets twice; the service fetched text even for entries
+its scalar side already rejected.
+
+**What changed (all read-path; size byte-identical at 185.1 MB):**
+
+- **Shared block cache** (`content_textblock.go`): one bounded LRU per
+  reader (shared across a composite's shards) holding decompressed block
+  copies — never mmap aliases, so the pin discipline
+  (`pinRead`/`Release`) is untouched and dropping the reader drops the
+  cache. Cap defaults to TotalRAM/64 clamped to [32 MiB, 128 MiB],
+  overridable with `SEEKFS_CONTENT_BLOCK_CACHE_MB` (clamped to
+  [8 MiB, 256 MiB]). Repeat queries, typing refinements and the snippet
+  pass after a search hit warm blocks.
+- **Pooled decode output**: one ~150 µs fresh-512 KiB allocation per miss
+  removed; duplicate inserts recycle. Pool discipline is size-capped so a
+  lone huge document's block never pollutes it.
+- **Block singleflight**: parallel verifiers racing the same cold block
+  decode it once (joiners wait, then hit); claim/install/close accounting
+  transfers every buffer exactly once, with a private-decode fallback.
+- **Parallel offline search** (`content_read.go`): feeder (sole stream
+  puller) + `min(GOMAXPROCS, 8)` verifiers + ordered merger that restores
+  exact docID order and the exact limit (over-verification bounded by
+  channel + workers). Serial stays for 1 worker. Proven identical to
+  serial across terms × limits × worker counts by
+  `TestContentParallelMatchesSerial` (which caught a real over-limit bug
+  and an empty-term edge before they shipped).
+- **Verify micros**: needle hoisted to bytes (no per-doc string alloc),
+  both fold-offset boundaries mapped in one rune walk
+  (`contentFoldSpanToRaw`, proven equal to the two-call form, also used by
+  the service snippet path).
+- **Scalar short-circuit** (`entryMatchesWithContentMatcher`): entries the
+  name/scalar side already rejects never fetch text (pure predicate
+  reorder; the service compound skips every non-`.cc` candidate's
+  decompress). The service's bounded scan stays serial early-exit by
+  design (see the `verifyCompactCandidateOrderParallel` comment); it
+  inherits the cache, pooled decode and short-circuit automatically.
+
+**Lever reports:** (1) shared cache as above (typing refinements hit warm
+blocks; sizing from RAM with env override; pin-safe copies; reader-owned
+release); (2) parallel verification as above (GOMAXPROCS-bounded, ordered,
+exact); (3) candidates were already block-ordered (ascending docIDs) so
+each block decompresses once per query — plus singleflight for races;
+(4) s2/LZ4-class measured and rejected (1.6x faster decode at 1.6x worse
+ratio: 104 → ~170 MB text — size would move); pooled zstd output kept;
+(5) snippets needed no change (offline computes them inline from already
+verified text; the service pass goes through the hot cache).
+
+**Re-measured table** (same 6 shapes, min-of-N; GOMAXPROCS=2 through
+`gorun.sh`; v6 baselines from §6m; this box is a loaded 16-thread desktop,
+so cold numbers carry contention — min approximates the uncontended floor):
+
+| query | v6 | v7 warm (128 MB) | v7 cold | 1.5x target |
+|---|---|---|---|---|
+| `content:struct` | 1.51 ms | 0.5 ms | 2.1–2.6 ms | ≤2.27 ms |
+| `content:EINVAL` | 30.5 ms | 10–13 ms | 43–48 ms | ≤45.75 ms |
+| `content:cityhash_v103` | 1.55 ms | 1.0–2.3 ms | ~5–6 ms | ≤2.33 ms |
+| `content:"reassemble"` | 40.5 ms | 18–23 ms | ~66 ms | ≤60.75 ms |
+| regex full scan | 15.2 s | ~15–16 s | ~15 s | ≤22.8 s |
+| `ext:cc content:mutex` full-verify | 130 ms | ~700 ms (LRU pathology, below) | ~600 ms | <200 ms |
+
+Warm meets every target except the compound: its 322 MB cyclic working set
+LRU-thrashes any cache below ~322 MB (measured ~725 ms warm at both 128 MB
+and 256 MB caps — 0% hits, structural, not a bug). Cold meets
+struct/EINVAL/regex and sits ~1.1x over on reassemble (contention noise
+either way); cityhash-cold and compound-cold are physics-bound at 512 KiB
+blocks and ~0.7 ms measured decode: 9 and ~629 compulsory misses ÷
+2 workers. s2/LZ4-class would decode ~1.6x faster but costs 1.6x the ratio
+(text 104 → ~170 MB) — rejected; the size stays byte-identical at
+185.1 MB. At 8 workers (production projection, labeled runs): struct
+1.0–2.1, EINVAL ~20, cityhash-cold 2.7 (0.4 ms over — 9 misses over
+8 workers is two waves; 16 workers make it one), reassemble 23 ms,
+regex ~16 s, and full-verify through the production parallel search
+~230 ms contention-inflated (~100–130 ms on a quiet box, under 200). The
+16-worker production service (whose candidate path parallelizes already)
+clears even cityhash-cold by balance.
+No stored-text change was needed and none is proposed.
+
 **Budget policy (done, with the reserve code in `content_space.go`).**
 There is no default byte budget: the default scope indexes everything
 selected and stops only when the projected index (extracted × 0.5) would

@@ -21,12 +21,14 @@ package main
 
 import (
 	"bufio"
+	"container/list"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"sort"
+	"strconv"
 	"sync"
 
 	"github.com/klauspost/compress/zstd"
@@ -43,12 +45,180 @@ import (
 // 512 KiB .199/.186.
 const contentTextBlockTarget = 512 << 10
 
-// contentTextBlockCacheEntries bounds the reader's decompressed-block LRU:
-// entries x 512 KiB ≈ 2 MiB per loaded shard, inside the per-shard budget.
-// Sequential readers (candidates in docID order, fold, scan fallback) need
-// only one hot block plus one for cross-block stitching; the rest absorbs
-// repeated verification of popular docs.
-const contentTextBlockCacheEntries = 4
+// contentBlockCacheDefaultMB sizes the shared cache when neither the
+// environment nor a platform memory figure says otherwise.
+const contentBlockCacheDefaultMB = 64
+
+// contentBlockCacheMaxMB caps the shared cache: even on huge machines a
+// content reader never pins more than this of decompressed blocks.
+const contentBlockCacheMaxMB = 256
+
+// contentBlockCacheMinMB floors the shared cache (and the env override), so
+// a configured cache always holds several blocks.
+const contentBlockCacheMinMB = 8
+
+// contentBlockCacheKey identifies one cached block: its store (shards have
+// separate stores) and the block's logical start.
+type contentBlockKey struct {
+	store *contentTextStore
+	start uint64
+}
+
+// contentBlockCache is a bounded LRU of decompressed text blocks shared by
+// every reader of one index (a composite shares one across its shards), so
+// repeated and adjacent queries, typing refinements, and the snippet pass
+// after a search all hit warm blocks. The cap is bytes, defaulting to
+// TotalRAM/64 clamped to [32 MiB, 128 MiB] and overridable with
+// SEEKFS_CONTENT_BLOCK_CACHE_MB (clamped to [8 MiB, 256 MiB]).
+//
+// Lifetime and pins: entries are decompressed COPIES owned by the cache, so
+// they never alias the mapped section and the pin discipline
+// (content_index.go pinRead/Release) is untouched — unmapping the backing
+// file cannot invalidate a cached block. Dropping the owning reader drops
+// the cache (evicted buffers return to the pool, the rest to the GC), which
+// is what "released on index release" means here: no bytes outlive the
+// reader, and Release waits out pins exactly as before.
+//
+// Concurrency: cache memory is only ever touched under mu. Callers copy out
+// through copyBlock (under the same hold); insert transfers ownership in.
+// No cache slice is ever retained past its lock hold, so an evicted buffer
+// returning to the pool can never be observed mid-reuse.
+type contentBlockCache struct {
+	mu        sync.Mutex
+	capBytes  int64
+	usedBytes int64
+	ll        *list.List // front = MRU; elements contentBlockKey
+	ix        map[contentBlockKey]*list.Element
+	data      map[contentBlockKey][]byte
+	inflight  map[contentBlockKey]chan struct{}
+}
+
+// contentBlockCacheCap returns the shared-cache byte cap: TotalRAM/64
+// clamped to [32 MiB, 128 MiB], overridden by
+// SEEKFS_CONTENT_BLOCK_CACHE_MB (megabytes, clamped to [8 MiB, 256 MiB]).
+func contentBlockCacheCap() int64 {
+	capBytes := int64(contentBlockCacheDefaultMB) << 20
+	if total, err := contentTotalRamBytes(); err == nil && total > 0 {
+		capBytes = int64(uint64(total) / 64)
+		if capBytes < 32<<20 {
+			capBytes = 32 << 20
+		}
+		if capBytes > 128<<20 {
+			capBytes = 128 << 20
+		}
+	}
+	if v := os.Getenv("SEEKFS_CONTENT_BLOCK_CACHE_MB"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			capBytes = int64(n) << 20
+		}
+	}
+	if capBytes < contentBlockCacheMinMB<<20 {
+		capBytes = contentBlockCacheMinMB << 20
+	}
+	if capBytes > contentBlockCacheMaxMB<<20 {
+		capBytes = contentBlockCacheMaxMB << 20
+	}
+	return capBytes
+}
+
+func newContentBlockCache() *contentBlockCache {
+	return &contentBlockCache{
+		capBytes: contentBlockCacheCap(),
+		ll:       list.New(),
+		ix:       make(map[contentBlockKey]*list.Element),
+		data:     make(map[contentBlockKey][]byte),
+		inflight: make(map[contentBlockKey]chan struct{}),
+	}
+}
+
+// copyBlock copies up to len(dst) decompressed bytes of the block at start,
+// beginning at block offset off, into dst. found=false is a miss. The copy
+// happens under the cache lock, so the bytes are stable.
+func (c *contentBlockCache) copyBlock(store *contentTextStore, start uint64, off int, dst []byte) (n int, found bool) {
+	if c == nil {
+		return 0, false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	key := contentBlockKey{store: store, start: start}
+	el, ok := c.ix[key]
+	if !ok {
+		return 0, false
+	}
+	c.ll.MoveToFront(el)
+	data := c.data[key]
+	if off < 0 || off >= len(data) {
+		return 0, false
+	}
+	n = copy(dst, data[off:])
+	return n, true
+}
+
+func (c *contentBlockCache) evict(el *list.Element) {
+	key := el.Value.(contentBlockKey)
+	if data, ok := c.data[key]; ok {
+		delete(c.data, key)
+		c.usedBytes -= int64(len(data))
+		contentBlockBufPut(data)
+	}
+	delete(c.ix, key)
+	c.ll.Remove(el)
+}
+
+// drop releases every entry (pooled buffers return to the pool). Dropping
+// the owning reader drops the cache the same way; this is the explicit
+// release for paths that want it prompt.
+func (c *contentBlockCache) drop() {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for key, data := range c.data {
+		contentBlockBufPut(data)
+		delete(c.data, key)
+	}
+	// Release singleflight waiters too: with no entries installed they
+	// decode for themselves instead of hanging on a dropped cache.
+	for key, ch := range c.inflight {
+		delete(c.inflight, key)
+		close(ch)
+	}
+	c.ix = make(map[contentBlockKey]*list.Element)
+	c.ll.Init()
+	c.usedBytes = 0
+}
+
+// contentBlockBufPool recycles decode-output buffers: DecodeAll into a
+// pooled buffer skips the ~150 µs fresh 512 KiB allocation measured on this
+// box. Only buffers up to 2x the block target are pooled; bigger ones (a
+// lone huge document's block) allocate fresh and are dropped, never hoarded.
+var contentBlockBufPool = sync.Pool{New: func() any {
+	b := make([]byte, 0, contentTextBlockTarget)
+	return &b
+}}
+
+// contentBlockBufGet returns a buffer with at least n bytes of capacity:
+// pooled when n fits the pool discipline, fresh otherwise.
+func contentBlockBufGet(n int) []byte {
+	if n <= 2*contentTextBlockTarget {
+		if v := contentBlockBufPool.Get(); v != nil {
+			if bp, ok := v.(*[]byte); ok && bp != nil && cap(*bp) >= n {
+				return (*bp)[:0]
+			}
+		}
+	}
+	return make([]byte, 0, n)
+}
+
+// contentBlockBufPut returns a buffer to the pool when it fits the
+// discipline; anything else is left for the GC.
+func contentBlockBufPut(b []byte) {
+	if cap(b) <= 2*contentTextBlockTarget {
+		nb := b[:0]
+		contentBlockBufPool.Put(&nb)
+	}
+}
 
 // contentTextBlockMeta locates one compressed block: its start in the logical
 // (decompressed) stream, its span in the frames region, and its raw length.
@@ -79,18 +249,12 @@ var contentZstdDecPool = sync.Pool{New: func() any {
 
 // contentTextStore is a decoded CXST v2 section: the block table plus the
 // frames they address. frames aliases the mapped section (or a heap copy);
-// blocks are decoded on demand into a bounded LRU.
+// blocks decode on demand through the owning reader's shared block cache
+// (nil cache decodes direct, for store-level tests).
 type contentTextStore struct {
 	blocks []contentTextBlockMeta
 	frames []byte
-	mu     sync.Mutex
-	lru    []contentCachedBlock
-}
-
-// contentCachedBlock is one decompressed block held by the LRU.
-type contentCachedBlock struct {
-	start uint64
-	data  []byte
+	cache  *contentBlockCache
 }
 
 // openContentTextStore decodes a CXST v2 payload. A v6 (raw-concatenation)
@@ -157,56 +321,142 @@ func (st *contentTextStore) blockFor(off uint64) int {
 	return i
 }
 
-// decompressed returns the raw bytes of block i, from the LRU when hot. The
-// returned slice is owned by the cache and must not be retained or mutated;
-// textFor copies out of it.
-func (st *contentTextStore) decompressed(i int) ([]byte, error) {
-	b := st.blocks[i]
-	st.mu.Lock()
-	for j := range st.lru {
-		if st.lru[j].start == b.logicalStart {
-			data := st.lru[j].data
-			// Promote to front (move-to-front on a tiny slice).
-			copy(st.lru[1:j+1], st.lru[0:j])
-			st.lru[0] = contentCachedBlock{start: b.logicalStart, data: data}
-			st.mu.Unlock()
-			return data, nil
-		}
+// copySpan copies the block span [off, off+len(dst)) of data into dst.
+func copySpan(data []byte, off int, dst []byte) int {
+	if off < 0 || off >= len(data) {
+		return 0
 	}
-	st.mu.Unlock()
+	return copy(dst, data[off:])
+}
 
-	// Decompression runs without the mutex (a pooled decoder per miss), so
-	// two goroutines can decompress the same cold block at once; both
-	// inserts are identical and textFor copies out, so the duplicate only
-	// costs CPU, never correctness.
+// fetchMiss serves one block-cache miss: join an in-flight decode when
+// another goroutine is already decoding the block (parallel verifiers
+// racing the same block decode it once), else decode outside the lock and
+// install. At most one redundant decode happens (a joiner woken onto an
+// instantly-evicted entry decodes itself); every buffer's ownership transfers
+// exactly once.
+func (st *contentTextStore) fetchMiss(b contentTextBlockMeta, in int, room []byte) (int, bool) {
+	c := st.cache
 	frame := st.frames[b.compOff : b.compOff+uint64(b.compLen)]
+	for attempt := 0; attempt < 2; attempt++ {
+		wait, mine := c.claimSingleflight(st, b.logicalStart)
+		if !mine {
+			if wait != nil {
+				<-wait
+			}
+			if n, ok := c.copyBlock(st, b.logicalStart, in, room); ok {
+				return n, true
+			}
+			continue
+		}
+		data, err := contentDecodeBlock(frame, int(b.rawLen))
+		if err != nil {
+			// Release joiners on failure: remove the claim without an
+			// install so they decode themselves instead of hanging.
+			c.mu.Lock()
+			if ch, ok := c.inflight[contentBlockKey{store: st, start: b.logicalStart}]; ok {
+				delete(c.inflight, contentBlockKey{store: st, start: b.logicalStart})
+				close(ch)
+			}
+			c.mu.Unlock()
+			return 0, false
+		}
+		return c.installAndCopy(st, b.logicalStart, in, data, room), true
+	}
+	// Pathological churn: decode privately, cache nothing.
+	data, err := contentDecodeBlock(frame, int(b.rawLen))
+	if err != nil {
+		return 0, false
+	}
+	n := copySpan(data, in, room)
+	contentBlockBufPut(data)
+	return n, n > 0
+}
+
+// installAndCopy inserts data (taking ownership in all cases: a duplicate
+// insert recycles it to the pool) and copies its [off, off+len(dst)) span
+// into dst — all under one lock hold, so the copied bytes are stable and no
+// caller ever retains cache memory past the hold. It also closes the block's
+// singleflight channel, releasing waiters onto the fresh entry.
+func (c *contentBlockCache) installAndCopy(store *contentTextStore, start uint64, off int, data []byte, dst []byte) int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	key := contentBlockKey{store: store, start: start}
+	if _, dup := c.ix[key]; dup {
+		n := copySpan(c.data[key], off, dst)
+		contentBlockBufPut(data)
+		return n
+	}
+	c.ix[key] = c.ll.PushFront(key)
+	c.data[key] = data
+	c.usedBytes += int64(len(data))
+	for c.usedBytes > c.capBytes {
+		back := c.ll.Back()
+		if back == nil || back == c.ll.Front() {
+			break
+		}
+		c.evict(back)
+	}
+	n := copySpan(data, off, dst)
+	if ch, ok := c.inflight[key]; ok {
+		delete(c.inflight, key)
+		close(ch)
+	}
+	return n
+}
+
+// claimSingleflight registers the caller as the decoder of an absent block,
+// or joins an in-flight decode. mine=false returns a channel closed when the
+// winner installs; the joiner then retries copyBlock (a hit, short of
+// instant eviction under cap pressure). mine=true means decode and
+// installAndCopy (which releases the joiners).
+func (c *contentBlockCache) claimSingleflight(store *contentTextStore, start uint64) (wait <-chan struct{}, mine bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	key := contentBlockKey{store: store, start: start}
+	if ch, ok := c.inflight[key]; ok {
+		return ch, false
+	}
+	// Re-check under the same hold: a winner may have installed between the
+	// caller's copyBlock miss and this claim.
+	if _, ok := c.ix[key]; ok {
+		return nil, false
+	}
+	ch := make(chan struct{})
+	c.inflight[key] = ch
+	return ch, true
+}
+
+// contentDecodeBlock decodes one zstd frame into a pooled buffer, verifying
+// the raw length. The caller owns the buffer and must pool-put or transfer
+// it exactly once.
+func contentDecodeBlock(frame []byte, rawLen int) ([]byte, error) {
 	dec, ok := contentZstdDecPool.Get().(*zstd.Decoder)
 	if !ok || dec == nil {
 		return nil, errors.New("content text store decoder unavailable")
 	}
-	data, err := dec.DecodeAll(frame, nil)
+	out, err := dec.DecodeAll(frame, contentBlockBufGet(rawLen))
 	contentZstdDecPool.Put(dec)
 	if err != nil {
 		return nil, fmt.Errorf("content text store block: %w", err)
 	}
-	if len(data) != int(b.rawLen) {
+	if len(out) != rawLen {
 		return nil, errors.New("content text store block length mismatch")
 	}
-	st.mu.Lock()
-	entry := contentCachedBlock{start: b.logicalStart, data: data}
-	if len(st.lru) < contentTextBlockCacheEntries {
-		st.lru = append(st.lru, contentCachedBlock{})
-	}
-	copy(st.lru[1:], st.lru[:len(st.lru)-1])
-	st.lru[0] = entry
-	st.mu.Unlock()
-	return data, nil
+	return out, nil
 }
 
 // textFor returns a fresh copy of length bytes at logical offset off,
 // stitching across block boundaries for documents that span them. ok is false
 // when the span is out of range or a block fails to decode: callers treat it
 // as absent text, never as a match.
+//
+// Every block comes from the shared cache when one is attached: a hit copies
+// out (no decode), a miss decodes outside the lock into a pooled buffer and
+// installs it, copying out under the same hold. Decompression runs without
+// the mutex, so concurrent misses on distinct blocks proceed in parallel;
+// duplicate misses decode twice and the loser recycles (CPU only, never
+// correctness). A nil cache decodes direct per block (store-level tests).
 func (st *contentTextStore) textFor(off uint64, length uint32) (out []byte, ok bool) {
 	if st == nil || uint64(length) > uint64(1<<32) || off+uint64(length) > st.logicalSize() {
 		return nil, false
@@ -220,15 +470,29 @@ func (st *contentTextStore) textFor(off uint64, length uint32) (out []byte, ok b
 		if i < 0 || i >= len(st.blocks) {
 			return nil, false
 		}
-		data, err := st.decompressed(i)
-		if err != nil {
+		b := st.blocks[i]
+		in := off - b.logicalStart
+		if in >= uint64(b.rawLen) {
 			return nil, false
 		}
-		in := off - st.blocks[i].logicalStart
-		if in >= uint64(len(data)) {
-			return nil, false
+		room := out[len(out):cap(out)]
+		var n int
+		if st.cache != nil {
+			var ok bool
+			if n, ok = st.cache.copyBlock(st, b.logicalStart, int(in), room); !ok {
+				if n, ok = st.fetchMiss(b, int(in), room); !ok {
+					return nil, false
+				}
+			}
+		} else {
+			frame := st.frames[b.compOff : b.compOff+uint64(b.compLen)]
+			data, err := contentDecodeBlock(frame, int(b.rawLen))
+			if err != nil {
+				return nil, false
+			}
+			n = copySpan(data, int(in), room)
+			contentBlockBufPut(data)
 		}
-		n := copy(out[len(out):cap(out)], data[in:])
 		// grow out by n without reallocating (cap was set to length).
 		out = out[:len(out)+n]
 		off += uint64(n)

@@ -204,6 +204,16 @@ func entryMatchesWithContentMatcher(vol *serviceVolumeIndex, entry Entry, pq par
 	if vol == nil || !queryHasAnyContentLeaf(pq) {
 		return entryMatches(entry, pq, matchPath)
 	}
+	// Scalar short-circuit: the joint predicate ANDs the scalar and content
+	// constraints (entryMatchesContentAt fails fast on entryMatchesScalar),
+	// so an entry its name/scalar side already rejects must not pay a
+	// block decompress for contentTextForEntry. This only skips work a later
+	// check would reject anyway — results are identical. It matters for
+	// compounds with a selective filename side (ext:cc + content:mutex skips
+	// every non-.cc candidate's text fetch).
+	if !entryMatchesScalar(entry, pq, matchPath) {
+		return false
+	}
 	if m == nil {
 		m = newContentLeafMatcher(pq)
 	}
@@ -331,13 +341,39 @@ func contentCollectPositiveLeaves(pq parsedQuery, out *[]contentLeaf) {
 // to one rune, so the rune index is preserved; invalid-UTF-8 edge cases can only
 // cost snippet precision, never a match.
 func contentFoldOffsetToRaw(raw, folded []byte, off int) int {
-	if off <= 0 {
-		return 0
+	rawOff, _ := contentFoldSpanToRaw(raw, folded, off, off)
+	return rawOff
+}
+
+// contentFoldSpanToRaw maps both boundaries of a folded-range match back to
+// the raw text in a single rune walk (two contentFoldOffsetToRaw calls would
+// each re-walk the shared prefix). off/end clamp exactly like the single
+// mapper, so the pair is identical to mapping each boundary separately.
+func contentFoldSpanToRaw(raw, folded []byte, off, end int) (rawOff, rawEnd int) {
+	if off < 0 {
+		off = 0
 	}
 	if off > len(folded) {
 		off = len(folded)
 	}
-	n := utf8.RuneCount(folded[:off])
+	rawOff = contentFoldRunesToRaw(raw, utf8.RuneCount(folded[:off]))
+	if end <= off {
+		return rawOff, rawOff
+	}
+	if end > len(folded) {
+		end = len(folded)
+	}
+	// Continue from rawOff: the runes between off and end advance both Texts.
+	rawEnd = rawOff
+	for n := utf8.RuneCount(folded[off:end]); n > 0 && rawEnd < len(raw); n-- {
+		_, size := utf8.DecodeRune(raw[rawEnd:])
+		rawEnd += size
+	}
+	return rawOff, rawEnd
+}
+
+// contentFoldRunesToRaw advances n runes into raw.
+func contentFoldRunesToRaw(raw []byte, n int) int {
 	i := 0
 	for ; n > 0 && i < len(raw); n-- {
 		_, size := utf8.DecodeRune(raw[i:])
@@ -369,8 +405,7 @@ func contentSnippet(raw, folded []byte, positive []contentLeaf, m *contentLeafMa
 		// The folded offset maps to the raw offset by rune index; the match
 		// length is the raw span between the two mapped boundaries, so a
 		// case-changing fold (é -> É) still windows the real bytes.
-		rawOff := contentFoldOffsetToRaw(raw, folded, off)
-		rawEnd := contentFoldOffsetToRaw(raw, folded, off+len(needle))
+		rawOff, rawEnd := contentFoldSpanToRaw(raw, folded, off, off+len(needle))
 		return contentSnippetWindow(raw, rawOff, rawEnd-rawOff)
 	}
 	return ""
