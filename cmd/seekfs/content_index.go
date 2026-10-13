@@ -968,8 +968,13 @@ func contentSaveAssembled(path string, idx *contentIndex, files map[uint32]strin
 	if _, err := tmp.WriteAt(header, 0); err != nil {
 		return fail(err)
 	}
-	if err := tmp.Sync(); err != nil {
-		return fail(err)
+	tSync := time.Now()
+	syncErr := tmp.Sync()
+	if pc := contentAssemblePhaseCapture; pc != nil {
+		contentPhaseAdd(&pc.saveFsync, time.Since(tSync))
+	}
+	if syncErr != nil {
+		return fail(syncErr)
 	}
 	if err := tmp.Close(); err != nil {
 		_ = os.Remove(name)

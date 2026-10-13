@@ -28,6 +28,7 @@ import (
 	"io"
 	"os"
 	"sort"
+	"time"
 )
 
 // contentSectionFileBufSize is the buffered-I/O size for spilling a finished
@@ -125,6 +126,13 @@ func (b *contentExternalSectionBuilder) spill() error {
 	if len(b.buf) == 0 {
 		return nil
 	}
+	t0 := time.Now()
+	defer func() {
+		if pc := contentAssemblePhaseCapture; pc != nil {
+			contentPhaseAdd(&pc.spillSort, time.Since(t0))
+			contentPhaseAdd(&pc.spills, time.Duration(1))
+		}
+	}()
 	if contentExternalSortWorkers(len(b.buf)) < 2 {
 		sort.Sort(contentExternalRecordSlice(b.buf))
 		return b.spillSorted()
@@ -482,7 +490,11 @@ func (b *contentExternalSectionBuilder) FinishFile(path string) error {
 	if err != nil {
 		return err
 	}
+	tMerge := time.Now()
 	asm, cleanup, err := b.mergeInto(blocks)
+	if pc := contentAssemblePhaseCapture; pc != nil {
+		contentPhaseAdd(&pc.mergeGram, time.Since(tMerge))
+	}
 	if cleanup != nil {
 		defer cleanup()
 	}
@@ -492,7 +504,12 @@ func (b *contentExternalSectionBuilder) FinishFile(path string) error {
 	if asm == nil {
 		return nil
 	}
-	if err := asm.writeFile(path); err != nil {
+	tWrite := time.Now()
+	err = asm.writeFile(path)
+	if pc := contentAssemblePhaseCapture; pc != nil {
+		contentPhaseAdd(&pc.writeGram, time.Since(tWrite))
+	}
+	if err != nil {
 		return err
 	}
 	b.removeRuns()

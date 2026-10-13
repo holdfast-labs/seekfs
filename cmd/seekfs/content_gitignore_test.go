@@ -311,6 +311,61 @@ func TestContentIgnoreDigestTracksGlobalFile(t *testing.T) {
 	}
 }
 
+// The file-only dispatch (matchFile) must return exactly what match returns
+// for files at every level: negations and dirOnly patterns matching an
+// intermediate component are load-bearing for precedence (a real
+// `.gemini/.gitignore` dropped 18 files when they were skipped), while only
+// non-negated, non-dirOnly exact/affix shapes take the basename shortcut.
+func TestContentIgnoreMatchFileMatchesMatch(t *testing.T) {
+	datas := []string{
+		// The .gemini regression: !commands/ (negated dirOnly) shadows /*.
+		"/*\n!.gitignore\n!commands/\n!OWNERS\n!.style.mdformat\n!policies/\n/policies/*\n!/policies/README.md\n",
+		// Negated suffix over suffix, anchored, case, dirOnly, globs.
+		"*.log\n!keep.log\n/build-cache\n/GEMINI.md\nout/\n!out/keep\n*.tmp\n",
+		// Prefix/suffix/exact/rest/dirOnly/** interplay.
+		"prefix*\n*suffix\nתקexact\nfoo]bar\n*~\n**/deep/*.dat\nmid/**/tail\n",
+		// Bare star and odd shapes stay on the full path.
+		"*\n**\na*b\n?single\n[abc].o\n",
+	}
+	compSets := [][]string{
+		{"repo", "commands", "PRESUBMIT.py"},
+		{"repo", ".gemini", "commands", "PRESUBMIT.py"},
+		{"repo", "keep.log", "x.tmp"},
+		{"repo", "a.log"},
+		{"repo", "keep.log"},
+		{"repo", "build-cache", "x.txt"},
+		{"repo", "sub", "build-cache", "x.txt"},
+		{"repo", "GEMINI.md"},
+		{"repo", ".gemini", "GEMINI.md"},
+		{"repo", "out", "a.txt"},
+		{"repo", "out", "keep"},
+		{"repo", "prefixfile"},
+		{"repo", "midsuffix"},
+		{"repo", "foo]bar"},
+		{"repo", "x", "deep", "y.dat"},
+		{"repo", "mid", "a", "b", "tail"},
+		{"repo", "axb"},
+		{"repo", "qsingle"},
+		{"repo", "b.o"},
+		{"repo", "anything", "at", "all"},
+	}
+	for _, data := range datas {
+		f := parseContentIgnoreFile(data, []string{"repo"})
+		if f == nil {
+			t.Fatalf("parse of %q returned nil", data)
+		}
+		for _, comps := range compSets {
+			for depth := 0; depth < len(comps); depth++ {
+				want := f.match(comps, depth, false)
+				if got := f.matchFile(comps, depth); got != want {
+					t.Errorf("data %q comps %q depth %d: matchFile=%v, match=%v",
+						data, comps, depth, got, want)
+				}
+			}
+		}
+	}
+}
+
 func TestContentScopeFingerprintTracksIgnoreFiles(t *testing.T) {
 	repo := t.TempDir()
 	writeContentTree(t, repo, map[string]string{".git/HEAD": "x", ".gitignore": "out/\n"})

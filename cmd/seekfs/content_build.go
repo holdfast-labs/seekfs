@@ -19,6 +19,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 	"unicode/utf8"
 )
 
@@ -554,6 +555,12 @@ func assembleContentIndexStreamed(source contentBuildSource, tmpDir string) (*co
 	var dictForSection []byte
 	var dictID uint32
 	trainAndSet := func() error {
+		t0 := time.Now()
+		defer func() {
+			if pc := contentAssemblePhaseCapture; pc != nil {
+				contentPhaseAdd(&pc.train, time.Since(t0))
+			}
+		}()
 		sampling = false
 		if textWriter.logicalSize() < contentDictMinLogical {
 			sample = nil
@@ -615,6 +622,7 @@ func assembleContentIndexStreamed(source contentBuildSource, tmpDir string) (*co
 				break
 			}
 			toks := make([]contentTokenizedDoc, len(raws))
+			tokStart := time.Now()
 			if len(raws) == 1 || workers == 1 {
 				for i := range raws {
 					toks[i] = contentTokenizeDocForBuild(raws[i].text)
@@ -636,6 +644,10 @@ func assembleContentIndexStreamed(source contentBuildSource, tmpDir string) (*co
 				}
 				wg.Wait()
 			}
+			if pc := contentAssemblePhaseCapture; pc != nil {
+				contentPhaseAdd(&pc.tokenize, time.Since(tokStart))
+			}
+			emitStart := time.Now()
 			for i := range raws {
 				d := &raws[i]
 				t := &toks[i]
@@ -695,6 +707,9 @@ func assembleContentIndexStreamed(source contentBuildSource, tmpDir string) (*co
 					gramBuilder.Add(contentGramU32String(gram), docID)
 				}
 				contentAssembleStreamHook(int(docID))
+			}
+			if pc := contentAssemblePhaseCapture; pc != nil {
+				contentPhaseAdd(&pc.emit, time.Since(emitStart))
 			}
 			// The source ended mid-batch with sampling still open: train on
 			// the whole accumulation now (a per-doc exhausted check would
@@ -1124,6 +1139,12 @@ func contentGramsOf(text []byte) map[string]struct{} {
 const contentPathsRestartInterval = 64
 
 func encodeContentPaths(paths []string) []byte {
+	t0 := time.Now()
+	defer func() {
+		if pc := contentAssemblePhaseCapture; pc != nil {
+			contentPhaseAdd(&pc.pathsEncode, time.Since(t0))
+		}
+	}()
 	n := len(paths)
 	if n == 0 {
 		return nil

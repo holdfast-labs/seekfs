@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 )
 
 // contentSystemExcludeSegments are directory names excluded anywhere in a path
@@ -69,6 +70,32 @@ func contentBinaryExtension(ext string) bool {
 		return false
 	}
 	_, ok := contentBinaryExtensions[ext]
+	return ok
+}
+
+// contentBinaryRejectSet precomputes the known-binary extensions minus any a
+// registered extractor claims, so the per-file sniff-mode gate is one map
+// lookup instead of a registry scan. All extractors register in init, so the
+// once-lazy set is fixed before any build runs.
+var contentBinaryRejectSet = sync.OnceValue(func() map[string]struct{} {
+	out := make(map[string]struct{}, len(contentBinaryExtensions))
+	for ext := range contentBinaryExtensions {
+		if !contentRegistryClaimsExt(ext) {
+			out[ext] = struct{}{}
+		}
+	}
+	return out
+})
+
+// contentBinaryRejected reports whether ext is rejected without opening the
+// file under sniff-mode selection: a known-binary extension no registered
+// extractor claims. Identical to contentBinaryExtension(ext) &&
+// !contentRegistryClaimsExt(ext) with the registry scan hoisted.
+func contentBinaryRejected(ext string) bool {
+	if ext == "" {
+		return false
+	}
+	_, ok := contentBinaryRejectSet()[ext]
 	return ok
 }
 
@@ -316,7 +343,7 @@ func (r contentScopeResolved) allows(path string) (unit, kind string, ok bool) {
 	}
 	ext := contentPathExtension(p)
 	if r.SniffText {
-		if contentBinaryExtension(ext) && !contentRegistryClaimsExt(ext) {
+		if contentBinaryRejected(ext) {
 			return "", "", false
 		}
 	} else if _, ok := r.ExtSet[ext]; !ok {

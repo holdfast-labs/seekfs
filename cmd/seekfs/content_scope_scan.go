@@ -103,6 +103,10 @@ type contentScopeScanConfig struct {
 	// genChanged reports whether the base moved under the scan (same index
 	// pointer, generation and journal); checked per batch under indexMu.
 	genChanged func() bool
+	// shared, when non-nil, is the ignore-file parse cache the scan's
+	// workers share (each distinct file read and parsed once per scan).
+	// Nil makes the scan allocate a private one.
+	shared *contentIgnoreSharedCache
 }
 
 // contentScanWorker carries one range's private scan state: no mutex sits in
@@ -136,6 +140,10 @@ func scanScopeMembers(s *goSearchService, vol *serviceVolumeIndex, cfg contentSc
 		moved   bool
 	}
 	out := make([]workerOut, workers)
+	shared := cfg.shared
+	if shared == nil {
+		shared = newContentIgnoreSharedCache()
+	}
 	var scanned atomic.Int64
 	var wg sync.WaitGroup
 	for w := 0; w < workers; w++ {
@@ -150,6 +158,7 @@ func scanScopeMembers(s *goSearchService, vol *serviceVolumeIndex, cfg contentSc
 				repos = cfg.scope.Ignore.repos
 			}
 			ws.Ignore = newContentGitIgnore(repos)
+			ws.Ignore.shared = shared
 			worker := &contentScanWorker{
 				scope:  &ws,
 				ignore: ws.Ignore,
@@ -330,7 +339,7 @@ func (w *contentScanWorker) admitRecord(id int, rec CompactRecord) (contentScope
 	// Extension gate first: it needs only the name, no path.
 	ext := contentPathExtension(rec.Name)
 	if w.scope.SniffText {
-		if contentBinaryExtension(ext) && !contentRegistryClaimsExt(ext) {
+		if contentBinaryRejected(ext) {
 			return out, false
 		}
 	} else if _, ok := w.scope.ExtSet[ext]; !ok {
@@ -340,17 +349,19 @@ func (w *contentScanWorker) admitRecord(id int, rec CompactRecord) (contentScope
 	if raw == "" {
 		return out, false
 	}
+	// Outside worktrees the name-based system excludes still apply to the
+	// file's own ancestry (in-repo files never consult segments — git
+	// decides there). dec.segHit already covers every non-final component
+	// (the basename is spared by contentPathHasExcludedSegment, so the old
+	// per-file full-path recheck was a recomputation of this memo bit).
+	if dec.repo == "" && w.scope.SystemExcludes && dec.segHit {
+		return out, false
+	}
 	var priority int
 	if dec.repo != "" {
 		priority = 0
 	} else if dec.unit != "" {
 		priority = dec.priority
-		// Outside worktrees the name-based system excludes still apply to
-		// the file's own ancestry (in-repo files never consult segments —
-		// git decides there).
-		if w.scope.SystemExcludes && dec.segHit {
-			return out, false
-		}
 	} else {
 		// The parent matched no root: the file can only join through a
 		// root naming it exactly (a root strictly inside the parent
@@ -373,8 +384,6 @@ func (w *contentScanWorker) admitRecord(id int, rec CompactRecord) (contentScope
 		if w.ignore.ignoredInRepo(raw, false, dec.repo) {
 			return out, false
 		}
-	} else if w.scope.SystemExcludes && contentPathHasExcludedSegment(contentNormPath(raw), contentSystemExcludeSegments) {
-		return out, false
 	}
 	frn := rec.FRN
 	if w.isWalk {
