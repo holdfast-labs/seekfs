@@ -270,6 +270,20 @@ func searchServiceVolumesGlobalComponentsOnlySnapshot(snapshot globalQuerySnapsh
 			// keeps memory O(limit) and runs one verification pass, which is
 			// the difference between 28s and tens of ms for regex-literal
 			// queries.
+			if base, verified, ok, err := collectGlobalPathDeferredTopN(componentIt, volumes, snapshots, pq, limit); ok || err != nil {
+				if err != nil {
+					return nil, true, err
+				}
+				if opts.Trace != nil {
+					opts.Trace.ComponentRecordsVerified += verified
+				}
+				results := globalRankedEntriesToEntries(mergeGlobalOverlayEntries(volumes, snapshots, base, pq, limit))
+				opts.Trace.setPlannerMode("global-components")
+				addGlobalComponentTraceTerms(opts.Trace, pq, len(base))
+				opts.Trace.setSource("global:components", len(base))
+				opts.Trace.setComplete(true)
+				return results, true, nil
+			}
 			base, verified, err := collectGlobalVerifiedTopN(componentIt, volumes, snapshots, pq, limit, nil)
 			if err != nil {
 				return nil, true, err

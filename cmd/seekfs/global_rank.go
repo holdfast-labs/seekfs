@@ -634,6 +634,134 @@ func collectGlobalVerifiedTopNRange(ids []globalRecordID, volumes []*serviceVolu
 	return out, verified, false
 }
 
+// collectGlobalPathDeferredTopN verifies component-iterator candidates without
+// building entries, sorts the lightweight survivors by rank, then materializes
+// entries in rank order (path-tied groups ordered by path, exactly like the
+// full verify-sort-truncate) until the limit fills, applying the exact
+// entryMatches gate on the way. It returns ok=false whenever the shape is not
+// a single volume without overlay records, so callers keep the entry-building
+// verifier there: multi-volume and overlay order compares entries, not local
+// ranks.
+//
+// The record-level precheck is a strict SUPERSET of the entry gate (it only
+// ever admits extra candidates, which the final gate drops): scalar/type/ext
+// checks are exact on the record, path terms and dirs reuse the established
+// parent-chain walk, and everything else (regexps, globs, parents, exists,
+// OR/NOT groups, under) passes through to the final gate. Looseness only
+// costs sort slots, never correctness.
+func collectGlobalPathDeferredTopN(it globalIDIterator, volumes []*serviceVolumeIndex, snapshots []*volumeSnapshot, pq parsedQuery, limit int) ([]globalRankedEntry, int, bool, error) {
+	if it == nil || limit <= 0 || len(volumes) != 1 || globalSnapshotsHaveOverlayRecords(snapshots) {
+		return nil, 0, false, nil
+	}
+	vol := volumes[0]
+	if vol == nil || vol.index == nil {
+		return nil, 0, false, nil
+	}
+	ids, canceled := collectGlobalIteratorCancelable(it, 0, func() bool { return queryCanceled(pq) })
+	if canceled {
+		return nil, 0, false, errQueryCanceled
+	}
+	volumePQ := pq
+	volumePQ.Terms = append([]string(nil), pq.Terms...)
+	dropSatisfiedVolumeTerms(&volumePQ, vol.index.Volume)
+	rankOf := candidateRanker(vol.index, vol.rankForQuery(pq))
+	type lightID struct {
+		id   int
+		rank int
+	}
+	lights := make([]lightID, 0, min(len(ids), limit*16))
+	termsOK := queryPathTermPrecheckSafe(volumePQ)
+	for pos, id := range ids {
+		if pos&1023 == 0 && queryCanceled(pq) {
+			return nil, 0, false, errQueryCanceled
+		}
+		if globalHiddenContains(snapshots, id) || id.volume != 0 || id.local < 0 || id.local >= vol.index.compactRecordCount() {
+			continue
+		}
+		rec := vol.index.compactRecord(id.local)
+		if rec.Deleted {
+			continue
+		}
+		if !compactRecordPrecheck(rec, volumePQ, volumePQ.MatchPath) {
+			continue
+		}
+		if termsOK && !vol.index.compactPathContainsAll(id.local, volumePQ.Terms) {
+			continue
+		}
+		matched := true
+		for _, dir := range volumePQ.Dirs {
+			if dir == "" || !asciiOnlyString(dir) {
+				// Undecidable cheaply; the final gate decides.
+				continue
+			}
+			if !vol.index.compactPathContainsTerm(id.local, dir) {
+				matched = false
+				break
+			}
+		}
+		if !matched {
+			continue
+		}
+		for _, sf := range volumePQ.SizeFilters {
+			if !sf.matches(rec.Size) {
+				matched = false
+				break
+			}
+		}
+		if !matched {
+			continue
+		}
+		for _, df := range volumePQ.DateFilters {
+			if !df.matches(rec.ModUnix) {
+				matched = false
+				break
+			}
+		}
+		if !matched {
+			continue
+		}
+		for _, leaf := range volumePQ.Features {
+			if _, ok := leaf.matches[rec.FRN]; !ok {
+				matched = false
+				break
+			}
+		}
+		if !matched {
+			continue
+		}
+		lights = append(lights, lightID{id: id.local, rank: rankOf(id.local)})
+	}
+	sort.Slice(lights, func(i, j int) bool { return lights[i].rank < lights[j].rank })
+	pathCache := make(map[int]string)
+	verified := 0
+	out := make([]globalRankedEntry, 0, limit)
+	for i := 0; i < len(lights) && len(out) < limit; {
+		j := i + 1
+		for j < len(lights) && lights[j].rank == lights[i].rank {
+			j++
+		}
+		group := make([]globalRankedEntry, 0, j-i)
+		for _, light := range lights[i:j] {
+			pathCache = boundPathCache(pathCache)
+			entry, ok := compactCandidateEntryIfMatchIn(vol, vol.index, volumePQ, light.id, pathCache, true, false, nil)
+			verified++
+			if !ok {
+				continue
+			}
+			group = append(group, globalRankedEntry{entry: entry, rank: light.rank, volume: 0, tie: entry.Path})
+		}
+		sort.Slice(group, func(a, b int) bool { return group[a].tie < group[b].tie })
+		for _, item := range group {
+			if len(out) >= limit {
+				break
+			}
+			out = append(out, item)
+		}
+		i = j
+	}
+	return out, verified, true, nil
+}
+
 func countGlobalVerifiedIterator(it globalIDIterator, volumes []*serviceVolumeIndex, snapshots []*volumeSnapshot, pq parsedQuery, matcher *contentLeafMatcher) (int, int, error) {
 	if it == nil {
 		return 0, 0, nil
