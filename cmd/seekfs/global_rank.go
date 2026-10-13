@@ -27,6 +27,102 @@ func globalExtOnlySupported(pq parsedQuery) bool {
 	return pq.Type == "" || pq.Type == "file" || pq.Type == "dir"
 }
 
+// globalExtSortedTopN serves single-volume sorted ext: queries without
+// materializing the whole posting: posting records are verified at the
+// record level (exact for ext-lane shapes, which admit no path predicates),
+// the top-N by rank is heap-selected, and only the winners are materialized
+// into entries. Ranks are unique per live record, so the heap winners are
+// exactly the records a full verify-sort-truncate would keep; any
+// verification surprise falls back to that path (ok=false). Multi-volume
+// queries and overlay-active volumes keep the existing path (global order
+// there compares entries, not local ranks).
+func globalExtSortedTopN(snapshot globalQuerySnapshot, pq parsedQuery, extFilter globalExtFilter, limit int, trace *searchTrace) ([]Entry, bool) {
+	if limit <= 0 || len(snapshot.volumes) != 1 ||
+		globalSnapshotsHaveHidden(snapshot.overlays) || globalSnapshotsHaveOverlayRecords(snapshot.overlays) {
+		return nil, false
+	}
+	vol := snapshot.volumes[0]
+	if vol == nil || vol.index == nil {
+		return nil, false
+	}
+	if err := checkQueryCapabilities(pq, vol.index); err != nil {
+		return nil, false
+	}
+	volumePQ := pq
+	dropSatisfiedVolumeTerms(&volumePQ, vol.index.Volume)
+	if queryNeedsPath(volumePQ) {
+		return nil, false
+	}
+	ids, ok := globalExtPostingIDs(snapshot.volumes, extFilter.ext, 0, trace)
+	if !ok {
+		return nil, false
+	}
+	rankOf := candidateRanker(vol.index, vol.rankForQuery(volumePQ))
+	h := make(candidateRankMaxHeap, 0, min(limit, len(ids)))
+	for _, id := range ids {
+		if id.volume != 0 || id.local < 0 || id.local >= vol.index.compactRecordCount() {
+			continue
+		}
+		rec := vol.index.compactRecord(id.local)
+		if rec.Deleted || !vol.recordMatchesNonPath(id.local, rec, volumePQ) {
+			continue
+		}
+		item := candidateRankItem{id: id.local, rank: rankOf(id.local)}
+		if len(h) < limit {
+			heap.Push(&h, item)
+			continue
+		}
+		if item.rank < h[0].rank {
+			h[0] = item
+			heap.Fix(&h, 0)
+		}
+	}
+	if len(h) == 0 {
+		setGlobalExtTrace(trace, pq, extFilter, len(ids))
+		return []Entry{}, true
+	}
+	winners := make([]int, len(h))
+	for i := range h {
+		winners[i] = h[i].id
+	}
+	sortIDsByRank(winners, rankOf)
+	pathCache := make(map[int]string)
+	skipVerify := compactCandidateCanSkipEntryMatches(volumePQ, true)
+	ranked := make([]globalRankedEntry, 0, len(winners))
+	for _, id := range winners {
+		entry, ok := compactCandidateEntryIfMatchIn(vol, vol.index, volumePQ, id, pathCache, true, skipVerify, nil)
+		if !ok {
+			// Record-level verification promised a match; a drop here
+			// means the shape evolved past the lane's contract, so let
+			// the exhaustive path decide instead of underfilling.
+			return nil, false
+		}
+		ranked = append(ranked, globalRankedEntry{entry: entry, rank: rankOf(id), volume: 0, tie: entry.Path})
+	}
+	sortGlobalRankedEntries(ranked, pq)
+	if len(ranked) > limit {
+		ranked = ranked[:limit]
+	}
+	setGlobalExtTrace(trace, pq, extFilter, len(ids))
+	return globalRankedEntriesToEntries(ranked), true
+}
+
+func setGlobalExtTrace(trace *searchTrace, pq parsedQuery, extFilter globalExtFilter, candidates int) {
+	if trace == nil {
+		return
+	}
+	trace.setPlannerMode("global-ext")
+	trace.addTerm(traceTerm{
+		Term:      extFilter.ext,
+		Kind:      "extension",
+		Source:    "global:" + extFilter.source,
+		CountHint: candidates,
+		Exact:     true,
+	})
+	trace.setSource("global:"+extFilter.source, candidates)
+	trace.setComplete(true)
+}
+
 func globalExtDefaultSupported(pq parsedQuery) bool {
 	return globalExtOnlySupported(pq) && (pq.SortColumn == "" || pq.SortColumn == "path" ||
 		pq.SortColumn == "size" || pq.SortColumn == "modified" || pq.SortColumn == "extension" || pq.SortColumn == "type") &&

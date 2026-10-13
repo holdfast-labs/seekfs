@@ -59,6 +59,9 @@ func searchServiceVolumesGlobalExtOnlySnapshot(snapshot globalQuerySnapshot, opt
 		return results, true, nil
 	}
 	if pq.SortColumn != "" {
+		if results, ok := globalExtSortedTopN(snapshot, pq, extFilter, limit, opts.Trace); ok {
+			return results, true, nil
+		}
 		ids, ok := globalExtPostingIDs(volumes, extFilter.ext, 0, opts.Trace)
 		if !ok {
 			return nil, false, nil
