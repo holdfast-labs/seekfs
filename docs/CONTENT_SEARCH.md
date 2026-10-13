@@ -1295,6 +1295,150 @@ stays stale, pre-v6 rebuilds, mid-loop wrap), `content_scope_scan_test.go`
 (flat + drive-root differentials, unfilled-cap regression), and the updated
 `below-lowest-valid` attach branch (ready + usable, journal never re-read).
 
+## 6q. Index size reduction (done)
+
+With text already at 0.197x (§6o), the remaining mass was terms+grams
+(~75 MB, ~39% of the 191 MB single-file point) and the filename index's
+derived sections (86 MB of the 125 MB `chromium.gsi`, 556k entries;
+resident derived ≈ 78 MB here, scaling to the live service's ≈ 222 MB
+at 1.46M entries). Everything below ships with identical recall (differentials
+and full-corpus hit equality) and resident query arrays that are
+byte-identical, so query latency moves only where noted.
+
+**Content index: format v9** (v8 sidecars fail the version gate and rebuild
+through the PF-3 path; manifests stay v5). Measured on identical inputs
+(86,213 docs / 640 MB raw selected from `chromium.gsi`, single file):
+
+| section | v8 | v9 | v9/v8 |
+|---|---|---|---|
+| file total | 220,504,115 | 208,377,748 | 0.945 (−5.50%) |
+| text (CXST) | 120,696,117 | 120,696,117 | 1.00 |
+| grams (CXGR) | 68,579,142 | 58,462,043 | 0.852 (−14.75%) |
+| terms (CXTR) | 22,202,096 | 21,914,876 | 0.987 (−1.29%) |
+| paths (CXPT) | 2,031,190 | 2,031,190 | 1.00 |
+| doctable (CXDT) | 6,897,044 | 5,172,784 | 0.75 (−25.0%) |
+| pruned set (CXGP) | — | 2,184 (728 keys) | new |
+
+What changed:
+
+- **Slim gram rows** (`content_postings.go`, both the in-memory encoder
+  and the streaming assembler): entries drop `count`+`firstBlock` and
+  block metas drop `byteOffset` (16 → 12 byte rows). The decoder rebuilds
+  all three as prefix sums over the key-ordered tables and rejects any
+  mismatch (trailing blocks, short blob, out-of-range entry).
+- **Singleton gram entries**: ~1/3 of gram keys on code corpora occur in
+  exactly one document; they now ride inline (docID in the entry, no
+  blocks) instead of paying a 16-byte meta plus a block payload.
+- **Nibble-packed term lengths** (`content_termsdict.go`): both front-code
+  lengths ride one header byte when each fits in 14, else 0xFF plus the two
+  uvarints. Paths keep the legacy two-uvarint framing in a separate
+  decoder: repository paths share long prefixes, so the escape cost +1 B
+  per path (measured, reverted).
+- **Doctable 80 → 60 bytes**: `RawSize`/`DocLen`/`ModUnix` leave the wire
+  (no query path reads them; verified by grep). `FileSize`/`FileModNano`
+  stay for the walk reconcile.
+- **Dense-gram pruning** (`contentGramPruneDF` = 25000, a var): grams past
+  the threshold are dropped from CXGR and listed in CXGP. The reader skips
+  pruned grams as constraints (verification still decides); a term left
+  with no usable gram scans like a sub-3-byte term. The builder buffers
+  whole keys so the prune decision precedes any flush (transient peak =
+  densest key; the buffer resets to `[:0]` to keep the bounded-heap
+  guarantee — a reslicing regression was caught by
+  `TestContentExternalBoundedBuffer` before it shipped).
+
+ pruning curve (86k docs, blob bytes at/above df): ≥1k 81.5%, ≥5k 57.1%,
+≥10k 37.9%, ≥20k 17.7%, ≥30k 9.7%, ≥40k 5.5%. The 25k line prunes 728
+keys (~8.5 MB blob). Benchmark rarest grams stay indexed (struct 17.2k,
+EINVAL 11.3k, mutex 4.4k, reassemble 591, cityhash 144), so no flagship
+query goes all-pruned; all-pruned degenerate terms (`the`) scan to the
+limit and terminate fast exactly because they are common (measured
+2–5 ms either way).
+
+Query table, min-of-9, GOMAXPROCS=2, baselines re-measured in the same
+sessions (this box carries ±25% same-file contention noise, so only
+consistent directional deltas count; hit lists are byte-identical on
+every shape, including the all-pruned scan):
+
+| query | v8 | v9 |
+|---|---|---|
+| `content:struct` (20) | 3.2 ms | 2.6–3.1 ms |
+| `content:EINVAL` (20) | 32.5 ms | 36.0 ms (+11%, see below) |
+| `content:cityhash_v103` (10) | 2.0–2.4 ms | 0.5–1.0 ms (faster) |
+| `content:"reassemble"` (6) | 37–60 ms | 41–50 ms (even, noisy) |
+| `mutex` unlimited (109) | 454–510 ms | 509–645 ms (even, noisy) |
+| `mutex` (20) | 25–26 ms | 25–26 ms |
+| `the` all-pruned (20) | ~5 ms | 0–2 ms |
+
+EINVAL is the one regression over 10% (+11%, +3.5 ms absolute, from 33
+extra scattered verify candidates after dropping 2 of its 4 constraints).
+It is kept with justification: it stays inside the §6n 1.5x-of-v6 budget
+(36.0 vs 45.75 ms), every other shape is even or faster, recall is
+identical, and it buys ~8.5 MB. The threshold is a var operators can
+raise; raising to 40k would un-prune EINVAL's grams entirely at ~5 MB
+less savings.
+
+**Filename index (no version bump).** Readers accept old and new layouts
+(the SUBT 3→8 precedent); writers emit the compact forms. Resident arrays
+stay byte-identical, so queries cannot move. Measured on
+`E:\bench\chromium.gsi` (125,416,892 B) by recoding its sections, plus a
+synthetic 556k-entry direct build for the writer proof:
+
+| section | before | after | delta |
+|---|---|---|---|
+| RANK/SRNK/MRNK/ERNK/TRNK/PRNK (6x) | 26.68 MB (order+rank) | 13.34 MB (order only) | −13.34 MB |
+| PATR (5 attr lists) | 9.08 MB raw u32 | 2.27 MB delta-varint | −6.81 MB |
+| SUBT (8 parts) | 17.79 MB | 15.56 MB (7 parts) | −2.23 MB |
+| **file total** | **125.42 MB** | **~103.0 MB** | **−17.9%** |
+
+Rank sections persist the order alone; `decodeRankSection` rebuilds the
+rank as its exact inverse (deleted IDs keep rank 0, bit-identical to the
+stored array). PATR reuses the existing `encodeDeltaUvarint32` under a
+`PTR2` magic with the legacy framing as fallback. SUBT drops `start`
+(the inverse of the persisted order). Load pays one O(n) inversion per
+family (~ms; cold CLI open of a 99 MB new-format index is 0.69 s
+including the file read). Old-format indexes load unchanged (verified by
+CLI search/count against the fixture). Resident is unchanged by design:
+ranks, subtree arrays and PNGR are all live-queried in both directions,
+and halving resident would trade O(1) access for binary searches on hot
+paths.
+
+**Tried and rejected/deferred (with reason):**
+
+- Lower prune thresholds (10k: −23 MB): struct (17k) and EINVAL (11k)
+  go all-pruned and fall to scans — flagship latency, not just bytes.
+- Nibble-packed path lengths: +1 B/doc (long shared prefixes always take
+  the escape); reverted, paths keep legacy framing.
+- Elias-Fano posting lists: worse than delta-varint at the measured
+  ~1.15 B/posting gap distribution; needs skip-based intersection.
+- 8192-doc gram blocks: halves metas but coarsens bounded-decode
+  granularity for little net gain.
+- Reassigning docIDs for smaller gaps (e.g. path order): breaks the
+  DocID-is-FRN-index invariant the resolver joins on.
+- Dropping df==1 terms: breaks fuzzy correction recall (98.4% top-1).
+- Dropping full term keys for hashes: same reason.
+- Larger shard target (fewer shards, less +10.9% tax): grows fold heap
+  past the per-shard bound; single-file builds unaffected.
+- Shared cross-shard dictionaries: breaks fold isolation (as in §6m).
+- Recomputing SUBT minima / SUBS / subtree intervals at load (would drop
+  ~15 MB more): every CLI open pays 5+ O(n) passes over the child graph;
+  kept on disk.
+- CHLD offsets→counts varint (~1.6 MB) and LOWR offset packing (~0.4 MB):
+  real but small for the format churn; deferred.
+- s2/LZ4 text and smaller text blocks: already rejected in §6n/§6o.
+
+Tests: prune parity/codec/differential tests (`TestContentPostingPrunesDenseKeys`,
+`TestContentExternalPruneParity`, `TestContentPrunedGramsCodec`,
+`TestContentPrunedIndexMatchesUnpruned`, `TestContentServicePrunedIndexParity`),
+prefix-sum validation (`TestContentPostingV9PrefixSumsValidated`,
+`TestContentPostingSingletonEntry`), nibble framing
+(`TestContentTermDictNibbleFraming`), rank forms
+(`TestDecodeRankSectionCompactAndLegacy`,
+`TestDirectRankSectionsPersistOrderOnly`), SUBT/PATR forms
+(`TestDecodeSubtreeSectionCompactAndLegacy`,
+`TestAttrPostingSectionDeltaAndLegacy`); `TestContentIndexRoundTrip` now
+expects the trimmed wire fields as zero and
+`TestContentIndexRejectsPreviousVersion` guards v8.
+
 ## 7. Carried debt / known gaps
 
 - **Snippet case is preserved; no fixup-aware path remains.** The `.gsx` text

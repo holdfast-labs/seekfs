@@ -196,6 +196,44 @@ func TestContentShardedBuildServesAllShards(t *testing.T) {
 	}
 }
 
+// Pruning is per shard: a gram dense in one shard is pruned there and kept
+// where it is rare. The composite still answers identically, mixing scans
+// (pruned shards) with intersections (unpruned ones).
+func TestContentShardedPrunedServesAllShards(t *testing.T) {
+	old := contentGramPruneDF
+	contentGramPruneDF = 1
+	f := newShardedFixture(t)
+	contentGramPruneDF = old
+	reader := f.vol.content.readerView()
+	if reader == nil || reader.idx.shards == nil {
+		t.Fatal("attached content base is not sharded")
+	}
+	prunedShards := 0
+	for _, sh := range reader.idx.shards {
+		if len(sh.reader.pruned) > 0 {
+			prunedShards++
+		}
+	}
+	if prunedShards == 0 {
+		t.Fatal("no shard pruned anything; threshold test is vacuous")
+	}
+	if prunedShards == len(reader.idx.shards) {
+		t.Fatal("every shard pruned everything; want mixed pruned/unpruned shards")
+	}
+	if n := f.count(t, "shared"); n != 5 {
+		t.Fatalf("content:shared = %d hits; want 5 across mixed shards", n)
+	}
+	if n := f.count(t, "padding"); n != 5 {
+		t.Fatalf("content:padding = %d hits; want 5", n)
+	}
+	if n := f.count(t, "betatwo"); n != 1 {
+		t.Fatalf("content:betatwo = %d hits; want 1", n)
+	}
+	if n := f.count(t, "zzznope"); n != 0 {
+		t.Fatalf("content:zzznope = %d hits; want 0", n)
+	}
+}
+
 func TestContentShardMaskUnderPrunesShards(t *testing.T) {
 	f := newShardedFixture(t)
 	reader := f.vol.content.readerView()
