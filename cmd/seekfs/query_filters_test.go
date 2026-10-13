@@ -232,9 +232,20 @@ func TestPathFilterEnablesPathMatching(t *testing.T) {
 }
 
 func TestGlobalBoundedScanBudgetGate(t *testing.T) {
+	// The gate under test reads only vol.index.compactRecordCount(); the
+	// 40M case must NOT materialize 40M records (gigabytes of commit plus
+	// the constructor's pack/sort passes, ~44s on this box). A bare
+	// MMapRecords count reports the size with no backing allocation, and
+	// the gate never dereferences record storage, so the asserted budget
+	// math is identical.
 	vol := func(records int) *serviceVolumeIndex {
-		idx := &Index{Source: "usn", Volume: "C:", Compact: true, Records: make([]CompactRecord, records)}
-		return newServiceVolumeIndex("budget.gsi", idx)
+		idx := &Index{Source: "usn", Volume: "C:", Compact: true}
+		if records >= 1_000_000 {
+			idx.MMapRecords = &MMapRecords{count: records}
+		} else {
+			idx.Records = make([]CompactRecord, records)
+		}
+		return &serviceVolumeIndex{index: idx}
 	}
 	now := time.Now()
 	if !globalBoundedScanBudgetOK(nil, parsedQuery{}, 3) {
