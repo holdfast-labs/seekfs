@@ -259,6 +259,269 @@ func estimateGlobalPathTerm(volumes []*serviceVolumeIndex, term string) int {
 	return total
 }
 
+// underScopedTerm is one probe term's verdict against the under roots: a
+// satisfied term holds on every under subtree and is omitted from the
+// conjunction (verification re-checks it), otherwise estimate bounds the
+// under-scoped side for probe ordering.
+type underScopedTerm struct {
+	term      string
+	satisfied bool
+	estimate  int
+}
+
+// underLocalsByVolume groups under roots per volume.
+func underLocalsByVolume(volumes []*serviceVolumeIndex, underRoots []globalRecordID) map[int][]int {
+	byVolume := make(map[int][]int)
+	for _, root := range underRoots {
+		if root.volume < 0 || root.volume >= len(volumes) {
+			continue
+		}
+		byVolume[root.volume] = append(byVolume[root.volume], root.local)
+	}
+	return byVolume
+}
+
+// localInUnderIntervals reports whether id sits in any of the under
+// subtrees. Subtree intervals nest or stay disjoint, so one interval probe
+// per under root decides membership exactly.
+func (vol *serviceVolumeIndex) localInUnderIntervals(id int, underLocals []int) bool {
+	if vol == nil || vol.index == nil || id < 0 || id >= len(vol.subtreeStart) {
+		return false
+	}
+	pos := vol.subtreeStart[id]
+	if pos == ^uint32(0) {
+		return false
+	}
+	for _, u := range underLocals {
+		if u < 0 || u >= len(vol.subtreeStart) || u >= len(vol.subtreeEnd) {
+			continue
+		}
+		if start, end := vol.subtreeStart[u], vol.subtreeEnd[u]; start != ^uint32(0) && start <= pos && pos < end {
+			return true
+		}
+	}
+	return false
+}
+
+// partitionTermRoots splits a term's component roots against one volume's
+// under locals. covered[i] reports whether underLocals[i] sits at or below
+// some root (the term then holds on that whole under subtree); inU holds the
+// roots strictly inside some under subtree; outside roots contribute nothing
+// under the scope and are dropped. ok=false declines scoping whenever an
+// interval cannot be trusted, so the caller keeps the legacy assembly.
+func partitionTermRoots(vol *serviceVolumeIndex, underLocals, roots []int) (inU []int, covered []bool, ok bool) {
+	covered = make([]bool, len(underLocals))
+	for _, u := range underLocals {
+		if !vol.subtreeIntervalValid(u) {
+			return nil, nil, false
+		}
+	}
+	for _, r := range roots {
+		if r < 0 || r >= len(vol.subtreeStart) || r >= len(vol.subtreeEnd) || vol.subtreeStart[r] == ^uint32(0) {
+			return nil, nil, false
+		}
+	}
+	for i, u := range underLocals {
+		uStart := vol.subtreeStart[u]
+		for _, r := range roots {
+			if r == u {
+				covered[i] = true
+				break
+			}
+			rStart, rEnd := vol.subtreeStart[r], vol.subtreeEnd[r]
+			if rStart <= uStart && uStart < rEnd {
+				covered[i] = true
+				break
+			}
+		}
+	}
+	for _, r := range roots {
+		// Roots at an under root are covered, not inside: their subtree is
+		// the scope itself, which the satisfied check already accounts for.
+		// Strictly inside: the root's whole subtree lies under the scope.
+		// (A file root can never strictly contain an under root, since
+		// interval starts are unique per record, so containment always
+		// means a true ancestor dir.) Anything else is outside the scope;
+		// disjoint intervals prove it contributes nothing under it.
+		atUnder := false
+		for _, u := range underLocals {
+			if r == u {
+				atUnder = true
+				break
+			}
+		}
+		if atUnder {
+			continue
+		}
+		for _, u := range underLocals {
+			uStart, uEnd := vol.subtreeStart[u], vol.subtreeEnd[u]
+			rStart, rEnd := vol.subtreeStart[r], vol.subtreeEnd[r]
+			if uStart <= rStart && rStart < uEnd && rEnd <= uEnd {
+				inU = append(inU, r)
+				break
+			}
+		}
+	}
+	if len(inU) > 1 {
+		sort.Ints(inU)
+		inU = uniqueSortedInts(inU)
+	}
+	return inU, covered, true
+}
+
+// scopedTermEstimate bounds one term's under-scoped side cardinality without
+// materializing it: exact name hits under the scope plus the in-scope root
+// intervals (overlaps only over-count, which declines conservatively).
+// satisfied reports the term holds on every under subtree of every volume.
+// ok=false declines scoping.
+func scopedTermEstimate(volumes []*serviceVolumeIndex, underByVolume map[int][]int, term string) (estimate int, satisfied bool, ok bool) {
+	if term == "" {
+		return 0, false, false
+	}
+	satisfied = true
+	for volumeIndex, vol := range volumes {
+		if vol == nil || vol.index == nil {
+			return 0, false, false
+		}
+		underLocals := underByVolume[volumeIndex]
+		if !vol.pathComponentPostingAvailable(term) {
+			return 0, false, false
+		}
+		if len(vol.subtreeOrder) == 0 || len(vol.subtreeStart) == 0 || len(vol.subtreeEnd) == 0 {
+			// No persisted subtree order: the legacy iterator serves the
+			// exact path posting instead; scoping declines to keep it.
+			return 0, false, false
+		}
+		roots := vol.pathTermRootIDs(term)
+		inU, covered, ok := partitionTermRoots(vol, underLocals, roots)
+		if !ok {
+			return 0, false, false
+		}
+		for _, c := range covered {
+			if !c {
+				satisfied = false
+			}
+		}
+		for _, id := range vol.nameTermPosting(term) {
+			if vol.localInUnderIntervals(id, underLocals) {
+				estimate++
+			}
+		}
+		for _, r := range inU {
+			estimate += int(vol.subtreeEnd[r] - vol.subtreeStart[r])
+		}
+		if estimate > serviceComponentMultiTermScanMaxIDs {
+			return 0, false, false
+		}
+	}
+	return estimate, satisfied, true
+}
+
+// scopedPathTermIterator materializes one term's under-scoped side per
+// volume: exact name hits under the scope plus the in-scope root subtrees.
+// It must agree with scopedTermEstimate (same partition); ok=false declines.
+func scopedPathTermIterator(volumes []*serviceVolumeIndex, underByVolume map[int][]int, term string) (globalIDIterator, bool) {
+	if term == "" {
+		return nil, false
+	}
+	children := make([]globalIDIterator, 0, len(volumes))
+	for volumeIndex, vol := range volumes {
+		if vol == nil || vol.index == nil {
+			return nil, false
+		}
+		underLocals := underByVolume[volumeIndex]
+		if !vol.pathComponentPostingAvailable(term) {
+			return nil, false
+		}
+		if len(vol.subtreeOrder) == 0 || len(vol.subtreeStart) == 0 || len(vol.subtreeEnd) == 0 {
+			return nil, false
+		}
+		roots := vol.pathTermRootIDs(term)
+		inU, _, ok := partitionTermRoots(vol, underLocals, roots)
+		if !ok {
+			return nil, false
+		}
+		ids := make([]int, 0, 64)
+		for _, id := range vol.nameTermPosting(term) {
+			if vol.localInUnderIntervals(id, underLocals) {
+				ids = append(ids, id)
+			}
+		}
+		if len(inU) > 0 {
+			sub := newGlobalSubtreeIterator(volumeIndex, vol, inU)
+			children = append(children, sub)
+		}
+		// An empty side is an exact empty conjunction contributor, not a
+		// decline: keep the empty record iterator so the intersection below
+		// stays empty exactly like the legacy assembly.
+		it := newGlobalRecordIterator(volumeIndex, ids)
+		children = append(children, &it)
+	}
+	return newGlobalMergeIterator(children...), true
+}
+
+// underScopedTermPrefix assembles the under/terms prefix of a component
+// query, consuming the plain terms (scoped sides drive the conjunction, so
+// the under subtree is never materialized then). It returns ok=false to keep
+// the legacy under-iterator assembly. A satisfied term holds on every under
+// subtree and is omitted: verification re-checks every term exactly, so
+// dropping it changes no result.
+func underScopedTermPrefix(volumes []*serviceVolumeIndex, pq parsedQuery, underRoots []globalRecordID) (globalIDIterator, bool) {
+	terms := pathPlanProbeTerms(nonVolumeTerms(pq.Terms))
+	if globalRegexLiteralSupported(pq) {
+		return nil, false
+	}
+	if len(underRoots) == 0 {
+		// Scope not in the index: the legacy under iterator is an empty
+		// merge, so the conjunction is empty without building term sides.
+		return newGlobalMergeIterator(), true
+	}
+	underByVolume := underLocalsByVolume(volumes, underRoots)
+	if len(terms) == 0 {
+		under, ok := globalUnderIterator(volumes, pq.Under)
+		if !ok {
+			return nil, false
+		}
+		return under, true
+	}
+	scoped := make([]underScopedTerm, 0, len(terms))
+	for _, term := range terms {
+		estimate, satisfied, ok := scopedTermEstimate(volumes, underByVolume, term)
+		if !ok {
+			return nil, false
+		}
+		scoped = append(scoped, underScopedTerm{term: term, satisfied: satisfied, estimate: estimate})
+	}
+	// Satisfied terms leave the conjunction; the survivors drive it.
+	remaining := scoped[:0]
+	for _, s := range scoped {
+		if !s.satisfied {
+			remaining = append(remaining, s)
+		}
+	}
+	scoped = remaining
+	if len(scoped) == 0 {
+		// Every term holds on all of the scope: the prefix is the scope
+		// itself, and verification re-checks the dropped terms.
+		under, ok := globalUnderIterator(volumes, pq.Under)
+		if !ok {
+			return nil, false
+		}
+		return under, true
+	}
+	sort.SliceStable(scoped, func(i, j int) bool { return scoped[i].estimate < scoped[j].estimate })
+	driver, ok := scopedPathTermIterator(volumes, underByVolume, scoped[0].term)
+	if !ok {
+		return nil, false
+	}
+	current := driver
+	for _, s := range scoped[1:] {
+		filtered := newGlobalPathTermFilterIterator(current, volumes, s.term)
+		current = &filtered
+	}
+	return current, true
+}
+
 func globalUnderIterator(volumes []*serviceVolumeIndex, under string) (globalIDIterator, bool) {
 	roots, ok := globalUnderRoots(volumes, under)
 	if !ok {
@@ -424,14 +687,24 @@ func globalComponentQueryIterator(volumes []*serviceVolumeIndex, pq parsedQuery,
 			current = newGlobalIntersectionIterator(current, next)
 		}
 	}
+	termsScoped := false
 	if pq.Under != "" {
-		under, ok := globalUnderIterator(volumes, pq.Under)
+		underRoots, ok := globalUnderRoots(volumes, pq.Under)
 		if !ok {
 			return nil, false
 		}
-		current = under
+		if prefix, ok := underScopedTermPrefix(volumes, pq, underRoots); ok {
+			current = prefix
+			termsScoped = true
+		} else {
+			under, ok := globalUnderIterator(volumes, pq.Under)
+			if !ok {
+				return nil, false
+			}
+			current = under
+		}
 	}
-	if terms := nonVolumeTerms(pq.Terms); len(terms) > 0 {
+	if terms := nonVolumeTerms(pq.Terms); len(terms) > 0 && !termsScoped {
 		probes := sortGlobalPathProbeTerms(volumes, pathPlanProbeTerms(terms))
 		if len(probes) == 0 {
 			return nil, false

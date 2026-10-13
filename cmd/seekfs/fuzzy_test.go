@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"math/rand"
 	"strings"
 	"testing"
@@ -592,6 +593,221 @@ func TestFuzzyNameDistanceMatchesWindowOracle(t *testing.T) {
 		if gok != wok || (gok && (gd != wd || gp != wp || gw != ww)) {
 			t.Fatalf("fuzzyNameDistance(%q, %q, %d) = %d/%v/%d/%v, oracle %d/%v/%d/%v",
 				name, term, tau, gd, gp, gw, gok, wd, wp, ww, wok)
+		}
+	}
+}
+
+func TestFuzzyDistanceScratchMatchesWrapper(t *testing.T) {
+	// The scratch (buffer-reuse + ASCII fast path + length prefilter) entry
+	// must agree with the allocating wrapper on every shape, including
+	// non-ASCII names, empty inputs, and the short-name decline. One scratch
+	// is reused across the whole corpus, so this also catches buffer aliasing
+	// between consecutive candidates.
+	names := []string{
+		"", "a", "ab", "chrome.exe", "browser_test.cc", "BUILD.gn",
+		"render_frame_sink_manager.cc", "x", "chrom", "chromebook",
+		"sodanco.txt", "Só Danço mix.mp3", "ｃｈｒｏｍｅ.txt", "mmm",
+		"a_b-c.d", "repeatedrepeatedrepeatedname",
+	}
+	terms := []string{"", "a", "chorme", "broswer", "chrome", "chrmae", "doccumnet", "sodanco", "mmm", "build"}
+	var sc fuzzyDistanceScratch
+	for _, name := range names {
+		for _, term := range terms {
+			for _, tau := range []int{1, 2} {
+				termRunes := []rune(term)
+				gd, gp, gw, gok := fuzzyNameDistance(name, term, tau)
+				sd, sp, sw, sok := fuzzyNameDistanceScratch(name, termRunes, asciiOnlyString(term), tau, &sc)
+				if gok != sok || (gok && (gd != sd || gp != sp || gw != sw)) {
+					t.Fatalf("scratch(%q, %q, %d) = %d/%v/%d/%v, wrapper %d/%v/%d/%v",
+						name, term, tau, sd, sp, sw, sok, gd, gp, gw, gok)
+				}
+				// The scratch must also agree with the window oracle on
+				// non-degenerate inputs (empty terms never reach fuzzy
+				// search: terms under 3 runes are declined up front, and
+				// the oracle disagrees with the wrapper there).
+				if term != "" {
+					wd, wp, ww, wok := fuzzyNameDistanceWindows(name, term, tau)
+					if gok != wok || (gok && (gd != wd || gp != wp || gw != ww)) {
+						t.Fatalf("wrapper(%q, %q, %d) = %d/%v/%d/%v, oracle %d/%v/%d/%v",
+							name, term, tau, gd, gp, gw, gok, wd, wp, ww, wok)
+					}
+				}
+			}
+		}
+	}
+}
+
+func TestFuzzyDistanceScratchRandomVsOracle(t *testing.T) {
+	// The banded scratch DP must agree with the unbanded per-window oracle
+	// on larger inputs too (long names, tau 2), sharing one scratch across
+	// all calls to also cover buffer growth and rotation staleness.
+	rng := rand.New(rand.NewSource(7))
+	alpha := "abcdefg._-xyz"
+	word := func(n int) string {
+		b := make([]byte, n)
+		for i := range b {
+			b[i] = alpha[rng.Intn(len(alpha))]
+		}
+		return string(b)
+	}
+	var sc fuzzyDistanceScratch
+	for i := 0; i < 5000; i++ {
+		name := word(1 + rng.Intn(40))
+		term := word(3 + rng.Intn(10))
+		tau := 1 + rng.Intn(2)
+		termRunes := []rune(term)
+		sd, sp, sw, sok := fuzzyNameDistanceScratch(name, termRunes, asciiOnlyString(term), tau, &sc)
+		wd, wp, ww, wok := fuzzyNameDistanceWindows(name, term, tau)
+		if sok != wok || (sok && (sd != wd || sp != wp || sw != ww)) {
+			t.Fatalf("scratch(%q, %q, %d) = %d/%v/%d/%v, oracle %d/%v/%d/%v",
+				name, term, tau, sd, sp, sw, sok, wd, wp, ww, wok)
+		}
+	}
+}
+
+func TestDamerauBoundedReuseMatchesWrapper(t *testing.T) {
+	pairs := [][2]string{
+		{"", ""}, {"a", ""}, {"", "abc"}, {"kitten", "sitting"},
+		{"chrome", "chorme"}, {"chrome", "chrmae"}, {"abcdef", "abcfed"},
+		{"sodanco", "sodanco"}, {" Tocantins", "tocantins"},
+	}
+	var sc fuzzyDistanceScratch
+	for _, p := range pairs {
+		a, b := []rune(p[0]), []rune(p[1])
+		for _, max := range []int{0, 1, 2, 3} {
+			want := damerauLevenshteinBounded(a, b, max)
+			got := damerauLevenshteinBoundedReuse(a, b, max, &sc)
+			if got != want {
+				t.Fatalf("reuse(%q, %q, %d) = %d, want %d", p[0], p[1], max, got, want)
+			}
+		}
+	}
+}
+
+// TestAppendFuzzyCollectsPastEnoughBoundary pins the collection-cap
+// semantics: the in-flight variant always over-collects past the
+// need*fuzzyCollectFactor cap, and that tail participates in the final
+// sort. Stopping mid-variant would change which survivors reach a small
+// top-N. The fixture lines up 30 equidistant typo matches with ranks
+// opposing id order, so a mid-variant cutoff picks the wrong winner.
+func TestAppendFuzzyCollectsPastEnoughBoundary(t *testing.T) {
+	idx := &Index{Source: "usn", Volume: "Q:", Compact: true, DBPath: ""}
+	add := func(name string) {
+		idx.Records = append(idx.Records, CompactRecord{
+			FRN:       uint64(len(idx.Records) + 10),
+			ParentFRN: uint64(10),
+			Parent:    0,
+			Name:      name,
+		})
+	}
+	add(".")
+	// Insertion order opposes name order: ids ascend while names descend,
+	// so collection order and rank order disagree.
+	for i := 29; i >= 0; i-- {
+		add(fmt.Sprintf("unittest_%02d.txt", i))
+	}
+	buildOrders(idx)
+	vol := newServiceVolumeIndex("", idx)
+	vol.volume = "Q:"
+	vol.rebuildNameTrigramsLocked()
+	volumes := []*serviceVolumeIndex{vol}
+	opts := queryOptions{Query: "unitest", Limit: 1}
+	// Independent expectation: every file is a distance-1 survivor, so the
+	// winner is the rank-minimum under the full ranking keys.
+	pq, err := parseQuery(opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pqNoTerms := pq
+	pqNoTerms.Terms = nil
+	rankVec := vol.rankForQuery(pqNoTerms)
+	term := "unitest"
+	termRunes := []rune(term)
+	var sc fuzzyDistanceScratch
+	bestRank := -1
+	bestPath := ""
+	n := vol.index.compactRecordCount()
+	for id := 0; id < n; id++ {
+		rec := vol.index.compactRecord(id)
+		if rec.Deleted {
+			continue
+		}
+		nameLower := foldFuzzyText(strings.ToLower(rec.Name))
+		dist, _, _, ok := fuzzyNameDistanceScratch(nameLower, termRunes, true, 1, &sc)
+		if !ok || dist == 0 {
+			continue
+		}
+		var rank uint64
+		if id < len(rankVec) {
+			rank = uint64(rankVec[id])
+		}
+		if bestRank < 0 || rank < uint64(bestRank) {
+			bestRank = int(rank)
+			bestPath = rec.Name
+		}
+	}
+	if bestPath == "" {
+		t.Fatal("no distance-1 survivors in fixture")
+	}
+	matches, added := appendFuzzyServiceMatches(volumes, opts, nil)
+	if !added || len(matches) != 1 {
+		t.Fatalf("added=%v matches=%v, want exactly one fuzzy winner", added, len(matches))
+	}
+	if matches[0].Name != bestPath {
+		t.Fatalf("winner = %q, want rank-minimum %q", matches[0].Name, bestPath)
+	}
+}
+
+func TestScoreFuzzyRefsParallelMatchesSerial(t *testing.T) {
+	// Parallel scoring must merge deterministically: repeating the fixture
+	// ids past the parallel threshold has to score every repetition exactly
+	// like the small (serial) run. Needs GOMAXPROCS > 1 to exercise the
+	// parallel path; the serial path is always correct by construction.
+	vol := buildFuzzyTestVolume(t)
+	pq, err := parseQuery(queryOptions{Query: "tonics", Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pqNoTerms := pq
+	pqNoTerms.Terms = nil
+	rankVec := vol.rankForQuery(pqNoTerms)
+	term := "tonics"
+	termRunes := []rune(term)
+	termMask := fuzzyLetterMask(term)
+	base := []int{1, 2, 3, 4, 5, 6}
+	var scSerial, scParallel fuzzyDistanceScratch
+	serial := scoreFuzzyRefs(vol, rankVec, base, termRunes, true, termMask, 1, &scSerial)
+	if len(serial) != len(base) {
+		t.Fatalf("serial scores = %d, want %d", len(serial), len(base))
+	}
+	big := make([]int, 0, 2*fuzzyParallelScoreMinIDs)
+	for len(big) < 2*fuzzyParallelScoreMinIDs {
+		big = append(big, base...)
+	}
+	parallel := scoreFuzzyRefs(vol, rankVec, big, termRunes, true, termMask, 1, &scParallel)
+	for i, s := range parallel {
+		if want := serial[i%len(base)]; s != want {
+			t.Fatalf("parallel score[%d] (id %d) = %+v, want %+v", i, big[i], s, want)
+		}
+	}
+}
+
+func TestFuzzyBestWindowAtReuseMatchesWrapper(t *testing.T) {
+	names := []string{"chrome.exe", "browser_test.cc", "render_frame.cc", "ab", "xochromey"}
+	terms := []string{"chorme", "broswer", "frame", "ab"}
+	var sc fuzzyDistanceScratch
+	for _, name := range names {
+		for _, term := range terms {
+			for _, tau := range []int{1, 2} {
+				for _, start := range []int{0, 1, 3} {
+					want := fuzzyBestWindowAt(name, term, start, tau)
+					got := fuzzyBestWindowAtReuse([]rune(name), []rune(term), start, tau, &sc)
+					if got != want {
+						t.Fatalf("reuse(%q, %q, start=%d, %d) = %q, want %q",
+							name, term, start, tau, got, want)
+					}
+				}
+			}
 		}
 	}
 }
