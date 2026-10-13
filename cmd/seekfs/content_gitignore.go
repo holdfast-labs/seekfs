@@ -327,6 +327,16 @@ func (g *contentGitIgnore) ignoredInRepo(original string, isDir bool, repo strin
 			return true
 		}
 	}
+	return g.ignoredInRepoComps(repo, relOrig, isDir)
+}
+
+// ignoredInRepoComps answers the tail of ignoredInRepo for precomputed
+// relative components: the parent-chain ignore check plus the file's own
+// match. Callers must have established repo membership and a clean split
+// (see the scan worker's parent-path construction, which guarantees
+// component alignment by construction); behavior is otherwise identical to
+// ignoredInRepo.
+func (g *contentGitIgnore) ignoredInRepoComps(repo string, relOrig []string, isDir bool) bool {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	if len(relOrig) > 1 && g.dirIgnoredLocked(repo, relOrig[:len(relOrig)-1]) {

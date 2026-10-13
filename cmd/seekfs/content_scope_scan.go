@@ -120,6 +120,14 @@ type contentScanWorker struct {
 	memo   map[int32]contentParentDecision
 	cache  map[int]string
 	count  int
+	// parentOrig memoizes one directory's reconstructed original-case path so
+	// each file's path is one parent-plus-name concatenation instead of a
+	// full chain walk (byte-identical to reconstruction: the same chain,
+	// the same `\` joins, the same root/dedup rules; reserved and
+	// separator-bearing names keep the slow path). repoDepth memoizes each
+	// repo's component depth for the relOrig split.
+	parentOrig map[int32]string
+	repoDepth  map[string]int
 }
 
 // scanScopeMembers runs cfg over the index, returning one admitted-member
@@ -160,13 +168,15 @@ func scanScopeMembers(s *goSearchService, vol *serviceVolumeIndex, cfg contentSc
 			ws.Ignore = newContentGitIgnore(repos)
 			ws.Ignore.shared = shared
 			worker := &contentScanWorker{
-				scope:  &ws,
-				ignore: ws.Ignore,
-				idx:    cfg.idx,
-				isWalk: cfg.isWalk,
-				memo:   make(map[int32]contentParentDecision, 4096),
-				cache:  make(map[int]string, 1024),
-				count:  count,
+				scope:      &ws,
+				ignore:     ws.Ignore,
+				idx:        cfg.idx,
+				isWalk:     cfg.isWalk,
+				memo:       make(map[int32]contentParentDecision, 4096),
+				cache:      make(map[int]string, 1024),
+				count:      count,
+				parentOrig: make(map[int32]string, 4096),
+				repoDepth:  make(map[string]int),
 			}
 			members, top, limited, moved := worker.scanRange(s, vol, cfg, start, end, &scanned)
 			out[w] = workerOut{members: members, top: top, limited: limited, moved: moved}
@@ -345,7 +355,7 @@ func (w *contentScanWorker) admitRecord(id int, rec CompactRecord) (contentScope
 	} else if _, ok := w.scope.ExtSet[ext]; !ok {
 		return out, false
 	}
-	raw := w.idx.reconstructCompactPathCached(id, w.cache)
+	raw := w.fileOrigPath(id, rec)
 	if raw == "" {
 		return out, false
 	}
@@ -380,9 +390,24 @@ func (w *contentScanWorker) admitRecord(id int, rec CompactRecord) (contentScope
 	}
 	if dec.repo != "" {
 		// In-repo files still face the basename patterns; the directory
-		// part already cleared dirIgnored via the memo.
-		if w.ignore.ignoredInRepo(raw, false, dec.repo) {
-			return out, false
+		// part already cleared dirIgnored via the memo. The relative
+		// components come from one split of the parent-built path (no
+		// re-normalization, no worktree re-lookup); misalignment falls
+		// back to the legacy entry.
+		relOrig, ok := w.fileRelComps(raw, dec.repo)
+		if !ok {
+			if w.ignore.ignoredInRepo(raw, false, dec.repo) {
+				return out, false
+			}
+		} else {
+			for _, c := range relOrig {
+				if strings.EqualFold(c, ".git") {
+					return out, false
+				}
+			}
+			if w.ignore.ignoredInRepoComps(dec.repo, relOrig, false) {
+				return out, false
+			}
 		}
 	}
 	frn := rec.FRN
@@ -458,8 +483,51 @@ func (w *contentScanWorker) dirDecision(id int32) contentParentDecision {
 func (w *contentScanWorker) memoize(id int32, d contentParentDecision) {
 	if len(w.memo) >= contentScanMemoMax {
 		w.memo = make(map[int32]contentParentDecision, 4096)
+		w.parentOrig = make(map[int32]string, 4096)
 	}
 	w.memo[id] = d
+}
+
+// fileOrigPath returns the record's absolute original-case path: the
+// parent's memoized path plus the name, falling back to full reconstruction
+// for volume-root children (whose root/dedup rules reconstruction owns),
+// reserved names, and separator-bearing names. The concatenation is
+// byte-identical to reconstruction on well-formed records (the same chain,
+// joins and root handling); corrupt parent links stay on the legacy path's
+// exact behavior by using reconstruction itself for the parent.
+func (w *contentScanWorker) fileOrigPath(id int, rec CompactRecord) string {
+	parent, name := rec.Parent, rec.Name
+	if parent >= 0 && name != "" && name != "." && strings.IndexAny(name, `/\`) < 0 {
+		if pop, ok := w.parentOrig[parent]; ok {
+			return pop + `\` + name
+		}
+		if pop := w.idx.reconstructCompactPathCached(int(parent), w.cache); pop != "" {
+			if len(w.parentOrig) >= contentScanMemoMax {
+				w.parentOrig = make(map[int32]string, 4096)
+			}
+			w.parentOrig[parent] = pop
+			return pop + `\` + name
+		}
+	}
+	return w.idx.reconstructCompactPathCached(id, w.cache)
+}
+
+// fileRelComps splits an ignore-member file path into the components below
+// its worktree root. Alignment holds by construction (the path extends a
+// repo-member parent whose membership the memo established, and folding is
+// per-rune so the prefix relationship survives it); a short split falls back
+// to not-ok and the caller uses the legacy path.
+func (w *contentScanWorker) fileRelComps(raw, repo string) ([]string, bool) {
+	k, ok := w.repoDepth[repo]
+	if !ok {
+		k = len(contentSplitComponents(repo))
+		w.repoDepth[repo] = k
+	}
+	comps := contentSplitComponents(raw)
+	if len(comps) <= k {
+		return nil, false
+	}
+	return comps[k:], true
 }
 
 // deriveChildDecision derives directory name's decision from its parent's.
