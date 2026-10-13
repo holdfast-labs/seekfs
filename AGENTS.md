@@ -21,6 +21,19 @@
 - If `seekfs` is not on PATH in a fresh shell, call the repository binary
   directly.
 
+## Reference tools: fsearch and fff
+
+- The product bar is **as fast as fsearch, as accurate as fff**, with a small
+  index so content search can cover the whole drive.
+- "fsearch" always means **Noah Dunnagan's fsearch**
+  (<https://github.com/noahdunnagan/fsearch>), never the unrelated Linux GTK
+  app cboxdoerfer/fsearch. "fff" means **dmtrKovalenko/fff**
+  (<https://github.com/dmtrKovalenko/fff>, fff.nvim).
+- `docs/REFERENCE_TOOLS.md` summarizes how each one works and lists seekfs's
+  current gaps against them. Read it before working on speed, ranking, typo
+  tolerance, content coverage or index size, and update its gap list when you
+  close one.
+
 ## Release builds (`dist/`)
 
 - `dist\seekfs-windows-amd64\seekfs.exe` is the Windows service binary (the
