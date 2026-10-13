@@ -395,12 +395,13 @@ func (vol *serviceVolumeIndex) boundedScanCandidatesFiltered(pq parsedQuery, fil
 	if vol == nil || vol.index == nil {
 		return nil, false
 	}
-	if filter != nil && filter.members == nil && filter.source.hasPosting {
+	if filter != nil && filter.bits == nil && filter.source.hasPosting {
 		ids := filter.source.posting.materialize()
-		filter.members = make(map[int]struct{}, len(ids))
+		nf := newBoundedScanMembershipFilter(vol.index.compactRecordCount())
 		for _, id := range ids {
-			filter.members[int(id)] = struct{}{}
+			nf.add(int(id))
 		}
+		filter.bits, filter.count, filter.n = nf.bits, nf.count, nf.n
 	}
 	// Name-memo lane: the full ordered scan with bit checks instead of
 	// per-candidate path verification. Hidden exclusion does not apply on
@@ -611,22 +612,87 @@ func (vol *serviceVolumeIndex) boundedScanCandidatesHiddenTop(pq parsedQuery, hi
 	return vol.boundedScanHiddenTop(pq, hidden, limit, nil)
 }
 
+// boundedScanSearchCandidates is the top-N floor for single-volume searches:
+// cheap exact-superset pre-filters (ext posting, dir subtree, required regex
+// literal runs, trigram exact-empty) narrow the scan, and the scan itself
+// stops at the limit in scan order. It mirrors the global bounded lane's
+// per-volume logic, so order and exactness match the exhaustive scan the
+// verify loop would otherwise truncate to the same limit. Count queries,
+// biased queries (whose downstream re-ranking needs the full set), and
+// content queries (whose inline verification needs its own budgets) keep the
+// exhaustive floor.
+func (vol *serviceVolumeIndex) boundedScanSearchCandidates(pq parsedQuery) ([]int, bool) {
+	if vol == nil || vol.index == nil || pq.CountOnly || pq.Limit <= 0 ||
+		pq.RootBias != "" || pq.CWDBias != "" || queryHasAnyContentLeaf(pq) {
+		return vol.boundedScanCandidates(pq)
+	}
+	// Posting-derived pre-filters describe base records; uncommitted
+	// recent/trigram-recent additions are merged by the scan itself, so only
+	// filter when there is nothing uncommitted to miss (mirrors
+	// plainTermNameTrigramExactEmpty's recentIDs gate).
+	if len(vol.recentIDs) == 0 && len(vol.nameTrigramRecent) == 0 {
+		var filter *boundedScanMembershipFilter
+		exactEmpty, filterOK := vol.boundedScanPrefilter(pq, &filter)
+		if exactEmpty {
+			return []int{}, true
+		}
+		if filterOK {
+			return vol.boundedScanCandidatesHiddenTopFiltered(pq, pq.hidden, pq.Limit, filter)
+		}
+	}
+	return vol.boundedScanCandidatesHiddenTop(pq, pq.hidden, pq.Limit)
+}
+
 // boundedScanMembershipFilter pre-filters the bounded name/id-order scan to a
 // selective ext/glob-ext posting so broad queries with a cheap extension filter
 // do not walk every record.  The scan order is unchanged (id order when the
 // resident name order is absent, name order otherwise), so the top-N semantics
 // of boundedScanCandidatesHiddenTop are preserved exactly.
+//
+// Membership is a bitset over record IDs, not a map: the scan probes every
+// position, so a map lookup per position dominates the check it guards. A
+// bitset probe is a bounds check plus one word load.
 type boundedScanMembershipFilter struct {
-	source  candidatePlanSource
-	members map[int]struct{}
+	source candidatePlanSource
+	bits   []uint64
+	count  int
+	n      int
+}
+
+func newBoundedScanMembershipFilter(recordCount int) *boundedScanMembershipFilter {
+	return &boundedScanMembershipFilter{
+		bits: make([]uint64, (recordCount+63)/64),
+		n:    recordCount,
+	}
+}
+
+func (f *boundedScanMembershipFilter) add(id int) {
+	if f == nil || id < 0 || id >= f.n {
+		return
+	}
+	w := id / 64
+	b := uint64(1) << uint(id%64)
+	if f.bits[w]&b == 0 {
+		f.bits[w] |= b
+		f.count++
+	}
+}
+
+func (f *boundedScanMembershipFilter) len() int {
+	if f == nil {
+		return 0
+	}
+	return f.count
 }
 
 func (f *boundedScanMembershipFilter) contains(id int) bool {
-	if f == nil || f.members == nil {
+	if f == nil || f.bits == nil {
 		return true
 	}
-	_, ok := f.members[id]
-	return ok
+	if id < 0 || id >= f.n {
+		return false
+	}
+	return f.bits[id/64]&(uint64(1)<<uint(id%64)) != 0
 }
 
 // boundedScanCandidatesHiddenTopFiltered is boundedScanCandidatesHiddenTop with
@@ -638,12 +704,13 @@ func (vol *serviceVolumeIndex) boundedScanCandidatesHiddenTopFiltered(pq parsedQ
 	if vol == nil || vol.index == nil || limit <= 0 {
 		return nil, false
 	}
-	if filter != nil && filter.members == nil && filter.source.hasPosting {
+	if filter != nil && filter.bits == nil && filter.source.hasPosting {
 		ids := filter.source.posting.materialize()
-		filter.members = make(map[int]struct{}, len(ids))
+		nf := newBoundedScanMembershipFilter(vol.index.compactRecordCount())
 		for _, id := range ids {
-			filter.members[int(id)] = struct{}{}
+			nf.add(int(id))
 		}
+		filter.bits, filter.count, filter.n = nf.bits, nf.count, nf.n
 	}
 	return vol.boundedScanHiddenTop(pq, hidden, limit, filter)
 }
@@ -843,11 +910,11 @@ func (vol *serviceVolumeIndex) planPlainTermPathFilter(pq parsedQuery) (filter *
 	if best == nil || len(best) > serviceComponentMultiTermScanMaxIDs {
 		return nil, false, false
 	}
-	members := make(map[int]struct{}, len(best))
+	filter = newBoundedScanMembershipFilter(vol.index.compactRecordCount())
 	for _, id := range best {
-		members[id] = struct{}{}
+		filter.add(id)
 	}
-	return &boundedScanMembershipFilter{members: members}, false, true
+	return filter, false, true
 }
 
 // plainTermMayOccurInPathPrefix protects name-only trigram proofs from path
@@ -1052,7 +1119,7 @@ func (vol *serviceVolumeIndex) planRegexLiteralFilter(pq parsedQuery) (filter *b
 	if len(disjuncts) == 0 {
 		return nil, false, false
 	}
-	members := make(map[int]struct{}, 64)
+	filter = newBoundedScanMembershipFilter(vol.index.compactRecordCount())
 	kept := 0
 	for _, runs := range disjuncts {
 		hasUsable := false
@@ -1085,11 +1152,11 @@ func (vol *serviceVolumeIndex) planRegexLiteralFilter(pq parsedQuery) (filter *b
 			// exact superset of the match set.
 			continue
 		}
-		if len(members)+len(best) > serviceComponentMultiTermScanMaxIDs {
+		if filter.len()+len(best) > serviceComponentMultiTermScanMaxIDs {
 			return nil, false, false
 		}
 		for _, id := range best {
-			members[id] = struct{}{}
+			filter.add(id)
 		}
 		kept++
 	}
@@ -1098,7 +1165,7 @@ func (vol *serviceVolumeIndex) planRegexLiteralFilter(pq parsedQuery) (filter *b
 		// this volume.
 		return nil, true, true
 	}
-	return &boundedScanMembershipFilter{members: members}, false, true
+	return filter, false, true
 }
 
 // planDirSubtreeFilter builds a membership pre-filter for `type:dir <term>`
@@ -1149,7 +1216,7 @@ func (vol *serviceVolumeIndex) planDirSubtreeFilter(pq parsedQuery) (*boundedSca
 	if total == 0 {
 		return nil, false
 	}
-	members := make(map[int]struct{}, total)
+	filter := newBoundedScanMembershipFilter(vol.index.compactRecordCount())
 	for _, root := range roots {
 		if root < 0 || root >= len(vol.subtreeStart) || root >= len(vol.subtreeEnd) {
 			continue
@@ -1159,8 +1226,8 @@ func (vol *serviceVolumeIndex) planDirSubtreeFilter(pq parsedQuery) (*boundedSca
 			continue
 		}
 		for _, id32 := range vol.subtreeOrder[start:end] {
-			members[int(id32)] = struct{}{}
+			filter.add(int(id32))
 		}
 	}
-	return &boundedScanMembershipFilter{members: members}, true
+	return filter, true
 }

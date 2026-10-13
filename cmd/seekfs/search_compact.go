@@ -815,13 +815,13 @@ func (vol *serviceVolumeIndex) nameTermCandidates(pq parsedQuery) ([]int, bool) 
 		}
 	}
 	if len(pq.Terms) == 0 && len(pq.Exts) == 0 && len(pq.Globs) == 0 && len(pq.OrGroups) == 0 {
-		if candidates, ok := vol.boundedScanCandidates(pq); ok {
+		if candidates, ok := vol.boundedScanSearchCandidates(pq); ok {
 			pq.Trace.setSource("bounded-scan", len(candidates))
 			return candidates, true
 		}
 	}
 	if queryHasNonASCIIPlainTerm(pq) {
-		if candidates, ok := vol.boundedScanCandidates(pq); ok {
+		if candidates, ok := vol.boundedScanSearchCandidates(pq); ok {
 			pq.Trace.setSource("bounded-scan", len(candidates))
 			return candidates, true
 		}
@@ -928,7 +928,7 @@ func (vol *serviceVolumeIndex) nameTermCandidates(pq parsedQuery) ([]int, bool) 
 		pq.Trace.setSource("under", len(candidates))
 		return candidates, true
 	}
-	if candidates, ok := vol.boundedScanCandidates(pq); ok {
+	if candidates, ok := vol.boundedScanSearchCandidates(pq); ok {
 		pq.Trace.setSource("bounded-scan", len(candidates))
 		return candidates, true
 	}

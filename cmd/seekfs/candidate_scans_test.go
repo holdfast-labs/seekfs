@@ -59,10 +59,13 @@ func TestBoundedScanPrefilterPlainTerm(t *testing.T) {
 		if exactEmpty || !filterOK || filter == nil {
 			t.Fatalf("prefilter = (%v, %v, %v), want filter set", exactEmpty, filterOK, filter)
 		}
-		if len(filter.members) == 0 {
+		if filter.len() == 0 {
 			t.Fatal("filter has no members for a term known to match")
 		}
-		for id := range filter.members {
+		for id := 0; id < vol.index.compactRecordCount(); id++ {
+			if !filter.contains(id) {
+				continue
+			}
 			if !vol.index.compactPathContainsTerm(id, "trainingdata") {
 				t.Fatalf("filter member %d does not contain the term", id)
 			}
@@ -73,7 +76,7 @@ func TestBoundedScanPrefilterPlainTerm(t *testing.T) {
 		pq := mustParsePrefilterQuery(t, queryOptions{Query: "sample-volume.nrrd", MatchPath: true, Limit: 20})
 		var filter *boundedScanMembershipFilter
 		exactEmpty, filterOK := vol.boundedScanPrefilter(pq, &filter)
-		if exactEmpty || !filterOK || filter == nil || len(filter.members) == 0 {
+		if exactEmpty || !filterOK || filter == nil || filter.len() == 0 {
 			t.Fatalf("prefilter = (%v, %v), want filter set", exactEmpty, filterOK)
 		}
 	})
