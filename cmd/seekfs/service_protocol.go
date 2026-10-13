@@ -557,24 +557,29 @@ type serviceVolumeIndex struct {
 	// up. Persists skip their tick while it is held (the WAL keeps changes
 	// durable).
 	contentSnapshotHold atomic.Int32
-	underCache          map[int]postingCacheEntry
-	underRootCache      map[string]postingCacheEntry
-	dirty               bool
-	lastPersist         time.Time
-	persistFailures     int
-	persistRetryAfter   time.Time
-	lastPersistErr      string
-	lastReplayAt        time.Time
-	lastReplayErr       string
-	lastReplayNext      int64
-	replayStrikes       int
-	stallObservedCp     int64
-	stallObservedAt     time.Time
-	recovering          atomic.Bool
-	searchCount         uint64
-	overlay             *overlaySegment
-	snap                atomic.Pointer[volumeSnapshot]
-	snapshotGen         atomic.Uint64
+	// persistActive counts background persists in flight. A persist raises
+	// it before checking contentSnapshotHold and a snapshot raises the hold
+	// before waiting for it to drain, so a snapshot never overlaps a persist
+	// that started before it.
+	persistActive     atomic.Int32
+	underCache        map[int]postingCacheEntry
+	underRootCache    map[string]postingCacheEntry
+	dirty             bool
+	lastPersist       time.Time
+	persistFailures   int
+	persistRetryAfter time.Time
+	lastPersistErr    string
+	lastReplayAt      time.Time
+	lastReplayErr     string
+	lastReplayNext    int64
+	replayStrikes     int
+	stallObservedCp   int64
+	stallObservedAt   time.Time
+	recovering        atomic.Bool
+	searchCount       uint64
+	overlay           *overlaySegment
+	snap              atomic.Pointer[volumeSnapshot]
+	snapshotGen       atomic.Uint64
 }
 
 type overlaySegment struct {

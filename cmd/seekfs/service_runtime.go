@@ -1057,6 +1057,8 @@ func (s *goSearchService) persistVolumeIfDue(vol *serviceVolumeIndex, force bool
 	if !force && envBool("SEEKFS_DISABLE_BACKGROUND_PERSIST") {
 		return
 	}
+	vol.persistActive.Add(1)
+	defer vol.persistActive.Add(-1)
 	if !force && vol.contentSnapshotHold.Load() > 0 {
 		return // a content snapshot is copying this index; persist next tick
 	}

@@ -119,6 +119,11 @@ var errContentBuildAborted = errors.New("content build aborted")
 // sidecar could be published.
 var errContentBuildStale = errors.New("content build stale")
 
+// contentSnapshotPersistWait bounds how long a content snapshot waits for an
+// in-flight background persist (which takes seconds to a minute on a large
+// volume) before starting its copy.
+var contentSnapshotPersistWait = 3 * time.Minute
+
 // contentBuildSnapshotResult tells runContentBuild what a metadata snapshot
 // produced.
 type contentBuildSnapshotResult int
@@ -417,6 +422,14 @@ func (s *goSearchService) snapshotContentBuildItems(vol *serviceVolumeIndex, opt
 	// would restart the snapshot (see contentSnapshotHold).
 	vol.contentSnapshotHold.Add(1)
 	defer vol.contentSnapshotHold.Add(-1)
+	// A persist that started before the hold still swaps vol.index when it
+	// finishes; wait it out so the copy starts on the index that stays.
+	for deadline := time.Now().Add(contentSnapshotPersistWait); vol.persistActive.Load() > 0; {
+		if s.contentStopped(vol) || time.Now().After(deadline) {
+			return nil, 0, 0, contentBuildSnapshotChanged
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
 	s.indexMu.RLock()
 	if vol.index == nil || (vol.index.Source != "usn" && vol.index.Source != "walk") {
 		s.indexMu.RUnlock()

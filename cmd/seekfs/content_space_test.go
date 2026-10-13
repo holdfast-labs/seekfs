@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestContentMkdirWorkUsesSidecarDirAndClearsStale(t *testing.T) {
@@ -127,5 +128,36 @@ func TestContentSnapshotHoldsBackgroundPersist(t *testing.T) {
 	vol.contentSnapshotHold.Add(-1)
 	if !vol.dirty {
 		t.Fatal("background persist ran while a content snapshot held it")
+	}
+}
+
+// A snapshot waits for a background persist already in flight (it would swap
+// vol.index mid-copy) and a persist backs off while a snapshot holds.
+func TestContentSnapshotWaitsForInFlightPersist(t *testing.T) {
+	t.Setenv("SEEKFS_CONTENT_SEARCH", "1")
+	stubContentCatchUpSync(t)
+	stubContentBuildSync(t)
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "a.txt"), []byte("hello needle"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	stubContentCatchUpJournal(t, usnJournalDataV0{UsnJournalID: 7, FirstUsn: 1, LowestValidUsn: 1, NextUsn: 100})
+	vol, _ := contentBuildTestVolume(t, dir, 7, 100, []CompactRecord{{FRN: 10, ParentFRN: 10, Parent: -1, Name: "a.txt", Size: 12}})
+	vol.persistActive.Add(1) // a persist is mid-flight
+	var sawActive bool
+	contentBuildSnapshotBatchHook = func(*goSearchService, *serviceVolumeIndex) {
+		sawActive = sawActive || vol.persistActive.Load() > 0
+	}
+	go func() {
+		time.Sleep(100 * time.Millisecond)
+		vol.persistActive.Add(-1) // the persist finishes
+	}()
+	s := contentTestService(t)
+	s.ensureContentBuild(vol)
+	if sawActive {
+		t.Fatal("snapshot copied while a persist was still in flight")
+	}
+	if got := vol.content.stateOf(); got != contentStateReady {
+		t.Fatalf("state = %q; want ready once the in-flight persist finished", got)
 	}
 }
