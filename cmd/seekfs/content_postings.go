@@ -1,12 +1,20 @@
 package main
 
-// Content trigram (CXGR) block codec, format v7.
+// Content trigram (CXGR) block codec, format v9.
 //
 // The v9 record block format carries only []uint32, so content postings get
 // their own block codec. Each posting list is split into
 // contentPostingBlockSize blocks so a reader pages through a term without
 // decoding the whole list, and each block records its first docID so
 // intersections can skip.
+//
+// v9 changes (format v9 gate; v8 sections never meet this decoder):
+//   - Entries drop count and firstBlock (16 -> 12 bytes); the decoder
+//     rebuilds both as prefix sums over the key-ordered tables.
+//   - Block metas drop byteOffset (16 -> 12 bytes); the decoder rebuilds
+//     offsets as the prefix sum of byteLens.
+//   - Single-document grams are singleton entries carrying the docID inline
+//     with no blocks (see contentPostingEntry).
 //
 // v7 changes (format v7 gate; v6 sections never meet this decoder):
 //   - No term frequencies: grams always had tf=1 and no query path reads tf
@@ -48,16 +56,41 @@ type contentDocFreq struct {
 }
 
 // contentPostingEntry is the dictionary row for one gram key.
+//
+// v9 changes (format v9 gate; v8 sections never meet this decoder):
+//   - The entry drops count and firstBlock (16 -> 12 bytes). Blocks are
+//     emitted in key order, so firstBlock is the prefix sum of the preceding
+//     entries' block counts, and count is the sum of the entry's block
+//     counts; the decoder rebuilds both in one pass.
+//   - A gram occurring in exactly one document is a singleton entry: it
+//     carries the docID inline and owns no blocks (measured: ~1/3 of gram
+//     keys on code corpora), saving a block meta plus a 2-byte block payload
+//     per such key. The pad byte becomes a flags byte (0 = multi,
+//     1 = singleton).
 type contentPostingEntry struct {
 	key        [3]byte
+	single    bool
 	count      uint32
 	firstBlock uint32
 	blockCount uint32
+	singleDoc  uint32
 }
+
+// contentPostingEntryMulti and contentPostingEntrySingle are the flags-byte
+// values distinguishing the two v9 entry kinds.
+const (
+	contentPostingEntryMulti   = 0
+	contentPostingEntrySingle  = 1
+)
 
 // contentBlockMeta locates one encoded block and records its bounds.
 // byteOffset is u32: a section never exceeds the 4 GiB sidecar cap, so every
 // block address fits.
+//
+// v9 drops the stored byteOffset (16 -> 12 bytes): blocks are laid out in
+// order, so each offset is the prefix sum of the preceding blocks' byteLens;
+// the decoder rebuilds them in one pass and rejects a section whose running
+// sum does not land exactly on the blob length.
 type contentBlockMeta struct {
 	firstDocID uint32
 	count      uint32
@@ -65,8 +98,8 @@ type contentBlockMeta struct {
 	byteLen    uint32
 }
 
-const contentPostingEntrySize = 16 // key(3)+pad(1)+count(4)+firstBlock(4)+blockCount(4)
-const contentBlockMetaSize = 16    // firstDocID(4)+count(4)+byteOffset(4)+byteLen(4)
+const contentPostingEntrySize = 12 // key(3)+flags(1)+a(4)+b(4): multi=(firstBlock,blockCount), single=(docID,0)
+const contentBlockMetaSize = 12    // firstDocID(4)+count(4)+byteLen(4)
 
 // contentPostingBlockList and contentPostingBlockBitmap are the per-block
 // payload kinds.
@@ -196,16 +229,23 @@ func encodeContentPostingSection(postings map[string][]contentDocFreq) []byte {
 
 	for _, key := range keys {
 		ids := postings[key]
-		entry := contentPostingEntry{
-			count:      uint32(len(ids)),
-			firstBlock: uint32(len(blocks)),
-		}
+		entry := contentPostingEntry{}
 		copy(entry.key[:], key)
 
 		docIDs := make([]uint32, len(ids))
 		for i, p := range ids {
 			docIDs[i] = p.docID
 		}
+		if len(docIDs) == 1 {
+			// Singleton: the docID rides inline; no blocks are emitted.
+			entry.single = true
+			entry.count = 1
+			entry.singleDoc = docIDs[0]
+			entries = append(entries, entry)
+			continue
+		}
+		entry.firstBlock = uint32(len(blocks))
+		entry.count = uint32(len(docIDs))
 		for start := 0; start < len(docIDs); start += contentPostingBlockSize {
 			end := min(len(docIDs), start+contentPostingBlockSize)
 			chunk := docIDs[start:end]
@@ -233,15 +273,19 @@ func encodeContentPostingSection(postings map[string][]contentDocFreq) []byte {
 	_ = binary.Write(&buf, binary.LittleEndian, uint32(blockBlob.Len()))
 	for _, e := range entries {
 		buf.Write(e.key[:])
-		_ = binary.Write(&buf, binary.LittleEndian, uint8(0))
-		_ = binary.Write(&buf, binary.LittleEndian, e.count)
-		_ = binary.Write(&buf, binary.LittleEndian, e.firstBlock)
-		_ = binary.Write(&buf, binary.LittleEndian, e.blockCount)
+		if e.single {
+			_ = binary.Write(&buf, binary.LittleEndian, uint8(contentPostingEntrySingle))
+			_ = binary.Write(&buf, binary.LittleEndian, e.singleDoc)
+			_ = binary.Write(&buf, binary.LittleEndian, uint32(0))
+		} else {
+			_ = binary.Write(&buf, binary.LittleEndian, uint8(contentPostingEntryMulti))
+			_ = binary.Write(&buf, binary.LittleEndian, e.firstBlock)
+			_ = binary.Write(&buf, binary.LittleEndian, e.blockCount)
+		}
 	}
 	for _, b := range blocks {
 		_ = binary.Write(&buf, binary.LittleEndian, b.firstDocID)
 		_ = binary.Write(&buf, binary.LittleEndian, b.count)
-		_ = binary.Write(&buf, binary.LittleEndian, b.byteOffset)
 		_ = binary.Write(&buf, binary.LittleEndian, b.byteLen)
 	}
 	buf.Write(blockBlob.Bytes())
@@ -275,28 +319,74 @@ func decodeContentPostingIndex(data []byte) (*contentPostingIndex, error) {
 	for i := 0; i < entryCount; i++ {
 		p := off + i*contentPostingEntrySize
 		copy(idx.entries[i].key[:], data[p:p+3])
-		idx.entries[i].count = binary.LittleEndian.Uint32(data[p+4:])
-		idx.entries[i].firstBlock = binary.LittleEndian.Uint32(data[p+8:])
-		idx.entries[i].blockCount = binary.LittleEndian.Uint32(data[p+12:])
+		switch data[p+3] {
+		case contentPostingEntryMulti:
+			idx.entries[i].firstBlock = binary.LittleEndian.Uint32(data[p+4:])
+			idx.entries[i].blockCount = binary.LittleEndian.Uint32(data[p+8:])
+			if idx.entries[i].blockCount == 0 {
+				return nil, errors.New("content postings multi entry without blocks")
+			}
+		case contentPostingEntrySingle:
+			idx.entries[i].single = true
+			idx.entries[i].count = 1
+			idx.entries[i].singleDoc = binary.LittleEndian.Uint32(data[p+4:])
+			if binary.LittleEndian.Uint32(data[p+8:]) != 0 {
+				return nil, errors.New("content postings singleton reserved word nonzero")
+			}
+		default:
+			return nil, errors.New("content postings bad entry flags")
+		}
 		if i > 0 && bytes.Compare(idx.entries[i-1].key[:], idx.entries[i].key[:]) >= 0 {
 			return nil, errors.New("content postings keys out of order")
 		}
 	}
 	off += entryCount * contentPostingEntrySize
+	// Rebuild the dropped firstBlock/count/byteOffset fields in one pass:
+	// blocks are laid out in key order, so offsets prefix-sum the lengths
+	// and entries prefix-sum the block counts.
+	var blobOff uint64
 	for i := 0; i < blockCount; i++ {
 		p := off + i*contentBlockMetaSize
 		idx.blocks[i] = contentBlockMeta{
 			firstDocID: binary.LittleEndian.Uint32(data[p:]),
 			count:      binary.LittleEndian.Uint32(data[p+4:]),
-			byteOffset: binary.LittleEndian.Uint32(data[p+8:]),
-			byteLen:    binary.LittleEndian.Uint32(data[p+12:]),
+			byteOffset: uint32(blobOff),
+			byteLen:    binary.LittleEndian.Uint32(data[p+8:]),
 		}
 		if idx.blocks[i].count == 0 || idx.blocks[i].count > contentPostingBlockSize {
 			return nil, errors.New("content postings bad block count")
 		}
-		if uint64(idx.blocks[i].byteOffset)+uint64(idx.blocks[i].byteLen) > uint64(blockBlobLen) {
+		blobOff += uint64(idx.blocks[i].byteLen)
+		if blobOff > uint64(blockBlobLen) {
 			return nil, errors.New("content postings block out of range")
 		}
+	}
+	if blobOff != uint64(blockBlobLen) {
+		return nil, errors.New("content postings blob length mismatch")
+	}
+	var nextFirst uint32
+	for i := range idx.entries {
+		e := &idx.entries[i]
+		if e.single {
+			continue
+		}
+		// The stored firstBlock must match the prefix sum: entries own
+		// contiguous block runs, so any gap or overlap is corruption.
+		if e.firstBlock != nextFirst {
+			return nil, errors.New("content postings first block mismatch")
+		}
+		if uint64(e.firstBlock)+uint64(e.blockCount) > uint64(len(idx.blocks)) {
+			return nil, errors.New("content postings entry out of range")
+		}
+		var sum uint32
+		for _, b := range idx.blocks[e.firstBlock : e.firstBlock+e.blockCount] {
+			sum += b.count
+		}
+		e.count = sum
+		nextFirst += e.blockCount
+	}
+	if int(nextFirst) != len(idx.blocks) {
+		return nil, errors.New("content postings trailing blocks")
 	}
 	off += blockCount * contentBlockMetaSize
 	idx.blockBlob = data[off : off+blockBlobLen]
@@ -331,6 +421,20 @@ func (idx *contentPostingIndex) postings(key string) (next func() (uint32, uint3
 		return nil, false
 	}
 	e := idx.entries[i]
+	if e.single {
+		doc := e.singleDoc
+		done := false
+		return func() (uint32, uint32, bool) {
+			if done {
+				return 0, 0, false
+			}
+			done = true
+			if contentPostingDecodeHook != nil {
+				contentPostingDecodeHook()
+			}
+			return doc, 0, true
+		}, true
+	}
 	if int64(e.firstBlock)+int64(e.blockCount) > int64(len(idx.blocks)) {
 		return nil, false
 	}

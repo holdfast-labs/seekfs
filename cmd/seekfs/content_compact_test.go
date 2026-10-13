@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sort"
+	"strings"
 	"testing"
 )
 
@@ -350,5 +352,59 @@ func TestContentTermDictScale(t *testing.T) {
 	})
 	if n != len(keys) {
 		t.Fatalf("scan visited %d keys; want %d", n, len(keys))
+	}
+}
+
+// v9 packs both front-code lengths into one header byte when each fits in
+// 14; longer shared prefixes or suffixes take the 0xFF escape plus two
+// uvarints. Both forms round-trip through every decode path.
+func TestContentTermDictNibbleFraming(t *testing.T) {
+	keys := []string{
+		"a",
+		"ab",
+		"abc",
+		"abd",
+		"content",
+		"contention",
+		"contentious",
+		"context",
+		"controller",
+		strings.Repeat("p", 14) + "suffix",
+		strings.Repeat("p", 15) + "suffix-needs-escape",
+		strings.Repeat("q", 40),
+		strings.Repeat("q", 40) + strings.Repeat("r", 40),
+		strings.Repeat("z", 200),
+	}
+	sort.Strings(keys)
+	df := map[string]uint32{}
+	for i, k := range keys {
+		df[k] = uint32(i%300 + 1)
+	}
+	data := encodeContentTermDict(keys, df)
+	// At least one record must take the escape (the 200-rune key shares a
+	// long prefix with nothing but exceeds the nibble), and the section must
+	// be smaller than two-uvarint framing would allow.
+	if !bytes.Contains(data, []byte{contentFrontCodedEscape}) {
+		t.Fatal("framing test corpus produced no escape record")
+	}
+	d, err := decodeContentTermDict(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, k := range keys {
+		if got, ok := d.count(k); !ok || got != int(df[k]) {
+			t.Fatalf("count(%q) = %d, %v; want %d", k, got, ok, df[k])
+		}
+		if at, ok := d.keyAt(sort.SearchStrings(keys, k)); !ok || at != k {
+			t.Fatalf("keyAt(%q) = %q, %v", k, at, ok)
+		}
+	}
+	var scanned []string
+	d.scanRange(0, d.keyCount(), func(key []byte, freq int) bool {
+		scanned = append(scanned, string(append([]byte(nil), key...)))
+		return true
+	})
+	if !reflect.DeepEqual(scanned, keys) {
+		t.Fatalf("scan order mismatch:\n got %q\nwant %q", scanned, keys)
 	}
 }

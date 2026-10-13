@@ -1157,6 +1157,11 @@ func encodeContentPaths(paths []string) []byte {
 				shared++
 			}
 		}
+		// Paths keep the legacy two-uvarint framing: repository paths share
+		// long directory prefixes and carry long file names, so both
+		// lengths almost always exceed the term dictionary's one-byte
+		// header and an escape marker would only add a byte per path
+		// (measured +1 B/doc on the Chromium sample).
 		var tmp [binary.MaxVarintLen64]byte
 		m := binary.PutUvarint(tmp[:], uint64(shared))
 		blob.Write(tmp[:m])
@@ -1238,7 +1243,7 @@ func decodeContentPaths(data []byte, docCount int) ([]string, error) {
 				return nil, errors.New("content paths restart offset mismatch")
 			}
 		}
-		key, next, ok := decodeFrontCodedKey(blob, pos, prev)
+		key, next, ok := decodeLegacyFrontCodedKey(blob, pos, prev)
 		if !ok {
 			return nil, errors.New("content paths key truncated")
 		}

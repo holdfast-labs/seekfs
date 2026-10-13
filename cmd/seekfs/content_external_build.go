@@ -678,6 +678,8 @@ func (a *contentExternalAssembler) startKey(key []byte) {
 		firstBlock: uint32(len(a.blocks)),
 	}
 	a.entry.key = a.curKey
+	a.entry.single = false
+	a.entry.singleDoc = 0
 }
 
 func (a *contentExternalAssembler) addPosting(docID uint32) {
@@ -711,6 +713,18 @@ func (a *contentExternalAssembler) endKey() {
 	if !a.hasKey {
 		return
 	}
+	if a.entry.count == 1 && len(a.block) == 1 {
+		// Singleton: the docID rides inline; no blocks are emitted, so
+		// later keys' firstBlock prefix sums stay contiguous.
+		a.entry.single = true
+		a.entry.singleDoc = a.block[0]
+		a.entry.firstBlock = 0
+		a.entry.blockCount = 0
+		a.block = a.block[:0]
+		a.entries = append(a.entries, a.entry)
+		a.hasKey = false
+		return
+	}
 	a.flushBlock()
 	a.entry.blockCount = uint32(len(a.blocks)) - a.entry.firstBlock
 	a.entries = append(a.entries, a.entry)
@@ -739,15 +753,19 @@ func (a *contentExternalAssembler) appendTables(out []byte) []byte {
 	out = binary.LittleEndian.AppendUint32(out, uint32(len(a.blocks)))
 	out = binary.LittleEndian.AppendUint32(out, uint32(a.blockBlob.Len()))
 	for _, e := range a.entries {
-		out = append(out, e.key[0], e.key[1], e.key[2], 0)
-		out = binary.LittleEndian.AppendUint32(out, e.count)
-		out = binary.LittleEndian.AppendUint32(out, e.firstBlock)
-		out = binary.LittleEndian.AppendUint32(out, e.blockCount)
+		if e.single {
+			out = append(out, e.key[0], e.key[1], e.key[2], contentPostingEntrySingle)
+			out = binary.LittleEndian.AppendUint32(out, e.singleDoc)
+			out = binary.LittleEndian.AppendUint32(out, 0)
+		} else {
+			out = append(out, e.key[0], e.key[1], e.key[2], contentPostingEntryMulti)
+			out = binary.LittleEndian.AppendUint32(out, e.firstBlock)
+			out = binary.LittleEndian.AppendUint32(out, e.blockCount)
+		}
 	}
 	for _, b := range a.blocks {
 		out = binary.LittleEndian.AppendUint32(out, b.firstDocID)
 		out = binary.LittleEndian.AppendUint32(out, b.count)
-		out = binary.LittleEndian.AppendUint32(out, b.byteOffset)
 		out = binary.LittleEndian.AppendUint32(out, b.byteLen)
 	}
 	return out

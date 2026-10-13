@@ -51,8 +51,12 @@ func TestContentIndexRoundTrip(t *testing.T) {
 		t.Fatalf("docs = %d, want %d", len(got.Docs), len(idx.Docs))
 	}
 	for i := range idx.Docs {
-		if got.Docs[i] != idx.Docs[i] {
-			t.Fatalf("doc %d = %+v, want %+v", i, got.Docs[i], idx.Docs[i])
+		// v9 drops RawSize/DocLen/ModUnix from the wire (no query path reads
+		// them); they decode as zero while every other field round-trips.
+		want := idx.Docs[i]
+		want.RawSize, want.DocLen, want.ModUnix = 0, 0, 0
+		if got.Docs[i] != want {
+			t.Fatalf("doc %d = %+v, want %+v", i, got.Docs[i], want)
 		}
 	}
 	if !bytes.Equal(got.Sections[contentSectionGrams], []byte("gram-payload")) {
