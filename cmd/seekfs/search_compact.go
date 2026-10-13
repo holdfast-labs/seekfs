@@ -779,8 +779,20 @@ func (vol *serviceVolumeIndex) nameTermCandidates(pq parsedQuery) ([]int, bool) 
 					// explicit sorts), so order the content posting set the same
 					// way. sort:relevance keeps its own post-verify ranking and
 					// is left in candidate (docID) order here.
+					//
+					// Pure-regex queries are the exception: they were full
+					// scans before the regex prefilter, so their candidates
+					// keep the scan's walk order (orderForQuery position,
+					// record order when nil). Verifying the prefiltered set
+					// in that relative order emits exactly the historical
+					// sequence; the rank-ordered path would visibly reorder
+					// results on volumes whose rank and scan orders differ.
 					if pq.SortColumn != "relevance" {
-						sortCandidateIDs(candidates, pq, vol.index, vol.rankForQuery(pq))
+						if contentLeavesAllRegex(pq) {
+							vol.sortCandidateIDsByScanOrder(candidates, pq)
+						} else {
+							sortCandidateIDs(candidates, pq, vol.index, vol.rankForQuery(pq))
+						}
 					}
 					pq.Trace.setSource("content-candidates", len(candidates))
 					return candidates, true
@@ -998,6 +1010,45 @@ func (vol *serviceVolumeIndex) nameTermCandidates(pq parsedQuery) ([]int, bool) 
 	}
 	pq.Trace.setSource("name-term-posting", len(candidates))
 	return candidates, true
+}
+
+// sortCandidateIDsByScanOrder orders candidates in the bounded scan's walk
+// order: orderForQuery position, record order when the volume has no order.
+// A pure-regex query answered from trigram-prefiltered candidates verifies
+// that subset in the same relative order the historical full scan walked,
+// so the emitted matches (sets, order, counts, snippets) are identical
+// while most records are never touched. Record IDs the order does not know
+// (delta additions, or a short order) sort last by record ID, deterministically.
+func (vol *serviceVolumeIndex) sortCandidateIDsByScanOrder(ids []int, pq parsedQuery) {
+	order := vol.orderForQuery(pq)
+	if len(order) == 0 {
+		sort.Ints(ids)
+		return
+	}
+	recordCount := vol.index.compactRecordCount()
+	pos := make([]int, recordCount)
+	for i := range pos {
+		pos[i] = -1
+	}
+	for p, id32 := range order {
+		if id := int(id32); id >= 0 && id < recordCount && pos[id] < 0 {
+			pos[id] = p
+		}
+	}
+	// An ID outside the order sorts after every ordered ID, by record ID.
+	rankOf := func(id int) [2]int {
+		if id >= 0 && id < recordCount && pos[id] >= 0 {
+			return [2]int{0, pos[id]}
+		}
+		return [2]int{1, id}
+	}
+	sort.SliceStable(ids, func(i, j int) bool {
+		ai, bj := rankOf(ids[i]), rankOf(ids[j])
+		if ai[0] != bj[0] {
+			return ai[0] < bj[0]
+		}
+		return ai[1] < bj[1]
+	})
 }
 
 func (vol *serviceVolumeIndex) overlayAwareNameTermCandidates(pq parsedQuery) ([]int, bool) {
