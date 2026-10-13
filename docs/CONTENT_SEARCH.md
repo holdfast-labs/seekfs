@@ -1761,6 +1761,139 @@ metadata reconcile gave up after three attempts and silently scheduled a
 rebuild. `contentCatchUpFailed` now logs its reason. Covered by
 `TestContentReconcileScansHoldBackgroundPersists` (fails without the hold).
 
+## 6v. Content underfill + cold pages (done)
+
+Branch `perf/content-underfill`, from `integ/content-main` at 47f3911.
+It takes the two hotspots §6s left open — 0-result content compounds paying
+~1.2 s of underfill fuzzy trials, and decode-bound cold first pages — with
+read-path-only changes: result sets, order, counts and snippets are proven
+identical by golden fingerprints plus lane/serial/parallel parities.
+
+**Fresh baseline.** §6s numbers are stale: the base now ships format v9
+(smaller grams, pruned dense grams, §6q) and the build-speed work (§6r), and
+the previous fixture (`fixtures/v8-sample.gsx`) fails the v9 version gate.
+The profile below re-runs the full §6s harness unchanged (it needed no v9
+fixes) against `E:\bench\scratch\underfill\v9-sample.gsx` — a copy of the
+ready v9 build `E:\bench\scratch\review\merged-v9.gsx` (76,465 docs, same
+input; join health 76465/76465). Min-of-7, GOMAXPROCS=2,
+`go test -p 1`; before/after claims are same-session A/B pairs (this box
+carries heavy same-file contention noise — cross-session absolutes move
+±2x, so only in-session deltas and the golden identity count).
+
+| query | fresh baseline warm | fresh baseline cold |
+|---|---|---|
+| `content:cityhash_v103` (10) | 2.1 ms | 5.7 ms |
+| `content:struct` (20-page) | 7.9 ms | 13.1 ms |
+| `content:EINVAL` (20-page) | 144.6 ms | 461 ms |
+| `content:"reassemble"` (5) | 82 ms | 238 ms |
+| `ext:cc content:mutex` (20-page) | 116.8 / 139.1 ms (lanes 1/0) | 541.6 ms |
+| `ext:cc content:mutex` (48, page 100) | 177.8 / 187.6 ms | 678.6 ms |
+| `ext:cc content:mutex` under `base` | 13.5 / 14.0 ms | 133.4 ms |
+| `content:mutex` under `base` (51) | 14.3 / 15.2 ms | 132.3 ms |
+| `content:/mutex_\w+/` (14) | 836 ms | 933.6 ms |
+| typo `mutxe`→`mute` (20) | 276.9 ms (fuzzy 307 ms) | — |
+| typo `recieve` (19 literal, no fuzzy) | 192.2 ms | — |
+| typo `strucure`→`structure` (20) | 952.6 ms (fuzzy 1052 ms, 218 MB decoded) | — |
+| 0-result compound under `agents`, lane off | 1648.6 ms (fuzzy 1787 ms) | — |
+| 0-result compound under `agents`, lane on | 79.3 ms (fuzzy ~105 ms) | — |
+| `content:mutex sort:relevance` | 214.4 ms | 402.6 ms |
+
+Shape-for-shape this matches §6s within noise (einval-20 141→145,
+compound-20 115→117, struct-20 7.1→7.9); the regex shape reads slower
+(400→836 ms) purely from parallel-suite contention in the baseline session.
+Counts are unchanged (struct 15,116, einval 422, mutex-under-base 51).
+
+**What changed (all read-path; size byte-identical):**
+
+- **Fuzzy trials take the posting-candidate path** (`postings.go`,
+  `content_fuzzy_trial_path_test.go`). `parseQuery`'s `parsedOverride`
+  branch returned the cloned retry tree without the request's per-search
+  scalars. A trial search threads per-volume fields
+  (`contentWindow`/`contentProbe`, budgets, `Trace`, deadline) through
+  `queryOptions` *after* the tree was built, so every trial saw
+  `contentWindow=0`: the bounded candidate path capped posting
+  materialization at the page limit, declared every broad superset capped,
+  and fell back to a full-corpus rank-ordered bounded scan — identical
+  results at ~50x the cost. The branch now overlays those scalars onto the
+  clone (leaf fields stay with the tree). Same-session min-of-7:
+  0-result compound lane-off 1648.6→99.7 ms (losing trials 850→8 ms each:
+  candidates + scalar filter prove empty with zero block decodes),
+  `strucure` 1106.6→104 ms (218 MB decoded → ~0), `mutxe` 258.8→93.1 ms.
+  Full-table after: compound-under-small lane-off 18.8 ms,
+  `mutxe` 14.5 ms, `strucure` 24.7 ms, all golden-identical.
+- **Halved + memoized the correction dict scan** (`content_fuzzy.go`,
+  `content_termsdict.go`, `content_fuzzy_scancache_test.go`). The scan is
+  inherently O(dict) — top-2-by-(distance, df) needs the full evaluation —
+  so the levers are per-key cost and repeats. First, the sound gates were
+  reordered: the letter bitmap runs before the pigeonhole piece-substring
+  tests (the scan's hottest cost, ~57% of samples), and ASCII keys get
+  their exact length free from the mask pass, rejecting out-of-range
+  lengths before any substring search (trials-build 76–137→47–53 ms
+  single-shot across six shapes). Second, per-dictionary scans memoize by
+  (dict generation, word, tau): dicts are immutable after decode and the
+  generation is a global atomic issued once per decode, so a hit is
+  exact-equivalent to a rescan even across address reuse; the mutable delta
+  vocabulary still merges fresh, cached maps are never mutated after
+  insert, the LRU holds 64 entries × 2048 terms, and empty scans memoize
+  too. Repeat typo builds measure 0.0 ms (cache hit).
+- **Parallelize verify-heavy early-stop pages at 2 workers**
+  (`search_compact.go`). The gate kept the serial walk for every early-stop
+  page at GOMAXPROCS=2 on the theory that merge/sync overhead cancels the
+  win. Same-session A/B shows the overhead only matters with no verify work
+  to spread: verify-heavy pages win ~2x warm *and* cold (compound-20 warm
+  99/95→53/53 ms, cold 346→177 ms; under-shapes to ~9–10 ms warm,
+  ~74–87 ms cold), while collect-only pages (pre-verified bounded scan,
+  `skipEntryMatches`) are even (einval-20 144→147 ms warm, 461→405 ms
+  cold). The gate now parallelizes at 2 workers unless the page is
+  collect-only; 3+ workers and limit-covers-candidates are untouched.
+  GOMAXPROCS=8 labeled: einval-20 60 ms, compound-20 23–30 ms (cold
+  65 ms), relevance 58 ms (cold 164 ms), `strucure` 18 ms.
+
+After table (min-of-7, GOMAXPROCS=2, quiet-box session; golden-identical
+to the baseline on every shape, lane, and warm/cold arm): rare 1.6/3.2,
+struct-20 9.1/12.2, einval-20 146.6/405.1, phrase 67.7/162.3, compound-20
+52.8–58.4/174.6, compound-100 82.5–92.8/278.7, compound-under 9.1–9.2/73.9,
+content-under 9.7/86.6, compound-under-small lane-off 18.8 (lane-on 0.5),
+`mutxe` 14.5, `recieve` 85.1 (no fuzzy either way),
+`strucure` 24.7, relevance 145.8/452.5, regex 609.1/686.5.
+
+**Tried and rejected (measured, not assumed):**
+
+- Skipping provably-empty trials via `contentCandidatesBounded`: corrections
+  come from dict terms with df > 0, so trial candidate sets are essentially
+  never empty — the gate would almost never fire. The windowed candidates
+  path *is* the cheap emptiness proof (8 ms, zero decodes for the losing
+  compound trials). Not implemented.
+- Reordering trials cheapest-first / capping below 4: changes which trial
+  wins when several match — changes results. Not implemented (§6s already
+  rejected capping for the same reason).
+- Block prefetch for cold pages: with 2 workers already decoding distinct
+  blocks concurrently, a prefetcher adds a third concurrent decoder on a
+  2-CPU box — contention, no headroom. The remaining cold cost is true
+  decode work. Not implemented.
+- Decode-order/block-locality changes and smaller relevance windows: change
+  minimal-verify order / ranking — rejected in §6s, still rejected.
+- Codec change (s2/LZ4-class): still rejected on ratio (§6n/§6o/§6s).
+
+**Remaining hotspots:** cold relevance (~450 ms) and cold einval (~405 ms)
+are compulsory window/scan decodes; the first-touch correction scan
+(~50 ms) is irreducible without an auxiliary index (format change); repeat
+typos are now free via the memo. Short-term pages stay complete-only-to-
+the-window by design.
+
+**Correctness:** `go vet ./...` clean; `go test -p 1 -timeout 40m
+./cmd/seekfs ./feature` passes except `TestHeadlessFrameCost`
+(`cmd/seekfs-native`, the known load-sensitive wall-clock failure in a
+package that does not import the changed code). New tests:
+`TestContentFuzzyTrialParityWithNormalParse`,
+`TestContentFuzzyWinningTrialTakesCandidatePath` (decoy fixture forces
+candidates ⊃ matches with an unfilled page so no widen masks the first
+search's path), `TestParseQueryOverrideCarriesSearchScalars`,
+`TestContentFuzzyScanCacheParity` (raw vs cold vs warm, hit counting,
+second-dict generation) — the first three fail without the overlay fix.
+Serial/parallel identity for the newly parallelized gate is covered by the
+existing `TestContentParallelContentMatchesSerial` (limits × workers).
+
 ## 7. Carried debt / known gaps
 
 - **Snippet case is preserved; no fixup-aware path remains.** The `.gsx` text
