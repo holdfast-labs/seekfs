@@ -150,6 +150,20 @@ func openContentReader(idx *contentIndex) (*contentReader, error) {
 		}
 		r.store = st
 	}
+	// A v8 shard carries its text dictionary as CXTD; frames decoded
+	// without it fail closed in textFor, so a missing section is never a
+	// wrong slice. Absent CXTD means plain (v7) frames.
+	if sec := idx.Sections[contentSectionDictText]; len(sec) > 0 {
+		if r.store == nil {
+			return nil, errors.New("content text dict without a text store")
+		}
+		id, content, err := decodeContentTextDict(sec)
+		if err != nil {
+			return nil, err
+		}
+		r.store.dictID = id
+		r.store.dict = content
+	}
 	r.cache = newContentBlockCache()
 	if r.store != nil {
 		r.store.cache = r.cache

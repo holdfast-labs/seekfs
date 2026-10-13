@@ -421,6 +421,13 @@ func assembleContentIndexStream(source contentBuildSource, tmpDir string) (*cont
 		}
 		idx.Sections[contentSectionGrams] = grams
 	}
+	if built.dictPath != "" {
+		dict, err := os.ReadFile(built.dictPath)
+		if err != nil {
+			return nil, err
+		}
+		idx.Sections[contentSectionDictText] = dict
+	}
 	text, err := os.ReadFile(built.textPath)
 	if err != nil {
 		return nil, err
@@ -448,6 +455,9 @@ type contentStreamedBuild struct {
 	// the corpus has no terms/grams.
 	termPath string
 	gramPath string
+	// dictPath holds the exact CXTD section bytes (the shard's trained
+	// text dictionary), or "" when the shard encodes plain.
+	dictPath string
 }
 
 // contentAssembleBatchDocs and contentAssembleBatchBytes bound the streaming
@@ -533,6 +543,33 @@ func assembleContentIndexStreamed(source contentBuildSource, tmpDir string) (*co
 	built := &contentStreamedBuild{}
 	var docs []contentDoc
 	var paths []string
+	// Dictionary sampling (v8): the first contentDictSampleBytes of stored
+	// text train the shard's dictionary, then later blocks encode against
+	// it. Sampling rides the normal emit path — every document is still
+	// emitted exactly once, in order — so it changes no offsets and costs
+	// one 8 MiB memcpy plus ~40 ms of training. dictForSection carries the
+	// trained bytes to the CXTD file below (nil for plain).
+	sampling := true
+	var sample []byte
+	var dictForSection []byte
+	var dictID uint32
+	trainAndSet := func() error {
+		sampling = false
+		if textWriter.logicalSize() < contentDictMinLogical {
+			sample = nil
+			return nil
+		}
+		if trained := contentTrainTextDict(sample, contentDictBudget); len(trained) > 0 {
+			if err := textWriter.setDict(contentTextDictID, trained); err != nil {
+				sample = nil
+				return err
+			}
+			dictForSection = trained
+			dictID = contentTextDictID
+		}
+		sample = nil
+		return nil
+	}
 	asmErr := func() error {
 		workers := contentBuildWorkerCount()
 		if workers < 1 {
@@ -547,12 +584,14 @@ func assembleContentIndexStreamed(source contentBuildSource, tmpDir string) (*co
 			// across pulls would alias overwritten bytes.
 			var raws []contentBuildDoc
 			var rawBytes int64
+			exhausted := false
 			for len(raws) < contentAssembleBatchDocs && rawBytes < contentAssembleBatchBytes {
 				d, ok, err := source()
 				if err != nil {
 					return err
 				}
 				if !ok {
+					exhausted = true
 					break
 				}
 				d.text = bytes.Clone(d.text)
@@ -565,6 +604,14 @@ func assembleContentIndexStreamed(source contentBuildSource, tmpDir string) (*co
 				}
 			}
 			if len(raws) == 0 {
+				// The source ended exactly on a batch boundary with
+				// sampling still open (small corpus): train on what the
+				// head holds, or stay plain.
+				if sampling {
+					if err := trainAndSet(); err != nil {
+						return err
+					}
+				}
 				break
 			}
 			toks := make([]contentTokenizedDoc, len(raws))
@@ -594,6 +641,20 @@ func assembleContentIndexStreamed(source contentBuildSource, tmpDir string) (*co
 				t := &toks[i]
 				docID := uint32(len(docs))
 				paths = append(paths, d.path)
+				// Dictionary sampling rides along: accumulate stored text
+				// until the sample cap or the exhausted source, then train
+				// once and keep emitting. Emission itself never pauses, so
+				// offsets, order and blocking are identical with or without
+				// a dictionary; only later frames reference it.
+				if sampling {
+					sample = append(sample, t.stored...)
+					sample = append(sample, '\n')
+					if len(sample) >= contentDictSampleBytes {
+						if err := trainAndSet(); err != nil {
+							return err
+						}
+					}
+				}
 				// Store case-preserving repaired text (PF-6a): a case-sensitive query
 				// verifies against these exact bytes, and snippets show the real case.
 				// The index (terms and grams) is built from a case-folded copy, so the
@@ -635,6 +696,15 @@ func assembleContentIndexStreamed(source contentBuildSource, tmpDir string) (*co
 				}
 				contentAssembleStreamHook(int(docID))
 			}
+			// The source ended mid-batch with sampling still open: train on
+			// the whole accumulation now (a per-doc exhausted check would
+			// train on one doc — the pull phase already knows the stream
+			// is done, but the emit phase must still consume the batch).
+			if sampling && exhausted {
+				if err := trainAndSet(); err != nil {
+					return err
+				}
+			}
 		}
 		return nil
 	}()
@@ -645,30 +715,53 @@ func assembleContentIndexStreamed(source contentBuildSource, tmpDir string) (*co
 	}
 	termPath := filepath.Join(tmpDir, "cxterm.sec")
 	gramPath := filepath.Join(tmpDir, "cxgram.sec")
-	// The text, term and gram sections are independent files; finishing them
-	// concurrently uses spare cores for the historically serial FinishFile
-	// phase. The bytes of each file are unaffected.
+	dictPath := filepath.Join(tmpDir, "cxdict.sec")
+	// The text, term, gram and dict sections are independent files;
+	// finishing them concurrently uses spare cores for the historically
+	// serial FinishFile phase. The bytes of each file are unaffected.
 	var finishWG sync.WaitGroup
-	var textErr, termErr, gramErr error
-	finishWG.Add(3)
+	var textErr, termErr, gramErr, dictErr error
+	finishWG.Add(4)
 	go func() { defer finishWG.Done(); textErr = textWriter.FinishFile(textPath) }()
 	go func() { defer finishWG.Done(); termErr = dictBuilder.FinishFile(termPath) }()
 	go func() { defer finishWG.Done(); gramErr = gramBuilder.FinishFile(gramPath) }()
+	go func() {
+		defer finishWG.Done()
+		if len(dictForSection) == 0 {
+			_ = os.Remove(dictPath)
+			return
+		}
+		sec := encodeContentTextDict(dictID, dictForSection)
+		if len(sec) == 0 {
+			_ = os.Remove(dictPath)
+			return
+		}
+		dictErr = os.WriteFile(dictPath, sec, 0o600)
+	}()
 	finishWG.Wait()
 	if textErr != nil {
 		_ = os.Remove(termPath)
 		_ = os.Remove(gramPath)
+		_ = os.Remove(dictPath)
 		return nil, textErr
 	}
 	if termErr != nil {
 		_ = os.Remove(textPath)
 		_ = os.Remove(gramPath)
+		_ = os.Remove(dictPath)
 		return nil, termErr
 	}
 	if gramErr != nil {
 		_ = os.Remove(textPath)
 		_ = os.Remove(termPath)
+		_ = os.Remove(dictPath)
 		return nil, gramErr
+	}
+	if dictErr != nil {
+		_ = os.Remove(textPath)
+		_ = os.Remove(termPath)
+		_ = os.Remove(gramPath)
+		return nil, dictErr
 	}
 	built.docs = docs
 	built.paths = paths
@@ -682,6 +775,9 @@ func assembleContentIndexStreamed(source contentBuildSource, tmpDir string) (*co
 	}
 	if st, err := os.Stat(gramPath); err == nil && st.Size() > 0 {
 		built.gramPath = gramPath
+	}
+	if st, err := os.Stat(dictPath); err == nil && st.Size() > 0 {
+		built.dictPath = dictPath
 	}
 	return built, nil
 }

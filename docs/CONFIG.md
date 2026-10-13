@@ -92,8 +92,10 @@ Files that sniff binary are tallied as `binary` in the `.gsx` policy and in
 
 There is no default `budget_bytes`: the build indexes everything selected
 and stops only when the projected index (extracted bytes × 0.5) would push
-the sidecar's volume below a free-space reserve — the larger of 10% of the
-volume's capacity or 20 GiB. Only an explicit value joins the sidecar
+the sidecar's volume below a free-space reserve — 5% of the volume's
+capacity clamped to [10 GiB, 20 GiB], shared by selection and the write-time
+guard, monotonic (allowance 0 at or below the reserve, with drops counted).
+Only an explicit value joins the sidecar
 identity. Large corpora build as folder shards (past 64 MiB of text), each
 capped at the 4 GiB per-file sidecar cap, so indexing everything stays
 memory-bounded and safe. Environment overrides are
