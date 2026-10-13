@@ -57,6 +57,15 @@ type contentExternalSectionBuilder struct {
 	// scratch is the radix-partition workspace, reused across spills so a
 	// large spill does not allocate a second buffer every time.
 	scratch []contentExternalRecord
+	// pruned holds the last merge's dense keys (see contentGramPruneDF),
+	// ascending. Valid after Finish/FinishFile until the next merge.
+	pruned []string
+}
+
+// PrunedKeys reports the dense gram keys the last merge dropped, ascending.
+// Nil when nothing was pruned.
+func (b *contentExternalSectionBuilder) PrunedKeys() []string {
+	return b.pruned
 }
 
 func newContentExternalSectionBuilder(tmpDir string, arenaBytes int) (*contentExternalSectionBuilder, error) {
@@ -557,6 +566,7 @@ func (b *contentExternalSectionBuilder) mergeInto(blocks contentBlobSink) (*cont
 		}
 	}
 	asm.endKey()
+	b.pruned = asm.prunedKeys()
 	return asm, cleanup, nil
 }
 
@@ -644,15 +654,22 @@ func (s *contentFileBlobSink) abort() {
 // entry; the block blob streams to the sink (memory or temp file) while the
 // entry/block metadata stays resident; finalize (bytes or writeFile) emits
 // header + entries + blocks + block blob in section order.
+//
+// A key's postings buffer whole (not one block at a time) so endKey can
+// prune dense keys before anything is flushed: a pruned key's docIDs are
+// discarded and the key joins pruned instead of the tables. The transient
+// peak is the densest key (at most every document, 4 bytes each); per-shard
+// builds bound this by the shard size.
 type contentExternalAssembler struct {
 	blockBlob contentBlobSink
 	entries   []contentPostingEntry
 	blocks    []contentBlockMeta
+	pruned    []string
 
 	curKey   [3]byte
 	hasKey   bool
 	entry    contentPostingEntry
-	block    []uint32 // current block's docIDs, buffered for the list/bitmap choice
+	block    []uint32 // current key's docIDs, buffered for the prune decision
 	firstDoc uint32
 }
 
@@ -688,24 +705,26 @@ func (a *contentExternalAssembler) addPosting(docID uint32) {
 	}
 	a.block = append(a.block, docID)
 	a.entry.count++
-	if len(a.block) >= contentPostingBlockSize {
-		a.flushBlock()
-	}
 }
 
-func (a *contentExternalAssembler) flushBlock() {
-	if len(a.block) == 0 {
-		return
+// flushKeyBlocks chunks the buffered key into contentPostingBlockSize blocks
+// and flushes each. The caller holds the whole key so the prune decision
+// precedes any flush. The buffer resets to [:0] (not resliced forward) so
+// the backing array is reused across keys, bounding transient garbage.
+func (a *contentExternalAssembler) flushKeyBlocks() {
+	for start := 0; start < len(a.block); start += contentPostingBlockSize {
+		end := min(len(a.block), start+contentPostingBlockSize)
+		chunk := a.block[start:end]
+		enc := encodeContentPostingBlock(chunk, chunk[0])
+		off := uint32(a.blockBlob.Len())
+		a.blockBlob.Write(enc)
+		a.blocks = append(a.blocks, contentBlockMeta{
+			firstDocID: chunk[0],
+			count:      uint32(len(chunk)),
+			byteOffset: off,
+			byteLen:    uint32(uint64(a.blockBlob.Len()) - uint64(off)),
+		})
 	}
-	enc := encodeContentPostingBlock(a.block, a.firstDoc)
-	off := uint32(a.blockBlob.Len())
-	a.blockBlob.Write(enc)
-	a.blocks = append(a.blocks, contentBlockMeta{
-		firstDocID: a.firstDoc,
-		count:      uint32(len(a.block)),
-		byteOffset: off,
-		byteLen:    uint32(uint64(a.blockBlob.Len()) - uint64(off)),
-	})
 	a.block = a.block[:0]
 }
 
@@ -725,10 +744,26 @@ func (a *contentExternalAssembler) endKey() {
 		a.hasKey = false
 		return
 	}
-	a.flushBlock()
+	if a.entry.count > uint32(contentGramPruneDF) {
+		// Dense key: drop the postings and record the prune. The query
+		// path skips pruned grams as constraints (see candidateStreamIn)
+		// and serves them from the CXGP set this merge reports.
+		a.pruned = append(a.pruned, string(a.curKey[:]))
+		a.block = a.block[:0]
+		a.hasKey = false
+		return
+	}
+	a.flushKeyBlocks()
 	a.entry.blockCount = uint32(len(a.blocks)) - a.entry.firstBlock
 	a.entries = append(a.entries, a.entry)
 	a.hasKey = false
+}
+
+// prunedKeys reports the dense keys dropped by the merge, in ascending key
+// order (the merge visits keys ascending). Valid after mergeInto returns,
+// until the next merge.
+func (a *contentExternalAssembler) prunedKeys() []string {
+	return a.pruned
 }
 
 func (a *contentExternalAssembler) bytes() []byte {

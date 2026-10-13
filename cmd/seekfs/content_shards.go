@@ -417,6 +417,9 @@ func contentBuildFiles(built *contentStreamedBuild) map[uint32]string {
 	if built.gramPath != "" {
 		files[contentSectionGrams] = built.gramPath
 	}
+	if built.prunePath != "" {
+		files[contentSectionPruned] = built.prunePath
+	}
 	if built.dictPath != "" {
 		files[contentSectionDictText] = built.dictPath
 	}

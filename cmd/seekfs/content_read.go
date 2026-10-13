@@ -94,6 +94,12 @@ type contentReader struct {
 	store *contentTextStore
 	paths []string
 	cache *contentBlockCache
+	// pruned is the CXGP pruned-gram set: dense grams the builder dropped
+	// from the postings (see contentGramPruneDF). Nil when the index
+	// prunes nothing. candidateStreamIn skips pruned grams as
+	// constraints; a term left with no usable gram falls back to the
+	// full scan like a sub-3-byte term.
+	pruned map[uint32]struct{}
 }
 
 // openContentReader decodes the queryable sections of idx.
@@ -142,6 +148,16 @@ func openContentReader(idx *contentIndex) (*contentReader, error) {
 			return nil, err
 		}
 		r.grams = g
+	}
+	// A v9 shard pruned of dense grams carries the set as CXGP; a corrupt
+	// set fails the load (like corrupt postings) so a query can never read
+	// a pruned gram as absent. Absent CXGP means unpruned postings.
+	if sec := idx.Sections[contentSectionPruned]; len(sec) > 0 {
+		p, err := decodeContentPrunedGrams(sec)
+		if err != nil {
+			return nil, err
+		}
+		r.pruned = p
 	}
 	if sec := idx.Sections[contentSectionText]; len(sec) > 0 {
 		st, err := openContentTextStore(sec)
@@ -450,6 +466,13 @@ func (r *contentReader) candidateStreamIn(term string, mask []bool) func() (uint
 			continue
 		}
 		seen[gram] = struct{}{}
+		// A pruned gram is no evidence of anything: the builder dropped
+		// its postings for size (see contentGramPruneDF), so it constrains
+		// nothing and verification decides. Only an indexed-but-absent
+		// gram proves the term is in no document.
+		if r.prunedGram(gram) {
+			continue
+		}
 		postings, found := r.grams.postings(gram)
 		if !found {
 			return contentEmptyDocIDStream
@@ -459,7 +482,23 @@ func (r *contentReader) candidateStreamIn(term string, mask []bool) func() (uint
 			return docID, ok
 		})
 	}
+	if len(streams) == 0 {
+		// Every gram was pruned: no posting constraint remains. Fall back
+		// to the full scan like a sub-3-byte term; verification decides.
+		// The stream stays ascending, so ordered callers are unaffected.
+		return r.allDocIDStream()
+	}
 	return intersectDocIDStreams(streams)
+}
+
+// prunedGram reports whether gram is in the index's pruned set (dropped for
+// size at build time). Grams are always 3 bytes at this call site.
+func (r *contentReader) prunedGram(gram string) bool {
+	if len(r.pruned) == 0 || len(gram) != 3 {
+		return false
+	}
+	_, ok := r.pruned[contentGramU32Of(gram)]
+	return ok
 }
 
 // allDocIDStream yields every document index in ascending order without

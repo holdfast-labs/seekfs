@@ -47,6 +47,20 @@ import (
 // intersection relies on is kept.
 const contentPostingBlockSize = 4096
 
+// contentGramPruneDF caps a gram's document frequency in the CXGR posting
+// section: a gram occurring in more documents is pruned (its postings are
+// dropped and the key joins the CXGP pruned set). Dense grams dominate the
+// section (measured: df >= 1000 keys are 5% of entries but 80% of blob
+// bytes on the Chromium sample) while contributing almost no selectivity —
+// the intersection is driven by the query's rarest gram — so pruning them
+// shrinks the section and speeds selective queries. Correctness is
+// structural: pruned grams are skipped as constraints (the verification
+// still decides), and a query whose every gram is pruned falls back to the
+// full scan like a sub-3-byte term. A degenerate term pays a scan bounded
+// by the result window, which terminates fast exactly because the term is
+// common. A var so tests can lower it.
+var contentGramPruneDF = 25000
+
 // contentDocFreq is one posting: a document and the term's frequency in it.
 // tf is retained for API compatibility (callers build these maps) but the v7
 // section encoding stores docIDs only; df for ranking comes from entry.count.
@@ -217,7 +231,7 @@ func encodeContentPostingSection(postings map[string][]contentDocFreq) []byte {
 	}
 	keys := make([]string, 0, len(postings))
 	for k, v := range postings {
-		if len(k) == 3 && len(v) > 0 {
+		if len(k) == 3 && len(v) > 0 && len(v) <= contentGramPruneDF {
 			keys = append(keys, k)
 		}
 	}
@@ -396,6 +410,54 @@ func decodeContentPostingIndex(data []byte) (*contentPostingIndex, error) {
 // key returns the dictionary key for an entry.
 func (idx *contentPostingIndex) key(e contentPostingEntry) string {
 	return string(e.key[:])
+}
+
+// encodeContentPrunedGrams serializes the CXGP pruned-gram set: the pruned
+// 3-byte keys in ascending order, concatenated (length/3 keys). Nil when
+// nothing was pruned (the section is then omitted).
+func encodeContentPrunedGrams(keys []string) []byte {
+	keep := keys[:0:0]
+	for _, k := range keys {
+		if len(k) == 3 {
+			keep = append(keep, k)
+		}
+	}
+	if len(keep) == 0 {
+		return nil
+	}
+	sort.Strings(keep)
+	var out []byte
+	for _, k := range keep {
+		out = append(out, k[0], k[1], k[2])
+	}
+	return out
+}
+
+// decodeContentPrunedGrams parses a CXGP section into the gram set the query
+// path skips as constraints. Keys are uint32 trigrams for O(1) lookup. Any
+// framing error fails the load: like a corrupt gram section, a corrupt
+// pruned set must rebuild, never serve results from the wrong constraint
+// set (ignoring it would read pruned grams as absent and return empty).
+func decodeContentPrunedGrams(data []byte) (map[uint32]struct{}, error) {
+	if len(data)%3 != 0 {
+		return nil, errors.New("content pruned grams length mismatch")
+	}
+	out := make(map[uint32]struct{}, len(data)/3)
+	var prev uint32
+	for i := 0; i < len(data); i += 3 {
+		g := uint32(data[i])<<16 | uint32(data[i+1])<<8 | uint32(data[i+2])
+		if i > 0 && g <= prev {
+			return nil, errors.New("content pruned grams out of order")
+		}
+		prev = g
+		out[g] = struct{}{}
+	}
+	return out, nil
+}
+
+// contentGramU32Of renders a 3-byte gram string as its uint32 key.
+func contentGramU32Of(gram string) uint32 {
+	return uint32(gram[0])<<16 | uint32(gram[1])<<8 | uint32(gram[2])
 }
 
 // contentPostingDecodeHook, when non-nil, is called for every posting the

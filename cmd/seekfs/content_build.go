@@ -421,6 +421,13 @@ func assembleContentIndexStream(source contentBuildSource, tmpDir string) (*cont
 		}
 		idx.Sections[contentSectionGrams] = grams
 	}
+	if built.prunePath != "" {
+		pruned, err := os.ReadFile(built.prunePath)
+		if err != nil {
+			return nil, err
+		}
+		idx.Sections[contentSectionPruned] = pruned
+	}
 	if built.dictPath != "" {
 		dict, err := os.ReadFile(built.dictPath)
 		if err != nil {
@@ -455,6 +462,9 @@ type contentStreamedBuild struct {
 	// the corpus has no terms/grams.
 	termPath string
 	gramPath string
+	// prunePath holds the exact CXGP pruned-gram section bytes, or "" when
+	// no gram exceeded contentGramPruneDF.
+	prunePath string
 	// dictPath holds the exact CXTD section bytes (the shard's trained
 	// text dictionary), or "" when the shard encodes plain.
 	dictPath string
@@ -762,6 +772,19 @@ func assembleContentIndexStreamed(source contentBuildSource, tmpDir string) (*co
 		_ = os.Remove(termPath)
 		_ = os.Remove(gramPath)
 		return nil, dictErr
+	}
+	// The pruned-gram set rides its own section file, written once the gram
+	// merge (which decides the prunes) is done.
+	prunePath := filepath.Join(tmpDir, "cxprune.sec")
+	if sec := encodeContentPrunedGrams(gramBuilder.PrunedKeys()); len(sec) > 0 {
+		if err := os.WriteFile(prunePath, sec, 0o600); err != nil {
+			_ = os.Remove(textPath)
+			_ = os.Remove(termPath)
+			_ = os.Remove(gramPath)
+			_ = os.Remove(dictPath)
+			return nil, err
+		}
+		built.prunePath = prunePath
 	}
 	built.docs = docs
 	built.paths = paths

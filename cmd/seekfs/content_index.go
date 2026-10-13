@@ -148,6 +148,7 @@ const (
 	contentSectionPaths    uint32 = 'C'<<24 | 'X'<<16 | 'P'<<8 | 'T'
 	contentSectionPolicy   uint32 = 'C'<<24 | 'X'<<16 | 'P'<<8 | 'L'
 	contentSectionScope    uint32 = 'C'<<24 | 'X'<<16 | 'S'<<8 | 'C'
+	contentSectionPruned   uint32 = 'C'<<24 | 'X'<<16 | 'G'<<8 | 'P'
 )
 
 // contentBuildPolicy is the extraction policy a `.gsx` was built with and the

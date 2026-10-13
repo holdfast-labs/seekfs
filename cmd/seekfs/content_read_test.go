@@ -414,6 +414,76 @@ func TestContentCandidatesStreamingMatchesFullDecode(t *testing.T) {
 	}
 }
 
+// A pruned index answers identically to an unpruned one: pruned grams are
+// skipped as constraints (verification decides), and an all-pruned term
+// scans like a sub-3-byte term. The corpus shares dense grams across every
+// doc while rare terms pin subsets.
+func TestContentPrunedIndexMatchesUnpruned(t *testing.T) {
+	var docs []contentBuildDoc
+	for i := 0; i < 60; i++ {
+		text := "common filler deliberately shared across every document "
+		switch {
+		case i == 5:
+			text += "uniquewordxyz "
+		case i < 20:
+			text += "zebrastripe "
+		}
+		if i >= 10 && i < 30 {
+			text += "midwaymarker "
+		}
+		docs = append(docs, contentBuildDoc{frn: uint64(1000 + i), path: "d" + string(rune('a'+i%26)) + ".txt", text: []byte(text)})
+	}
+	build := func(threshold int) *contentReader {
+		old := contentGramPruneDF
+		contentGramPruneDF = threshold
+		defer func() { contentGramPruneDF = old }()
+		idx, err := assembleContentIndex(append([]contentBuildDoc(nil), docs...), t.TempDir())
+		if err != nil {
+			t.Fatal(err)
+		}
+		r, err := openContentReader(idx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return r
+	}
+	plain := build(1 << 30)
+	if plain.pruned != nil && len(plain.pruned) != 0 {
+		t.Fatal("unpruned index must carry no pruned set")
+	}
+	pruned := build(40)
+	if len(pruned.pruned) == 0 {
+		t.Fatal("pruned index must carry a pruned set")
+	}
+	// The dense shared grams must actually be pruned (else the test is vacuous).
+	for _, g := range []string{"com", "omm", "mmo", "mon"} {
+		if _, ok := pruned.pruned[contentGramU32Of(g)]; !ok {
+			t.Fatalf("shared gram %q not pruned", g)
+		}
+	}
+	for _, q := range []string{"common", "filler", "zebrastripe", "midwaymarker", "uniquewordxyz", "mm", "zzzabsent", "shared across"} {
+		want := plain.search(q, 0)
+		got := pruned.search(q, 0)
+		if len(got) != len(want) {
+			t.Fatalf("query %q: pruned hits=%d, want %d", q, len(got), len(want))
+		}
+		for i := range want {
+			if got[i] != want[i] {
+				t.Fatalf("query %q hit %d: pruned %+v, want %+v", q, i, got[i], want[i])
+			}
+		}
+	}
+	// The all-pruned term streams every docID, ascending, like a short term.
+	all := collectDocIDStream(pruned.candidateStream("common"), 0)
+	if len(all) != 60 || all[0] != 0 || all[59] != 59 {
+		t.Fatalf("all-pruned candidates = %d docs, [%d..%d]; want 60 [0..59]", len(all), all[0], all[len(all)-1])
+	}
+	// An indexed-but-absent gram is still evidence of absence.
+	if got := pruned.candidates("zzzabsent", 0); len(got) != 0 {
+		t.Fatalf("absent-term candidates = %v; want none", got)
+	}
+}
+
 // A broad key with a small budget must yield the capped set without decoding the
 // whole posting list.
 func TestContentCandidatesBroadKeyStopsEarly(t *testing.T) {

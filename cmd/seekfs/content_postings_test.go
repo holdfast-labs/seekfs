@@ -260,6 +260,60 @@ func TestContentPostingSingletonEntry(t *testing.T) {
 	}
 }
 
+// Grams past the prune threshold are dropped from the section: dense keys
+// cost more than they select. The in-memory encoder filters them like the
+// streaming assembler does.
+func TestContentPostingPrunesDenseKeys(t *testing.T) {
+	old := contentGramPruneDF
+	contentGramPruneDF = 3
+	defer func() { contentGramPruneDF = old }()
+	postings := map[string][]contentDocFreq{
+		"aaa": {{docID: 1}, {docID: 2}, {docID: 3}, {docID: 4}, {docID: 5}},
+		"bbb": {{docID: 1}, {docID: 2}, {docID: 3}},
+		"ccc": {{docID: 7}},
+	}
+	idx, err := decodeContentPostingIndex(encodeContentPostingSection(postings))
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if _, ok := idx.lookup("aaa"); ok {
+		t.Fatal("dense key must be pruned from the section")
+	}
+	if got, ok := idx.lookup("bbb"); !ok || len(got) != 3 {
+		t.Fatalf("bbb = %+v, %v; want 3 postings", got, ok)
+	}
+	if got, ok := idx.lookup("ccc"); !ok || len(got) != 1 || got[0].docID != 7 {
+		t.Fatalf("ccc = %+v, %v; want singleton 7", got, ok)
+	}
+	if len(idx.entries) != 2 {
+		t.Fatalf("entries = %d; want 2 (bbb multi, ccc singleton)", len(idx.entries))
+	}
+}
+
+// The CXGP pruned-gram set round-trips; corrupt framings fail the load.
+func TestContentPrunedGramsCodec(t *testing.T) {
+	set, err := decodeContentPrunedGrams(encodeContentPrunedGrams([]string{"the", "and", "aaa"}))
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	for _, g := range []string{"the", "and", "aaa"} {
+		if _, ok := set[contentGramU32Of(g)]; !ok {
+			t.Fatalf("pruned set misses %q", g)
+		}
+	}
+	if _, ok := set[contentGramU32Of("zzz")]; ok {
+		t.Fatal("pruned set must not contain zzz")
+	}
+	if encodeContentPrunedGrams(nil) != nil {
+		t.Fatal("empty prune set must encode as nil (section omitted)")
+	}
+	for _, bad := range [][]byte{{'a', 'b'}, {'a', 'b', 'c', 'd'}, {'b', 'b', 'b', 'a', 'a', 'a'}} {
+		if _, err := decodeContentPrunedGrams(bad); err == nil {
+			t.Fatalf("decoder accepted corrupt pruned set %q", bad)
+		}
+	}
+}
+
 // v9 drops the stored firstBlock/count/byteOffset fields; the decoder
 // rebuilds them as prefix sums and rejects any section whose stored values
 // or lengths disagree.
