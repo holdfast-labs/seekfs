@@ -935,8 +935,8 @@ func TestContentServiceBuildBudgetUsesExtractedTextAndPriority(t *testing.T) {
 		t.Fatal(err)
 	}
 	for path, body := range map[string]string{
-		filepath.Join(dir, "a.html"):  "<html><body>rootword</body></html>",
-		filepath.Join(repo, "z.html"): "<html><body>repoword</body></html>",
+		filepath.Join(dir, "a.txt"):  "rootword",
+		filepath.Join(repo, "z.txt"): "repoword",
 	} {
 		if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
 			t.Fatal(err)
@@ -946,10 +946,10 @@ func TestContentServiceBuildBudgetUsesExtractedTextAndPriority(t *testing.T) {
 	const cp = int64(100)
 	stubContentCatchUpJournal(t, usnJournalDataV0{UsnJournalID: journal, FirstUsn: 1, LowestValidUsn: 1, NextUsn: cp})
 	vol, gsx := contentBuildTestVolume(t, dir, journal, uint64(cp), []CompactRecord{
-		{FRN: 1, Parent: -1, Name: "a.html", Size: 34},
+		{FRN: 1, Parent: -1, Name: "a.txt", Size: 8},
 		{FRN: 2, Parent: -1, Name: "repo", Mode: uint32(os.ModeDir)},
 		{FRN: 3, Parent: 1, ParentFRN: 2, Name: ".git", Mode: uint32(os.ModeDir)},
-		{FRN: 4, Parent: 1, ParentFRN: 2, Name: "z.html", Size: 34},
+		{FRN: 4, Parent: 1, ParentFRN: 2, Name: "z.txt", Size: 8},
 	})
 	s := contentTestService(t)
 	s.contentCfg.Content.BudgetBytes = 16
@@ -1027,6 +1027,65 @@ func TestContentServiceBuildBudgetDropsExactFilesAndBytes(t *testing.T) {
 	}
 	if !h.Incomplete {
 		t.Fatal("budget-truncated sidecar must report incomplete")
+	}
+}
+
+// A biting free-space reserve records exact dropped files and bytes like an
+// explicit budget, but names the reserve instead: the default scope indexes
+// everything until the projected index would breach the volume's reserve.
+func TestContentServiceBuildReserveDropsExactFilesAndBytes(t *testing.T) {
+	t.Setenv("SEEKFS_CONTENT_SEARCH", "1")
+	stubContentCatchUpSync(t)
+	stubContentBuildSync(t)
+	oldFree, oldTotal := contentFreeBytesFn, contentTotalBytesFn
+	defer func() { contentFreeBytesFn, contentTotalBytesFn = oldFree, oldTotal }()
+	// 20 GiB reserve (5% of 500 GiB, capped), 9 bytes of headroom: allowance
+	// is 18 extracted bytes.
+	contentTotalBytesFn = func(_ string) (uint64, error) { return 500 << 30, nil }
+	contentFreeBytesFn = func(_ string) (uint64, error) { return (20 << 30) + 9, nil }
+	dir := t.TempDir()
+	bodies := map[string]string{
+		"a.txt": "alpha",
+		"b.txt": "bravo!",
+		"c.txt": "charlie?",
+	}
+	for name, body := range bodies {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	const journal = uint64(94)
+	const cp = int64(102)
+	stubContentCatchUpJournal(t, usnJournalDataV0{UsnJournalID: journal, FirstUsn: 1, LowestValidUsn: 1, NextUsn: cp})
+	vol, gsx := contentBuildTestVolume(t, dir, journal, uint64(cp), []CompactRecord{
+		{FRN: 1, Parent: -1, Name: "a.txt", Size: 5},
+		{FRN: 2, Parent: -1, Name: "b.txt", Size: 6},
+		{FRN: 3, Parent: -1, Name: "c.txt", Size: 8},
+	})
+	s := contentTestService(t)
+	// No explicit budget: the reserve governs. Fits a.txt + b.txt (5+6=11
+	// of 18 allowed), drops c.txt (8 bytes of extracted text).
+	s.ensureContentBuild(vol)
+	built, err := contentLoadFile(gsx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	releaseContentIndexOnCleanup(t, built)
+	if len(built.Docs) != 2 || built.Policy.ScopeDropped != 1 {
+		t.Fatalf("reserve index docs=%d dropped=%d; want 2 docs, 1 dropped", len(built.Docs), built.Policy.ScopeDropped)
+	}
+	if built.Policy.ScopeDroppedBytes != int64(len("charlie?")) {
+		t.Fatalf("reserve index policy = %+v; want dropped_bytes=%d", built.Policy, len("charlie?"))
+	}
+	if built.Policy.BudgetBytes != 0 || built.Policy.ReserveBytes != 20<<30 {
+		t.Fatalf("reserve index policy = %+v; want budget=0 reserve=20GiB", built.Policy)
+	}
+	h := vol.content.healthSnapshot(0)
+	if h.ScopeDropped != 1 || h.ReserveBytes != 20<<30 || h.BudgetBytes != 0 {
+		t.Fatalf("reserve health = %+v; want exact dropped files and the reserve", h)
+	}
+	if !h.Incomplete {
+		t.Fatal("reserve-truncated sidecar must report incomplete")
 	}
 }
 

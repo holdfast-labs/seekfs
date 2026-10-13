@@ -81,7 +81,8 @@ func TestContentExternalBuilderFinishFileParity(t *testing.T) {
 	feed := func(b *contentExternalSectionBuilder) {
 		for doc := uint32(0); doc < 300; doc++ {
 			for k := 0; k < 40; k++ {
-				b.Add(fmt.Sprintf("term-%d-%d", doc%37, k), doc, uint32(k%5+1))
+				// 3-byte gram keys (the builder's contract since v7).
+				b.Add(fmt.Sprintf("%02d%c", doc%37, 'a'+byte(k%26)), doc)
 			}
 		}
 	}

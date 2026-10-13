@@ -5,22 +5,21 @@ import (
 	"fmt"
 	"math/rand"
 	"os"
-	"reflect"
 	"runtime"
-	"strings"
 	"sync"
 	"testing"
 	"time"
 )
 
-// randomPostingSet builds nkeys keys with a varying number of ascending-docID
-// postings and tf in 1..5, the shape the builder promises to match.
+// randomPostingSet builds nkeys 3-byte gram keys with a varying number of
+// ascending-docID postings, the shape the builder promises to match. tf
+// varies in the input but v7 stores docIDs only, so comparisons use docIDs.
 func randomPostingSet(seed int64, nkeys, maxPostings int) ([]string, map[string][]contentDocFreq) {
 	rng := rand.New(rand.NewSource(seed))
 	keys := make([]string, nkeys)
 	postings := make(map[string][]contentDocFreq, nkeys)
 	for i := range keys {
-		keys[i] = fmt.Sprintf("key-%02d-%s", i, strings.Repeat("x", i%7))
+		keys[i] = fmt.Sprintf("%c%c%c", 'a'+byte(i/(26*26)), 'a'+byte((i/26)%26), 'a'+byte(i%26))
 		n := rng.Intn(maxPostings + 1)
 		list := make([]contentDocFreq, 0, n)
 		doc := uint32(0)
@@ -31,6 +30,14 @@ func randomPostingSet(seed int64, nkeys, maxPostings int) ([]string, map[string]
 		postings[keys[i]] = list
 	}
 	return keys, postings
+}
+
+func postingDocIDs(list []contentDocFreq) []uint32 {
+	out := make([]uint32, len(list))
+	for i, p := range list {
+		out[i] = p.docID
+	}
+	return out
 }
 
 func TestContentExternalEquivalence(t *testing.T) {
@@ -44,7 +51,7 @@ func TestContentExternalEquivalence(t *testing.T) {
 	defer b.Close()
 	for _, k := range keys {
 		for _, p := range postings[k] {
-			b.Add(k, p.docID, p.tf)
+			b.Add(k, p.docID)
 		}
 	}
 	got, err := b.Finish()
@@ -70,8 +77,9 @@ func TestContentExternalEquivalence(t *testing.T) {
 		if !ok {
 			t.Fatalf("lookup(%q) missing", k)
 		}
-		if !reflect.DeepEqual(list, postings[k]) {
-			t.Fatalf("lookup(%q) = %v, want %v", k, list, postings[k])
+		wantIDs, gotIDs := postingDocIDs(postings[k]), postingDocIDs(list)
+		if !bytes.Equal(uint32SliceBytes(wantIDs), uint32SliceBytes(gotIDs)) {
+			t.Fatalf("lookup(%q) docIDs differ", k)
 		}
 	}
 }
@@ -84,13 +92,12 @@ func TestContentExternalMultiBlock(t *testing.T) {
 	}
 	defer b.Close()
 
-	want := make([]contentDocFreq, 0, n)
+	want := make([]uint32, 0, n)
 	doc := uint32(0)
 	for i := 0; i < n; i++ {
 		doc += uint32(1 + i%3)
-		tf := uint32(1 + i%5)
-		b.Add("alpha", doc, tf)
-		want = append(want, contentDocFreq{docID: doc, tf: tf})
+		b.Add("alp", doc)
+		want = append(want, doc)
 	}
 	data, err := b.Finish()
 	if err != nil {
@@ -100,15 +107,15 @@ func TestContentExternalMultiBlock(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(idx.entries) != 1 || idx.entries[0].blockCount != 5 {
-		t.Fatalf("blocks = %+v, want 5 for one key", idx.entries)
+	if len(idx.entries) != 1 || idx.entries[0].blockCount != 2 {
+		t.Fatalf("blocks = %+v, want 2 for one 5000-posting key", idx.entries)
 	}
-	got, ok := idx.lookup("alpha")
+	got, ok := idx.lookup("alp")
 	if !ok || len(got) != n {
 		t.Fatalf("lookup = %d postings, %v; want %d", len(got), ok, n)
 	}
-	if !reflect.DeepEqual(got, want) {
-		t.Fatal("decoded postings differ from input")
+	if !bytes.Equal(uint32SliceBytes(want), uint32SliceBytes(postingDocIDs(got))) {
+		t.Fatal("decoded docIDs differ from input")
 	}
 }
 
@@ -118,7 +125,8 @@ func TestContentExternalEmpty(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer b.Close()
-	b.Add("", 1, 1) // empty key is ignored, same as encode
+	b.Add("", 1) // empty key is ignored, same as encode
+	b.Add("toolongkey", 2)
 	if got, err := b.Finish(); err != nil || got != nil {
 		t.Fatalf("Finish() = %v, %v; want nil, nil", got, err)
 	}
@@ -137,7 +145,7 @@ func TestContentExternalDeterminism(t *testing.T) {
 		defer b.Close()
 		for _, k := range keys {
 			for _, p := range postings[k] {
-				b.Add(k, p.docID, p.tf)
+				b.Add(k, p.docID)
 			}
 		}
 		out, err := b.Finish()
@@ -172,11 +180,11 @@ func TestContentExternalBoundedBuffer(t *testing.T) {
 
 	rng := rand.New(rand.NewSource(7))
 	for k := 0; k < nkeys; k++ {
-		key := fmt.Sprintf("term-%04d", k)
+		key := fmt.Sprintf("%c%c%c", 'a'+byte(k/(26*26)), 'a'+byte((k/26)%26), 'a'+byte(k%26))
 		doc := uint32(0)
 		for j := 0; j < perKey; j++ {
 			doc += uint32(1 + rng.Intn(4))
-			b.Add(key, doc, uint32(1+rng.Intn(3)))
+			b.Add(key, doc)
 		}
 	}
 

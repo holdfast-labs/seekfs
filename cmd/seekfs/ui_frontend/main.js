@@ -335,6 +335,9 @@ function contentStatusText(content) {
   }
   if (content.error) return `Contents: ${content.error}`;
   if (content.scope_dropped) {
+    if (content.reserve_bytes) {
+      return `${content.scope_dropped.toLocaleString()} files not indexed (disk reserve ${formatBudgetBytes(content.reserve_bytes)}) — free up space or set [features.content] budget_bytes`;
+    }
     return `${content.scope_dropped.toLocaleString()} files not indexed (budget ${formatBudgetBytes(content.budget_bytes)}) — raise [features.content] budget_bytes`;
   }
   if (content.incomplete || content.partial) return "Contents: partial results";

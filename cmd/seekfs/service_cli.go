@@ -455,8 +455,13 @@ func contentHealthSummary(h *contentHealth) string {
 		fmt.Fprintf(&b, " scope_reconcile_pending=%d", h.ScopeReconcilePending)
 	}
 	if h.ScopeDropped > 0 {
-		fmt.Fprintf(&b, " scope_dropped_files=%d scope_dropped_bytes=%d budget=%s (raise [features.content] budget_bytes)",
-			h.ScopeDropped, h.ScopeDroppedBytes, contentBudgetLabel(h.BudgetBytes))
+		if h.ReserveBytes > 0 {
+			fmt.Fprintf(&b, " scope_dropped_files=%d scope_dropped_bytes=%d reserve=%s (free disk space below the reserve; free up space or set [features.content] budget_bytes)",
+				h.ScopeDropped, h.ScopeDroppedBytes, contentBudgetLabel(h.ReserveBytes))
+		} else {
+			fmt.Fprintf(&b, " scope_dropped_files=%d scope_dropped_bytes=%d budget=%s (raise [features.content] budget_bytes)",
+				h.ScopeDropped, h.ScopeDroppedBytes, contentBudgetLabel(h.BudgetBytes))
+		}
 	}
 	if h.BuildError != "" {
 		fmt.Fprintf(&b, " build_error=%s", h.BuildError)
@@ -951,8 +956,26 @@ func (s *goSearchService) Execute(args []string, r <-chan svc.ChangeRequest, cha
 		case svc.Interrogate:
 			changes <- req.CurrentStatus
 		case svc.Stop, svc.Shutdown:
-			changes <- svc.Status{State: svc.StopPending}
-			s.signalServiceStop()
+			// Bounded shutdown with SCM progress: report STOP_PENDING with
+			// a wait hint covering the whole stop, then bump the checkpoint
+			// as each teardown phase starts so SCM can tell a slow stop
+			// from a wedged one. shutdownService itself is deadline-bound;
+			// <-done adds only the bounded pipe-listener drain.
+			waitHint := uint32((serviceShutdownTimeout + serviceShutdownRemoteWait + serviceShutdownListenerWait + 2*time.Second).Milliseconds())
+			checkpoint := uint32(1)
+			sendStopPending := func() {
+				changes <- svc.Status{State: svc.StopPending, Accepts: svc.AcceptStop | svc.AcceptShutdown, CheckPoint: checkpoint, WaitHint: waitHint}
+			}
+			sendStopPending()
+			stopping := make(chan struct{})
+			go func() {
+				s.shutdownService(func(string) {
+					checkpoint++
+					sendStopPending()
+				})
+				close(stopping)
+			}()
+			<-stopping
 			<-done
 			return false, 0
 		}

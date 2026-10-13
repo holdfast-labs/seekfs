@@ -562,4 +562,8 @@ func TestUIContentStatusFromHealth(t *testing.T) {
 	if dropped.ScopeDropped != 12345 || dropped.ScopeDroppedBytes != 6789 || dropped.BudgetBytes != 2<<30 {
 		t.Fatalf("uiContentStatusFrom dropped = %+v", dropped)
 	}
+	reserved := uiContentStatusFrom(&contentHealth{State: contentStateDegraded, ScopeDropped: 12, ReserveBytes: 20 << 30})
+	if reserved.ScopeDropped != 12 || reserved.ReserveBytes != 20<<30 {
+		t.Fatalf("uiContentStatusFrom reserve = %+v", reserved)
+	}
 }

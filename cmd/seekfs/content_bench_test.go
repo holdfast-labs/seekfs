@@ -290,8 +290,8 @@ func BenchmarkContentCountVsFilename(b *testing.B) {
 func contentLaneBenchVolume(b *testing.B) *serviceVolumeIndex {
 	b.Helper()
 	const (
-		n            = 50_000
-		dirs         = 8
+		n              = 50_000
+		dirs           = 8
 		selectiveEvery = 6_250 // ~8 of 50k
 		pelicanEvery   = 3_125 // ~16 of 50k
 	)
@@ -409,6 +409,7 @@ func BenchmarkContentGlobalLane(b *testing.B) {
 	}
 	os.Setenv("SEEKFS_CONTENT_GLOBAL_LANE", "1")
 }
+
 // contentBenchMeasureAllocBytes returns the total bytes allocated per call of fn,
 // measured with runtime.MemStats so the regression gate is framework-free and
 // deterministic.

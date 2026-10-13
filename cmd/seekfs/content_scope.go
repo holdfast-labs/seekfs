@@ -35,27 +35,14 @@ const (
 const (
 	// contentScopeBudgetFraction bounds the projected `.gsx` at a fraction of
 	// the hard cap, leaving headroom for index overhead and delta growth. It
-	// applies to the legacy fallback default only; the normal default is a
-	// fraction of the index volume's free space (see defaultContentScopeBudget).
+	// applies only when no volume anchor is available at all.
 	contentScopeBudgetFraction = 0.5
-	// contentGSXOverheadMultiplier scales eligible extraction bytes to a
-	// projected `.gsx` size. Postings (terms + trigrams) can exceed the stored
-	// text, so the projection is text*multiplier, calibrated against a real
-	// sidecar; it is an estimate, and the encode-time cap check is the backstop.
-	contentGSXOverheadMultiplier = 1.3
-	// contentScopeBudgetFreeFraction derives the default content budget from
-	// the index volume's free space: sharding bounds build and fold memory per
-	// 64 MiB shard, so the budget is really temporary disk space, and a fixed
-	// 2 GiB default truncates Chromium-size repos (509k files) mid-corpus.
-	contentScopeBudgetFreeFraction = 0.1
-	// contentScopeBudgetFloorBytes keeps the derived default sane on small or
-	// nearly-full volumes. contentScopeBudgetCeilBytes caps the derived and
-	// explicit budgets well above the 4 GiB single-file sidecar cap: any
-	// corpus past the 64 MiB shard target builds as folder shards, each
-	// individually capped at contentGSXMaxBytes by contentSaveFile, so a large
-	// total budget stays memory-bounded and per-file safe.
-	contentScopeBudgetFloorBytes = 2 << 30
-	contentScopeBudgetCeilBytes  = 32 << 30
+	// contentScopeBudgetCeilBytes caps an explicit budget_bytes well above
+	// the 4 GiB single-file sidecar cap: any corpus past the 64 MiB shard
+	// target builds as folder shards, each individually capped at
+	// contentGSXMaxBytes by contentSaveFile, so a large total budget stays
+	// memory-bounded and per-file safe.
+	contentScopeBudgetCeilBytes = 32 << 30
 )
 
 // contentScopeConfig is the raw, per-key config form (pointer bools are
@@ -86,35 +73,16 @@ type contentScope struct {
 }
 
 func defaultContentScope() contentScope {
+	// BudgetBytes 0 with BudgetExplicit false means unlimited: index
+	// everything selected, stopping only when the projected index would
+	// breach the volume's free-space reserve (see contentScopeAllowance).
+	// The memory side stays bounded because sharding caps each shard at
+	// contentShardTargetBytes of extracted text.
 	return contentScope{
 		Mode:           contentScopeAuto,
 		IncludeGit:     true,
 		SystemExcludes: true,
-		BudgetBytes:    defaultContentScopeBudget(""),
 	}
-}
-
-// defaultContentScopeBudget derives the default extracted-text budget for the
-// volume holding anchorPath from that volume's free space: a tenth of free
-// space, floored so small volumes still index a useful corpus and capped at
-// the sidecar cap the encode-time check enforces. An empty or unreadable
-// anchor falls back to the legacy half-of-cap default, so estimates and unit
-// tests without a volume path behave as before. The anchor is normally the
-// volume's `.gsi` path, whose directory is also where the `.gsx` is written.
-func defaultContentScopeBudget(anchorPath string) int64 {
-	if anchorPath != "" {
-		if free, err := contentFreeDiskBytes(anchorPath); err == nil && free > 0 {
-			budget := int64(float64(free) * contentScopeBudgetFreeFraction)
-			if budget < contentScopeBudgetFloorBytes {
-				budget = contentScopeBudgetFloorBytes
-			}
-			if budget > contentScopeBudgetCeilBytes {
-				budget = contentScopeBudgetCeilBytes
-			}
-			return budget
-		}
-	}
-	return int64(float64(contentGSXMaxBytes) * contentScopeBudgetFraction)
 }
 
 // contentNormPath normalizes a path for scope comparison: cleaned, and
@@ -175,9 +143,9 @@ func parseContentScopeMode(s string) (contentScopeMode, bool) {
 
 // contentScopeForVolume resolves the effective scope: defaults, then the global
 // [content] config, then any [content."<volume>"] override, then environment.
-// The budget default is derived from the index volume's free space (see
-// defaultContentScopeBudget) unless config or environment sets budget_bytes
-// explicitly; the explicit value wins and is clamped to the sidecar cap.
+// Without config or environment budget_bytes the budget is unlimited and
+// reserve-governed (see contentScopeAllowance); an explicit value wins and is
+// clamped to the ceiling.
 func contentScopeForVolume(cfg appConfig, volume string) contentScope {
 	s := defaultContentScope()
 	budgetSet := false
@@ -216,28 +184,20 @@ func contentScopeForVolume(cfg appConfig, volume string) contentScope {
 		budgetSet = true
 	}
 	// BudgetExplicit records operator provenance for the scope fingerprint:
-	// only an explicit budget joins the sidecar identity. The derived default
-	// moves with free space, and fingerprinting it would rebuild on drift.
+	// only an explicit budget joins the sidecar identity. The default
+	// (BudgetBytes 0) is reserve-governed against live disk figures, and
+	// fingerprinting it would rebuild on every drift.
 	s.BudgetExplicit = budgetSet
 	if s.Mode == "" {
 		s.Mode = contentScopeAuto
 	}
-	// Without an explicit budget, derive it from the index volume's free
-	// space so a Chromium-size repo indexes completely; the legacy fixed
-	// default only covers callers with no volume anchor. The derived value
-	// stays non-explicit (BudgetExplicit above), so free-space drift never
-	// invalidates the sidecar identity.
 	if !budgetSet {
-		if anchor := contentScopeBudgetAnchor(volume); anchor != "" {
-			s.BudgetBytes = defaultContentScopeBudget(anchor)
-		}
-	}
-	if s.BudgetBytes <= 0 || s.BudgetBytes > contentScopeBudgetCeilBytes {
-		if anchor := contentScopeBudgetAnchor(volume); anchor != "" {
-			s.BudgetBytes = defaultContentScopeBudget(anchor)
-		} else {
-			s.BudgetBytes = defaultContentScope().BudgetBytes
-		}
+		// No explicit budget: unlimited, reserve-governed. Sharding bounds
+		// memory per shard, so the budget is disk space, enforced live
+		// against the reserve (see contentScopeAllowance), not a byte cap.
+		s.BudgetBytes = 0
+	} else if s.BudgetBytes <= 0 || s.BudgetBytes > contentScopeBudgetCeilBytes {
+		s.BudgetBytes = contentScopeBudgetCeilBytes
 	}
 	return s
 }

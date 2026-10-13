@@ -241,6 +241,43 @@ func (rs *remoteLoopbackServer) close() {
 	rs.wg.Wait()
 }
 
+// closeBounded is the shutdown-path close: it stops the listener, cancels all
+// in-flight work, and waits up to d for the connections to finish. On timeout
+// it returns anyway (a wedged request must not hold SCM stop); process exit
+// reclaims the connections. New requests are refused once shutdown begins, so
+// no wg.Add can race the wait below.
+func (rs *remoteLoopbackServer) closeBounded(d time.Duration) {
+	close(rs.stop)
+	if rs.ln != nil {
+		rs.ln.Close()
+	}
+	rs.mu.Lock()
+	conns := make([]*remoteConn, 0, len(rs.conns))
+	for rc := range rs.conns {
+		conns = append(conns, rc)
+	}
+	rs.mu.Unlock()
+	for _, rc := range conns {
+		rc.shutdown()
+	}
+	drained := make(chan struct{})
+	go func() {
+		for _, rc := range conns {
+			rc.waitInFlight()
+		}
+		<-rs.done
+		rs.wg.Wait()
+		close(drained)
+	}()
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-drained:
+	case <-timer.C:
+		serviceLog("service shutdown: remote connections did not drain in %s; exiting anyway", d)
+	}
+}
+
 // remoteRequestState tracks one in-flight remote request for connection-scoped
 // cancellation.
 type remoteRequestState struct {

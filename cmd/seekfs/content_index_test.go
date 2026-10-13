@@ -66,10 +66,32 @@ func TestContentIndexRoundTrip(t *testing.T) {
 	}
 }
 
+// A sidecar stamped with the previous doc-table version must fail the
+// version gate (never attach stale): the service sees no usable base and
+// its PF-3 build path rebuilds it. The v7 section decoders never see v6
+// bytes.
+func TestContentIndexRejectsPreviousVersion(t *testing.T) {
+	idx := newContentIndex()
+	idx.Docs = contentTestDocs()
+	data := contentIndexEncode(idx)
+	if len(data) < contentHeaderSize() {
+		t.Fatal("encoded index shorter than its header")
+	}
+	bad := append([]byte(nil), data...)
+	binary.LittleEndian.PutUint32(bad[8:], uint32(contentIndexVersion-1))
+	if _, err := contentIndexDecode(bad); err == nil {
+		t.Fatal("v6-stamped sidecar decoded without error")
+	}
+	// The manifest version still decodes (manifests carry no doc table).
+	if contentManifestVersion == contentIndexVersion {
+		t.Fatal("manifest and index versions must differ for this test")
+	}
+}
+
 func TestContentIndexPolicyRoundTrip(t *testing.T) {
 	idx := newContentIndex()
 	idx.Docs = contentTestDocs()
-	idx.Policy = contentBuildPolicy{MaxRaw: 1 << 20, MaxText: 1 << 19, Skipped: 3, Truncated: 2, ScopeDropped: 1, ScopeDroppedBytes: 42, BudgetBytes: 1 << 20, Binary: 7}
+	idx.Policy = contentBuildPolicy{MaxRaw: 1 << 20, MaxText: 1 << 19, Skipped: 3, Truncated: 2, ScopeDropped: 1, ScopeDroppedBytes: 42, BudgetBytes: 1 << 20, Binary: 7, ReserveBytes: 20 << 30}
 	got, err := contentIndexDecode(contentIndexEncode(idx))
 	if err != nil {
 		t.Fatalf("contentDecode: %v", err)
@@ -100,6 +122,11 @@ func TestContentIndexPolicyDecodesOlderSizes(t *testing.T) {
 	b56 := full.encode()[:56]
 	if got, ok := decodeContentPolicy(b56); !ok || got != full || got.Binary != 0 {
 		t.Fatalf("56-byte policy = %+v, %v; want %+v with zero binary", got, ok, full)
+	}
+	// A 64-byte CXPL (pre reserve) decodes with the reserve zero.
+	b64 := full.encode()[:64]
+	if got, ok := decodeContentPolicy(b64); !ok || got.Binary != full.Binary || got.ReserveBytes != 0 {
+		t.Fatalf("64-byte policy = %+v, %v; want binary kept and zero reserve", got, ok)
 	}
 }
 

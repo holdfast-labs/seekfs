@@ -1041,7 +1041,13 @@ func (s *goSearchService) persistVolumeLoop(vol *serviceVolumeIndex) {
 		}
 		select {
 		case <-s.stop:
-			s.persistVolumeIfDue(vol, true)
+			// No final blocking persist on shutdown: the fold plus the
+			// multi-gigabyte tmp write, commit and reload stalls SCM stop
+			// past its deadline (STOP_PENDING) when several volumes are
+			// due at once. The WAL holds every replayed batch, so
+			// durability is preserved without it; a persist killed
+			// mid-flight is safe (tmp + atomic rename, and the WAL rewrite
+			// keeps the post-snapshot frames for the next startup replay).
 			return
 		case <-ticker.C:
 			s.sweepStaleIndexTempFilesIfDue(time.Now())
@@ -1057,6 +1063,8 @@ func (s *goSearchService) persistVolumeIfDue(vol *serviceVolumeIndex, force bool
 	if !force && envBool("SEEKFS_DISABLE_BACKGROUND_PERSIST") {
 		return
 	}
+	vol.persistActive.Add(1)
+	defer vol.persistActive.Add(-1)
 	if !force && vol.contentSnapshotHold.Load() > 0 {
 		return // a content snapshot is copying this index; persist next tick
 	}

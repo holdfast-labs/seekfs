@@ -67,30 +67,33 @@ func TestContentHTMLExtractsBodyAndTitle(t *testing.T) {
 	if got.Class != contentClassHTML {
 		t.Fatalf("class = %d; want %d", got.Class, contentClassHTML)
 	}
+	// The source is indexed with its markup (ripgrep parity): page text,
+	// script, style, comments and tags are all searchable.
 	text := string(got.Text)
-	for _, want := range []string{"Alpha Page Title", "Heading", "Body needle here."} {
+	for _, want := range []string{"Alpha Page Title", "Heading", "Body needle here.", "secretneedle", "commentneedle", "color:red", "<h1>"} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("text %q missing %q", text, want)
 		}
 	}
-	for _, banned := range []string{"secretneedle", "commentneedle", "color:red", "<h1>", "<!DOCTYPE"} {
-		if strings.Contains(text, banned) {
-			t.Fatalf("extracted excluded content %q: %q", banned, text)
-		}
-	}
 }
 
+// contentHTMLText (rendered text, used for HTML email parts) separates block
+// elements and decodes entities.
 func TestContentHTMLBlockTagsSeparateWords(t *testing.T) {
-	got := contentHTMLExtract(t, []byte("<div>alpha</div><div>beta</div><p>gamma</p><p>delta</p>"))
-	text := string(got.Text)
+	text, _, err := contentHTMLText(context.Background(), "<div>alpha</div><div>beta</div><p>gamma</p><p>delta</p>", 1<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if !strings.Contains(text, "alpha beta") || !strings.Contains(text, "gamma delta") {
 		t.Fatalf("block tags did not separate words: %q", text)
 	}
 }
 
 func TestContentHTMLEntitiesDecode(t *testing.T) {
-	got := contentHTMLExtract(t, []byte("<p>Tom &amp; Jerry caf&#233; r&eacute;sum&eacute;</p>"))
-	text := string(got.Text)
+	text, _, err := contentHTMLText(context.Background(), "<p>Tom &amp; Jerry caf&#233; r&eacute;sum&eacute;</p>", 1<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
 	for _, want := range []string{"Tom & Jerry", "café", "résumé"} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("text %q missing decoded %q", text, want)
@@ -288,9 +291,9 @@ func TestContentServiceAllowlistIncludesHTML(t *testing.T) {
 	}
 }
 
-// A .html file is extracted (class HTML) rather than raw-markup indexed: body
-// and title terms are findable, script/style terms are not.
-func TestContentBuildIndexesHTMLNotRawMarkup(t *testing.T) {
+// A .html file is indexed as source (class HTML, extractor v2): body, title,
+// script and style terms are all findable, as ripgrep would find them.
+func TestContentBuildIndexesHTMLSource(t *testing.T) {
 	dir := t.TempDir()
 	page := `<!DOCTYPE html><html><head><title>titleneedle</title>` +
 		`<style>.x{content:"styleneedle"}</style></head>` +
@@ -306,20 +309,15 @@ func TestContentBuildIndexesHTMLNotRawMarkup(t *testing.T) {
 		t.Fatalf("built %d docs; want 1", len(idx.Docs))
 	}
 	if idx.Docs[0].ContentType != contentClassHTML || idx.Docs[0].ExtractorVersion != (contentHTMLExtractor{}).Version() {
-		t.Fatalf("doc identity = (%d,%d); want HTML v1", idx.Docs[0].ContentType, idx.Docs[0].ExtractorVersion)
+		t.Fatalf("doc identity = (%d,%d); want HTML v2", idx.Docs[0].ContentType, idx.Docs[0].ExtractorVersion)
 	}
 	r, err := openContentReader(idx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, term := range []string{"bodyneedle", "titleneedle"} {
+	for _, term := range []string{"bodyneedle", "titleneedle", "scriptneedle", "styleneedle"} {
 		if hits := r.search(term, 0); len(hits) != 1 || hits[0].Path != "page.html" {
 			t.Fatalf("term %q not findable: %v", term, contentPathsOf(hits))
-		}
-	}
-	for _, term := range []string{"scriptneedle", "styleneedle"} {
-		if hits := r.search(term, 0); len(hits) != 0 {
-			t.Fatalf("excluded term %q indexed: %v", term, contentPathsOf(hits))
 		}
 	}
 }

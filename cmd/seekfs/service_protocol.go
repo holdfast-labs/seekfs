@@ -411,13 +411,16 @@ type goSearchService struct {
 	processMode string
 	stop        chan struct{}
 	stopOnce    sync.Once
-	dbs         []string
-	indexes     []*Index
-	volumes     []*serviceVolumeIndex
-	loading     bool
-	loadErr     string
-	indexMu     sync.RWMutex
-	requestSeq  atomic.Int64
+	// shutdownOnce guards the bounded shutdown sequence so the SCM stop
+	// handler and servePrivileged never run the teardown twice.
+	shutdownOnce sync.Once
+	dbs          []string
+	indexes      []*Index
+	volumes      []*serviceVolumeIndex
+	loading      bool
+	loadErr      string
+	indexMu      sync.RWMutex
+	requestSeq   atomic.Int64
 	// lastTempSweep holds the unix-nano time of the last stale index temp sweep,
 	// so the periodic sweep runs once per interval no matter how many volume
 	// loops call it.
@@ -557,24 +560,29 @@ type serviceVolumeIndex struct {
 	// up. Persists skip their tick while it is held (the WAL keeps changes
 	// durable).
 	contentSnapshotHold atomic.Int32
-	underCache          map[int]postingCacheEntry
-	underRootCache      map[string]postingCacheEntry
-	dirty               bool
-	lastPersist         time.Time
-	persistFailures     int
-	persistRetryAfter   time.Time
-	lastPersistErr      string
-	lastReplayAt        time.Time
-	lastReplayErr       string
-	lastReplayNext      int64
-	replayStrikes       int
-	stallObservedCp     int64
-	stallObservedAt     time.Time
-	recovering          atomic.Bool
-	searchCount         uint64
-	overlay             *overlaySegment
-	snap                atomic.Pointer[volumeSnapshot]
-	snapshotGen         atomic.Uint64
+	// persistActive counts background persists in flight. A persist raises
+	// it before checking contentSnapshotHold and a snapshot raises the hold
+	// before waiting for it to drain, so a snapshot never overlaps a persist
+	// that started before it.
+	persistActive     atomic.Int32
+	underCache        map[int]postingCacheEntry
+	underRootCache    map[string]postingCacheEntry
+	dirty             bool
+	lastPersist       time.Time
+	persistFailures   int
+	persistRetryAfter time.Time
+	lastPersistErr    string
+	lastReplayAt      time.Time
+	lastReplayErr     string
+	lastReplayNext    int64
+	replayStrikes     int
+	stallObservedCp   int64
+	stallObservedAt   time.Time
+	recovering        atomic.Bool
+	searchCount       uint64
+	overlay           *overlaySegment
+	snap              atomic.Pointer[volumeSnapshot]
+	snapshotGen       atomic.Uint64
 }
 
 type overlaySegment struct {
@@ -631,8 +639,13 @@ type postingCacheEntry struct {
 	gen uint64
 }
 
+// serviceLog appends one line to service.log in the seekfs dir. The dir is
+// resolved through defaultSeekFSDir (SEEKFS_DIR-aware), so the test suite can
+// redirect it with SEEKFS_DIR instead of appending to the machine's real
+// %ProgramData%\seekfs\service.log. In production SEEKFS_DIR is unset and the
+// path is unchanged (%ProgramData%\seekfs\service.log).
 func serviceLog(format string, args ...any) {
-	dir := filepath.Join(os.Getenv("ProgramData"), "seekfs")
+	dir := defaultSeekFSDir()
 	if dir == "" || dir == "seekfs" {
 		dir = filepath.Join(os.TempDir(), "seekfs")
 	}

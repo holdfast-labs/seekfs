@@ -233,11 +233,12 @@ func TestContentParallelSpillIsByteIdentical(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer b.Close()
-		// Deterministic pseudo-random keys across shared prefixes, plus
-		// duplicate keys with ascending docIDs (the builder's contract).
+		// Deterministic pseudo-random 3-byte gram keys across shared
+		// prefixes, plus duplicate keys with ascending docIDs (the
+		// builder's contract since v7).
 		for i := 0; i < 20000; i++ {
-			key := string(rune('a'+(i*7919)%26)) + string(rune('a'+(i*104729)%26)) + "key" + string(rune('0'+(i/26)%10))
-			b.Add(key, uint32(i/3), uint32(i%7+1))
+			key := string(rune('a'+(i*7919)%26)) + string(rune('a'+(i*104729)%26)) + string(rune('a'+(i/26)%26))
+			b.Add(key, uint32(i/3))
 		}
 		out, err := b.Finish()
 		if err != nil {
@@ -264,7 +265,7 @@ func TestContentParallelSpillIsByteIdentical(t *testing.T) {
 		defer b.Close()
 		grams := []string{"the", "ion", "e_a", "   ", "(){", "xyz"}
 		for i := 0; i < 20000; i++ {
-			b.Add(grams[i%len(grams)], uint32(i/2), 1)
+			b.Add(grams[i%len(grams)], uint32(i/2))
 		}
 		out, err := b.Finish()
 		if err != nil {
