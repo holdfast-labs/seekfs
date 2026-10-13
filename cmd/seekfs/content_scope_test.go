@@ -454,31 +454,40 @@ func TestContentScopeReserve(t *testing.T) {
 		t.Fatalf("reserve(unknown) = %d; want the fixed fallback", got)
 	}
 	contentDiskReserveBytes = 0
-	// Allowance: (free - reserve) / multiplier, on a 2 TiB volume (20 GiB
-	// reserve) with 100 GiB free.
+	// Allowance budgets the build's peak (spool + output): (free - reserve -
+	// shard scratch) / peak multiplier, on a 2 TiB volume (20 GiB reserve)
+	// with 100 GiB free.
 	contentTotalBytesFn = func(_ string) (uint64, error) { return 2 << 40, nil }
 	contentFreeBytesFn = func(_ string) (uint64, error) { return 100 << 30, nil }
-	if got, want := contentScopeAllowance(vol), int64(float64(80<<30)/contentScopeEncodedMultiplier); got != want {
+	headroom := uint64(80<<30) - contentScopeScratchSlack()
+	if got, want := contentScopeAllowance(vol, 0), int64(float64(headroom)/contentScopePeakMultiplier); got != want {
 		t.Fatalf("allowance = %d; want %d", got, want)
+	}
+	// Bytes the build already spooled are part of its peak, not a second
+	// charge: with 30 GiB spooled (free fell to 70 GiB) the total allowance
+	// is unchanged.
+	contentFreeBytesFn = func(_ string) (uint64, error) { return 70 << 30, nil }
+	if got, want := contentScopeAllowance(vol, 30<<30), int64(float64(headroom)/contentScopePeakMultiplier); got != want {
+		t.Fatalf("allowance with spool credited = %d; want %d", got, want)
 	}
 	// At or below the reserve nothing more is selected: less free space
 	// never means more indexing.
 	contentFreeBytesFn = func(_ string) (uint64, error) { return 1 << 30, nil }
-	if got := contentScopeAllowance(vol); got != 0 {
+	if got := contentScopeAllowance(vol, 0); got != 0 {
 		t.Fatalf("allowance below reserve = %d; want 0", got)
 	}
 	if contentScopeFitsReserve(vol, 1) {
 		t.Fatal("below the reserve nothing fits")
 	}
 	// The fits check agrees with the allowance: 100 GiB free, 20 GiB
-	// reserve: 120 GiB extracted projects to 60 GiB, leaving 40 GiB (fits);
-	// 200 GiB projects to 100 GiB, leaving nothing (breaches).
+	// reserve: 40 GiB extracted peaks at 60 GiB (fits in ~80 GiB of
+	// headroom); 60 GiB peaks at 90 GiB (breaches).
 	contentFreeBytesFn = func(_ string) (uint64, error) { return 100 << 30, nil }
-	if !contentScopeFitsReserve(vol, 120<<30) {
-		t.Fatal("120 GiB extracted must fit: projected 60 GiB leaves 40 GiB of a 20 GiB reserve")
+	if !contentScopeFitsReserve(vol, 40<<30) {
+		t.Fatal("40 GiB extracted must fit: a 60 GiB peak leaves the 20 GiB reserve")
 	}
-	if contentScopeFitsReserve(vol, 200<<30) {
-		t.Fatal("200 GiB extracted must not fit: projected 100 GiB leaves nothing")
+	if contentScopeFitsReserve(vol, 60<<30) {
+		t.Fatal("60 GiB extracted must not fit: a 90 GiB peak breaches the reserve")
 	}
 	// Anchors: bare volumes anchor at the root, absolute paths at themselves,
 	// anything else anchors nowhere.

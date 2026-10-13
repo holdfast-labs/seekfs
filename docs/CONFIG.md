@@ -91,8 +91,8 @@ Files that sniff binary are tallied as `binary` in the `.gsx` policy and in
 `loaded --json` — expected rejections, never drops.
 
 There is no default `budget_bytes`: the build indexes everything selected
-and stops only when the projected index (extracted bytes × 0.5) would push
-the sidecar's volume below a free-space reserve — 5% of the volume's
+and stops only when the build's projected peak disk use (extracted bytes ×
+1.5: the text spool plus the index) would push the sidecar's volume below a free-space reserve — 5% of the volume's
 capacity clamped to [10 GiB, 20 GiB], shared by selection and the write-time
 guard, monotonic (allowance 0 at or below the reserve, with drops counted).
 Only an explicit value joins the sidecar

@@ -1039,10 +1039,11 @@ func TestContentServiceBuildReserveDropsExactFilesAndBytes(t *testing.T) {
 	stubContentBuildSync(t)
 	oldFree, oldTotal := contentFreeBytesFn, contentTotalBytesFn
 	defer func() { contentFreeBytesFn, contentTotalBytesFn = oldFree, oldTotal }()
-	// 20 GiB reserve (5% of 500 GiB, capped), 9 bytes of headroom: allowance
-	// is 18 extracted bytes.
+	// 20 GiB reserve (5% of 500 GiB, capped) plus the in-flight shard
+	// scratch, and 17 bytes of headroom: the build peak (spool + output,
+	// ×1.5) allows 11 extracted bytes.
 	contentTotalBytesFn = func(_ string) (uint64, error) { return 500 << 30, nil }
-	contentFreeBytesFn = func(_ string) (uint64, error) { return (20 << 30) + 9, nil }
+	contentFreeBytesFn = func(_ string) (uint64, error) { return (20 << 30) + contentScopeScratchSlack() + 17, nil }
 	dir := t.TempDir()
 	bodies := map[string]string{
 		"a.txt": "alpha",
@@ -1064,7 +1065,7 @@ func TestContentServiceBuildReserveDropsExactFilesAndBytes(t *testing.T) {
 	})
 	s := contentTestService(t)
 	// No explicit budget: the reserve governs. Fits a.txt + b.txt (5+6=11
-	// of 18 allowed), drops c.txt (8 bytes of extracted text).
+	// of 11 allowed), drops c.txt (8 bytes of extracted text).
 	s.ensureContentBuild(vol)
 	built, err := contentLoadFile(gsx)
 	if err != nil {
@@ -1086,6 +1087,62 @@ func TestContentServiceBuildReserveDropsExactFilesAndBytes(t *testing.T) {
 	}
 	if !h.Incomplete {
 		t.Fatal("reserve-truncated sidecar must report incomplete")
+	}
+}
+
+// A sharded build removes each shard's scratch once the shard is saved, so the
+// volume never holds a second copy of every saved shard next to the spool.
+func TestContentServiceBuildRemovesShardScratchAsItGoes(t *testing.T) {
+	t.Setenv("SEEKFS_CONTENT_SEARCH", "1")
+	stubContentCatchUpSync(t)
+	stubContentBuildSync(t)
+	restoreTarget, restoreConc := contentShardTargetBytes, contentShardBuildConcurrency
+	contentShardTargetBytes, contentShardBuildConcurrency = 1, 1 // one shard per file, sequential
+	t.Cleanup(func() { contentShardTargetBytes, contentShardBuildConcurrency = restoreTarget, restoreConc })
+	dir := t.TempDir()
+	names := []string{"a.txt", "b.txt", "c.txt", "d.txt"}
+	var recs []CompactRecord
+	for i, name := range names {
+		body := "body of " + name
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		recs = append(recs, CompactRecord{FRN: uint64(i + 1), Parent: -1, Name: name, Size: int64(len(body))})
+	}
+	const journal = uint64(95)
+	const cp = int64(103)
+	stubContentCatchUpJournal(t, usnJournalDataV0{UsnJournalID: journal, FirstUsn: 1, LowestValidUsn: 1, NextUsn: cp})
+	vol, gsx := contentBuildTestVolume(t, dir, journal, uint64(cp), recs)
+	// The write guard checks free space right before each shard save; count
+	// the shard scratch directories alive at that moment.
+	oldFree := contentFreeBytesFn
+	t.Cleanup(func() { contentFreeBytesFn = oldFree })
+	maxScratch, checks := 0, 0
+	contentFreeBytesFn = func(path string) (uint64, error) {
+		if path == contentShardDir(gsx) {
+			checks++
+			live, _ := filepath.Glob(filepath.Join(filepath.Dir(gsx), contentWorkPrefix+"*", "shard-*"))
+			if len(live) > maxScratch {
+				maxScratch = len(live)
+			}
+		}
+		return 0, errTestReserve
+	}
+	s := contentTestService(t)
+	s.ensureContentBuild(vol)
+	built, err := contentLoadFile(gsx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	releaseContentIndexOnCleanup(t, built)
+	if len(built.Docs) != len(names) {
+		t.Fatalf("sharded build docs=%d; want %d", len(built.Docs), len(names))
+	}
+	if checks < 2 {
+		t.Fatalf("saw %d shard save checks; want one per shard (sharded path not taken)", checks)
+	}
+	if maxScratch > 1 {
+		t.Fatalf("%d shard scratch directories alive at a save; want at most the in-flight one", maxScratch)
 	}
 }
 

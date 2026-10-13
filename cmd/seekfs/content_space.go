@@ -51,6 +51,20 @@ const contentScopeReserveMaxBytes = 20 << 30
 // backstop: the projection only decides when selection stops.
 const contentScopeEncodedMultiplier = 0.5
 
+// contentScopePeakMultiplier projects the peak bytes a service build holds on
+// the sidecar's volume per selected extracted byte: the text spool (1.0, kept
+// until the last shard is saved) plus the encoded output. Selection budgets
+// against this peak, not the final size, so the write-time guard does not trip
+// mid-build after selection has already spent the headroom.
+const contentScopePeakMultiplier = 1 + contentScopeEncodedMultiplier
+
+// contentScopeScratchSlack is the headroom kept for the shards being
+// assembled at once: their section files exist alongside the spool until
+// each shard is saved and its scratch removed.
+func contentScopeScratchSlack() uint64 {
+	return uint64(contentShardBuildConcurrency) * uint64(contentShardTargetBytes)
+}
+
 // contentScopeReserveFor returns the reserve kept free on the volume holding
 // anchorPath. Unknown capacity falls back to contentDiskReserveBytes (0 in
 // tests, which disables the reserve there).
@@ -69,23 +83,40 @@ func contentScopeReserveFor(anchorPath string) uint64 {
 	return reserve
 }
 
-// contentScopeAllowance returns the extracted-text bytes selectable before
-// the projected index would breach the reserve on anchorPath's volume:
-// (free - reserve) / multiplier, and 0 when the volume is already at or below
-// its reserve, so it never grows as free space shrinks. Unknown free space
-// means unlimited (the write-time guard is the backstop). Callers recompute it
-// as selection proceeds and keep extracting past it to tally exact dropped
-// counts, which health reports.
-func contentScopeAllowance(anchorPath string) int64 {
+// contentScopeHeadroom returns the bytes a build may occupy on anchorPath's
+// volume at its peak: free space plus the bytes this build has already
+// spooled there (they are part of the peak, so counting them against free
+// space as well would charge them twice), minus the reserve and the in-flight
+// shard scratch. ok is false when free space is unknown.
+func contentScopeHeadroom(anchorPath string, spooled int64) (headroom uint64, ok bool) {
 	free, err := contentFreeBytesFn(anchorPath)
 	if err != nil {
+		return 0, false
+	}
+	if spooled > 0 {
+		free += uint64(spooled)
+	}
+	need := contentScopeReserveFor(anchorPath) + contentScopeScratchSlack()
+	if free <= need {
+		return 0, true
+	}
+	return free - need, true
+}
+
+// contentScopeAllowance returns the extracted-text bytes selectable before
+// the build's peak (spool plus output, contentScopePeakMultiplier) would
+// breach the reserve on anchorPath's volume, given the bytes this build has
+// already spooled: headroom / peak multiplier, and 0 at or below the reserve,
+// so it never grows as free space shrinks. Unknown free space means unlimited
+// (the write-time guard is the backstop). Callers recompute it as selection
+// proceeds and keep extracting past it to tally exact dropped counts, which
+// health reports.
+func contentScopeAllowance(anchorPath string, spooled int64) int64 {
+	headroom, ok := contentScopeHeadroom(anchorPath, spooled)
+	if !ok {
 		return int64(^uint64(0) >> 1)
 	}
-	reserve := contentScopeReserveFor(anchorPath)
-	if free <= reserve {
-		return 0
-	}
-	allowance := float64(free-reserve) / contentScopeEncodedMultiplier
+	allowance := float64(headroom) / contentScopePeakMultiplier
 	if allowance >= float64(int64(^uint64(0)>>1)) {
 		return int64(^uint64(0) >> 1)
 	}
@@ -93,20 +124,20 @@ func contentScopeAllowance(anchorPath string) int64 {
 }
 
 // contentScopeFitsReserve reports whether selecting extracted bytes (total,
-// including the candidate) still projects an index that leaves the reserve
-// free on the volume holding anchorPath. Unknown free space never stops the
-// selection (the write-time guard is the backstop).
+// including the candidate) keeps the build's projected peak within the
+// headroom above the reserve on the volume holding anchorPath, before
+// anything is spooled: the estimate's view of contentScopeAllowance. Unknown
+// free space never stops the selection (the write-time guard is the
+// backstop).
 func contentScopeFitsReserve(anchorPath string, extracted int64) bool {
 	if extracted < 0 {
 		return true
 	}
-	free, err := contentFreeBytesFn(anchorPath)
-	if err != nil {
+	headroom, ok := contentScopeHeadroom(anchorPath, 0)
+	if !ok {
 		return true
 	}
-	reserve := contentScopeReserveFor(anchorPath)
-	projected := uint64(float64(extracted) * contentScopeEncodedMultiplier)
-	return projected < free && free-projected >= reserve
+	return headroom > 0 && float64(extracted)*contentScopePeakMultiplier <= float64(headroom)
 }
 
 // contentDiskCheckEvery is how many bytes a build writes between free-space
