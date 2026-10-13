@@ -32,7 +32,13 @@ func TestContentIndexDBAllOptInBuildsSidecar(t *testing.T) {
 	if err := saveIndex(db, idx); err != nil {
 		t.Fatal(err)
 	}
-	if err := cmdContentIndex([]string{"-db", db, "-all"}); err != nil {
+	// An empty private config keeps the machine's real seekfs.toml and
+	// plugin.toml (which may set a content budget) out of the build.
+	config := filepath.Join(t.TempDir(), "seekfs.toml")
+	if err := os.WriteFile(config, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := cmdContentIndex([]string{"-db", db, "-all", "-config", config}); err != nil {
 		t.Fatalf("content-index -all: %v", err)
 	}
 	built, err := contentLoadFile(contentIndexPathForDB(db))
@@ -46,7 +52,7 @@ func TestContentIndexDBAllOptInBuildsSidecar(t *testing.T) {
 	built.Release()
 	t.Setenv("SEEKFS_CONTENT_SCOPE", "explicit")
 	t.Setenv("SEEKFS_CONTENT_ROOTS", dir)
-	if err := cmdContentIndex([]string{"-db", db, "-scoped"}); err != nil {
+	if err := cmdContentIndex([]string{"-db", db, "-scoped", "-config", config}); err != nil {
 		t.Fatalf("content-index -scoped: %v", err)
 	}
 	scoped, err := contentLoadFile(contentIndexPathForDB(db))
