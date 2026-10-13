@@ -1295,6 +1295,116 @@ stays stale, pre-v6 rebuilds, mid-loop wrap), `content_scope_scan_test.go`
 (flat + drive-root differentials, unfilled-cap regression), and the updated
 `below-lowest-valid` attach branch (ready + usable, journal never re-read).
 
+## 6r. Build profile + throughput (done)
+
+Where the v8 build time goes, and what got faster. All numbers are the
+65k–77k-file Chromium sample on the same box (16-thread desktop shared with
+other agents, so every figure is noisy: interleaved same-session runs,
+min/median reported, GOMAXPROCS=4, 16 build workers unless noted). The
+600 MB budget selects 76,637 files / 572 MB raw → 76,465 docs /
+571 MB extracted → a 190 MB sidecar (text 103.9, grams 58.8, terms 19.6,
+paths 6.1 MB); the 120 MB budget selects 15,577 files for quick iterations.
+The filename-index-driven scope scan visits all 555,849 records regardless
+of budget, so scan numbers are budget-independent.
+
+**Method.** `zz_buildspeed_profile_local_test.go` (local-only, never
+committed) runs the production shape — legacy select, prefetch extract +
+spool, streamed assemble, streaming save, then an 8192-doc spread fold —
+with per-phase wall timers (`contentAssemblePhaseTimes`, test-gated, nil in
+production: tokenize/emit/train/spillSort/merge/write/encode/paths/fsync),
+CPU + alloc + block + mutex profiles (`SEEKFS_PROFILE=1`), a warm
+slurp-vs-extract micro split, and sha256 section fingerprints.
+`zz_buildspeed_base_local_test.go` is the HEAD-compatible coarse harness
+for the stashed baseline. Correctness guard: the optimized 600 MB build
+carries the same 76,465 doc records and byte-identical section payloads as
+`fixtures/v8-sample.gsx` (all tags compared, plus identical hit lists on 5
+query shapes), and the 120 MB section hashes are stable across runs; the
+cross-worker assemble/spill identity tests plus the new matchFile and pipe
+tests stay green.
+
+**Claim check: "extraction-dominated".** Half true. Interleaved 600 MB
+medians (2 baseline + 2 optimized runs; extraction code paths unchanged, so
+the extract column is contention noise, not a win):
+
+| phase | baseline (eb2f8cb) | optimized | delta |
+|---|---|---|---|
+| scope scan (full index) | ~25 s, ~47 µs/record | ~7–14 s (7.9/10.7 at 600 MB) | 3.7x same-session |
+| extract (76.6k files) | 76.0 s | 68.2 s (noise) | — |
+| assemble (571 MB text) | 60.5 s | 37.2 s | **38%** |
+| save (190 MB, incl. fsync ~0.5 s) | 0.9 s | 0.8 s | — |
+| BUILD total | ~137 s | ~106 s | ~23% |
+| 8192-doc spread fold | ~61 s | ~38 s | **38%** |
+
+Assembly was the other half all along; the scan was the largest *fixed*
+cost (paid in full on every build). The old "~9 min cold" is first-touch
+opens (MFT + Defender, ~ms each) plus an uncontended-box assemble; on this
+shared box cold-vs-warm cannot be separated honestly (no elevation to drop
+caches, siblings churn them): first prefetch batches after churn show
+multi-ms/file opens while the warm micro split shows slurp 97–160 µs/file
+vs full extract 105–238 µs/file (open+read ≈ 85% of warm cost). Reads are
+cheap; **opens are the extraction**: 59 s of CreateFile syscalls in one
+120 MB profile, 74% of all sampled CPU under load.
+
+**What the profiles proved.** CPU: go-git ignore matching was ~40–70% of
+build CPU (`filepath.Match` per pattern per file per level); syscalls
+(CreateFile) dominate under contention. Allocs: term/gram tokenizer maps
+are ~41% of all allocated bytes (2.3 GB of 6.9 GB at 120 MB). Block/mutex:
+no lock contention anywhere (71 ms total); the prefetch feeder blocks only
+on its pacing bound (no pipeline pathology).
+
+**What changed (all output byte-identical; query paths untouched):**
+
+- **Scope scan 25.2 s → 6.9 s (3.7x, same session, set-identical).**
+  `matchFile`: file-only dispatch over floating patterns (exact-name map,
+  prefix/suffix affixes, rest) merged by descending line; negations and
+  dirOnly keep the full Match because an intermediate-component match is
+  load-bearing for precedence (skipping them dropped 18 `.gemini/` files;
+  pinned by `TestContentIgnoreMatchFileMatchesMatch`). One ignore parse
+  cache shared by a scan's workers (43,638 dirs, 5.2 M hits — was: every
+  worker re-read every touched file). The `segHit` memo replaces the
+  per-file full-path system-segment recheck (same predicate: the basename
+  is spared). Binary-extension reject precomputed once. Parent-path memo
+  (one split per file, no per-file chain walk) measured ~3%, inside noise —
+  kept for the ~400 MB of garbage it removes per full scan.
+- **Assemble 60.5 s → 37.2 s at 600 MB (38%; fold likewise).** An ordered
+  text pipe (`content_textpipe.go`) moves zstd encoding to its own thread
+  while emit keeps doing posting Adds (emit 5.6–6.3 s → 4.0–4.3 s at
+  120 MB; 120 MB BUILD 8.8–9.5 s → 7.5–8.1 s, ~15%). Spill runs use fixed
+  8-byte records (no uvarint per posting), 8 KiB run reads / 64 KiB run
+  writes, and an allocation-free merge reader (spill ~5% here; the varint
+  removal materializes on quiet IO).
+- 600 MB sub-phases (optimized medians): tokenize 8.4 s, zstd encode
+  ~16.4 s (now overlapped with Adds), spill/sort 14.5 s (87 spills),
+  merge 7.9 s, dict train ~0.06 s, paths ~0.03 s, save 0.8 s.
+
+**Fold + shards.** Single-file 8192-doc spread fold re-assembles
+everything: 61 s → 38 s. Sharded (120 MB corpus, 16 MB target, 9 shards,
++22% size tax at this small target vs ~6% at the 64 MB production target):
+serial assemble 10.3 s (slowest shard 1.4 s, so concurrency-2 lands
+~5–6 s); spread 8192 (5/9 dirty) 4.7 s, docID-clustered 8192 (5/9) 4.4 s,
+one-folder-100 (1/9) 1.0 s — 8x over the single-file fold for localized
+edits. Shard folds inherit the pipe/run-format wins (same assembler).
+
+**Tried and rejected (measured, not assumed).** Sort+dedupe tokenize
+(slices over hash maps, no per-occurrence strings, no fold copy): tokenize
+1.2 s → 2.7 s at 120 MB (2.2x *slower*, BUILD +19%) — Go maps win on CPU
+here; reverted. Bigger run buffers died in `TestContentExternalBoundedBuffer`
+(8 KiB reads kept). Zero-size-file skip at selection: 103 of 76,637 files
+(0.13%) — not worth the diff. `mmap` for large files: moot on this corpus
+(`truncated=0`, no over-cap files). Bare-`*`/glob affixes and dirOnly
+skips in the dispatch: unsound for precedence (the 18-file divergence).
+More tokenize/encode level tweaks: the BetterCompression+dict point is
+already optimal (§6o); only threads were left, and the pipe took them.
+
+**Remaining bottlenecks.** (1) Extraction opens: irreducible per-file OS
+cost (~100 µs warm, ms cold); the service build additionally sleeps
+`contentBuildBatchPause` (25 ms per 64 docs ≈ 30 s on 76k files —
+unmeasured here since harnesses bypass the governor; making it idle-aware
+is open). (2) zstd encode (~16 s at 600 MB, now overlapped not reduced —
+a second encode worker would need ordered frame handoff). (3) Merge run
+reads under contention. (4) Scan residual: per-level ignore match after
+the dispatch (~7 s). Prefetch/assemble/show/save/fsync are all minor.
+
 ## 7. Carried debt / known gaps
 
 - **Snippet case is preserved; no fixup-aware path remains.** The `.gsx` text
