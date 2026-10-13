@@ -236,8 +236,19 @@ func scanContentScope(idx *Index, scope contentScope, volume string, maxFiles in
 			est.TextCandidates++
 		}
 	}
+	// An explicit budget truncates the priority-ordered candidates at the
+	// byte cap. The default (BudgetBytes 0, non-explicit) truncates only
+	// when the projected index would breach the volume's free-space
+	// reserve; the anchor is the volume root, the same volume the sidecar
+	// is written to.
+	anchor := contentScopeBudgetAnchor(volume)
 	for _, c := range candidates {
-		if est.Bytes+c.bytes > resolved.BudgetBytes {
+		if resolved.BudgetExplicit {
+			if est.Bytes+c.bytes > resolved.BudgetBytes {
+				est.BudgetHit = true
+				break
+			}
+		} else if !contentScopeFitsReserve(anchor, est.Bytes+c.bytes) {
 			est.BudgetHit = true
 			break
 		}
@@ -255,7 +266,7 @@ func scanContentScope(idx *Index, scope contentScope, volume string, maxFiles in
 			est.ByUnit = append(est.ByUnit, contentScopeUnit{Root: c.unit, Kind: c.kind, Files: 1, Bytes: c.bytes})
 		}
 	}
-	est.ProjectedGSXBytes = int64(float64(est.Bytes) * contentGSXOverheadMultiplier)
+	est.ProjectedGSXBytes = int64(float64(est.Bytes) * contentScopeEncodedMultiplier)
 	if sniffSample > 0 {
 		est.applySniffSample(candidates, sniffSample)
 	}

@@ -72,14 +72,46 @@ func TestContentBuildAndSearch(t *testing.T) {
 
 // A small result limit must not allocate an all-document candidate slice.
 func TestContentOfflineLimitedSearchStreamsCandidates(t *testing.T) {
-	r := &contentReader{idx: &contentIndex{Docs: make([]contentDoc, 100000)}, text: []byte("a")}
-	for i := range r.idx.Docs {
-		r.idx.Docs[i].TextLen = 1
+	// 100k one-byte docs through the real blocked text store: the point is
+	// that candidate enumeration stays lazy (no O(docs) slice), not that
+	// verification is free (each verified doc decompresses its block once,
+	// then hits the block LRU).
+	dir := t.TempDir()
+	w, err := newContentTextBlockWriter(dir)
+	if err != nil {
+		t.Fatal(err)
 	}
+	for i := 0; i < 100000; i++ {
+		if err := w.Append([]byte("a")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	secPath := filepath.Join(dir, "cxtext.sec")
+	if err := w.FinishFile(secPath); err != nil {
+		t.Fatal(err)
+	}
+	sec, err := os.ReadFile(secPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := openContentTextStore(sec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	docs := make([]contentDoc, 100000)
+	for i := range docs {
+		docs[i].DocID = uint32(i)
+		docs[i].TextOff = uint64(i)
+		docs[i].TextLen = 1
+	}
+	r := &contentReader{idx: &contentIndex{Docs: docs}, store: store, paths: make([]string, len(docs))}
 	if hits := r.search("a", 1); len(hits) != 1 || hits[0].DocID != 0 {
 		t.Fatalf("limited search = %v", hits)
 	}
-	if allocs := testing.AllocsPerRun(10, func() { r.search("a", 1) }); allocs > 15 {
+	// The first search above warms the block LRU; steady-state verification
+	// of one doc is a copy plus a fold, with no per-document candidate
+	// materialization.
+	if allocs := testing.AllocsPerRun(10, func() { r.search("a", 1) }); allocs > 25 {
 		t.Fatalf("limited search allocated %.0f times; candidate enumeration should be lazy", allocs)
 	}
 }

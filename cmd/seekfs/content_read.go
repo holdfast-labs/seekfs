@@ -83,9 +83,9 @@ func contentSnippetWindow(text []byte, off, matchLen int) string {
 // contentReader is a decoded `.gsx` ready to query.
 type contentReader struct {
 	idx   *contentIndex
-	terms *contentPostingIndex
+	terms *contentTermDict
 	grams *contentPostingIndex
-	text  []byte
+	store *contentTextStore
 	paths []string
 }
 
@@ -99,7 +99,6 @@ func openContentReader(idx *contentIndex) (*contentReader, error) {
 	}
 	r := &contentReader{
 		idx:   idx,
-		text:  idx.Sections[contentSectionText],
 		paths: make([]string, len(idx.Docs)),
 	}
 	for i := range idx.Docs {
@@ -113,7 +112,7 @@ func openContentReader(idx *contentIndex) (*contentReader, error) {
 		r.paths = paths
 	}
 	if sec := idx.Sections[contentSectionTerms]; len(sec) > 0 {
-		t, err := decodeContentPostingIndex(sec)
+		t, err := decodeContentTermDict(sec)
 		if err != nil {
 			return nil, err
 		}
@@ -126,10 +125,20 @@ func openContentReader(idx *contentIndex) (*contentReader, error) {
 		}
 		r.grams = g
 	}
+	if sec := idx.Sections[contentSectionText]; len(sec) > 0 {
+		st, err := openContentTextStore(sec)
+		if err != nil {
+			return nil, err
+		}
+		r.store = st
+	}
 	return r, nil
 }
 
-// docText returns the stored text of a document.
+// docText returns a fresh copy of the stored text of a document: the v7 text
+// store is block-compressed, so the bytes are decompressed (through the
+// block LRU) and copied out. A corrupt offset or undecodable block reads as
+// absent, never as a wrong slice. Callers use the bytes transiently.
 func (r *contentReader) docText(docID uint32) []byte {
 	if r.idx.shards != nil {
 		if sh, local, ok := r.shardOf(docID); ok {
@@ -141,11 +150,17 @@ func (r *contentReader) docText(docID uint32) []byte {
 		return nil
 	}
 	d := r.idx.Docs[docID]
-	end := d.TextOff + uint64(d.TextLen)
-	if end > uint64(len(r.text)) {
+	if d.TextLen == 0 {
+		return []byte{}
+	}
+	if r.store == nil {
 		return nil
 	}
-	return r.text[d.TextOff:end]
+	text, ok := r.store.textFor(d.TextOff, d.TextLen)
+	if !ok {
+		return nil
+	}
+	return text
 }
 
 // docPath returns the path for a docID.

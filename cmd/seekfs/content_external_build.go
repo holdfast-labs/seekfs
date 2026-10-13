@@ -1,13 +1,14 @@
 package main
 
-// Bounded external-merge builder for a content posting section.
+// Bounded external-merge builder for the content gram (CXGR) section.
 //
 // encodeContentPostingSection needs the whole key -> postings map resident at
 // once. This builder produces byte-identical output while only ever holding an
 // arena of pending records plus the merge state: Add buffers records until the
 // estimated byte count exceeds arenaBytes, then sorts the buffer by (key, docID)
 // and spills it to a temporary run file. Finish spills the tail and k-way merges
-// the runs back in (key, docID) order, flushing 1024-posting blocks as it goes.
+// the runs back in (key, docID) order, flushing contentPostingBlockSize
+// blocks as it goes.
 //
 // Memory ceiling: peak transient memory is arenaBytes + the merge heap (one
 // record per run) + the output being assembled. The returned section is still
@@ -16,7 +17,7 @@ package main
 //
 // Callers must add each (key, docID) pair at most once and add postings for a key
 // in ascending docID order (the same contract encodeContentPostingSection has).
-// Empty keys and keys longer than 65535 bytes are ignored, matching encode.
+// Keys must be 3-byte grams; anything else is ignored, matching encode.
 
 import (
 	"bufio"
@@ -27,14 +28,13 @@ import (
 	"io"
 	"os"
 	"sort"
-	"sync"
 )
 
 // contentSectionFileBufSize is the buffered-I/O size for spilling a finished
 // posting section to disk and for streaming it back into a `.gsx`.
 const contentSectionFileBufSize = 1 << 20
 
-const contentExternalRecordOverhead = 10 // keyLen(2)+docID(4)+tf(4)
+const contentExternalRecordOverhead = 6 // keyLen(2)+docID(4)
 
 // contentExternalRunBufSize bounds each open run's read buffer. The merge holds
 // one buffer per run, so keeping it small keeps the heap near the arena size.
@@ -43,7 +43,6 @@ const contentExternalRunBufSize = 2048
 type contentExternalRecord struct {
 	key   string
 	docID uint32
-	tf    uint32
 }
 
 type contentExternalSectionBuilder struct {
@@ -70,14 +69,14 @@ func newContentExternalSectionBuilder(tmpDir string, arenaBytes int) (*contentEx
 	return &contentExternalSectionBuilder{tmpDir: tmpDir, arenaBytes: arenaBytes}, nil
 }
 
-func (b *contentExternalSectionBuilder) Add(key string, docID uint32, tf uint32) {
+func (b *contentExternalSectionBuilder) Add(key string, docID uint32) {
 	if b.err != nil || b.closed {
 		return
 	}
-	if key == "" || len(key) > int(^uint16(0)) {
+	if len(key) != 3 {
 		return
 	}
-	b.buf = append(b.buf, contentExternalRecord{key: key, docID: docID, tf: tf})
+	b.buf = append(b.buf, contentExternalRecord{key: key, docID: docID})
 	b.bufBytes += len(key) + contentExternalRecordOverhead
 	b.records++
 	if b.bufBytes > b.arenaBytes {
@@ -134,17 +133,16 @@ func (b *contentExternalSectionBuilder) spill() error {
 }
 
 // spillRadix sorts a large pending buffer with one MSD radix step on the
-// first key byte: records are stable-partitioned into 256 first-byte groups,
-// each group is ordered independently on a worker pool, and groups stream
-// into the run file in byte order. First-byte groups are key-disjoint ranges,
-// so concatenation is exactly the fully-sorted order — no cross-group merge
-// and ~8 fewer comparisons per record than a whole-buffer sort.
-//
-// A buffer of all 3-byte keys (the gram builder) takes the counting path:
-// each group is counting-sorted on its last two bytes with no comparisons at
-// all. Stability preserves the input's ascending-docID order within equal
-// keys (documents arrive in docID order and contribute each key once), so the
-// (key, docID) contract holds without an explicit tiebreak.
+// first key byte plus a counting sort on the 2-byte suffix: records are
+// stable-partitioned into 256 first-byte groups, each group is
+// counting-sorted with no comparisons at all, and groups stream into the run
+// file in byte order. First-byte groups are key-disjoint ranges, so
+// concatenation is exactly the fully-sorted order — no cross-group merge.
+// Stability preserves the input's ascending-docID order within equal keys
+// (documents arrive in docID order and contribute each key once), so the
+// (key, docID) contract holds without an explicit tiebreak. All keys are
+// 3-byte grams (the builder's contract since v7), so there is no general
+// fallback: a non-3-byte key would already have been rejected by Add.
 func (b *contentExternalSectionBuilder) spillRadix() error {
 	buf := b.buf
 	if cap(b.scratch) < len(buf) {
@@ -152,13 +150,8 @@ func (b *contentExternalSectionBuilder) spillRadix() error {
 	}
 	scratch := b.scratch[:len(buf)]
 	var counts [256]int
-	all3 := true
 	for i := range buf {
-		k := buf[i].key
-		counts[k[0]]++
-		if len(k) != 3 {
-			all3 = false
-		}
+		counts[buf[i].key[0]]++
 	}
 	// Stable partition buf -> scratch by first key byte.
 	var off [256]int
@@ -175,87 +168,39 @@ func (b *contentExternalSectionBuilder) spillRadix() error {
 	if err != nil {
 		return err
 	}
-	if all3 {
-		// Counting path: per-group counting sort on the 2-byte suffix,
-		// stable so equal keys keep ascending docIDs. Groups stream into
-		// the run file in first-byte order.
-		var c2 [65536]int
-		var start [65536]int
-		for c := 0; c < 256; c++ {
-			lo := off[c]
-			g := scratch[lo : lo+counts[c]]
-			if len(g) == 0 {
-				continue
-			}
-			for i := range g {
-				k := g[i].key
-				c2[int(k[1])<<8|int(k[2])]++
-			}
-			s := 0
-			for v := 0; v < 65536; v++ {
-				start[v] = s
-				s += c2[v]
-			}
-			dst := buf[lo : lo+len(g)]
-			for i := range g {
-				k := g[i].key
-				v := int(k[1])<<8 | int(k[2])
-				dst[start[v]] = g[i]
-				start[v]++
-			}
-			for i := range g {
-				k := g[i].key
-				c2[int(k[1])<<8|int(k[2])] = 0
-			}
-			if err := rw.writeRecords(dst); err != nil {
-				return rw.abort(err)
-			}
+	// Counting path: per-group counting sort on the 2-byte suffix, stable
+	// so equal keys keep ascending docIDs. Groups stream into the run file
+	// in first-byte order.
+	var c2 [65536]int
+	var start [65536]int
+	for c := 0; c < 256; c++ {
+		lo := off[c]
+		g := scratch[lo : lo+counts[c]]
+		if len(g) == 0 {
+			continue
 		}
-	} else {
-		// MSD path: sort each first-byte group independently across the
-		// worker pool, then stream groups in byte order.
-		w := contentBuildWorkerCount()
-		if w < 1 {
-			w = 1
+		for i := range g {
+			k := g[i].key
+			c2[int(k[1])<<8|int(k[2])]++
 		}
-		if w > 256 {
-			w = 256
+		s := 0
+		for v := 0; v < 65536; v++ {
+			start[v] = s
+			s += c2[v]
 		}
-		if w > 1 {
-			var wg sync.WaitGroup
-			next := 0
-			var mu sync.Mutex
-			for i := 0; i < w; i++ {
-				wg.Add(1)
-				go func() {
-					defer wg.Done()
-					for {
-						mu.Lock()
-						c := next
-						next++
-						mu.Unlock()
-						if c >= 256 {
-							return
-						}
-						g := scratch[off[c] : off[c]+counts[c]]
-						sort.Sort(contentExternalRecordSlice(g))
-					}
-				}()
-			}
-			wg.Wait()
-		} else {
-			for c := 0; c < 256; c++ {
-				g := scratch[off[c] : off[c]+counts[c]]
-				sort.Sort(contentExternalRecordSlice(g))
-			}
+		dst := buf[lo : lo+len(g)]
+		for i := range g {
+			k := g[i].key
+			v := int(k[1])<<8 | int(k[2])
+			dst[start[v]] = g[i]
+			start[v]++
 		}
-		for c := 0; c < 256; c++ {
-			if counts[c] == 0 {
-				continue
-			}
-			if err := rw.writeRecords(scratch[off[c] : off[c]+counts[c]]); err != nil {
-				return rw.abort(err)
-			}
+		for i := range g {
+			k := g[i].key
+			c2[int(k[1])<<8|int(k[2])] = 0
+		}
+		if err := rw.writeRecords(dst); err != nil {
+			return rw.abort(err)
 		}
 	}
 	path, err := rw.commit()
@@ -269,7 +214,7 @@ func (b *contentExternalSectionBuilder) spillRadix() error {
 }
 
 // runFileWriter streams sorted records into one run file with the exact
-// historical encoding (uvarint keyLen, key bytes, uvarint docID, uvarint tf).
+// historical encoding (uvarint keyLen, key bytes, uvarint docID).
 type runFileWriter struct {
 	f       *os.File
 	bw      *bufio.Writer
@@ -294,10 +239,6 @@ func (w *runFileWriter) writeOne(r *contentExternalRecord) error {
 		return err
 	}
 	n = binary.PutUvarint(w.scratch[:], uint64(r.docID))
-	if _, err := w.bw.Write(w.scratch[:n]); err != nil {
-		return err
-	}
-	n = binary.PutUvarint(w.scratch[:], uint64(r.tf))
 	if _, err := w.bw.Write(w.scratch[:n]); err != nil {
 		return err
 	}
@@ -360,13 +301,6 @@ func (b *contentExternalSectionBuilder) spillSorted() error {
 			return err
 		}
 		n = binary.PutUvarint(scratch[:], uint64(r.docID))
-		if _, err := bw.Write(scratch[:n]); err != nil {
-			bw.Flush()
-			f.Close()
-			os.Remove(path)
-			return err
-		}
-		n = binary.PutUvarint(scratch[:], uint64(r.tf))
 		if _, err := bw.Write(scratch[:n]); err != nil {
 			bw.Flush()
 			f.Close()
@@ -443,7 +377,6 @@ type contentRunReader struct {
 	br    *bufio.Reader
 	key   []byte
 	docID uint32
-	tf    uint32
 	done  bool
 }
 
@@ -484,13 +417,8 @@ func (r *contentRunReader) advance() error {
 	if err != nil {
 		return err
 	}
-	tf, err := binary.ReadUvarint(r.br)
-	if err != nil {
-		return err
-	}
 	r.key = key
 	r.docID = uint32(docID)
-	r.tf = uint32(tf)
 	return nil
 }
 
@@ -517,7 +445,7 @@ func (h *contentMergeHeap) Pop() any {
 // merge k-way merges the runs and assembles the section. Run files are left in
 // place so a failed merge can still be cleaned up by Close.
 func (b *contentExternalSectionBuilder) merge() ([]byte, error) {
-	asm, cleanup, err := b.mergeInto(newContentMemoryBlobSink(), newContentMemoryBlobSink())
+	asm, cleanup, err := b.mergeInto(newContentMemoryBlobSink())
 	if cleanup != nil {
 		defer cleanup()
 	}
@@ -550,16 +478,11 @@ func (b *contentExternalSectionBuilder) FinishFile(path string) error {
 		_ = os.Remove(path)
 		return nil
 	}
-	keys, err := newContentFileBlobSink(b.tmpDir)
-	if err != nil {
-		return err
-	}
 	blocks, err := newContentFileBlobSink(b.tmpDir)
 	if err != nil {
-		keys.abort()
 		return err
 	}
-	asm, cleanup, err := b.mergeInto(keys, blocks)
+	asm, cleanup, err := b.mergeInto(blocks)
 	if cleanup != nil {
 		defer cleanup()
 	}
@@ -576,13 +499,12 @@ func (b *contentExternalSectionBuilder) FinishFile(path string) error {
 	return nil
 }
 
-// mergeInto k-way merges the runs into an assembler whose key/block blobs
-// stream to the given sinks. It returns (nil, nil, nil) when every run is
-// empty. Callers must run cleanup (which releases the sinks' temp resources)
-// and must not use the assembler afterwards.
-func (b *contentExternalSectionBuilder) mergeInto(keys, blocks contentBlobSink) (*contentExternalAssembler, func(), error) {
+// mergeInto k-way merges the runs into an assembler whose block blob streams
+// to the given sink. It returns (nil, nil, nil) when every run is empty.
+// Callers must run cleanup (which releases the sink's temp resources) and
+// must not use the assembler afterwards.
+func (b *contentExternalSectionBuilder) mergeInto(blocks contentBlobSink) (*contentExternalAssembler, func(), error) {
 	cleanup := func() {
-		keys.abort()
 		blocks.abort()
 	}
 	readers := make([]*contentRunReader, 0, len(b.runs))
@@ -613,16 +535,16 @@ func (b *contentExternalSectionBuilder) mergeInto(keys, blocks contentBlobSink) 
 		}
 	}()
 
-	asm := newContentExternalAssembler(b.records, keys, blocks)
-	// The assembler owns the sinks from here; success or merge error both run
-	// the sinks' abort through cleanup, which is a no-op after finalize.
+	asm := newContentExternalAssembler(b.records, blocks)
+	// The assembler owns the sink from here; success or merge error both run
+	// the sink's abort through cleanup, which is a no-op after finalize.
 	for h.Len() > 0 {
 		r := h[0]
-		if !asm.hasKey || !bytes.Equal(asm.curKey, r.key) {
+		if !asm.hasKey || !bytes.Equal(asm.curKey[:], r.key) {
 			asm.endKey()
 			asm.startKey(r.key)
 		}
-		asm.addPosting(r.docID, r.tf)
+		asm.addPosting(r.docID)
 
 		if err := r.advance(); err != nil {
 			return nil, cleanup, err
@@ -638,7 +560,7 @@ func (b *contentExternalSectionBuilder) mergeInto(keys, blocks contentBlobSink) 
 	return asm, cleanup, nil
 }
 
-// contentBlobSink streams one posting blob (keys or blocks) during the merge.
+// contentBlobSink streams one posting blob (the block blob) during the merge.
 // The in-memory sink preserves the historical merge behavior for Finish; the
 // file sink lets FinishFile merge multi-gigabyte sections with O(metadata)
 // heap. Lengths are exact byte counts; copyTo replays the bytes in order.
@@ -700,7 +622,7 @@ func (s *contentFileBlobSink) copyTo(w io.Writer) error {
 }
 
 // abort releases the sink's temp file. After a successful writeFile the blob
-// files are already removed and abort is a no-op.
+// file is already removed and abort is a no-op.
 func (s *contentFileBlobSink) abort() {
 	if s.bw != nil {
 		_ = s.bw.Flush()
@@ -718,37 +640,31 @@ func (s *contentFileBlobSink) abort() {
 
 // contentExternalAssembler builds the output tables in the same order as
 // encodeContentPostingSection: keys ascending, each key's postings chunked into
-// 1024-doc blocks. The key/block blobs stream to sinks (memory or temp files)
-// while the entry/block metadata stays resident; finalize (bytes or writeFile)
-// emits header + entries + blocks + keys + blocks in section order.
+// contentPostingBlockSize blocks. Gram keys are fixed 3-byte strings stored inline in the
+// entry; the block blob streams to the sink (memory or temp file) while the
+// entry/block metadata stays resident; finalize (bytes or writeFile) emits
+// header + entries + blocks + block blob in section order.
 type contentExternalAssembler struct {
-	keyBlob   contentBlobSink
 	blockBlob contentBlobSink
 	entries   []contentPostingEntry
 	blocks    []contentBlockMeta
 
-	curKey   []byte
+	curKey   [3]byte
 	hasKey   bool
 	entry    contentPostingEntry
-	inBlock  bool
+	block    []uint32 // current block's docIDs, buffered for the list/bitmap choice
 	firstDoc uint32
-	count    uint32
-	offset   uint64
-	maxTF    uint32
-	prevDoc  int64
-	scratch  [binary.MaxVarintLen64]byte
 }
 
 // newContentExternalAssembler seeds an in-memory blockBlob from the total
 // record count so it avoids most of the doubling growth at the end of the
-// merge. Two bytes per posting covers the common small-delta and small-tf
-// case; a key with huge gaps just makes blockBlob grow once more, still
-// bounded by the output. keyBlob is left to grow on its own (distinct keys are
-// usually far smaller than records). File sinks ignore the seed.
-func newContentExternalAssembler(records int, keys, blocks contentBlobSink) *contentExternalAssembler {
-	a := &contentExternalAssembler{keyBlob: keys, blockBlob: blocks}
+// merge. One byte per posting covers the common small-delta case; a key with
+// huge gaps just makes blockBlob grow once more, still bounded by the output.
+// File sinks ignore the seed.
+func newContentExternalAssembler(records int, blocks contentBlobSink) *contentExternalAssembler {
+	a := &contentExternalAssembler{blockBlob: blocks}
 	if mem, ok := blocks.(*contentMemoryBlobSink); ok && records > 0 {
-		mem.buf.Grow(records*2 + 1024)
+		mem.buf.Grow(records + 1024)
 	}
 	a.entries = make([]contentPostingEntry, 0, 64)
 	a.blocks = make([]contentBlockMeta, 0, 64)
@@ -756,52 +672,39 @@ func newContentExternalAssembler(records int, keys, blocks contentBlobSink) *con
 }
 
 func (a *contentExternalAssembler) startKey(key []byte) {
-	a.curKey = append(a.curKey[:0], key...)
+	copy(a.curKey[:], key)
 	a.hasKey = true
 	a.entry = contentPostingEntry{
-		keyOff:     uint32(a.keyBlob.Len()),
-		keyLen:     uint16(len(key)),
 		firstBlock: uint32(len(a.blocks)),
 	}
-	a.keyBlob.Write(key)
+	a.entry.key = a.curKey
 }
 
-func (a *contentExternalAssembler) addPosting(docID, tf uint32) {
-	if !a.inBlock {
-		a.inBlock = true
+func (a *contentExternalAssembler) addPosting(docID uint32) {
+	if len(a.block) == 0 {
 		a.firstDoc = docID
-		a.count = 0
-		a.offset = uint64(a.blockBlob.Len())
-		a.maxTF = 0
-		a.prevDoc = int64(docID) - 1
 	}
-	n := binary.PutUvarint(a.scratch[:], uint64(int64(docID)-a.prevDoc-1))
-	a.blockBlob.Write(a.scratch[:n])
-	n = binary.PutUvarint(a.scratch[:], uint64(tf))
-	a.blockBlob.Write(a.scratch[:n])
-	a.prevDoc = int64(docID)
-	a.count++
-	if tf > a.maxTF {
-		a.maxTF = tf
-	}
+	a.block = append(a.block, docID)
 	a.entry.count++
-	if a.count >= contentPostingBlockSize {
+	if len(a.block) >= contentPostingBlockSize {
 		a.flushBlock()
 	}
 }
 
 func (a *contentExternalAssembler) flushBlock() {
-	if !a.inBlock {
+	if len(a.block) == 0 {
 		return
 	}
+	enc := encodeContentPostingBlock(a.block, a.firstDoc)
+	off := uint32(a.blockBlob.Len())
+	a.blockBlob.Write(enc)
 	a.blocks = append(a.blocks, contentBlockMeta{
 		firstDocID: a.firstDoc,
-		count:      a.count,
-		byteOffset: a.offset,
-		byteLen:    uint32(uint64(a.blockBlob.Len()) - a.offset),
-		maxTF:      a.maxTF,
+		count:      uint32(len(a.block)),
+		byteOffset: off,
+		byteLen:    uint32(uint64(a.blockBlob.Len()) - uint64(off)),
 	})
-	a.inBlock = false
+	a.block = a.block[:0]
 }
 
 func (a *contentExternalAssembler) endKey() {
@@ -818,12 +721,9 @@ func (a *contentExternalAssembler) bytes() []byte {
 	if len(a.entries) == 0 {
 		return nil
 	}
-	total := 16 + len(a.entries)*contentPostingEntrySize + len(a.blocks)*contentBlockMetaSize + int(a.keyBlob.Len()) + int(a.blockBlob.Len())
+	total := 16 + len(a.entries)*contentPostingEntrySize + len(a.blocks)*contentBlockMetaSize + int(a.blockBlob.Len())
 	out := make([]byte, 0, total)
 	out = a.appendTables(out)
-	if err := a.keyBlob.copyTo(sliceWriter{&out}); err != nil {
-		return nil
-	}
 	if err := a.blockBlob.copyTo(sliceWriter{&out}); err != nil {
 		return nil
 	}
@@ -831,16 +731,15 @@ func (a *contentExternalAssembler) bytes() []byte {
 }
 
 // appendTables emits the section header plus the entry and block tables: the
-// byte prefix shared by the in-memory and file final forms.
+// byte prefix shared by the in-memory and file final forms. keyBlobLen is 0:
+// v7 gram keys sit inline in the entries.
 func (a *contentExternalAssembler) appendTables(out []byte) []byte {
 	out = binary.LittleEndian.AppendUint32(out, uint32(len(a.entries)))
-	out = binary.LittleEndian.AppendUint32(out, uint32(a.keyBlob.Len()))
+	out = binary.LittleEndian.AppendUint32(out, 0)
 	out = binary.LittleEndian.AppendUint32(out, uint32(len(a.blocks)))
 	out = binary.LittleEndian.AppendUint32(out, uint32(a.blockBlob.Len()))
 	for _, e := range a.entries {
-		out = binary.LittleEndian.AppendUint32(out, e.keyOff)
-		out = binary.LittleEndian.AppendUint16(out, e.keyLen)
-		out = binary.LittleEndian.AppendUint16(out, 0)
+		out = append(out, e.key[0], e.key[1], e.key[2], 0)
 		out = binary.LittleEndian.AppendUint32(out, e.count)
 		out = binary.LittleEndian.AppendUint32(out, e.firstBlock)
 		out = binary.LittleEndian.AppendUint32(out, e.blockCount)
@@ -848,16 +747,15 @@ func (a *contentExternalAssembler) appendTables(out []byte) []byte {
 	for _, b := range a.blocks {
 		out = binary.LittleEndian.AppendUint32(out, b.firstDocID)
 		out = binary.LittleEndian.AppendUint32(out, b.count)
-		out = binary.LittleEndian.AppendUint64(out, b.byteOffset)
+		out = binary.LittleEndian.AppendUint32(out, b.byteOffset)
 		out = binary.LittleEndian.AppendUint32(out, b.byteLen)
-		out = binary.LittleEndian.AppendUint32(out, b.maxTF)
 	}
 	return out
 }
 
 // writeFile finalizes the section into the file at path: header + tables,
-// then the streamed key and block blobs. The bytes are identical to bytes().
-// The blob sinks' temp files are removed.
+// then the streamed block blob. The bytes are identical to bytes().
+// The blob sink's temp file is removed.
 func (a *contentExternalAssembler) writeFile(path string) error {
 	if len(a.entries) == 0 {
 		return nil
@@ -869,16 +767,12 @@ func (a *contentExternalAssembler) writeFile(path string) error {
 	bw := bufio.NewWriterSize(f, contentSectionFileBufSize)
 	_, err = bw.Write(a.appendTables(nil))
 	if err == nil {
-		err = a.keyBlob.copyTo(bw)
-	}
-	if err == nil {
 		err = a.blockBlob.copyTo(bw)
 	}
 	if err == nil {
 		err = bw.Flush()
 	}
 	cerr := f.Close()
-	a.keyBlob.abort()
 	a.blockBlob.abort()
 	if err != nil {
 		_ = os.Remove(path)

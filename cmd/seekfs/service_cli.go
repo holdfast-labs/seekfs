@@ -444,8 +444,13 @@ func contentHealthSummary(h *contentHealth) string {
 		fmt.Fprintf(&b, " docs=%d", h.Docs)
 	}
 	if h.ScopeDropped > 0 {
-		fmt.Fprintf(&b, " scope_dropped_files=%d scope_dropped_bytes=%d budget=%s (raise [features.content] budget_bytes)",
-			h.ScopeDropped, h.ScopeDroppedBytes, contentBudgetLabel(h.BudgetBytes))
+		if h.ReserveBytes > 0 {
+			fmt.Fprintf(&b, " scope_dropped_files=%d scope_dropped_bytes=%d reserve=%s (free disk space below the reserve; free up space or set [features.content] budget_bytes)",
+				h.ScopeDropped, h.ScopeDroppedBytes, contentBudgetLabel(h.ReserveBytes))
+		} else {
+			fmt.Fprintf(&b, " scope_dropped_files=%d scope_dropped_bytes=%d budget=%s (raise [features.content] budget_bytes)",
+				h.ScopeDropped, h.ScopeDroppedBytes, contentBudgetLabel(h.BudgetBytes))
+		}
 	}
 	if h.BuildError != "" {
 		fmt.Fprintf(&b, " build_error=%s", h.BuildError)

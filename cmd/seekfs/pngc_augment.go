@@ -471,6 +471,37 @@ func freeDiskBytes(path string) (uint64, error) {
 	return free, nil
 }
 
+// totalDiskBytes reports the total capacity bytes of the volume holding path,
+// resolving through non-existent parents to the enclosing volume like
+// freeDiskBytes.
+func totalDiskBytes(path string) (uint64, error) {
+	path, err := filepath.Abs(path)
+	if err != nil {
+		return 0, err
+	}
+	for {
+		if _, err := os.Stat(path); err == nil {
+			break
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return 0, err
+		}
+		parent := filepath.Dir(path)
+		if parent == path {
+			break
+		}
+		path = parent
+	}
+	p, err := windows.UTF16PtrFromString(path)
+	if err != nil {
+		return 0, err
+	}
+	var total uint64
+	if err := windows.GetDiskFreeSpaceEx(p, nil, &total, nil); err != nil {
+		return 0, err
+	}
+	return total, nil
+}
+
 func closeMappedIndex(idx *Index) {
 	if idx != nil && idx.MMapRecords != nil && idx.MMapRecords.file != nil {
 		_ = idx.MMapRecords.file.close()

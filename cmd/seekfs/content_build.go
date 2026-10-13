@@ -8,7 +8,6 @@ package main
 // service-driven incremental path is P2.
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"encoding/binary"
@@ -440,7 +439,9 @@ type contentStreamedBuild struct {
 	docs []contentDoc
 	// paths parallels docs by DocID.
 	paths []string
-	// textPath holds the exact CXST section bytes; textSize is its length.
+	// textPath holds the exact CXST section bytes (v7: header + block
+	// table + zstd frames); textSize is the logical (decompressed) stream
+	// length the doc table addresses.
 	textPath string
 	textSize uint64
 	// termPath/gramPath hold the exact CXTR/CXGR section bytes, or "" when
@@ -507,35 +508,29 @@ func assembleContentIndexStreamed(source contentBuildSource, tmpDir string) (*co
 	if source == nil {
 		return nil, errors.New("nil content build source")
 	}
-	termBuilder, err := newContentExternalSectionBuilder(tmpDir, contentBuildArenaBytes)
+	// The terms section is dictionary-only in v7 (no postings: no query
+	// path reads term postings), so it builds through the key-counting dict
+	// builder; grams keep full postings through the section builder.
+	dictBuilder, err := newContentExternalDictBuilder(tmpDir, contentBuildArenaBytes)
 	if err != nil {
 		return nil, err
 	}
-	defer termBuilder.Close()
+	defer dictBuilder.Close()
 	gramBuilder, err := newContentExternalSectionBuilder(tmpDir, contentBuildArenaBytes)
 	if err != nil {
 		return nil, err
 	}
 	defer gramBuilder.Close()
 
-	textFile, err := os.CreateTemp(tmpDir, "cxtext-*.sec")
+	// The text store compresses incrementally as docs arrive; the writer
+	// spools compressed frames and finalizes the section file at the end,
+	// so peak heap stays one block plus one document.
+	textWriter, err := newContentTextBlockWriter(tmpDir)
 	if err != nil {
 		return nil, err
 	}
-	textPath := textFile.Name()
-	textW := bufio.NewWriterSize(textFile, contentSectionFileBufSize)
-	var textSize uint64
-	// closeText flushes and closes the spool; removeOnErr deletes the partial
-	// file when assembly fails.
-	closeText := func() error {
-		if err := textW.Flush(); err != nil {
-			_ = textFile.Close()
-			return err
-		}
-		return textFile.Close()
-	}
 
-	built := &contentStreamedBuild{textPath: textPath}
+	built := &contentStreamedBuild{}
 	var docs []contentDoc
 	var paths []string
 	asmErr := func() error {
@@ -604,7 +599,12 @@ func assembleContentIndexStreamed(source contentBuildSource, tmpDir string) (*co
 				// The index (terms and grams) is built from a case-folded copy, so the
 				// case-insensitive prefilter stays a superset of every case-sensitive
 				// match (tgrep's merged-case index, case-aware verify).
-				if _, err := textW.Write(t.stored); err != nil {
+				//
+				// TextOff/TextLen address the logical (decompressed) stream, so
+				// the doc table is identical with or without block compression;
+				// only the CXST section bytes change.
+				textOff := textWriter.logicalSize()
+				if err := textWriter.Append(t.stored); err != nil {
 					return err
 				}
 				docs = append(docs, contentDoc{
@@ -616,51 +616,53 @@ func assembleContentIndexStreamed(source contentBuildSource, tmpDir string) (*co
 					RawSize:          int64(len(t.stored)),
 					ModUnix:          d.modUnix,
 					ContentHash:      t.hash,
-					TextOff:          textSize,
+					TextOff:          textOff,
 					TextLen:          uint32(len(t.stored)),
 					FileSize:         d.fileSize,
 					FileModNano:      d.fileModNano,
 				})
-				textSize += uint64(len(t.stored))
 				// Documents arrive in ascending docID order, so each key's Adds arrive
 				// in ascending docID order as the builder requires. The per-doc
-				// (term -> tf) multiset is identical to the serial path's, and
-				// the builder sorts on spill, so Add order within a doc cannot
-				// change the encoded bytes.
-				for term, tf := range t.terms {
-					termBuilder.Add(term, docID, tf)
+				// term set is identical to the serial path's, and the builder
+				// sorts on spill, so Add order within a doc cannot change the
+				// encoded bytes. Each term is added once per document, so the
+				// dict builder's Add count is exactly the document frequency.
+				for term := range t.terms {
+					dictBuilder.Add(term)
 				}
 				for gram := range t.grams {
-					gramBuilder.Add(contentGramU32String(gram), docID, 1)
+					gramBuilder.Add(contentGramU32String(gram), docID)
 				}
 				contentAssembleStreamHook(int(docID))
 			}
 		}
 		return nil
 	}()
+	textPath := filepath.Join(tmpDir, "cxtext.sec")
 	if asmErr != nil {
-		_ = textW.Flush()
-		_ = textFile.Close()
-		_ = os.Remove(textPath)
+		textWriter.abort()
 		return nil, asmErr
-	}
-	if err := closeText(); err != nil {
-		_ = os.Remove(textPath)
-		return nil, err
 	}
 	termPath := filepath.Join(tmpDir, "cxterm.sec")
 	gramPath := filepath.Join(tmpDir, "cxgram.sec")
-	// The term and gram sections are independent files; merging and writing
-	// them concurrently uses a second core for the historically serial
-	// FinishFile phase. The bytes of each file are unaffected.
+	// The text, term and gram sections are independent files; finishing them
+	// concurrently uses spare cores for the historically serial FinishFile
+	// phase. The bytes of each file are unaffected.
 	var finishWG sync.WaitGroup
-	var termErr, gramErr error
-	finishWG.Add(2)
-	go func() { defer finishWG.Done(); termErr = termBuilder.FinishFile(termPath) }()
+	var textErr, termErr, gramErr error
+	finishWG.Add(3)
+	go func() { defer finishWG.Done(); textErr = textWriter.FinishFile(textPath) }()
+	go func() { defer finishWG.Done(); termErr = dictBuilder.FinishFile(termPath) }()
 	go func() { defer finishWG.Done(); gramErr = gramBuilder.FinishFile(gramPath) }()
 	finishWG.Wait()
+	if textErr != nil {
+		_ = os.Remove(termPath)
+		_ = os.Remove(gramPath)
+		return nil, textErr
+	}
 	if termErr != nil {
 		_ = os.Remove(textPath)
+		_ = os.Remove(gramPath)
 		return nil, termErr
 	}
 	if gramErr != nil {
@@ -670,7 +672,11 @@ func assembleContentIndexStreamed(source contentBuildSource, tmpDir string) (*co
 	}
 	built.docs = docs
 	built.paths = paths
-	built.textSize = textSize
+	built.textPath = textPath
+	// textSize stays the logical (decompressed) stream length: shard
+	// planning and the reshard threshold budget memory and work by corpus
+	// size, not by compressed bytes.
+	built.textSize = textWriter.logicalSize()
 	if st, err := os.Stat(termPath); err == nil && st.Size() > 0 {
 		built.termPath = termPath
 	}
@@ -754,7 +760,11 @@ func buildContentIndexForIndex(ctx context.Context, idx *Index, opts contentBuil
 			truncated++
 		}
 		if ok {
-			if opts.Scope != nil {
+			// Only an explicit budget caps the offline build: the default
+			// is reserve-governed, and the offline CLI (unlike the service
+			// build) has no sidecar volume to project a reserve against at
+			// selection time — the save fails loudly if the disk fills.
+			if opts.Scope != nil && opts.Scope.BudgetExplicit {
 				n := int64(len(doc.text))
 				if n > opts.Scope.BudgetBytes-scopeBytes {
 					return nil, fmt.Errorf("content-index: scoped build exceeds %d-byte extracted-text budget; narrow the scope or raise budget_bytes", opts.Scope.BudgetBytes)
@@ -999,41 +1009,166 @@ func contentGramsOf(text []byte) map[string]struct{} {
 	return out
 }
 
-// encodeContentPaths serializes docID -> path.
+// encodeContentPaths serializes docID -> path (format v7, CXPT v2).
+//
+// Paths share long prefixes (repo/dir names) but are stored in docID (FRN)
+// order, so adjacent paths share little. Instead of front-coding in stored
+// order, v7 sorts a copy (keeping a docID -> sorted-position permutation),
+// front-codes the sorted paths where prefixes actually share, and stores the
+// permutation for O(1) docID lookup. Measured on the 65k-doc Chromium sample:
+// 4.56 MB raw -> 1.15 MB blob + 0.26 MB permutation.
+//
+// Layout:
+//   u32 count | u32 restartInterval | u32 restartCount | u32 blobLen
+//   restarts: restartCount x {blobOff u32, pathLen u32, path bytes}
+//   blob: count x {[prefixLen uvarint][suffixLen uvarint][suffix bytes]}
+//     over paths in sorted order (restart records self-contained)
+//   perm: count x u32 LE (perm[docID] = index into the sorted paths)
+const contentPathsRestartInterval = 64
+
 func encodeContentPaths(paths []string) []byte {
-	var buf bytes.Buffer
-	_ = binary.Write(&buf, binary.LittleEndian, uint32(len(paths)))
-	for _, p := range paths {
+	n := len(paths)
+	if n == 0 {
+		return nil
+	}
+	order := make([]int, n)
+	for i := range order {
+		order[i] = i
+	}
+	sort.Slice(order, func(i, j int) bool { return paths[order[i]] < paths[order[j]] })
+	sorted := make([]string, n)
+	perm := make([]uint32, n)
+	for pos, doc := range order {
+		p := paths[doc]
 		if len(p) > int(^uint16(0)) {
 			p = p[:int(^uint16(0))]
 		}
-		_ = binary.Write(&buf, binary.LittleEndian, uint16(len(p)))
-		buf.WriteString(p)
+		sorted[pos] = p
+		perm[doc] = uint32(pos)
 	}
-	return buf.Bytes()
+
+	const interval = contentPathsRestartInterval
+	restartCount := (n + interval - 1) / interval
+	var blob bytes.Buffer
+	blobOffs := make([]uint32, n)
+	prev := ""
+	for i, k := range sorted {
+		blobOffs[i] = uint32(blob.Len())
+		shared := 0
+		if i%interval != 0 {
+			for shared < len(prev) && shared < len(k) && prev[shared] == k[shared] {
+				shared++
+			}
+		}
+		var tmp [binary.MaxVarintLen64]byte
+		m := binary.PutUvarint(tmp[:], uint64(shared))
+		blob.Write(tmp[:m])
+		m = binary.PutUvarint(tmp[:], uint64(len(k)-shared))
+		blob.Write(tmp[:m])
+		blob.WriteString(k[shared:])
+		prev = k
+	}
+
+	var out bytes.Buffer
+	_ = binary.Write(&out, binary.LittleEndian, uint32(n))
+	_ = binary.Write(&out, binary.LittleEndian, uint32(interval))
+	_ = binary.Write(&out, binary.LittleEndian, uint32(restartCount))
+	_ = binary.Write(&out, binary.LittleEndian, uint32(blob.Len()))
+	for r := 0; r < restartCount; r++ {
+		i := r * interval
+		_ = binary.Write(&out, binary.LittleEndian, blobOffs[i])
+		_ = binary.Write(&out, binary.LittleEndian, uint32(len(sorted[i])))
+		out.WriteString(sorted[i])
+	}
+	out.Write(blob.Bytes())
+	for _, v := range perm {
+		_ = binary.Write(&out, binary.LittleEndian, v)
+	}
+	return out.Bytes()
 }
 
 func decodeContentPaths(data []byte, docCount int) ([]string, error) {
-	if len(data) < 4 {
+	if len(data) < 16 {
 		return nil, errors.New("content paths truncated")
 	}
-	n := int(binary.LittleEndian.Uint32(data[:4]))
+	n := int(binary.LittleEndian.Uint32(data[0:]))
+	interval := int(binary.LittleEndian.Uint32(data[4:]))
+	restartCount := int(binary.LittleEndian.Uint32(data[8:]))
+	blobLen := int(binary.LittleEndian.Uint32(data[12:]))
 	if n != docCount {
 		return nil, errors.New("content paths count mismatch")
 	}
-	out := make([]string, n)
-	off := 4
+	if n == 0 {
+		if restartCount != 0 || blobLen != 0 {
+			return nil, errors.New("content paths length mismatch")
+		}
+		return nil, nil
+	}
+	if interval <= 0 || restartCount != (n+interval-1)/interval || blobLen < 0 {
+		return nil, errors.New("content paths header mismatch")
+	}
+	off := 16
+	restarts := make([]string, 0, restartCount)
+	restartIx := make([]int, 0, restartCount)
+	for r := 0; r < restartCount; r++ {
+		if off+8 > len(data) {
+			return nil, errors.New("content paths restarts truncated")
+		}
+		blobOff := int(binary.LittleEndian.Uint32(data[off:]))
+		pathLen := int(binary.LittleEndian.Uint32(data[off+4:]))
+		off += 8
+		if pathLen < 0 || off+pathLen > len(data) {
+			return nil, errors.New("content paths restart truncated")
+		}
+		restarts = append(restarts, string(data[off:off+pathLen]))
+		restartIx = append(restartIx, blobOff)
+		off += pathLen
+	}
+	if off+blobLen+n*4 > len(data) {
+		return nil, errors.New("content paths length mismatch")
+	}
+	blob := data[off : off+blobLen]
+	off += blobLen
+	// Decode the sorted paths, verifying order and restart alignment: a
+	// corrupt blob fails here, not in a later lookup. Equal adjacent paths
+	// are allowed (two docs may share a stored path across origins).
+	sorted := make([]string, 0, n)
+	prev := ""
+	pos := 0
 	for i := 0; i < n; i++ {
-		if off+2 > len(data) {
-			return nil, errors.New("content paths truncated")
+		if i%interval == 0 {
+			if pos != restartIx[i/interval] {
+				return nil, errors.New("content paths restart offset mismatch")
+			}
 		}
-		l := int(binary.LittleEndian.Uint16(data[off:]))
-		off += 2
-		if off+l > len(data) {
-			return nil, errors.New("content paths truncated")
+		key, next, ok := decodeFrontCodedKey(blob, pos, prev)
+		if !ok {
+			return nil, errors.New("content paths key truncated")
 		}
-		out[i] = string(data[off : off+l])
-		off += l
+		if key < prev {
+			return nil, errors.New("content paths out of order")
+		}
+		if i%interval == 0 && key != restarts[i/interval] {
+			return nil, errors.New("content paths restart key mismatch")
+		}
+		prev = key
+		pos = next
+		sorted = append(sorted, key)
+	}
+	if pos != len(blob) {
+		return nil, errors.New("content paths blob length mismatch")
+	}
+	// The permutation must be exact: every sorted position named exactly
+	// once, or a docID would resolve to another document's path.
+	out := make([]string, n)
+	seen := make([]bool, n)
+	for doc := 0; doc < n; doc++ {
+		p := int(binary.LittleEndian.Uint32(data[off+doc*4:]))
+		if p < 0 || p >= n || seen[p] {
+			return nil, errors.New("content paths permutation mismatch")
+		}
+		seen[p] = true
+		out[doc] = sorted[p]
 	}
 	return out, nil
 }

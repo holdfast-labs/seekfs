@@ -1030,6 +1030,64 @@ func TestContentServiceBuildBudgetDropsExactFilesAndBytes(t *testing.T) {
 	}
 }
 
+// A biting free-space reserve records exact dropped files and bytes like an
+// explicit budget, but names the reserve instead: the default scope indexes
+// everything until the projected index would breach the volume's reserve.
+func TestContentServiceBuildReserveDropsExactFilesAndBytes(t *testing.T) {
+	t.Setenv("SEEKFS_CONTENT_SEARCH", "1")
+	stubContentCatchUpSync(t)
+	stubContentBuildSync(t)
+	oldFree, oldTotal := contentFreeBytesFn, contentTotalBytesFn
+	defer func() { contentFreeBytesFn, contentTotalBytesFn = oldFree, oldTotal }()
+	// 50 GiB reserve, 9 bytes of headroom: allowance is 18 extracted bytes.
+	contentTotalBytesFn = func(_ string) (uint64, error) { return 500 << 30, nil }
+	contentFreeBytesFn = func(_ string) (uint64, error) { return (50 << 30) + 9, nil }
+	dir := t.TempDir()
+	bodies := map[string]string{
+		"a.txt": "alpha",
+		"b.txt": "bravo!",
+		"c.txt": "charlie?",
+	}
+	for name, body := range bodies {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	const journal = uint64(94)
+	const cp = int64(102)
+	stubContentCatchUpJournal(t, usnJournalDataV0{UsnJournalID: journal, FirstUsn: 1, LowestValidUsn: 1, NextUsn: cp})
+	vol, gsx := contentBuildTestVolume(t, dir, journal, uint64(cp), []CompactRecord{
+		{FRN: 1, Parent: -1, Name: "a.txt", Size: 5},
+		{FRN: 2, Parent: -1, Name: "b.txt", Size: 6},
+		{FRN: 3, Parent: -1, Name: "c.txt", Size: 8},
+	})
+	s := contentTestService(t)
+	// No explicit budget: the reserve governs. Fits a.txt + b.txt (5+6=11
+	// of 18 allowed), drops c.txt (8 bytes of extracted text).
+	s.ensureContentBuild(vol)
+	built, err := contentLoadFile(gsx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	releaseContentIndexOnCleanup(t, built)
+	if len(built.Docs) != 2 || built.Policy.ScopeDropped != 1 {
+		t.Fatalf("reserve index docs=%d dropped=%d; want 2 docs, 1 dropped", len(built.Docs), built.Policy.ScopeDropped)
+	}
+	if built.Policy.ScopeDroppedBytes != int64(len("charlie?")) {
+		t.Fatalf("reserve index policy = %+v; want dropped_bytes=%d", built.Policy, len("charlie?"))
+	}
+	if built.Policy.BudgetBytes != 0 || built.Policy.ReserveBytes != 50<<30 {
+		t.Fatalf("reserve index policy = %+v; want budget=0 reserve=50GiB", built.Policy)
+	}
+	h := vol.content.healthSnapshot(0)
+	if h.ScopeDropped != 1 || h.ReserveBytes != 50<<30 || h.BudgetBytes != 0 {
+		t.Fatalf("reserve health = %+v; want exact dropped files and the reserve", h)
+	}
+	if !h.Incomplete {
+		t.Fatal("reserve-truncated sidecar must report incomplete")
+	}
+}
+
 // A volume whose generation keeps changing must not spin builds forever: after
 // contentBuildMaxAttempts retries the build gives up and surfaces degraded with
 // a BuildError in health.

@@ -1,11 +1,14 @@
 package main
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 )
+
+var errTestReserve = errors.New("test reserve stub")
 
 // stampContentTestScope makes hand-built USN fixtures represent a sidecar
 // produced under the current default service scope.
@@ -37,16 +40,14 @@ func TestContentScopeForVolumeDefaults(t *testing.T) {
 	if s.Mode != contentScopeAuto || !s.IncludeGit || !s.SystemExcludes {
 		t.Fatalf("defaults = %+v; want auto/git/system", s)
 	}
-	// Without config the budget derives from the volume's free space (floored
-	// and capped), and is not explicit, so it stays out of the fingerprint.
-	if want := defaultContentScopeBudget(contentScopeBudgetAnchor("C:")); s.BudgetBytes != want {
-		t.Fatalf("default budget = %d; want derived %d", s.BudgetBytes, want)
-	}
-	if s.BudgetBytes < contentScopeBudgetFloorBytes || s.BudgetBytes > contentScopeBudgetCeilBytes {
-		t.Fatalf("default budget = %d; want within [%d, %d]", s.BudgetBytes, contentScopeBudgetFloorBytes, contentScopeBudgetCeilBytes)
+	// Without config there is no byte budget: the default indexes
+	// everything selected and stops only at the volume's free-space
+	// reserve, so it stays out of the fingerprint.
+	if s.BudgetBytes != 0 {
+		t.Fatalf("default budget = %d; want 0 (unlimited, reserve-governed)", s.BudgetBytes)
 	}
 	if s.BudgetExplicit {
-		t.Fatal("derived default budget must not be explicit")
+		t.Fatal("default budget must not be explicit")
 	}
 }
 
@@ -97,8 +98,8 @@ func TestContentScopeInvalidFallsBack(t *testing.T) {
 	if s.Mode != contentScopeAuto {
 		t.Fatalf("invalid mode = %q; want auto", s.Mode)
 	}
-	if want := defaultContentScopeBudget(contentScopeBudgetAnchor("C:")); s.BudgetBytes != want {
-		t.Fatalf("invalid budget = %d; want derived default %d", s.BudgetBytes, want)
+	if s.BudgetBytes != 0 || s.BudgetExplicit {
+		t.Fatalf("invalid budget = %+v; want the unlimited default", s)
 	}
 }
 
@@ -267,8 +268,10 @@ func TestContentScopeEstimateAndDetect(t *testing.T) {
 	if est.Excluded["exclude"] == 0 || est.Excluded["ext"] != 0 {
 		t.Fatalf("excluded = %+v; want exclude>0, ext=0", est.Excluded)
 	}
-	if est.ProjectedGSXBytes <= est.Bytes {
-		t.Fatalf("projected %d should exceed bytes %d (overhead)", est.ProjectedGSXBytes, est.Bytes)
+	// The projection scales extracted bytes by the compact-encoding
+	// multiplier (< 1), so it sits below the raw byte count.
+	if want := int64(float64(est.Bytes) * contentScopeEncodedMultiplier); est.ProjectedGSXBytes != want {
+		t.Fatalf("projected %d; want %d (bytes x multiplier)", est.ProjectedGSXBytes, want)
 	}
 
 	// MaxFiles truncation is surfaced: two includable files, cap 1.
@@ -277,6 +280,7 @@ func TestContentScopeEstimateAndDetect(t *testing.T) {
 	}
 	budgeted := defaultContentScope()
 	budgeted.BudgetBytes = 110
+	budgeted.BudgetExplicit = true
 	if capped := scanContentScope(idx, budgeted, "C:", 0, 0, false); !capped.BudgetHit || capped.Files != 1 || capped.Bytes != 20 {
 		t.Fatalf("budget=110 => files=%d bytes=%d hit=%v; want 1/20/true (build/out.txt sorts first)", capped.Files, capped.Bytes, capped.BudgetHit)
 	} else if capped.BudgetBytes != 110 || capped.EligibleFiles != 4 || capped.EligibleBytes != 210 {
@@ -420,18 +424,52 @@ func TestContentEstimateSniffSampleProjectsBinary(t *testing.T) {
 	}
 }
 
-func TestDefaultContentScopeBudgetDerived(t *testing.T) {
-	// No anchor: the legacy fixed default.
-	if want := int64(float64(contentGSXMaxBytes) * contentScopeBudgetFraction); defaultContentScopeBudget("") != want {
-		t.Fatalf("anchorless budget = %d; want legacy %d", defaultContentScopeBudget(""), want)
+func TestContentScopeReserve(t *testing.T) {
+	oldFree, oldTotal, oldReserve := contentFreeBytesFn, contentTotalBytesFn, contentDiskReserveBytes
+	defer func() {
+		contentFreeBytesFn, contentTotalBytesFn, contentDiskReserveBytes = oldFree, oldTotal, oldReserve
+	}()
+	// A 500 GiB volume: reserve is 10% (50 GiB), above the 20 GiB floor.
+	contentTotalBytesFn = func(_ string) (uint64, error) { return 500 << 30, nil }
+	contentFreeBytesFn = func(_ string) (uint64, error) { return 100 << 30, nil }
+	if got := contentScopeReserveFor("E:\\"); got != 50<<30 {
+		t.Fatalf("reserve(500GiB) = %d; want 50 GiB", got)
 	}
-	// A real anchor: a tenth of free space within the floor/ceiling.
-	got := defaultContentScopeBudget(t.TempDir())
-	if got < contentScopeBudgetFloorBytes || got > contentScopeBudgetCeilBytes {
-		t.Fatalf("derived budget = %d; want within [%d, %d]", got, contentScopeBudgetFloorBytes, contentScopeBudgetCeilBytes)
+	// A 100 GiB volume: 10% (10 GiB) loses to the 20 GiB floor.
+	contentTotalBytesFn = func(_ string) (uint64, error) { return 100 << 30, nil }
+	if got := contentScopeReserveFor("E:\\"); got != contentScopeReserveMinBytes {
+		t.Fatalf("reserve(100GiB) = %d; want the 20 GiB floor", got)
 	}
-	if contentScopeBudgetCeilBytes != 32<<30 {
-		t.Fatalf("budget ceiling = %d; want 32 GiB (sharded corpora exceed the 4 GiB single-file cap)", contentScopeBudgetCeilBytes)
+	// Unknown capacity falls back to the fixed reserve (0 in the test
+	// suite, which disables the reserve there).
+	contentTotalBytesFn = func(_ string) (uint64, error) { return 0, errTestReserve }
+	contentDiskReserveBytes = 7
+	if got := contentScopeReserveFor("E:\\"); got != 7 {
+		t.Fatalf("reserve(unknown) = %d; want the fixed fallback", got)
+	}
+	contentDiskReserveBytes = 0
+	// Allowance: (free - reserve) / multiplier.
+	contentTotalBytesFn = func(_ string) (uint64, error) { return 500 << 30, nil }
+	contentFreeBytesFn = func(_ string) (uint64, error) { return 100 << 30, nil }
+	if got, want := contentScopeAllowance("E:\\"), int64(float64(50<<30)/contentScopeEncodedMultiplier); got != want {
+		t.Fatalf("allowance = %d; want %d", got, want)
+	}
+	// Below the reserve the allowance is unlimited (fail-open): the
+	// write-time guard stays the backstop.
+	contentFreeBytesFn = func(_ string) (uint64, error) { return 1 << 30, nil }
+	if got := contentScopeAllowance("E:\\"); got != int64(^uint64(0)>>1) {
+		t.Fatalf("allowance below reserve = %d; want unlimited", got)
+	}
+	// The fits check agrees: under the allowance it passes, over it stops.
+	// 100 GiB free, 50 GiB reserve: 60 GiB extracted projects to 30 GiB
+	// encoded, leaving 70 GiB free (fits); 120 GiB projects to 60 GiB,
+	// leaving 40 GiB (breaches).
+	contentFreeBytesFn = func(_ string) (uint64, error) { return 100 << 30, nil }
+	if !contentScopeFitsReserve("E:\\", 60<<30) {
+		t.Fatal("60 GiB extracted must fit: projected 30 GiB leaves 70 GiB free of the 50 GiB reserve")
+	}
+	if contentScopeFitsReserve("E:\\", 120<<30) {
+		t.Fatal("120 GiB extracted must not fit: projected 60 GiB leaves 40 GiB free under the 50 GiB reserve")
 	}
 	// Anchors: bare volumes anchor at the root, absolute paths at themselves,
 	// anything else anchors nowhere.
@@ -443,6 +481,34 @@ func TestDefaultContentScopeBudgetDerived(t *testing.T) {
 	}
 	if a := contentScopeBudgetAnchor("relative"); a != "" {
 		t.Fatalf("relative volume anchored at %q", a)
+	}
+}
+
+func TestContentScopeEstimateReserveTruncates(t *testing.T) {
+	oldFree, oldTotal := contentFreeBytesFn, contentTotalBytesFn
+	defer func() { contentFreeBytesFn, contentTotalBytesFn = oldFree, oldTotal }()
+	// 50 GiB reserve, 9 bytes of headroom: allowance is 18 extracted bytes.
+	contentTotalBytesFn = func(_ string) (uint64, error) { return 500 << 30, nil }
+	contentFreeBytesFn = func(_ string) (uint64, error) { return (50 << 30) + 9, nil }
+	d := uint32(os.ModeDir)
+	recs := []CompactRecord{
+		{FRN: 1, Parent: -1, Mode: d, Name: "."},
+		{FRN: 2, Parent: 0, ParentFRN: 1, Mode: d, Name: "proj"},
+		{FRN: 3, Parent: 1, ParentFRN: 2, Mode: d, Name: ".git"},
+		{FRN: 4, Parent: 1, ParentFRN: 2, Name: "main.go", Size: 100},
+		{FRN: 5, Parent: 1, ParentFRN: 2, Name: "OWNERS", Size: 30},
+		{FRN: 6, Parent: 1, ParentFRN: 2, Name: "notes.xyz", Size: 40},
+	}
+	idx := &Index{Source: "usn", Volume: "C:", Compact: true, Roots: []string{`C:\`}, Records: recs}
+	est := scanContentScope(idx, defaultContentScope(), "C:", 0, 0, false)
+	if !est.BudgetHit || est.Files != 0 {
+		t.Fatalf("reserve estimate files=%d hit=%v; want 0/true (100-byte first file over the 18-byte allowance)", est.Files, est.BudgetHit)
+	}
+	if est.EligibleFiles != 3 || est.EligibleBytes != 170 {
+		t.Fatalf("eligible=%d/%d; want 3/170 (exact totals despite truncation)", est.EligibleFiles, est.EligibleBytes)
+	}
+	if est.BudgetBytes != 0 {
+		t.Fatalf("estimate budget = %d; want 0 (reserve-governed, not a byte cap)", est.BudgetBytes)
 	}
 }
 
@@ -458,8 +524,9 @@ func TestContentScopeFingerprintBudgetProvenance(t *testing.T) {
 		t.Fatal("derived-budget fingerprint must be stable")
 	}
 	// The same numeric budget, made explicit, joins the identity...
+	// (an explicit budget is always positive; 0 means unlimited).
 	exp := base
-	exp.BudgetBytes = a.BudgetBytes
+	exp.BudgetBytes = 12345678
 	exp.BudgetExplicit = true
 	if exp.resolve("C:", nil).fingerprint() == a.fingerprint() {
 		t.Fatal("an explicit budget must join the scope fingerprint")
@@ -476,14 +543,15 @@ func TestContentScopeFingerprintBudgetProvenance(t *testing.T) {
 		t.Fatalf("config budget = %+v; want explicit 1234", s)
 	}
 	// An explicit budget past the old single-file cap is honored (sharding
-	// keeps every shard file under it); past the ceiling it falls back.
+	// keeps every shard file under it); past the ceiling it clamps to the
+	// ceiling instead of silently dropping to a derived default.
 	big := appConfig{Content: contentScopeConfig{BudgetBytes: 8 << 30}}
-	if s := contentScopeForVolume(big, "C:"); s.BudgetBytes != 8<<30 {
-		t.Fatalf("8 GiB budget = %d; want it honored", s.BudgetBytes)
+	if s := contentScopeForVolume(big, "C:"); !s.BudgetExplicit || s.BudgetBytes != 8<<30 {
+		t.Fatalf("8 GiB budget = %+v; want explicit 8 GiB", s)
 	}
 	huge := appConfig{Content: contentScopeConfig{BudgetBytes: 64 << 30}}
-	if s := contentScopeForVolume(huge, "C:"); s.BudgetBytes != defaultContentScopeBudget(contentScopeBudgetAnchor("C:")) {
-		t.Fatalf("64 GiB budget = %d; want the derived default", s.BudgetBytes)
+	if s := contentScopeForVolume(huge, "C:"); !s.BudgetExplicit || s.BudgetBytes != contentScopeBudgetCeilBytes {
+		t.Fatalf("64 GiB budget = %+v; want explicit clamped to the %d ceiling", s, contentScopeBudgetCeilBytes)
 	}
 	t.Setenv("SEEKFS_CONTENT_BUDGET_BYTES", "5678")
 	if s := contentScopeForVolume(appConfig{}, "C:"); !s.BudgetExplicit || s.BudgetBytes != 5678 {

@@ -6,6 +6,7 @@ require (
 	gioui.org v0.10.3
 	github.com/akavel/rsrc v0.10.2
 	github.com/go-git/go-git/v5 v5.19.3
+	github.com/klauspost/compress v1.18.0
 	github.com/wailsapp/wails/v2 v2.16.0
 	golang.org/x/image v0.41.0
 	golang.org/x/net v0.57.0

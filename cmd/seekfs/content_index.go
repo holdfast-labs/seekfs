@@ -87,14 +87,19 @@ func contentSectionEagerVerify(tag uint32) bool {
 // index stays case-folded), so a v3 text store must not be read as if it were
 // case-preserving; the 06 bump (walk volumes) widens each doc record with the
 // source file's size and nanosecond mtime, which the walk reconcile diffs
-// against the filename index for change detection without a journal. A sidecar
-// whose version does not match is rejected on load, so it can never be
-// attached stale: the service sees no usable base and its PF-3 build path
+// against the filename index for change detection without a journal; the 07
+// bump (compact index) replaces the raw CXST text store with blocked zstd,
+// drops the CXTR term postings to a front-coded dictionary, and stores CXGR
+// gram postings as docIDs only with bitmap dense blocks (see
+// content_textblock.go, content_termsdict.go and content_postings.go). A
+// sidecar whose version does not match is rejected on load, so it can never
+// be attached stale: the service sees no usable base and its PF-3 build path
 // rebuilds it. (05 is the sharded-manifest version, which carries no doc
-// table; manifests are unaffected by the 06 bump.)
+// table; manifests are unaffected by the 06/07 bumps: a manifest names shard
+// files, and each shard carries the doc-table version itself.)
 var contentIndexMagic = [8]byte{'G', 'O', 'S', 'C', 'X', '0', '0', '4'}
 
-const contentIndexVersion = 6
+const contentIndexVersion = 7
 
 // contentOrigin records what the doc keys are, so a `.gsx` can never be
 // attached to a key space it does not join.
@@ -142,8 +147,11 @@ const (
 // build's skip/truncation counts, stored in the CXPL section. It makes the
 // size/encoding policy visible to the service's content health instead of a
 // silent drop. ScopeDropped/ScopeDroppedBytes are the exact files and
-// extracted-text bytes the scope byte budget excluded; BudgetBytes is the
-// budget that was enforced, so health can name it in the operator action.
+// extracted-text bytes the scope budget excluded; BudgetBytes is the explicit
+// budget that was enforced (0 when the default reserve-governed policy
+// applied), and ReserveBytes is the free-space reserve that bit instead (0
+// when an explicit budget or nothing bit), so health can name the operator
+// action either way.
 type contentBuildPolicy struct {
 	MaxRaw            int64
 	MaxText           int64
@@ -155,9 +163,13 @@ type contentBuildPolicy struct {
 	// Binary counts files that sniffed as binary (NUL in the head window):
 	// expected, ripgrep-agreeing rejections, tallied apart from Skipped.
 	Binary int64
+	// ReserveBytes is the volume free-space reserve enforced when the
+	// default policy stopped selection (see contentScopeReserveFor). v7
+	// sections carry 72 bytes; older 64-byte sections decode with 0.
+	ReserveBytes int64
 }
 
-const contentPolicySize = 64
+const contentPolicySize = 72
 
 func (p contentBuildPolicy) encode() []byte {
 	b := make([]byte, contentPolicySize)
@@ -169,6 +181,7 @@ func (p contentBuildPolicy) encode() []byte {
 	binary.LittleEndian.PutUint64(b[40:], uint64(p.ScopeDroppedBytes))
 	binary.LittleEndian.PutUint64(b[48:], uint64(p.BudgetBytes))
 	binary.LittleEndian.PutUint64(b[56:], uint64(p.Binary))
+	binary.LittleEndian.PutUint64(b[64:], uint64(p.ReserveBytes))
 	return b
 }
 
@@ -189,8 +202,13 @@ func decodeContentPolicy(data []byte) (contentBuildPolicy, bool) {
 		p.ScopeDroppedBytes = int64(binary.LittleEndian.Uint64(data[40:]))
 		p.BudgetBytes = int64(binary.LittleEndian.Uint64(data[48:]))
 	}
-	if len(data) >= contentPolicySize {
+	// Binary rides the pre-v7 64-byte tail; ReserveBytes the v7 72-byte
+	// tail. Either length decodes; a shorter section leaves zeros.
+	if len(data) >= 64 {
 		p.Binary = int64(binary.LittleEndian.Uint64(data[56:]))
+	}
+	if len(data) >= contentPolicySize {
+		p.ReserveBytes = int64(binary.LittleEndian.Uint64(data[64:]))
 	}
 	return p, true
 }

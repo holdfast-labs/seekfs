@@ -134,12 +134,16 @@ type contentHealth struct {
 	Skipped   int   `json:"skipped,omitempty"`
 	Truncated int   `json:"truncated,omitempty"`
 	// ScopeDropped/ScopeDroppedBytes are the exact files and extracted-text
-	// bytes the scope byte budget excluded at build time; BudgetBytes is the
-	// budget that was enforced. Non-zero means the corpus is partial and the
-	// operator action is to raise [features.content] budget_bytes.
+	// bytes the scope budget excluded at build time; BudgetBytes is the
+	// explicit budget that was enforced (0 when the default
+	// reserve-governed policy applied), and ReserveBytes is the free-space
+	// reserve that bit instead. Non-zero means the corpus is partial: the
+	// operator action is to raise [features.content] budget_bytes, or to
+	// free disk space past the reserve.
 	ScopeDropped      int   `json:"scope_dropped,omitempty"`
 	ScopeDroppedBytes int64 `json:"scope_dropped_bytes,omitempty"`
 	BudgetBytes       int64 `json:"budget_bytes,omitempty"`
+	ReserveBytes      int64 `json:"reserve_bytes,omitempty"`
 	// Binary counts files that sniffed as binary at build time (NUL in the
 	// head window, like ripgrep): expected rejections, not drops.
 	Binary int `json:"binary,omitempty"`
@@ -564,6 +568,10 @@ func mergeContentHealth(dst *contentHealth, src contentHealth) {
 	if src.BudgetBytes > dst.BudgetBytes {
 		dst.BudgetBytes = src.BudgetBytes
 	}
+	// Reserves likewise; the aggregate names the largest reserve that bit.
+	if src.ReserveBytes > dst.ReserveBytes {
+		dst.ReserveBytes = src.ReserveBytes
+	}
 	dst.SidecarBytes += src.SidecarBytes
 	dst.SidecarCap += src.SidecarCap
 	// Extractor versions should agree across volumes; keep the highest so a
@@ -793,6 +801,7 @@ func (s *contentVolumeState) setReady(idx *contentIndex, reader *contentReader, 
 		s.health.ScopeDropped = int(idx.Policy.ScopeDropped)
 		s.health.ScopeDroppedBytes = idx.Policy.ScopeDroppedBytes
 		s.health.BudgetBytes = idx.Policy.BudgetBytes
+		s.health.ReserveBytes = idx.Policy.ReserveBytes
 		s.health.Binary = int(idx.Policy.Binary)
 	}
 	// A targeted extractor-version refresh (WP11) keeps the volume usable: its
