@@ -1866,7 +1866,27 @@ func parseQuery(opts queryOptions) (parsedQuery, error) {
 		// PF-7b: a caller supplied a pre-built tree (the stripped filename-only
 		// query). Deep-copy it so a downstream in-place mutator
 		// (dropSatisfiedVolumeTerms) cannot reach the shared request-level tree.
-		return cloneParsedQuery(*opts.parsedOverride), nil
+		out := cloneParsedQuery(*opts.parsedOverride)
+		// The tree carries the parsed leaves; the request carries the
+		// per-search scalars. A retried search threads per-volume fields
+		// (contentWindow/contentProbe, budgets) through opts AFTER the tree
+		// was built — overlay them so the override path evaluates exactly
+		// like a normally-parsed query. Without the window the bounded
+		// candidate path caps materialization at the page limit, declares a
+		// broad posting superset capped, and falls back to a full-corpus
+		// bounded scan: identical results at ~50x the cost (a fuzzy trial
+		// re-verifies the whole corpus instead of its posting superset).
+		// Leaf fields (terms, content leaves, Under, sort, filters) stay
+		// with the tree: the retry built them from this same request.
+		out.Trace = opts.Trace
+		out.DeadlineUnix = opts.DeadlineUnix
+		out.Cancel = opts.Cancel
+		out.ContentCandidateBudget = opts.ContentCandidateBudget
+		out.ContentScanVisitBudget = opts.ContentScanVisitBudget
+		out.contentFullCandidates = opts.contentFullCandidates
+		out.contentWindow = opts.contentWindow
+		out.contentProbe = opts.contentProbe
+		return out, nil
 	}
 	pq := parsedQuery{
 		Raw:                    opts.Query,
