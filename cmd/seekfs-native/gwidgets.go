@@ -246,7 +246,7 @@ func searchGlyph(gtx layout.Context, c color.NRGBA, size image.Point) layout.Dim
 	paint.ColorOp{Color: c}.Add(gtx.Ops)
 	paint.PaintOp{}.Add(gtx.Ops)
 	e := float32(gtx.Dp(Dp(5)))
-	strokeLine(gtx, c, Dp(2), f32.Point{X: cx + r*0.7, Y: cy + r * 0.7}, f32.Point{X: cx + r*0.7 + e, Y: cy + r*0.7 + e})
+	strokeLine(gtx, c, Dp(2), f32.Point{X: cx + r*0.7, Y: cy + r*0.7}, f32.Point{X: cx + r*0.7 + e, Y: cy + r*0.7 + e})
 	return layout.Dimensions{Size: size}
 }
 
@@ -277,7 +277,7 @@ func gridGlyph(gtx layout.Context, c color.NRGBA, size image.Point) layout.Dimen
 	for _, dx := range []float32{-1, 1} {
 		for _, dy := range []float32{-1, 1} {
 			x, y := cx+dx*g, cy+dy*g
-			st := clip.Rect{Min: image.Point{X: int(x - g/2), Y: int(y - g/2)}, Max: image.Point{X: int(x + g / 2), Y: int(y + g/2)}}.Push(gtx.Ops)
+			st := clip.Rect{Min: image.Point{X: int(x - g/2), Y: int(y - g/2)}, Max: image.Point{X: int(x + g/2), Y: int(y + g/2)}}.Push(gtx.Ops)
 			paint.ColorOp{Color: c}.Add(gtx.Ops)
 			paint.PaintOp{}.Add(gtx.Ops)
 			st.Pop()

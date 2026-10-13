@@ -45,8 +45,8 @@ func (b *winBridge) ApplyFrame(dark bool) {
 	}
 }
 
-func (b *winBridge) Open(path string) error      { return shellOpen(path) }
-func (b *winBridge) Reveal(path string) error    { return shellReveal(path) }
+func (b *winBridge) Open(path string) error       { return shellOpen(path) }
+func (b *winBridge) Reveal(path string) error     { return shellReveal(path) }
 func (b *winBridge) Properties(path string) error { return shellProperties(path) }
 
 func (b *winBridge) Recycle(paths []string) error {

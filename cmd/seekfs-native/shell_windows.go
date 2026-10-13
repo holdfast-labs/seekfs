@@ -173,14 +173,14 @@ func buildShellContextMenu(clean []string) (*builtShellMenu, error) {
 	}()
 
 	type defContextMenu struct {
-		hwnd      uintptr
-		pcmcb     uintptr
+		hwnd       uintptr
+		pcmcb      uintptr
 		pidlFolder uintptr
-		psf       unsafe.Pointer
-		cidl      uint32
-		apidl     *unsafe.Pointer
-		psfFilter unsafe.Pointer
-		pidlItem  unsafe.Pointer
+		psf        unsafe.Pointer
+		cidl       uint32
+		apidl      *unsafe.Pointer
+		psfFilter  unsafe.Pointer
+		pidlItem   unsafe.Pointer
 	}
 	var dcm defContextMenu
 	if len(groups) == 1 && len(groups[0].children) > 0 {
@@ -340,11 +340,11 @@ type shFileOp struct {
 }
 
 const (
-	foDelete       = 0x3
-	fofAllowUndo   = 0x40
-	fofNoConfirm   = 0x10
-	fofSilent      = 0x04
-	fofNoErrorUI   = 0x400
+	foDelete        = 0x3
+	fofAllowUndo    = 0x40
+	fofNoConfirm    = 0x10
+	fofSilent       = 0x04
+	fofNoErrorUI    = 0x400
 	fofWantNukeWarn = 0x4000
 )
 
@@ -384,10 +384,10 @@ func recyclePaths(hwnd uintptr, paths []string) error {
 
 // dropFiles mirrors DROPFILES for CF_HDROP.
 type dropFiles struct {
-	Size    uint32
-	Pt      point
-	NC      int32
-	Wide    int32
+	Size uint32
+	Pt   point
+	NC   int32
+	Wide int32
 }
 
 // fileDropData builds a CF_HDROP global-memory blob for paths.

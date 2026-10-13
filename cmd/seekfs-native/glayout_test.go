@@ -33,14 +33,14 @@ func newFakeBridge() *fakeBridge {
 	return &fakeBridge{accent: color.NRGBA{R: 0, G: 0x66, B: 0xCC, A: 0xFF}, icons: map[string]image.Image{}}
 }
 
-func (b *fakeBridge) SystemDark() bool          { return b.dark }
-func (b *fakeBridge) SystemAccent() color.NRGBA { return b.accent }
-func (b *fakeBridge) SetHWND(hwnd uintptr)      {}
-func (b *fakeBridge) ApplyFrame(dark bool)      {}
-func (b *fakeBridge) Open(path string) error    { return nil }
-func (b *fakeBridge) Reveal(path string) error  { return nil }
-func (b *fakeBridge) Properties(path string) error { return nil }
-func (b *fakeBridge) Recycle(paths []string) error { return nil }
+func (b *fakeBridge) SystemDark() bool               { return b.dark }
+func (b *fakeBridge) SystemAccent() color.NRGBA      { return b.accent }
+func (b *fakeBridge) SetHWND(hwnd uintptr)           {}
+func (b *fakeBridge) ApplyFrame(dark bool)           {}
+func (b *fakeBridge) Open(path string) error         { return nil }
+func (b *fakeBridge) Reveal(path string) error       { return nil }
+func (b *fakeBridge) Properties(path string) error   { return nil }
+func (b *fakeBridge) Recycle(paths []string) error   { return nil }
 func (b *fakeBridge) CopyFiles(paths []string) error { return nil }
 func (b *fakeBridge) ShowContextMenu(paths []string, x, y int32, done func(bool, error)) {
 	done(true, nil)

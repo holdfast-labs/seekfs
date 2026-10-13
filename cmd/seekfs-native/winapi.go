@@ -164,9 +164,9 @@ var (
 
 	pDwmSetWindowAttribute = proc(modDwmapi, "DwmSetWindowAttribute")
 
-	pGlobalAlloc    = proc(modKernel32, "GlobalAlloc")
-	pGlobalLock     = proc(modKernel32, "GlobalLock")
-	pGlobalUnlock   = proc(modKernel32, "GlobalUnlock")
+	pGlobalAlloc      = proc(modKernel32, "GlobalAlloc")
+	pGlobalLock       = proc(modKernel32, "GlobalLock")
+	pGlobalUnlock     = proc(modKernel32, "GlobalUnlock")
 	pGetModuleHandleW = proc(modKernel32, "GetModuleHandleW")
 )
 
@@ -300,29 +300,29 @@ const (
 	swShowDefault = 10
 	swShowMax     = 3
 
-	wmCreate        = 0x0001
-	wmDestroy       = 0x0002
-	wmSize          = 0x0005
-	wmSetFocus      = 0x0007
-	wmKillFocus     = 0x0008
-	wmClose         = 0x0010
-	wmCommand       = 0x0111
-	wmNotify        = 0x004E
-	wmKeyDown       = 0x0100
-	wmChar          = 0x0102
-	wmCtlColorEdit  = 0x0133
-	wmCtlColorStatic = 0x0138
+	wmCreate          = 0x0001
+	wmDestroy         = 0x0002
+	wmSize            = 0x0005
+	wmSetFocus        = 0x0007
+	wmKillFocus       = 0x0008
+	wmClose           = 0x0010
+	wmCommand         = 0x0111
+	wmNotify          = 0x004E
+	wmKeyDown         = 0x0100
+	wmChar            = 0x0102
+	wmCtlColorEdit    = 0x0133
+	wmCtlColorStatic  = 0x0138
 	wmCtlColorListBox = 0x0134
-	wmHScroll       = 0x0114
-	wmVScroll       = 0x0115
-	wmLButtonDown   = 0x0201
-	wmLButtonUp     = 0x0202
-	wmMouseMove     = 0x0200
-	wmRButtonDown   = 0x0204
-	wmRButtonUp     = 0x0205
-	wmDpiChanged    = 0x02E0
-	wmSettingChange = 0x001A
-	wmThemeChanged  = 0x031A
+	wmHScroll         = 0x0114
+	wmVScroll         = 0x0115
+	wmLButtonDown     = 0x0201
+	wmLButtonUp       = 0x0202
+	wmMouseMove       = 0x0200
+	wmRButtonDown     = 0x0204
+	wmRButtonUp       = 0x0205
+	wmDpiChanged      = 0x02E0
+	wmSettingChange   = 0x001A
+	wmThemeChanged    = 0x031A
 
 	sizeRestored  = 0
 	sizeMinimized = 1
@@ -333,9 +333,9 @@ const (
 	gwlWndProc   = -4
 	gwlpUserData = -21
 
-	mfString    = 0x0000
-	mfSeparator = 0x0800
-	mfsChecked  = 0x0008
+	mfString       = 0x0000
+	mfSeparator    = 0x0800
+	mfsChecked     = 0x0008
 	tpmReturnCmd   = 0x0100
 	tpmRightButton = 0x0002
 
@@ -352,22 +352,22 @@ const (
 	opaque      = 2
 
 	// GetSysColor indices.
-	sysColorWindow      = 5
-	sysColorWindowText  = 8
-	sysColorHighlight   = 13
+	sysColorWindow        = 5
+	sysColorWindowText    = 8
+	sysColorHighlight     = 13
 	sysColorHighlightText = 14
-	sysColorBtnFace     = 15
-	sysColorGrayText    = 17
-	sysColorHotLight    = 26
+	sysColorBtnFace       = 15
+	sysColorGrayText      = 17
+	sysColorHotLight      = 26
 
 	idcArrow = 32512
 
-	cfHdrop = 15
+	cfHdrop       = 15
 	cfUnicodetext = 13
 
 	gmemMoveable = 0x0002
 
-	ecmFirst     = 0x1500
+	ecmFirst       = 0x1500
 	emSetCueBanner = ecmFirst + 1
 
 	vkReturn = 0x0D

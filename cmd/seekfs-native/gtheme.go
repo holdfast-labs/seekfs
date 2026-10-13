@@ -52,12 +52,12 @@ type Scheme struct {
 	Selected color.NRGBA // selected row fill
 	FocusBar color.NRGBA // focused-row accent bar
 	// Text.
-	Text    color.NRGBA
-	Subtle  color.NRGBA
-	Muted   color.NRGBA
-	Accent  color.NRGBA // system accent
+	Text     color.NRGBA
+	Subtle   color.NRGBA
+	Muted    color.NRGBA
+	Accent   color.NRGBA // system accent
 	OnAccent color.NRGBA
-	Match   color.NRGBA // snippet match emphasis
+	Match    color.NRGBA // snippet match emphasis
 	// Status health.
 	OK      color.NRGBA
 	Warning color.NRGBA

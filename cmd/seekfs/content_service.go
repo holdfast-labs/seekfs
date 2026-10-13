@@ -726,16 +726,16 @@ func aggregateContentHealth(healths []contentHealth) contentHealth {
 //
 //   - State is the most severe state: ready/off < unavailable < indexing <
 //     degraded < stale (contentStateSeverity).
- //   - Docs, DeltaBytes, Deferred, QueueDepth, Evictions, ExtractionErrors,
- //     Skipped, Truncated, Binary, ScopeDropped, ScopeDroppedBytes, SidecarBytes
- //     and SidecarCap are summed; BudgetBytes takes the largest;
- //     BuildDone/BuildTotal sum while indexing or reconciling; BuildPhase
- //     comes from an indexing or reconciling volume.
- //   - Partial, Incomplete and CountDivergent are OR-ed.
- //   - ExtractorRefresh is OR-ed and StaleExtractorDocs summed, so a targeted
- //     extractor-version refresh in progress on any volume is visible.
- //   - ScopeReconcile is OR-ed and ScopeReconcilePending summed, so an
- //     in-flight scope reconcile is visible.
+//   - Docs, DeltaBytes, Deferred, QueueDepth, Evictions, ExtractionErrors,
+//     Skipped, Truncated, Binary, ScopeDropped, ScopeDroppedBytes, SidecarBytes
+//     and SidecarCap are summed; BudgetBytes takes the largest;
+//     BuildDone/BuildTotal sum while indexing or reconciling; BuildPhase
+//     comes from an indexing or reconciling volume.
+//   - Partial, Incomplete and CountDivergent are OR-ed.
+//   - ExtractorRefresh is OR-ed and StaleExtractorDocs summed, so a targeted
+//     extractor-version refresh in progress on any volume is visible.
+//   - ScopeReconcile is OR-ed and ScopeReconcilePending summed, so an
+//     in-flight scope reconcile is visible.
 //   - DegradedVolumes is the deduped stable union.
 //   - ExtractorVersion takes the highest.
 //   - BuildError and FoldError each join the distinct non-empty reasons with "; ".

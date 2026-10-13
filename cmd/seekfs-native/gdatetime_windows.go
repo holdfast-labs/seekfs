@@ -23,7 +23,7 @@ func formatExplorerTime(t time.Time) string {
 	st := systemTimeOf(t)
 	var dateBuf [128]uint16
 	r, _, _ := syscall.SyscallN(pGetDateFormatEx.Addr(),
-		0, // LOCALE_NAME_USER_DEFAULT (NULL)
+		0,            // LOCALE_NAME_USER_DEFAULT (NULL)
 		uintptr(0x1), // DATE_SHORTDATE
 		uintptr(unsafe.Pointer(&st)),
 		0,
@@ -34,7 +34,7 @@ func formatExplorerTime(t time.Time) string {
 	}
 	var timeBuf [128]uint16
 	r, _, _ = syscall.SyscallN(pGetTimeFormatEx.Addr(),
-		0, // LOCALE_NAME_USER_DEFAULT (NULL)
+		0,            // LOCALE_NAME_USER_DEFAULT (NULL)
 		uintptr(0x2), // TIME_NOSECONDS
 		uintptr(unsafe.Pointer(&st)),
 		0, // lpFormat NULL = locale default

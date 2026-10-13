@@ -25,22 +25,22 @@ func newUI(pipe string, limit int, onFrame func()) *UI {
 	settings := loadSettings()
 	client := NewClient(pipe)
 	u := &UI{
-		client:   client,
-		searcher: NewSearcher(client, limit, 120*time.Millisecond),
-		history:  NewHistory(100),
-		shell:    newShellBridge(),
-		settings: settings,
-		th:       newMaterialTheme(),
-		sel:      map[int]bool{},
-		focus:    -1,
-		contents: settings.ContentsMode,
-		view:     viewModeFromString(settings.View),
-		sortKey:  sortKeyFromString(settings.SortColumn),
-		sortAsc:  settings.SortAsc,
-		query:    "",
-		under:    settings.Under,
+		client:    client,
+		searcher:  NewSearcher(client, limit, 120*time.Millisecond),
+		history:   NewHistory(100),
+		shell:     newShellBridge(),
+		settings:  settings,
+		th:        newMaterialTheme(),
+		sel:       map[int]bool{},
+		focus:     -1,
+		contents:  settings.ContentsMode,
+		view:      viewModeFromString(settings.View),
+		sortKey:   sortKeyFromString(settings.SortColumn),
+		sortAsc:   settings.SortAsc,
+		query:     "",
+		under:     settings.Under,
 		renameRow: -1,
-		colW:     defaultColW(),
+		colW:      defaultColW(),
 	}
 	if settings.SortColumn == "" {
 		u.sortAsc = true
