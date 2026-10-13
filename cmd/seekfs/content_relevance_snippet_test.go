@@ -28,6 +28,22 @@ type contentVolRecord struct {
 // matching FRN-keyed content index. Records with empty content get no doc.
 func newContentRecordVolume(t testing.TB, volume string, recs []contentVolRecord) *serviceVolumeIndex {
 	t.Helper()
+	// Each volume gets its own scratch dir: the assembler spills there, and
+	// the gsi path anchors the volume identity.
+	tmpDir := t.TempDir()
+	if err := os.MkdirAll(tmpDir, 0o755); err != nil {
+		t.Fatalf("volume scratch dir: %v", err)
+	}
+	return newContentRecordVolumeInDir(t, volume, recs, tmpDir)
+}
+
+// newContentRecordVolumeInDir is newContentRecordVolume with a caller-chosen
+// scratch dir, so cross-test shared fixtures can outlive the single test that
+// builds them (t.TempDir is removed when that test ends). The returned volume
+// is fully in-memory after the build; dir only anchors spill files and the
+// gsi path.
+func newContentRecordVolumeInDir(t testing.TB, volume string, recs []contentVolRecord, tmpDir string) *serviceVolumeIndex {
+	t.Helper()
 	t.Setenv("SEEKFS_CONTENT_SEARCH", "1")
 	idx := &Index{Source: "usn", Volume: volume, Compact: true}
 	build := make([]contentBuildDoc, 0, len(recs))
@@ -45,7 +61,7 @@ func newContentRecordVolume(t testing.TB, volume string, recs []contentVolRecord
 		}
 	}
 	contentIndexFRNs(idx)
-	cidx, err := assembleContentIndex(build, t.TempDir())
+	cidx, err := assembleContentIndex(build, tmpDir)
 	if err != nil {
 		t.Fatalf("assemble content index: %v", err)
 	}
@@ -54,7 +70,7 @@ func newContentRecordVolume(t testing.TB, volume string, recs []contentVolRecord
 	if err != nil {
 		t.Fatalf("open content reader: %v", err)
 	}
-	vol := newServiceVolumeIndex(filepath.Join(t.TempDir(), "seekfs_"+strings.TrimSuffix(volume, ":")+".gsi"), idx)
+	vol := newServiceVolumeIndex(filepath.Join(tmpDir, "seekfs_"+strings.TrimSuffix(volume, ":")+".gsi"), idx)
 	if vol.content == nil {
 		t.Fatal("content state not initialized")
 	}

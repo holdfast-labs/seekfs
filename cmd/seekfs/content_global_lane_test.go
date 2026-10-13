@@ -298,8 +298,9 @@ func TestContentGlobalLaneSkipsUnusableVolume(t *testing.T) {
 // the lane beyond the tiny fixture before it could become the default route.
 func TestContentGlobalLaneLargeCorpusDifferential(t *testing.T) {
 	t.Setenv("SEEKFS_CONTENT_SEARCH", "1")
-	volC := newContentRecordVolume(t, "C:", contentBoundedDifferentialRecords("C:", 4_300, 1_000_000))
-	volF := newContentRecordVolume(t, "F:", contentBoundedDifferentialRecords("F:", 4_300, 2_000_000))
+	// Shared read-only pair (same records/constructor as the old per-test
+	// build); this test never mutates the volumes.
+	volC, volF := sharedBoundedFlatVolumes(t)
 	scopes := []struct {
 		name string
 		vols []*serviceVolumeIndex
