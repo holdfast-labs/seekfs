@@ -120,6 +120,33 @@ Use `info --json` to inspect index layout and size contributors:
 2. Record current DB paths.
 3. Run `seekfs launch` with the same `-db` arguments.
 
+## Stopping the service
+
+```powershell
+.\seekfs.exe stop
+```
+
+Stop is bounded: the service reports `STOP_PENDING` with a wait hint and
+increments its checkpoint as each teardown phase starts (signal, content
+cancel, content drain, content release, companions), so the SCM can tell a
+slow stop from a wedged one, and the whole stop completes within seconds.
+
+What happens on stop, in order:
+
+1. The stop signal retires the USN replay loops, the background persist
+   loops, the stale-recovery loop, the walk watchers, and the pipe/remote
+   listeners.
+2. Content activations are cancelled, which aborts an in-flight drain tick,
+   service-owned build, delta fold, integrity pass, or restart catch-up at
+   its next per-document check. The content-task drain itself is
+   deadline-bound: a wedged extraction cannot hold the stop.
+3. Content sidecar mappings and locks are released best-effort under bounded
+   locks, and companion processes are stopped.
+4. No final blocking persist runs on the way out. The write-ahead log holds
+   every replayed batch, so durability is preserved without it; a persist or
+   content save killed mid-flight is safe (temp file + atomic rename, and the
+   WAL rewrite keeps the post-snapshot frames for the next startup replay).
+
 ## Uninstall
 
 ```powershell

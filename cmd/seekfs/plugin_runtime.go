@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"sort"
+	"time"
 
 	"seekfs/feature"
 )
@@ -76,49 +77,19 @@ func endContentTask(vol *serviceVolumeIndex) {
 	}
 }
 
+// servicePluginRestartContentWait bounds the content-task drain when the
+// plugin is reloaded at runtime (disable/reconfigure). It is generous so a
+// usable base survives a slow fold; the shutdown path uses the much shorter
+// serviceShutdownContentWait and proceeds regardless. A var so tests run
+// without the delay.
+var servicePluginRestartContentWait = 30 * time.Second
+
 // Cancel before waiting; retain the old state/mapping until queued builds,
 // catch-up, drains and folds have all released it. Filename queries continue.
+// The task drain is bounded (see stopContentPluginBounded): a wedged
+// extraction must not hang a plugin reload forever.
 func (s *goSearchService) stopContentPlugin(volumes []*serviceVolumeIndex) {
-	s.indexMu.Lock()
-	for _, vol := range volumes {
-		if a := vol.contentActivation.Load(); a != nil {
-			a.cancel()
-		}
-		vol.stopContentDrain()
-	}
-	s.indexMu.Unlock()
-	for _, vol := range volumes {
-		vol.contentTasksMu.Lock()
-		done := vol.contentTasksDone
-		count := vol.contentTasks
-		vol.contentTasksMu.Unlock()
-		if count > 0 {
-			<-done
-		}
-	}
-	s.indexMu.Lock()
-	defer s.indexMu.Unlock()
-	for _, vol := range volumes {
-		vol.mu.Lock()
-		if vol.content != nil {
-			vol.content.mu.Lock()
-			idx := vol.content.idx
-			vol.content.idx, vol.content.reader, vol.content.resolver = nil, nil, nil
-			vol.content.mu.Unlock()
-			if idx != nil {
-				idx.Release()
-			}
-		}
-		vol.content, vol.contentCoord = nil, nil
-		vol.contentActivation.Store(nil)
-		vol.mu.Unlock()
-	}
-	s.contentLocksMu.Lock()
-	defer s.contentLocksMu.Unlock()
-	for path, lock := range s.contentLocks {
-		lock.release()
-		delete(s.contentLocks, path)
-	}
+	s.stopContentPluginBounded(volumes, servicePluginRestartContentWait)
 }
 
 func (s *goSearchService) applyPluginDefinitions(defs map[string]pluginDefinition) {

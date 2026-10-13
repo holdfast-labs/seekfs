@@ -18,8 +18,14 @@ package main
 // searching.
 
 import (
+	"errors"
 	"fmt"
 )
+
+// errContentVerifyAborted stops the background integrity pass when the service
+// (or the volume's content plugin) is stopping. It is not a corruption signal:
+// the caller returns without marking anything stale.
+var errContentVerifyAborted = errors.New("content verify aborted: service stopping")
 
 // contentVerifySectionHook runs before each section is hashed. Tests use it
 // to pause the pass mid-hash (proving a concurrent Release waits the pin out)
@@ -38,6 +44,15 @@ var contentVerifySectionHook = func(tag uint32) {}
 // index was already released the pass stops early with an error instead of
 // hashing a gone mapping.
 func verifyContentSectionCRCs(idx *contentIndex) error {
+	return verifyContentSectionCRCsWithStop(idx, nil)
+}
+
+// verifyContentSectionCRCsWithStop is verifyContentSectionCRCs with a shutdown
+// check between sections: hashing gigabytes of text/postings must not hold a
+// service stop. stopped, when non-nil, aborts the pass with
+// errContentVerifyAborted (not a corruption signal). The offline `content`
+// command passes nil and always verifies the whole file.
+func verifyContentSectionCRCsWithStop(idx *contentIndex, stopped func() bool) error {
 	if idx == nil {
 		return fmt.Errorf("nil content index")
 	}
@@ -49,6 +64,9 @@ func verifyContentSectionCRCs(idx *contentIndex) error {
 		want, ok := idx.SectionCRC[tag]
 		if !ok {
 			continue
+		}
+		if stopped != nil && stopped() {
+			return errContentVerifyAborted
 		}
 		contentVerifySectionHook(tag)
 		if idx.released() {
@@ -62,7 +80,7 @@ func verifyContentSectionCRCs(idx *contentIndex) error {
 		if sh == nil || sh.idx == nil {
 			return fmt.Errorf("content shard is missing its index")
 		}
-		if err := verifyContentSectionCRCs(sh.idx); err != nil {
+		if err := verifyContentSectionCRCsWithStop(sh.idx, stopped); err != nil {
 			return err
 		}
 	}
@@ -90,7 +108,14 @@ func (s *goSearchService) verifyContentAfterAttach(vol *serviceVolumeIndex, expe
 	if s.contentStopped(vol) {
 		return
 	}
-	if err := verifyContentSectionCRCs(expect); err != nil {
+	stopped := func() bool { return s.contentStopped(vol) }
+	if err := verifyContentSectionCRCsWithStop(expect, stopped); err != nil {
+		// A shutdown abort is not corruption: leave the base alone (the
+		// shutdown release drops it) instead of marking stale and
+		// scheduling a rebuild nobody will run.
+		if errors.Is(err, errContentVerifyAborted) || s.contentStopped(vol) {
+			return
+		}
 		s.contentIntegrityFailed(vol, expect, err.Error())
 		return
 	}

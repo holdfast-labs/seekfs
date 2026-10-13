@@ -411,7 +411,10 @@ type goSearchService struct {
 	processMode string
 	stop        chan struct{}
 	stopOnce    sync.Once
-	dbs         []string
+	// shutdownOnce guards the bounded shutdown sequence so the SCM stop
+	// handler and servePrivileged never run the teardown twice.
+	shutdownOnce sync.Once
+	dbs          []string
 	indexes     []*Index
 	volumes     []*serviceVolumeIndex
 	loading     bool
@@ -636,8 +639,13 @@ type postingCacheEntry struct {
 	gen uint64
 }
 
+// serviceLog appends one line to service.log in the seekfs dir. The dir is
+// resolved through defaultSeekFSDir (SEEKFS_DIR-aware), so the test suite can
+// redirect it with SEEKFS_DIR instead of appending to the machine's real
+// %ProgramData%\seekfs\service.log. In production SEEKFS_DIR is unset and the
+// path is unchanged (%ProgramData%\seekfs\service.log).
 func serviceLog(format string, args ...any) {
-	dir := filepath.Join(os.Getenv("ProgramData"), "seekfs")
+	dir := defaultSeekFSDir()
 	if dir == "" || dir == "seekfs" {
 		dir = filepath.Join(os.TempDir(), "seekfs")
 	}
