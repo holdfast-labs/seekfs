@@ -28,6 +28,7 @@ package main
 import (
 	"container/heap"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
@@ -64,14 +65,14 @@ const contentScanMemoMax = 1 << 16
 // directory's normalized path (plus the scope), so a file's decision follows
 // from its parent's without rebuilding or rematching anything hierarchical.
 type contentParentDecision struct {
-	repo      string // deepest worktree containing the dir, "" if none
-	excluded  bool   // under an exclude prefix (whole subtree out)
-	segHit    bool   // an excluded segment on the dir path (non-final for children)
-	ignored   bool   // git-ignored (whole subtree dead)
-	unit      string // matched include root, "" if none
-	kind      string // "repo" or "root"
-	priority  int    // scope priority for admitted files below
-	computed  bool
+	repo     string // deepest worktree containing the dir, "" if none
+	excluded bool   // under an exclude prefix (whole subtree out)
+	segHit   bool   // an excluded segment on the dir path (non-final for children)
+	ignored  bool   // git-ignored (whole subtree dead)
+	unit     string // matched include root, "" if none
+	kind     string // "repo" or "root"
+	priority int    // scope priority for admitted files below
+	computed bool
 }
 
 // contentScopeMember is one admitted file: everything the build snapshot and
@@ -177,7 +178,15 @@ func scanScopeMembers(s *goSearchService, vol *serviceVolumeIndex, cfg contentSc
 			}
 			lists[w] = members
 		} else {
+			// Uncapped scans append to members; capped scans that never
+			// filled keep arrivals in top (heap order starts only once
+			// the cap fills). Concatenating both covers either shape —
+			// dropping top here would silently select nothing whenever
+			// the corpus stays under the cap.
 			lists[w] = out[w].members
+			for _, h := range out[w].top {
+				lists[w] = append(lists[w], h.member)
+			}
 		}
 	}
 	return lists, true
@@ -528,10 +537,23 @@ func (w *contentScanWorker) deriveChildDecision(parent contentParentDecision, na
 
 // dirDecisionStandalone decides a directory without inheritance (roots,
 // corrupt links, reserved names): the same predicates allows() applies,
-// evaluated on the directory's own path.
+// evaluated on the directory's own path. Parent -1 names the volume root
+// itself: flat test fixtures (and the volume's top-level records) hang
+// files directly off it, so it decides as the volume directory rather than
+// empty — otherwise every volume-root child would fall through to the
+// rootExact lookup in admitRecord and be silently dropped, diverging from
+// allows().
 func (w *contentScanWorker) dirDecisionStandalone(id int32) contentParentDecision {
 	var out contentParentDecision
-	if id < 0 || int(id) >= w.idx.compactRecordCount() {
+	if id < 0 {
+		if d, ok := w.memo[id]; ok {
+			return d
+		}
+		d := w.volumeRootDecision()
+		w.memoize(id, d)
+		return d
+	}
+	if int(id) >= w.idx.compactRecordCount() {
 		return out
 	}
 	raw := w.idx.reconstructCompactPathCached(int(id), w.cache)
@@ -554,7 +576,38 @@ func (w *contentScanWorker) dirDecisionStandalone(id int32) contentParentDecisio
 	return out
 }
 
-// priorityFor derives the scope priority from an already-matched decision:
+// volumeRootDecision decides the volume directory itself (the parent of
+// every Parent == -1 record): the same predicates allows() applies to any
+// directory path, evaluated on the normalized volume root. Equality is
+// covered by the prefix checks, so an explicit root or repo naming the
+// volume directory matches exactly like it does for files below it.
+func (w *contentScanWorker) volumeRootDecision() contentParentDecision {
+	var out contentParentDecision
+	vol := w.idx.Volume
+	if vol == "" {
+		return out
+	}
+	// Decide with a trailing separator: filepath.Clean keeps it for drive
+	// roots ("C:\" stays "c:\") and strips it for plain directories, so the
+	// normalized form always equals the normalized root form a root naming
+	// this volume takes. Without it a drive-root volume ("C:") never prefix-
+	// matches its own explicit root ("C:\") while every file below it does.
+	p := contentNormPath(vol + string(filepath.Separator))
+	out.excluded = w.scope.matchExcluded(p)
+	out.segHit = contentPathHasAllExcludedSegments(p)
+	if repo, ok := w.scope.matchRepo(p); ok {
+		out.repo = repo
+	}
+	if !out.excluded {
+		out.ignored = w.ignore.ignored(vol, true)
+	}
+	if unit, kind, ok := w.scope.matchRoot(p); ok {
+		out.unit, out.kind = unit, kind
+	}
+	out.priority = w.priorityFor(out)
+	return out
+}
+
 // repositories first, configured roots next, other roots last — the same
 // rule as contentScopeResolved.priority.
 func (w *contentScanWorker) priorityFor(d contentParentDecision) int {

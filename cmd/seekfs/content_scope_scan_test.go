@@ -234,6 +234,93 @@ func TestContentScanMatchesLegacy(t *testing.T) {
 	}
 }
 
+// Flat Parent == -1 records (volume-root children, the shape every
+// hand-built USN fixture uses) must diff exactly too: the parent decision
+// for -1 is the volume directory itself, not empty.
+func TestContentScanFlatMatchesLegacy(t *testing.T) {
+	dir := t.TempDir()
+	write := func(name, text string) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(text), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("a.txt", "alpha")
+	write("b.txt", "beta")
+	write(".gitignore", "b.txt\n")
+	if err := os.MkdirAll(filepath.Join(dir, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	write(filepath.Join(".git", "HEAD"), "x")
+	idx := &Index{Source: "usn", Volume: dir, Compact: true}
+	idx.Records = []CompactRecord{
+		{FRN: 10, ParentFRN: 10, Parent: -1, Name: "a.txt", Size: 5},
+		{FRN: 20, ParentFRN: 20, Parent: -1, Name: "b.txt", Size: 4},
+		{FRN: 30, ParentFRN: 30, Parent: -1, Name: ".gitignore", Size: 6},
+		{FRN: 40, ParentFRN: 40, Parent: -1, Name: ".git", Mode: uint32(os.ModeDir)},
+	}
+	contentIndexFRNs(idx)
+	s := contentTestService(t)
+	vol := newServiceVolumeIndex(filepath.Join(t.TempDir(), "scan.gsi"), idx)
+	releaseVolumeContentOnCleanup(t, vol)
+	// Drive-root volumes keep their trailing separator after Clean ("C:\"
+	// stays "c:\"); the volume-root decision must still prefix-match a root
+	// naming the volume, exactly like every file below it does.
+	drive := &Index{Source: "usn", Volume: `C:\`, Compact: true}
+	drive.Records = []CompactRecord{
+		{FRN: 10, ParentFRN: 10, Parent: -1, Name: "a.txt", Size: 5},
+		{FRN: 20, ParentFRN: 20, Parent: -1, Name: "b.txt", Size: 4},
+	}
+	contentIndexFRNs(drive)
+	driveVol := newServiceVolumeIndex(filepath.Join(t.TempDir(), "scan.gsi"), drive)
+	releaseVolumeContentOnCleanup(t, driveVol)
+	for _, mode := range []string{"auto", "explicit"} {
+		t.Setenv("SEEKFS_CONTENT_SCOPE", mode)
+		t.Setenv("SEEKFS_CONTENT_ROOTS", dir)
+		scope, ok := s.resolvedContentScope(vol)
+		if !ok {
+			t.Fatalf("scope %s: not resolvable", mode)
+		}
+		opts := defaultContentBuildOptions()
+		opts.Scope = &scope
+		want := legacyScanSelection(idx, opts, false)
+		got := fastScanSelection(t, s, vol, &scope, idx, false)
+		if len(got) != len(want) {
+			t.Fatalf("scope %s: fast=%d legacy=%d", mode, len(got), len(want))
+		}
+		for frn, w := range want {
+			g, ok := got[frn]
+			if !ok {
+				t.Fatalf("scope %s: key %d (%q) missing from fast scan", mode, frn, w.path)
+			}
+			if g.path != w.path || g.priority != w.priority {
+				t.Fatalf("scope %s: key %d fast=%+v legacy=%+v", mode, frn, g, w)
+			}
+		}
+		t.Setenv("SEEKFS_CONTENT_ROOTS", `C:\`)
+		driveScope, ok := s.resolvedContentScope(driveVol)
+		if !ok {
+			t.Fatalf("drive scope %s: not resolvable", mode)
+		}
+		driveOpts := defaultContentBuildOptions()
+		driveOpts.Scope = &driveScope
+		driveWant := legacyScanSelection(drive, driveOpts, false)
+		driveGot := fastScanSelection(t, s, driveVol, &driveScope, drive, false)
+		if len(driveGot) != len(driveWant) || len(driveWant) == 0 {
+			t.Fatalf("drive scope %s: fast=%d legacy=%d (legacy must admit the volume-root files)", mode, len(driveGot), len(driveWant))
+		}
+		for frn, w := range driveWant {
+			g, ok := driveGot[frn]
+			if !ok {
+				t.Fatalf("drive scope %s: key %d (%q) missing from fast scan", mode, frn, w.path)
+			}
+			if g.path != w.path || g.priority != w.priority {
+				t.Fatalf("drive scope %s: key %d fast=%+v legacy=%+v", mode, frn, g, w)
+			}
+		}
+	}
+}
+
 // The capped merge must keep the global top by (priority, path, frn),
 // matching the legacy single-heap scan exactly.
 func TestContentScanCappedMatchesLegacy(t *testing.T) {
@@ -280,6 +367,43 @@ func TestContentScanCappedMatchesLegacy(t *testing.T) {
 		w, ok := want[it.frn]
 		if !ok || w.path != it.path || w.priority != it.priority {
 			t.Fatalf("capped merge item %+v not in legacy top-50", it)
+		}
+	}
+}
+
+// A capped scan whose corpus never fills the cap must return the whole
+// admitted set, exactly like the uncapped scan: the per-worker top holds
+// arrivals until the cap fills, and dropping it would silently build an
+// empty sidecar for every corpus under the file cap.
+func TestContentScanCappedUnfilledMatchesLegacy(t *testing.T) {
+	rnd := rand.New(rand.NewSource(7))
+	fx := buildScanTreeFixture(t, rnd)
+	s := contentTestService(t)
+	vol := newServiceVolumeIndex(filepath.Join(t.TempDir(), "scan.gsi"), fx.idx)
+	releaseVolumeContentOnCleanup(t, vol)
+	t.Setenv("SEEKFS_CONTENT_SCOPE", "explicit")
+	t.Setenv("SEEKFS_CONTENT_ROOTS", fx.root)
+	scope, ok := s.resolvedContentScope(vol)
+	if !ok {
+		t.Fatal("scope not resolvable")
+	}
+	opts := defaultContentBuildOptions()
+	opts.Scope = &scope
+	want := legacyScanSelection(fx.idx, opts, false)
+	cfg := contentScopeScanConfig{scope: &scope, idx: fx.idx, maxFiles: 2000000,
+		stopped: func() bool { return false }, genChanged: func() bool { return false }}
+	lists, ok := scanScopeMembers(s, vol, cfg)
+	if !ok {
+		t.Fatal("fast scan moved")
+	}
+	items, limited := mergeScanMembers(lists, 2000000)
+	if limited || len(items) != len(want) {
+		t.Fatalf("unfilled capped merge = %d items limited=%v; want %d limited=false", len(items), limited, len(want))
+	}
+	for _, it := range items {
+		w, ok := want[it.frn]
+		if !ok || w.path != it.path || w.priority != it.priority {
+			t.Fatalf("unfilled capped item %+v not in legacy set", it)
 		}
 	}
 }

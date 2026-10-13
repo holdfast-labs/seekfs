@@ -160,6 +160,9 @@ func (s *goSearchService) reconcileMetadataPass(vol *serviceVolumeIndex, idx *co
 	live := make(map[uint64]contentFilePrint)
 	for _, l := range lists {
 		for _, m := range l {
+			if contentScopeMemberIgnored(&scope, m.path) {
+				continue
+			}
 			live[m.frn] = contentFilePrint{size: m.size, mod: m.mod}
 		}
 	}

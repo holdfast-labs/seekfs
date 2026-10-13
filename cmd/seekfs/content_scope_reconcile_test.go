@@ -7,12 +7,14 @@ import (
 )
 
 // scopeReconFixture is a flat single-repo USN volume (the volume directory
-// itself is the git worktree) with two text files. Tests stamp a sidecar
+// itself is the git worktree) with three text files. Tests stamp a sidecar
 // under one .gitignore revision and attach under another, so attach must
-// reconcile the selection difference instead of discarding the base.
+// reconcile the selection difference instead of discarding the base. Three
+// keep files keep honest diffs (one file) under the rebuild fraction.
 type scopeReconFixture struct {
 	dir        string
-	keepPath   string
+	keepPaths  []string
+	keepFRNs   []uint64
 	dropPath   string
 	ignorePath string
 	vol        *serviceVolumeIndex
@@ -27,14 +29,33 @@ func newScopeReconFixture(t *testing.T, ignoreText string) *scopeReconFixture {
 	stubContentBuildSync(t)
 
 	dir := t.TempDir()
-	keepPath := filepath.Join(dir, "keep.txt")
-	dropPath := filepath.Join(dir, "drop.txt")
-	if err := os.WriteFile(keepPath, []byte("keep needlekeep"), 0o644); err != nil {
-		t.Fatal(err)
+	var keepPaths []string
+	var keepFRNs []uint64
+	var records []CompactRecord
+	stat := func(path string) (int64, int64) {
+		t.Helper()
+		st, err := os.Stat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return st.Size(), st.ModTime().UnixNano()
 	}
+	for i, frn := range []uint64{10, 11, 12} {
+		path := filepath.Join(dir, "keep"+string(rune('1'+i))+".txt")
+		if err := os.WriteFile(path, []byte("keep needlekeep"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		size, mod := stat(path)
+		keepPaths = append(keepPaths, path)
+		keepFRNs = append(keepFRNs, frn)
+		records = append(records, CompactRecord{FRN: frn, ParentFRN: frn, Parent: -1, Name: "keep" + string(rune('1'+i)) + ".txt", Size: size, ModUnix: mod})
+	}
+	dropPath := filepath.Join(dir, "drop.txt")
 	if err := os.WriteFile(dropPath, []byte("drop needledrop"), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	dropSize, dropMod := stat(dropPath)
+	records = append(records, CompactRecord{FRN: 20, ParentFRN: 20, Parent: -1, Name: "drop.txt", Size: dropSize, ModUnix: dropMod})
 	if err := os.MkdirAll(filepath.Join(dir, ".git"), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -45,32 +66,20 @@ func newScopeReconFixture(t *testing.T, ignoreText string) *scopeReconFixture {
 	if err := os.WriteFile(ignorePath, []byte(ignoreText), 0o644); err != nil {
 		t.Fatal(err)
 	}
-
-	stat := func(path string) (int64, int64) {
-		t.Helper()
-		st, err := os.Stat(path)
-		if err != nil {
-			t.Fatal(err)
-		}
-		return st.Size(), st.ModTime().UnixNano()
-	}
-	keepSize, keepMod := stat(keepPath)
-	dropSize, dropMod := stat(dropPath)
 	ignoreSize, ignoreMod := stat(ignorePath)
+	records = append(records,
+		CompactRecord{FRN: 30, ParentFRN: 30, Parent: -1, Name: ".gitignore", Size: ignoreSize, ModUnix: ignoreMod},
+		CompactRecord{FRN: 40, ParentFRN: 40, Parent: -1, Name: ".git", Mode: uint32(os.ModeDir)},
+	)
 
 	const journal = uint64(7)
 	const cp = int64(100)
 	stubContentCatchUpJournal(t, usnJournalDataV0{UsnJournalID: journal, FirstUsn: 1, LowestValidUsn: 1, NextUsn: cp})
-	vol, gsx := contentBuildTestVolume(t, dir, journal, uint64(cp), []CompactRecord{
-		{FRN: 10, ParentFRN: 10, Parent: -1, Name: "keep.txt", Size: keepSize, ModUnix: keepMod},
-		{FRN: 20, ParentFRN: 20, Parent: -1, Name: "drop.txt", Size: dropSize, ModUnix: dropMod},
-		{FRN: 30, ParentFRN: 30, Parent: -1, Name: ".gitignore", Size: ignoreSize, ModUnix: ignoreMod},
-		{FRN: 40, ParentFRN: 40, Parent: -1, Name: ".git", Mode: uint32(os.ModeDir)},
-	})
+	vol, gsx := contentBuildTestVolume(t, dir, journal, uint64(cp), records)
 	s := contentTestService(t)
 	s.volumes = []*serviceVolumeIndex{vol}
 	s.indexes = []*Index{vol.index}
-	return &scopeReconFixture{dir: dir, keepPath: keepPath, dropPath: dropPath, ignorePath: ignorePath, vol: vol, gsx: gsx, s: s}
+	return &scopeReconFixture{dir: dir, keepPaths: keepPaths, keepFRNs: keepFRNs, dropPath: dropPath, ignorePath: ignorePath, vol: vol, gsx: gsx, s: s}
 }
 
 // writeScopeReconBase assembles a sidecar with the given file contents and
@@ -123,19 +132,32 @@ func (f *scopeReconFixture) rewriteIgnore(t *testing.T, text string) {
 
 func (f *scopeReconFixture) resolveForDrain(t *testing.T) func(uint64) (string, bool) {
 	t.Helper()
-	// Only the two text files resolve. The .gitignore's own FRN (30) stays
+	// Only the text files resolve. The .gitignore's own FRN (30) stays
 	// unresolvable on purpose: the service drain would decline it (no text
 	// extractor claims it), while the direct processQueue used here
 	// tombstones it instead — a phantom the fold carries harmlessly.
 	return func(frn uint64) (string, bool) {
-		switch frn {
-		case 10:
-			return f.keepPath, true
-		case 20:
+		for i, k := range f.keepFRNs {
+			if frn == k {
+				return f.keepPaths[i], true
+			}
+		}
+		if frn == 20 {
 			return f.dropPath, true
 		}
 		return "", false
 	}
+}
+
+// keepDocs builds base docs for the keep files with matching prints.
+func (f *scopeReconFixture) keepDocs(t *testing.T) []contentBuildDoc {
+	t.Helper()
+	var docs []contentBuildDoc
+	for i, k := range f.keepFRNs {
+		size, mod := f.filePrint(t, f.keepPaths[i])
+		docs = append(docs, contentBuildDoc{path: f.keepPaths[i], frn: k, text: []byte("keep needlekeep"), class: contentClassText, version: 1, fileSize: size, fileModNano: mod})
+	}
+	return docs
 }
 
 // A .gitignore edit that narrows the scope must tombstone the newly ignored
@@ -143,12 +165,10 @@ func (f *scopeReconFixture) resolveForDrain(t *testing.T) func(uint64) (string, 
 // and the fold persists the dropped doc plus the new fingerprint.
 func TestContentAttachReconcilesScopeContraction(t *testing.T) {
 	f := newScopeReconFixture(t, "")
-	keepSize, keepMod := f.filePrint(t, f.keepPath)
 	dropSize, dropMod := f.filePrint(t, f.dropPath)
-	f.writeScopeReconBase(t, []contentBuildDoc{
-		{path: f.keepPath, frn: 10, text: []byte("keep needlekeep"), class: contentClassText, version: 1, fileSize: keepSize, fileModNano: keepMod},
-		{path: f.dropPath, frn: 20, text: []byte("drop needledrop"), class: contentClassText, version: 1, fileSize: dropSize, fileModNano: dropMod},
-	})
+	docs := f.keepDocs(t)
+	docs = append(docs, contentBuildDoc{path: f.dropPath, frn: 20, text: []byte("drop needledrop"), class: contentClassText, version: 1, fileSize: dropSize, fileModNano: dropMod})
+	f.writeScopeReconBase(t, docs)
 	builds := stubContentBuildSchedule(t)
 
 	// The ignore edit lands while the service is stopped.
@@ -164,14 +184,13 @@ func TestContentAttachReconcilesScopeContraction(t *testing.T) {
 	if *builds != 0 {
 		t.Fatalf("scope contraction scheduled %d builds; want 0", *builds)
 	}
-	if n := f.vol.contentCoord.queued(); n != 1 {
-		t.Fatalf("contraction queued %d FRNs; want 1 (the .gitignore itself, which the drain declines; the ignored file drops, nothing new appears)", n)
+	// Nothing enqueues: the ignored file drops via tombstone, and the
+	// .gitignore itself is not selection (rules come from disk).
+	if n := f.vol.contentCoord.queued(); n != 0 {
+		t.Fatalf("contraction queued %d FRNs; want 0", n)
 	}
-	if n := f.vol.contentCoord.processQueue(f.resolveForDrain(t)); n != 0 {
-		t.Fatalf("contraction drain extracted %d docs; want 0", n)
-	}
-	if hits, err := contentServiceSearch(t, f.vol, "content:needlekeep", false); err != nil || len(hits) != 1 {
-		t.Fatalf("kept content not findable after reconcile: %v %v", hits, err)
+	if hits, err := contentServiceSearch(t, f.vol, "content:needlekeep", false); err != nil || len(hits) != 3 {
+		t.Fatalf("kept content hits = %d; want 3: %v %v", len(hits), hits, err)
 	}
 	if hits, _ := contentServiceSearch(t, f.vol, "content:needledrop", false); len(hits) != 0 {
 		t.Fatalf("newly ignored content still findable after reconcile: %v", hits)
@@ -201,10 +220,7 @@ func TestContentAttachReconcilesScopeContraction(t *testing.T) {
 // file at attach; after the drain its content is findable.
 func TestContentAttachReconcilesScopeExpansion(t *testing.T) {
 	f := newScopeReconFixture(t, "drop.txt\n")
-	keepSize, keepMod := f.filePrint(t, f.keepPath)
-	f.writeScopeReconBase(t, []contentBuildDoc{
-		{path: f.keepPath, frn: 10, text: []byte("keep needlekeep"), class: contentClassText, version: 1, fileSize: keepSize, fileModNano: keepMod},
-	})
+	f.writeScopeReconBase(t, f.keepDocs(t))
 	builds := stubContentBuildSchedule(t)
 
 	f.rewriteIgnore(t, "")
@@ -216,8 +232,8 @@ func TestContentAttachReconcilesScopeExpansion(t *testing.T) {
 	if *builds != 0 {
 		t.Fatalf("scope expansion scheduled %d builds; want 0", *builds)
 	}
-	if n := f.vol.contentCoord.queued(); n != 2 {
-		t.Fatalf("expansion queued %d FRNs; want 2 (the newly admitted file plus the .gitignore itself)", n)
+	if n := f.vol.contentCoord.queued(); n != 1 {
+		t.Fatalf("expansion queued %d FRNs; want 1 (the newly admitted file)", n)
 	}
 	if n := f.vol.contentCoord.processQueue(f.resolveForDrain(t)); n != 1 {
 		t.Fatalf("expansion drain extracted %d docs; want 1 (the newly admitted file)", n)
@@ -231,12 +247,10 @@ func TestContentAttachReconcilesScopeExpansion(t *testing.T) {
 // too far gone to trust, so attach stays stale and a rebuild is scheduled.
 func TestContentAttachRebuildsOnScopeFlood(t *testing.T) {
 	f := newScopeReconFixture(t, "")
-	keepSize, keepMod := f.filePrint(t, f.keepPath)
 	dropSize, dropMod := f.filePrint(t, f.dropPath)
-	f.writeScopeReconBase(t, []contentBuildDoc{
-		{path: f.keepPath, frn: 10, text: []byte("keep needlekeep"), class: contentClassText, version: 1, fileSize: keepSize, fileModNano: keepMod},
-		{path: f.dropPath, frn: 20, text: []byte("drop needledrop"), class: contentClassText, version: 1, fileSize: dropSize, fileModNano: dropMod},
-	})
+	docs := f.keepDocs(t)
+	docs = append(docs, contentBuildDoc{path: f.dropPath, frn: 20, text: []byte("drop needledrop"), class: contentClassText, version: 1, fileSize: dropSize, fileModNano: dropMod})
+	f.writeScopeReconBase(t, docs)
 	builds := stubContentBuildSchedule(t)
 
 	// Shrink the rebuild fraction to zero: any nonzero diff rebuilds.
@@ -259,10 +273,7 @@ func TestContentAttachRebuildsOnScopeFlood(t *testing.T) {
 // drift check: the differing selection reconciles without a rebuild.
 func TestContentScopeDriftCheckReconciles(t *testing.T) {
 	f := newScopeReconFixture(t, "drop.txt\n")
-	keepSize, keepMod := f.filePrint(t, f.keepPath)
-	f.writeScopeReconBase(t, []contentBuildDoc{
-		{path: f.keepPath, frn: 10, text: []byte("keep needlekeep"), class: contentClassText, version: 1, fileSize: keepSize, fileModNano: keepMod},
-	})
+	f.writeScopeReconBase(t, f.keepDocs(t))
 	f.s.attachContentForVolume(f.vol)
 	if got := f.vol.content.stateOf(); got != contentStateReady {
 		t.Fatalf("precondition state = %q; want ready", got)

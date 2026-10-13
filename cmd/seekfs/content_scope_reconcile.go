@@ -41,6 +41,20 @@ type contentScopeDiffResult struct {
 	drop    []uint64
 }
 
+// contentScopeMemberIgnored reports whether path is an in-repo ignore file
+// under scope. Ignore files carry the rules but never content docs (no text
+// extractor claims them; the drain declines them), so reconcile selection
+// skips them: enqueueing them would burn threshold budget on keys that can
+// never join the base, and a repo made only of ignore files would read as a
+// total wipe.
+func contentScopeMemberIgnored(scope *contentScopeResolved, path string) bool {
+	if scope == nil || scope.Ignore == nil || !contentIsIgnoreFile(path) {
+		return false
+	}
+	_, inRepo := scope.Ignore.repoFor(contentNormPath(path))
+	return inRepo
+}
+
 // scopeSelectionKeys runs one fast selection scan and returns the selected
 // key fingerprints. ok is false when the base moved mid-scan (caller
 // reschedules) or the scan stopped.
@@ -64,6 +78,9 @@ func (s *goSearchService) scopeSelectionKeys(vol *serviceVolumeIndex, scope *con
 	out := make(map[uint64]contentFilePrint)
 	for _, l := range lists {
 		for _, m := range l {
+			if contentScopeMemberIgnored(scope, m.path) {
+				continue
+			}
 			out[m.frn] = contentFilePrint{size: m.size, mod: m.mod}
 		}
 	}

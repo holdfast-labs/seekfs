@@ -364,10 +364,12 @@ func (s *goSearchService) contentReconcileWalkVolume(vol *serviceVolumeIndex, fo
 		seen[key] = struct{}{}
 		drops = append(drops, key)
 	}
-	if n := len(changed) + len(drops); len(base) > 0 && float64(n) > contentScopeReconcileRebuildFrac*float64(len(base)) {
-		// A wholesale change is cheaper as a clean rebuild; the usable
-		// base stays attached while it runs (never drop good content for
-		// a scope change alone).
+	if n := len(drops); len(base) > 0 && float64(n) > contentScopeReconcileRebuildFrac*float64(len(base)) {
+		// A wholesale disappearance is cheaper as a clean rebuild; changed
+		// files always reconcile (re-extraction is per-file either way),
+		// so only the drop side is gated. The usable base stays attached
+		// while the rebuild runs (never drop good content for a scope
+		// change alone).
 		serviceLog("content walk reconcile volume=%s changed=%d dropped=%d base=%d exceeds rebuild fraction; rebuilding",
 			vol.volume, len(changed), len(drops), len(base))
 		vol.content.markScopeReconcile(scope.fingerprint(), 0)

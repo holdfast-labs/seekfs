@@ -110,8 +110,13 @@ the limit. Set `[content]` keys `mode` (`auto`, `explicit`, `off`),
 `seekfs.toml`; `[content."C:"]` overrides one volume. Environment overrides
 are `SEEKFS_CONTENT_SCOPE`, `SEEKFS_CONTENT_ROOTS`,
 `SEEKFS_CONTENT_EXCLUDE`, and `SEEKFS_CONTENT_BUDGET_BYTES`. Sidecars store
-a fingerprint of their resolved scope; the service rebuilds an older sidecar
-or one whose scope changed before serving its stored content. Only an
+a fingerprint of their resolved scope; a sidecar whose scope moved (a repo
+appeared or vanished, an ignore rule changed, roots/exts/budget edited) is
+reconciled incrementally at attach instead of rebuilt: the current selection
+is diffed against the doc table, newly selected files enqueue for extraction
+and dropped ones tombstone for the next fold, which persists the reconciled
+fingerprint (§6o). Only a diff past half the base docs, an unresolvable
+scope, or an extractor/format incompatibility rebuilds from scratch. Only an
 explicit `budget_bytes` joins the fingerprint.
 
 Inside a detected worktree the scope follows git's ignore rules with git's
@@ -124,8 +129,9 @@ only relaxes matching for paths with no on-disk entry); folding would
 silently drop tracked source whenever a pattern differs in case
 (`build/.gitignore`'s `LASTCHANGE*` vs the tracked `lastchange.gni`). The
 global file joins the scope digest, and the drain loop polls its stat (it
-lives outside the volume, so the USN stream never reports it), so edits
-rebuild under the new rules.
+lives outside the volume, so the USN stream never reports it); an edit
+reconciles the selection difference under the new rules (§6o) instead of
+rebuilding the sidecar.
 
 The service selects Git repositories before configured roots, then known
 folders. It spools accepted extracted text to temporary disk before assembling
@@ -150,18 +156,18 @@ of the candidates to project the binary share (`projected_text_files`).
 
 There is no default extracted-text budget: the default scope indexes
 everything selected, and selection stops only when the projected index would
-push the volume holding the sidecar below a free-space reserve — the larger
-of 10% of the volume's capacity or 20 GiB (see `contentScopeReserveFor` in
-`content_space.go`). Sharding bounds build and fold memory per 64 MiB shard,
+push the volume holding the sidecar below a free-space reserve — 5% of the
+volume's capacity, clamped to [10 GiB, 20 GiB] (see `contentScopeReserveFor`
+in `content_space.go`). Sharding bounds build and fold memory per 64 MiB shard,
 so the budget is really disk space. The projection scales extracted bytes by
 `contentScopeEncodedMultiplier` (0.5, calibrated against the compact v7
 encoding at ~0.33 of extracted text); the encode-time size-cap check stays
 the backstop. Corpora past the shard target build as folder shards, each
 individually capped at the 4 GiB per-file sidecar cap (an over-cap shard
 refuses to publish, like a single-file over-cap build), which is why totals
-past 4 GiB are safe. If the volume is already below its reserve, selection
-is not refused outright (that would disable content on full disks); the
-existing 10 GiB write-time guard stays the backstop. Set `[content]`
+past 4 GiB are safe. A volume already at or below its reserve selects nothing
+more (allowance 0 — no fail-open); the same reserve governs the write-time
+guard, so selection and writes agree. Set `[content]`
 `budget_bytes` (or `[content."E:"]` per volume, or
 `SEEKFS_CONTENT_BUDGET_BYTES`) to pin an explicit extracted-text budget,
 which is enforced exactly as before and wins over the reserve. Only an
@@ -801,7 +807,9 @@ layout, and gitignore scope as USN volumes.
   phantom tombstones once bloated the delta and forced constant folds), empty
   files are never enqueued, unindexable files are remembered per fingerprint
   (coordinator decline hook) until they change, and a pre-fold restore
-  rescinds its tombstone.
+  rescinds its tombstone. Only the drop side is rebuild-gated: past half the
+  base docs vanishing, a clean rebuild replaces the reconcile (§6o); changed
+  files always re-extract incrementally.
 - **Freshness layers.** The existing `ReadDirectoryChangesW` watcher rebuilds
   the filename index on change; the rebuild path rebinds the resolver and
   reconciles immediately after. The drain loop reconciles on every filename
@@ -1125,10 +1133,11 @@ No stored-text change was needed and none is proposed.
 **Budget policy (done, with the reserve code in `content_space.go`).**
 There is no default byte budget: the default scope indexes everything
 selected and stops only when the projected index (extracted × 0.5) would
-breach the volume's free-space reserve — max(10% of capacity, 20 GiB).
-A volume already below its reserve is still built (bounded by the 10 GiB
-write-time guard); refusing everything would disable content on full
-disks instead of bounding it. Explicit `budget_bytes` still caps
+breach the volume's free-space reserve — 5% of capacity in [10 GiB, 20 GiB],
+monotonic (it never grows as free space shrinks) and shared by selection and
+the write-time guard, with no fail-open (allowance 0 at or below the
+reserve; unknown free space leaves selection unlimited with the write guard
+as backstop). Explicit `budget_bytes` still caps
 extracted bytes exactly as before. Both record exact `scope_dropped` /
 `scope_dropped_bytes`; the policy carries the enforced `budget_bytes`
 (0 when reserve-governed) or `reserve_bytes`, surfaced in
@@ -1137,6 +1146,52 @@ extracted bytes exactly as before. Both record exact `scope_dropped` /
 `TestContentScopeReserve`, `TestContentScopeEstimateReserveTruncates`,
 `TestContentServiceBuildReserveDropsExactFilesAndBytes` and the health/UI
 summary tests.
+
+## 6o. Scope reconcile + journal-wrap recovery (done)
+
+On a busy developer machine the scope fingerprint (repo list plus ignore
+digest) can move during a long build — a repo appears, a `.gitignore` edit
+admits or drops files — and a USN journal routinely wraps under a finished
+base. Both used to discard the sidecar (`stale` + full rebuild), potentially
+forever. Both now reconcile the selection difference through the existing
+delta/drain/fold pipeline instead.
+
+- **Attach + drift scope reconcile** (`content_scope_reconcile.go`). A
+  sidecar whose fingerprint differs from the resolved scope diffs the current
+  fast-scan selection against its doc table: newly selected keys enqueue for
+  extraction, dropped keys tombstone for the next fold, and the fold persists
+  the reconciled fingerprint — converging without re-extracting the corpus.
+  The steady-state drain loop re-checks the fingerprint every
+  `contentScopeDriftCheckPeriod` (30 s) plus a forced check on any in-volume
+  ignore edit, so config/env/ignore drift reconciles without a rebuild. Past
+  `contentScopeReconcileRebuildFrac` (half the base docs) the diff rebuilds
+  instead; in-scope ignore files themselves are never selection (their rules
+  are read from disk, and they would burn threshold budget as phantom
+  enqueues). The volume stays `ready` and usable throughout.
+- **Journal-wrap metadata reconcile** (`content_catchup_reconcile.go`). A
+  wrapped journal of the same generation keeps FRN identity, so catch-up
+  diffs the live filename index (base records plus the replay overlay, which
+  holds the wrap window's creates/modifies/deletes) against the doc table by
+  FRN: changed/new keys enqueue, deleted keys tombstone, and the fold claims
+  the reconciled volume checkpoint past the lost range. This covers wraps
+  during the build, while stopped, and mid-catch-up reads. The volume keeps
+  serving (`ready`, health `reconciling` with scan progress) until the fold.
+  A journal-ID change (new generation, FRNs unsafe) still goes stale, as do
+  sidecars predating the v6 file fingerprint, which cannot diff.
+- **Fast scan + build phases** (`content_scope_scan.go`). Selection is a
+  memoized parallel scan over the filename index (per-parent decision memo,
+  ~4x the legacy loop; differential tests bind it to `allows()`+`priority()`
+  on randomized, flat, and drive-root trees). The build reports
+  `scanning` (with the record total), `extracting`, and `assembling` phases
+  in health/CLI/UI instead of sitting at 0%, and a wrap reconcile reports
+  `reconciling` with progress. `BuildPhase`/`BuildTotal` flow through
+  `loaded`, the CLI status line, and the UI footer.
+
+Tests: `content_scope_reconcile_test.go` (contract/expand/flood/drift/phases),
+`content_catchup_reconcile_test.go` (stopped-wrap, overlay merge, ID-change
+stays stale, pre-v6 rebuilds, mid-loop wrap), `content_scope_scan_test.go`
+(flat + drive-root differentials, unfilled-cap regression), and the updated
+`below-lowest-valid` attach branch (ready + usable, journal never re-read).
 
 ## 7. Carried debt / known gaps
 
