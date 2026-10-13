@@ -800,15 +800,16 @@ func (s *goSearchService) runContentBuild(vol *serviceVolumeIndex, reuseSidecar 
 	// allowance is the extracted-text budget enforced below: the explicit
 	// budget_bytes when configured, else the reserve-derived allowance for
 	// the sidecar's volume, refreshed as the spool grows (free space moves
-	// under it). MaxInt64 means unlimited (unknown disk or already below
-	// the reserve; the write-time guard stays the backstop).
+	// under it; the spooled bytes are credited back, since the allowance
+	// budgets the build's whole peak). MaxInt64 means unlimited (unknown
+	// free space; the write-time guard stays the backstop).
 	allowance := int64(^uint64(0) >> 1)
 	var sinceAllowanceCheck int64
 	explicitBudget := opts.Scope != nil && opts.Scope.BudgetExplicit
 	if explicitBudget {
 		allowance = opts.Scope.BudgetBytes
 	} else {
-		allowance = contentScopeAllowance(tmpDir)
+		allowance = contentScopeAllowance(tmpDir, 0)
 	}
 	abortReason := ""
 	abortRetry := false
@@ -877,7 +878,7 @@ func (s *goSearchService) runContentBuild(vol *serviceVolumeIndex, reuseSidecar 
 		if !explicitBudget {
 			if sinceAllowanceCheck += n; sinceAllowanceCheck >= contentDiskCheckEvery {
 				sinceAllowanceCheck = 0
-				allowance = contentScopeAllowance(tmpDir)
+				allowance = contentScopeAllowance(tmpDir, used)
 			}
 		}
 		if overBudget || n > allowance-used {
@@ -991,18 +992,36 @@ func (s *goSearchService) runContentBuild(vol *serviceVolumeIndex, reuseSidecar 
 	// concurrent shard assembles must not share one directory. Sequential
 	// callers could share, but a private directory is equally correct and
 	// keeps one code path. Everything under tmpDir is removed with it.
-	assemble := func(order []int) (*contentStreamedBuild, *contentIndex, error) {
+	//
+	// saveShard assembles one shard, saves it, and removes its scratch at
+	// once: the save copies the section files into the shard, so keeping the
+	// scratch until tmpDir goes would hold a second copy of every saved
+	// shard on the volume alongside the spool.
+	assemble := func(order []int) (*contentStreamedBuild, *contentIndex, string, error) {
 		shardTmp, err := os.MkdirTemp(tmpDir, "shard-*")
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, "", err
 		}
 		built, err := assembleContentIndexStreamed(sourceOf(order), shardTmp)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, shardTmp, err
 		}
 		shard := contentShardHeader(header, built)
 		shard.Sections = map[uint32][]byte{contentSectionPaths: encodeContentPaths(built.paths)}
-		return built, shard, nil
+		return built, shard, shardTmp, nil
+	}
+	saveShard := func(dir string, order []int, prefixes []string) (contentShardInfo, error) {
+		built, shard, shardTmp, err := assemble(order)
+		if shardTmp != "" {
+			defer os.RemoveAll(shardTmp)
+		}
+		if err != nil {
+			return contentShardInfo{}, err
+		}
+		if err := contentCheckDiskReserve(dir); err != nil {
+			return contentShardInfo{}, err
+		}
+		return contentSaveShard(dir, shard, contentBuildFiles(built), prefixes)
 	}
 	// save assembles and writes the sidecar: one file for a corpus within a
 	// shard, otherwise folder shards plus a manifest. Shards are assembled one
@@ -1014,7 +1033,7 @@ func (s *goSearchService) runContentBuild(vol *serviceVolumeIndex, reuseSidecar 
 			for i := range all {
 				all[i] = i
 			}
-			built, shard, err := assemble(all)
+			built, shard, _, err := assemble(all)
 			if err != nil {
 				return err
 			}
@@ -1039,14 +1058,7 @@ func (s *goSearchService) runContentBuild(vol *serviceVolumeIndex, reuseSidecar 
 		infos := make([]contentShardInfo, 0, len(groups))
 		if len(groups) == 1 || contentShardBuildConcurrency < 2 {
 			for _, g := range groups {
-				built, shard, err := assemble(g.docs)
-				if err != nil {
-					return err
-				}
-				if err := contentCheckDiskReserve(dir); err != nil {
-					return err
-				}
-				info, err := contentSaveShard(dir, shard, contentBuildFiles(built), g.prefixes)
+				info, err := saveShard(dir, g.docs, g.prefixes)
 				if err != nil {
 					return err
 				}
@@ -1067,16 +1079,9 @@ func (s *goSearchService) runContentBuild(vol *serviceVolumeIndex, reuseSidecar 
 					defer wg.Done()
 					sem <- struct{}{}
 					defer func() { <-sem }()
-					built, shard, err := assemble(groups[gi].docs)
+					info, err := saveShard(dir, groups[gi].docs, groups[gi].prefixes)
 					if err == nil {
-						err = contentCheckDiskReserve(dir)
-					}
-					if err == nil {
-						var info contentShardInfo
-						info, err = contentSaveShard(dir, shard, contentBuildFiles(built), groups[gi].prefixes)
-						if err == nil {
-							par[gi] = info
-						}
+						par[gi] = info
 					}
 					if err != nil {
 						mu.Lock()

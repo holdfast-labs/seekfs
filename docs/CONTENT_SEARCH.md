@@ -159,10 +159,14 @@ everything selected, and selection stops only when the projected index would
 push the volume holding the sidecar below a free-space reserve — 5% of the
 volume's capacity, clamped to [10 GiB, 20 GiB] (see `contentScopeReserveFor`
 in `content_space.go`). Sharding bounds build and fold memory per 64 MiB shard,
-so the budget is really disk space. The projection scales extracted bytes by
-`contentScopeEncodedMultiplier` (0.5, calibrated against the compact
-encoding at ~0.33 of extracted text); the encode-time size-cap check stays
-the backstop. Corpora past the shard target build as folder shards, each
+so the budget is really disk space. Selection budgets the build's peak, not
+just its output: the text spool (1× extracted) lives next to the sidecar until
+the last shard is saved, so the projection scales extracted bytes by
+`contentScopePeakMultiplier` (1.5 = spool + `contentScopeEncodedMultiplier`,
+0.5, calibrated against the compact encoding at ~0.33 of extracted text),
+plus in-flight shard scratch, and credits the bytes already spooled when it
+refreshes mid-build. Each shard's scratch is removed as soon as the shard is
+saved. The encode-time size-cap check stays the backstop. Corpora past the shard target build as folder shards, each
 individually capped at the 4 GiB per-file sidecar cap (an over-cap shard
 refuses to publish, like a single-file over-cap build), which is why totals
 past 4 GiB are safe. A volume already at or below its reserve selects nothing
@@ -1133,8 +1137,8 @@ No stored-text change was needed and none is proposed.
 
 **Budget policy (done, with the reserve code in `content_space.go`).**
 There is no default byte budget: the default scope indexes everything
-selected and stops only when the projected index (extracted × 0.5) would
-breach the volume's free-space reserve — 5% of capacity in [10 GiB, 20 GiB],
+selected and stops only when the build's projected peak (extracted × 1.5:
+spool plus index, see §6t) would breach the volume's free-space reserve — 5% of capacity in [10 GiB, 20 GiB],
 monotonic (it never grows as free space shrinks) and shared by selection and
 the write-time guard, with no fail-open (allowance 0 at or below the
 reserve; unknown free space leaves selection unlimited with the write guard
@@ -1294,6 +1298,28 @@ Tests: `content_scope_reconcile_test.go` (contract/expand/flood/drift/phases),
 stays stale, pre-v6 rebuilds, mid-loop wrap), `content_scope_scan_test.go`
 (flat + drive-root differentials, unfilled-cap regression), and the updated
 `below-lowest-valid` attach branch (ready + usable, journal never re-read).
+
+## 6t. Reserve budgets the build peak (done)
+
+The first auto-scope build of the real E: index (1.46M records, ~29 GB free
+against the 20 GiB reserve) extracted 656k files and then failed while
+assembling: `content index stopped: only 20.0 GB free on E: (keeping 20.0 GB
+free)`. Selection had budgeted only the finished index (extracted × 0.5), but
+at the build's peak the volume also holds the whole text spool (1×) and,
+until the build ended, every assembled shard's private scratch (its text,
+term and gram section files, which the save copies into the shard). Peak use
+was therefore ~1.7× extracted, not 0.5×. The mid-build allowance refresh also
+read current free space, which already had the spool subtracted, so it
+charged spooled bytes twice and stopped at an inconsistent point.
+
+Fix: the allowance is now `(free + spooled − reserve − shard scratch) /
+contentScopePeakMultiplier` (1.5 = spool + output), where shard scratch is
+`contentShardBuildConcurrency × contentShardTargetBytes`; `--estimate` uses
+the same rule with nothing spooled; and each shard's scratch is removed as
+soon as it is saved, so scratch never exceeds the in-flight shards. The
+write-time guard and its monotonic reserve are unchanged. Covered by
+`TestContentScopeReserve` (peak allowance, spool credit, fits/allowance
+agreement).
 
 ## 7. Carried debt / known gaps
 
