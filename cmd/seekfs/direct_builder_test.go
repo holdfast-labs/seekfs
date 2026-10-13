@@ -178,6 +178,87 @@ func TestDirectRankFamiliesMatchComparator(t *testing.T) {
 	}
 }
 
+// Rank sections persist the order alone; the rank-by-id vector is rebuilt
+// at load as its exact inverse. Both on-disk forms decode identically.
+func TestDecodeRankSectionCompactAndLegacy(t *testing.T) {
+	order := []uint32{3, 1, 0, 2}
+	legacy := encodeUint32Section(order, []uint32{2, 1, 3, 0})
+	compact := encodeUint32Section(order)
+	gotOrder, gotRank := decodeRankSection(legacy, 4)
+	if !equalUint32s(gotOrder, order) || !equalUint32s(gotRank, []uint32{2, 1, 3, 0}) {
+		t.Fatalf("legacy decode = %v/%v", gotOrder, gotRank)
+	}
+	gotOrder, gotRank = decodeRankSection(compact, 4)
+	if !equalUint32s(gotOrder, order) || !equalUint32s(gotRank, []uint32{2, 1, 3, 0}) {
+		t.Fatalf("compact decode = %v/%v; want order %v with inverted rank", gotOrder, gotRank, order)
+	}
+	// Compact form is one part (4 + 4/live entries), not two.
+	if parts := directTestUint32Parts(t, compact); len(parts) != 1 {
+		t.Fatalf("compact section has %d parts; want 1", len(parts))
+	}
+	// Corrupt sections yield nils, never a panic or a wrong rank.
+	if o, r := decodeRankSection([]byte{9, 0, 0, 0, 1, 2, 3}, 4); o != nil || r != nil {
+		t.Fatal("truncated section must decode to nils")
+	}
+	badOrder := append([]uint32(nil), order...)
+	badOrder[0] = 99
+	if o, r := decodeRankSection(encodeUint32Section(badOrder), 4); o != nil || r != nil {
+		t.Fatal("out-of-range order value must decode to nils")
+	}
+	// Deleted records keep rank 0: the order covers only live IDs.
+	gotOrder, gotRank = decodeRankSection(encodeUint32Section([]uint32{2, 0}), 3)
+	if !equalUint32s(gotOrder, []uint32{2, 0}) || !equalUint32s(gotRank, []uint32{1, 0, 0}) {
+		t.Fatalf("sparse decode = %v/%v; want [2 0]/[1 0 0]", gotOrder, gotRank)
+	}
+}
+
+// The direct builder writes order-only rank sections while the loaded index
+// still exposes both arrays with the exact inverse relationship.
+func TestDirectRankSectionsPersistOrderOnly(t *testing.T) {
+	records := []directRecord{
+		{FRN: 40, Name: "zeta.TXT", Path: `X:\zeta.TXT`, Size: 0, ModUnix: 0},
+		{FRN: 10, Name: "dir", Path: `X:\dir`, Mode: uint32(os.ModeDir), Size: 0, ModUnix: 20},
+		{FRN: 30, Name: "a.go", Path: `X:\dir\a.go`, Size: 5, ModUnix: 10},
+		{FRN: 20, Name: ".profile", Path: `X:\.profile`, Size: 2, ModUnix: 30},
+	}
+	dir := t.TempDir()
+	out := filepath.Join(dir, "ranks-compact.gsi")
+	if _, err := buildDirect(context.Background(), directBuildOptions{OutputPath: out, SpoolDir: filepath.Join(dir, "spool"), Records: newDirectSliceSource(records), RunRecords: 2, RunBytes: 4096}); err != nil {
+		t.Fatal(err)
+	}
+	for _, tag := range []uint32{indexSectionRANK, indexSectionSRNK, indexSectionMRNK, indexSectionERNK, indexSectionTRNK, indexSectionPRNK} {
+		data := directTestSectionData(t, out, tag)
+		parts := directTestUint32Parts(t, data)
+		if len(parts) != 1 || len(parts[0]) != len(records) {
+			t.Fatalf("section %08x has %d parts x %d entries; want 1 x %d", tag, len(parts), len(parts[0]), len(records))
+		}
+	}
+	idx, err := loadIndexMMap(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = idx.MMapRecords.file.close() })
+	for _, tc := range []struct {
+		name  string
+		order []uint32
+		rank  []uint32
+	}{
+		{"RANK", idx.Derived.NameOrder, idx.Derived.NameRank},
+		{"SRNK", idx.Derived.SizeOrder, idx.Derived.SizeRank},
+		{"MRNK", idx.Derived.ModOrder, idx.Derived.ModRank},
+		{"ERNK", idx.Derived.ExtOrder, idx.Derived.ExtRank},
+		{"TRNK", idx.Derived.TypeOrder, idx.Derived.TypeRank},
+		{"PRNK", idx.Derived.PathOrder, idx.Derived.PathRank},
+	} {
+		if len(tc.order) != len(records) || len(tc.rank) != len(records) {
+			t.Fatalf("%s resident lengths=%d/%d want=%d", tc.name, len(tc.order), len(tc.rank), len(records))
+		}
+		if !equalUint32s(tc.rank, invertRankOrder(tc.order, len(records))) {
+			t.Fatalf("%s resident rank is not the inverse of the order", tc.name)
+		}
+	}
+}
+
 func TestDirectRankWorkerCountsPreserveOutput(t *testing.T) {
 	records := make([]directRecord, 0, 256)
 	for i := 0; i < 256; i++ {

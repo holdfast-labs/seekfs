@@ -908,7 +908,11 @@ func forEachDerivedSection(idx *Index, nameTokens []string, emit func(indexSecti
 	}
 	vol.queryIndex.nameOrder, vol.queryIndex.nameRank = nameOrder, nameRank
 	persistTrace("name-rank-ready")
-	if err := emitSection(indexSectionRANK, encodeUint32Section(nameOrder, nameRank)); err != nil {
+	// Rank sections persist the order alone; the rank-by-id vector is the
+	// exact inverse and is rebuilt at load (see decodeRankSection), halving
+	// the six rank sections. The in-memory rank stays live for the posting
+	// bounds built below.
+	if err := emitSection(indexSectionRANK, encodeUint32Section(nameOrder)); err != nil {
 		return err
 	}
 	vol.queryIndex.nameOrder = nil
@@ -931,7 +935,7 @@ func forEachDerivedSection(idx *Index, nameTokens []string, emit func(indexSecti
 		vol.queryIndex.sizeOrder, vol.queryIndex.sizeRank = order, rank
 		sizeRank = rank
 		persistTrace("size-rank-ready")
-		if err := emitSection(indexSectionSRNK, encodeUint32Section(order, rank)); err != nil {
+		if err := emitSection(indexSectionSRNK, encodeUint32Section(order)); err != nil {
 			return err
 		}
 		vol.queryIndex.sizeOrder = nil
@@ -945,7 +949,7 @@ func forEachDerivedSection(idx *Index, nameTokens []string, emit func(indexSecti
 		vol.queryIndex.modOrder, vol.queryIndex.modRank = order, rank
 		modRank = rank
 		persistTrace("modified-rank-ready")
-		if err := emitSection(indexSectionMRNK, encodeUint32Section(order, rank)); err != nil {
+		if err := emitSection(indexSectionMRNK, encodeUint32Section(order)); err != nil {
 			return err
 		}
 		vol.queryIndex.modOrder = nil
@@ -959,7 +963,7 @@ func forEachDerivedSection(idx *Index, nameTokens []string, emit func(indexSecti
 		vol.queryIndex.extOrder, vol.queryIndex.extRank = order, rank
 		extRank = rank
 		persistTrace("extension-rank-ready")
-		if err := emitSection(indexSectionERNK, encodeUint32Section(order, rank)); err != nil {
+		if err := emitSection(indexSectionERNK, encodeUint32Section(order)); err != nil {
 			return err
 		}
 		vol.queryIndex.extOrder = nil
@@ -972,7 +976,7 @@ func forEachDerivedSection(idx *Index, nameTokens []string, emit func(indexSecti
 		vol.queryIndex.typeOrder, vol.queryIndex.typeRank = order, rank
 		typeRank = rank
 		persistTrace("type-rank-ready")
-		if err := emitSection(indexSectionTRNK, encodeUint32Section(order, rank)); err != nil {
+		if err := emitSection(indexSectionTRNK, encodeUint32Section(order)); err != nil {
 			return err
 		}
 		vol.queryIndex.typeOrder = nil
@@ -985,7 +989,7 @@ func forEachDerivedSection(idx *Index, nameTokens []string, emit func(indexSecti
 		vol.queryIndex.pathOrder, vol.queryIndex.pathRank = order, rank
 		pathRank = rank
 		persistTrace("path-rank-ready")
-		if err := emitSection(indexSectionPRNK, encodeUint32Section(order, rank)); err != nil {
+		if err := emitSection(indexSectionPRNK, encodeUint32Section(order)); err != nil {
 			return err
 		}
 		vol.queryIndex.pathOrder = nil

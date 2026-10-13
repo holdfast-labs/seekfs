@@ -207,35 +207,17 @@ func decodeDerivedSection(out *indexDerivedSections, tag uint32, section []byte,
 	}
 	switch tag {
 	case indexSectionRANK:
-		parts := decodeUint32Section(section, 2)
-		if len(parts) == 2 {
-			out.NameOrder, out.NameRank = parts[0], parts[1]
-		}
+		out.NameOrder, out.NameRank = decodeRankSection(section, recordCount)
 	case indexSectionSRNK:
-		parts := decodeUint32Section(section, 2)
-		if len(parts) == 2 {
-			out.SizeOrder, out.SizeRank = parts[0], parts[1]
-		}
+		out.SizeOrder, out.SizeRank = decodeRankSection(section, recordCount)
 	case indexSectionMRNK:
-		parts := decodeUint32Section(section, 2)
-		if len(parts) == 2 {
-			out.ModOrder, out.ModRank = parts[0], parts[1]
-		}
+		out.ModOrder, out.ModRank = decodeRankSection(section, recordCount)
 	case indexSectionERNK:
-		parts := decodeUint32Section(section, 2)
-		if len(parts) == 2 {
-			out.ExtOrder, out.ExtRank = parts[0], parts[1]
-		}
+		out.ExtOrder, out.ExtRank = decodeRankSection(section, recordCount)
 	case indexSectionTRNK:
-		parts := decodeUint32Section(section, 2)
-		if len(parts) == 2 {
-			out.TypeOrder, out.TypeRank = parts[0], parts[1]
-		}
+		out.TypeOrder, out.TypeRank = decodeRankSection(section, recordCount)
 	case indexSectionPRNK:
-		parts := decodeUint32Section(section, 2)
-		if len(parts) == 2 {
-			out.PathOrder, out.PathRank = parts[0], parts[1]
-		}
+		out.PathOrder, out.PathRank = decodeRankSection(section, recordCount)
 	case indexSectionCHLD:
 		parts := decodeUint32Section(section, 3)
 		if len(parts) == 3 {
@@ -299,6 +281,48 @@ func finalizeDerivedSections(out *indexDerivedSections) {
 			out.Postings[tag] = posting
 		}
 	}
+}
+
+// decodeRankSection decodes one rank-family section in either on-disk form:
+// the historical 2-part (order, rank) layout, or the compact 1-part layout
+// carrying the order alone, with the rank rebuilt as its exact inverse (see
+// invertRankOrder). Writers emit the compact form, halving the six rank
+// sections; the 2-part form stays readable so older indexes load without a
+// rebuild. A corrupt section yields nils, exactly like a 2-part section
+// that fails its framing check today.
+func decodeRankSection(data []byte, recordCount int) (order, rank []uint32) {
+	if parts := decodeUint32Section(data, 2); len(parts) == 2 {
+		return parts[0], parts[1]
+	}
+	parts := decodeUint32Section(data, 1)
+	if len(parts) != 1 {
+		return nil, nil
+	}
+	rank = invertRankOrder(parts[0], recordCount)
+	if rank == nil {
+		return nil, nil
+	}
+	return parts[0], rank
+}
+
+// invertRankOrder rebuilds the rank-by-id vector as the exact inverse of an
+// order vector: order holds live record IDs in rank order, so rank[id] is
+// id's position, and records absent from the order (deleted) keep rank 0 —
+// bit-identical to the rank array the builders used to persist. recordCount
+// sizes the output; a value out of range yields nil instead of an
+// out-of-bounds index.
+func invertRankOrder(order []uint32, recordCount int) []uint32 {
+	if recordCount < 0 || len(order) > recordCount {
+		return nil
+	}
+	rank := make([]uint32, recordCount)
+	for pos, id := range order {
+		if id >= uint32(recordCount) {
+			return nil
+		}
+		rank[id] = uint32(pos)
+	}
+	return rank
 }
 
 func decodeUint32Section(data []byte, parts int) [][]uint32 {
