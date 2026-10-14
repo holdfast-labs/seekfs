@@ -94,13 +94,41 @@ Coverage and size (top priority: small index, content search everywhere):
    ripgrep on 10 terms (only documented extractor-limit diffs). Every
    decision is tallied (CXIS → `loaded --json` `inclusion`, `--estimate`,
    build lines).
-4. **Freshness:** edits go through the USN delta, drain and fold queue, which
-   adds seconds of lag. Read changed or dirty files directly at query time.
-5. **Footprint:** the service uses about 500 MB resident on E: (1.46M names)
-   and about 3.1 GB for 23.7M entries. Loading took about 40 s for 1.46M
-   entries.
-6. **Lazy first use:** an unindexed folder has no content search until the
-   budgeted build reaches it. Index on demand, folder first.
+4. **Freshness:** name side mostly done (`perf/freshness-footprint`).
+   The USN wake is event-driven (blocking journal read, ~0 idle CPU);
+   the overlay now publishes before the WAL fsync, so    fsync latency is
+   off the visibility path (durability unchanged — crash replays from
+   the journal). Walk volumes: debounce 250 ms → 50 ms for name
+   changes; write-only batches rebuild on a 500 ms coalescing debounce
+   so Size/ModUnix stay fresh for filters, sorts, and the content walk
+   reconcile (200-file scratch: create 685→~100–350 ms, rename 360→82
+   ms, delete 642→59 ms, write-only edit → `size:` ~600 ms); the batch
+   classifier fails safe (any framing doubt rebuilds). A restart
+   replays only `[checkpoint, head)` and now
+   serves the mmapped base + WAL overlay while the catch-up drains
+   behind queries (1.46M copy: base load ~0.3 s, first query ~1.1 s;
+   the live 40 s catch-up block moves off the query path). Remaining:
+   edited-file direct reads at query time (content side, with
+   `content/filter-tier`) and elevated-box validation of USN
+   end-to-end latency (~15 ms target).
+5. **Footprint:** name side instrumented and partly cut
+   (`perf/freshness-footprint`, `loaded --json` `cache_bytes` /
+   `block_cache_bytes`). The idle loop now drops the decoded
+   posting-block LRU (default cap 128 MB) and per-volume query caches
+   before `FreeOSMemory` (1.46M names, content-disabled: heap 73→50 MB,
+   working set 251→201 MB → ~72 MB idle). `lowmem` vs `resident`
+   unchanged. Still open: the ~500 MB E: working set is dominated by
+   the content build (name-only chromium 556k is ~67 MB WS); further
+   content-side wins belong to `content/filter-tier`; fsearch's 21–35 MB
+   daemon remains the far bar (mmap file pages always count in WS).
+6. **Lazy first use:** name side done (`perf/freshness-footprint`). A
+   search scoped `--under` a real folder with no index loaded answers
+   from a bounded folder-first walk (100k entries / 2 s, read-only)
+   instead of erroring; counts and folder-less queries keep the
+   no-index error. No background folder index is started on the query
+   path (it would race the budgeted builder and stall the query).
+   Content-side on-demand (unindexed folder has no content search until
+   the budgeted build reaches it) stays open with `content/filter-tier`.
 
 Accuracy and ranking (fff parity):
 

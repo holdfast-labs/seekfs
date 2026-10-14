@@ -19,7 +19,7 @@ func (s *goSearchService) runStandalone() error {
 	if s.processMode == "" {
 		s.processMode = "standalone"
 	}
-	applyServiceRuntimeMemoryTuning()
+	applyServiceRuntimeMemoryTuning(s)
 	fmt.Fprintf(os.Stderr, "seekfs privileged service listening on %s\n", s.pipeName)
 	go func() {
 		defer func() {
@@ -75,10 +75,14 @@ func (s *goSearchService) loadConfiguredIndexes() error {
 	s.startBackgroundNameTrigramBuilds(volumes)
 	s.startBackgroundNameIdentityBuilds(volumes)
 	for _, vol := range volumes {
-		if vol.state == "ready" && vol.index.Compact && vol.index.Source == "usn" {
-			go s.replayVolumeLoop(vol)
-			go s.persistVolumeLoop(vol)
-		} else if vol.state == "ready" && vol.index.Source == "walk" {
+		if vol.needsBackgroundCatchUp() {
+			// The mmapped base + WAL overlay are already queryable (the
+			// swap above published them); drain the USN backlog behind
+			// serving queries instead of ahead of it.
+			go s.backgroundCatchUpVolume(vol)
+			continue
+		}
+		if vol.state == "ready" && vol.index.Source == "walk" {
 			s.startWalkWatchers(vol)
 		} else if vol.state == "stale" && vol.index != nil && vol.index.Compact && vol.index.Source == "usn" {
 			// A volume that started stale (failed startup rebuild, journal
@@ -87,8 +91,6 @@ func (s *goSearchService) loadConfiguredIndexes() error {
 			// backoff until it recovers.
 			go s.staleRecoveryLoop(vol)
 		}
-	}
-	for _, vol := range volumes {
 		s.featuresVolumeReady(vol)
 	}
 	go s.replayStallWatchdog()
@@ -168,18 +170,11 @@ func loadConfiguredVolume(dbPath string) (*Index, *serviceVolumeIndex, error) {
 			}
 		}
 	}
-	if err := catchUpServiceVolume(vol); err != nil {
-		serviceLog("startup catch-up skipped volume=%s db=%s err=%v", vol.volume, vol.dbPath, err)
-		if shouldRebuildStaleIndex(err) {
-			if rebuilt, rebuildErr := rebuildServiceVolumeIndex(vol); rebuildErr == nil {
-				serviceLog("startup stale rebuild complete volume=%s db=%s entries=%d", rebuilt.volume, rebuilt.dbPath, rebuilt.index.entryCount())
-				vol = rebuilt
-				idx = rebuilt.index
-			} else {
-				serviceLog("startup stale rebuild failed volume=%s db=%s err=%v", vol.volume, vol.dbPath, rebuildErr)
-			}
-		}
-	}
+	// USN catch-up deliberately runs after the base index is already
+	// serving queries (backgroundCatchUpVolume): replaying only what
+	// changed since the checkpoint can still take tens of seconds on a
+	// busy volume, and blocking the swap on it leaves every query (and
+	// the time-to-first-query) waiting behind the backlog.
 	if serviceLowMemoryMode() && idx.Compact && idx.MMapRecords == nil {
 		if mmapIdx, mmapErr := loadIndexMMap(dbPath); mmapErr == nil {
 			idx = mmapIdx
@@ -581,6 +576,46 @@ func (p frnIndexPairs) Swap(i, j int) {
 	p.ids[i], p.ids[j] = p.ids[j], p.ids[i]
 }
 
+// needsBackgroundCatchUp reports whether the volume must drain the USN
+// journal forward from its checkpoint after startup. It mirrors the guard
+// inside catchUpServiceVolume: only compact USN volumes with a volume name
+// can replay. When true, loadConfiguredIndexes publishes the mmapped base +
+// WAL overlay for queries first and catch-up runs behind serving.
+func (vol *serviceVolumeIndex) needsBackgroundCatchUp() bool {
+	return vol != nil && vol.index != nil && vol.index.Compact && vol.index.Source == "usn" && vol.volume != ""
+}
+
+// backgroundCatchUpVolume drains the USN backlog for one volume after its
+// base index is already serving queries, then starts the same loops (or the
+// stale-recovery loop) and content attach the synchronous startup path used
+// to start. Queries served during the drain see the base + WAL overlay and
+// every batch publishes as it applies, so results converge on the live
+// journal instead of waiting behind it.
+func (s *goSearchService) backgroundCatchUpVolume(vol *serviceVolumeIndex) {
+	start := time.Now()
+	fromCheckpoint := vol.checkpoint
+	vol.state = "replaying"
+	if err := catchUpServiceVolume(vol); err != nil {
+		serviceLog("startup catch-up skipped volume=%s db=%s err=%v", vol.volume, vol.dbPath, err)
+		if shouldRebuildStaleIndex(err) {
+			if rebuildErr := s.rebuildVolumeInPlace(vol); rebuildErr == nil {
+				serviceLog("startup stale rebuild complete volume=%s db=%s entries=%d", vol.volume, vol.dbPath, vol.index.entryCount())
+			} else {
+				serviceLog("startup stale rebuild failed volume=%s db=%s err=%v", vol.volume, vol.dbPath, rebuildErr)
+			}
+		}
+	}
+	s.featuresVolumeReady(vol)
+	if vol.state == "ready" && vol.index.Compact && vol.index.Source == "usn" {
+		go s.replayVolumeLoop(vol)
+		go s.persistVolumeLoop(vol)
+	} else if vol.state == "stale" && vol.index != nil && vol.index.Compact && vol.index.Source == "usn" {
+		go s.staleRecoveryLoop(vol)
+	}
+	serviceLog("catch-up complete volume=%s db=%s replayed_usn=%d elapsed=%s state=%s",
+		vol.volume, vol.dbPath, vol.checkpoint-fromCheckpoint, time.Since(start).Round(time.Millisecond), vol.state)
+}
+
 func catchUpServiceVolume(vol *serviceVolumeIndex) error {
 	if vol.index == nil || !vol.index.Compact || vol.index.Source != "usn" || vol.volume == "" {
 		return nil
@@ -622,16 +657,19 @@ func catchUpServiceVolume(vol *serviceVolumeIndex) error {
 		}
 		// seekfs's own artifact churn is dropped before the WAL and the overlay
 		// so the checkpoint can advance past it (nextUSN below) without either
-		// growing from records that are never indexed.
+		// growing from records that are never indexed. The overlay publishes
+		// before the WAL fsync (same visibility-before-durability order as
+		// the live replay path); a crash before the WAL lands replays the
+		// same range from the journal.
 		changes = vol.filterOwnedReplayChanges(changes)
+		vol.applyUSNChanges(changes)
+		vol.checkpoint = nextUSN
+		vol.index.Checkpoint = nextUSN
 		if err := appendWAL(vol.dbPath, nextUSN, changes); err != nil {
 			vol.state = "stale"
 			vol.staleReason = err.Error()
 			return err
 		}
-		vol.applyUSNChanges(changes)
-		vol.checkpoint = nextUSN
-		vol.index.Checkpoint = nextUSN
 	}
 	if vol.dbPath != "" {
 		vol.dirty = true
@@ -1008,12 +1046,11 @@ func (s *goSearchService) replayVolumeOnce(vol *serviceVolumeIndex, buffer []byt
 		// the checkpoint must still cover the truncated tail (see above), while
 		// seekfs's own artifact churn must not reach the WAL or the overlay.
 		changes = vol.filterOwnedReplayChanges(changes)
-		if err := appendWAL(vol.dbPath, appliedCheckpoint, changes); err != nil {
-			vol.state = "stale"
-			vol.staleReason = err.Error()
-			vol.mu.Unlock()
-			return applied, err
-		}
+		// Publish before the WAL fsync: queries see the change as soon as
+		// the overlay snapshot lands, without waiting for the disk sync.
+		// Durability is preserved — the on-disk checkpoint only advances on
+		// fold, so a crash before the WAL lands replays the same USN range
+		// from the journal instead of losing it.
 		vol.applyUSNChanges(changes)
 		vol.checkpoint = appliedCheckpoint
 		vol.index.Checkpoint = appliedCheckpoint
@@ -1026,6 +1063,12 @@ func (s *goSearchService) replayVolumeOnce(vol *serviceVolumeIndex, buffer []byt
 		vol.stallObservedCp = 0
 		vol.stallObservedAt = time.Time{}
 		vol.dirty = true
+		if err := appendWAL(vol.dbPath, appliedCheckpoint, changes); err != nil {
+			vol.state = "stale"
+			vol.staleReason = err.Error()
+			vol.mu.Unlock()
+			return applied, err
+		}
 		vol.mu.Unlock()
 		applied = true
 		fromUSN = appliedCheckpoint

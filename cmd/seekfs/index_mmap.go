@@ -533,6 +533,25 @@ func (c *postingBlockLRU) maxBytes() int64 {
 	return c.limit
 }
 
+// clear drops every decoded posting block. Decodes are pure functions of
+// the mmapped sections, so the next query re-decodes on demand; the idle
+// memory release calls this to return the (up to 128 MiB default) heap
+// cache to the OS without changing any result.
+func (c *postingBlockLRU) clear() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.items = nil
+	c.ll.Init()
+	c.bytes = 0
+}
+
+// liveBytes reports the heap bytes currently held by cached blocks.
+func (c *postingBlockLRU) liveBytes() int64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.bytes
+}
+
 func (c *postingBlockLRU) get(key postingBlockCacheKey) ([]uint32, bool) {
 	maxBytes := c.maxBytes()
 	if maxBytes <= 0 {

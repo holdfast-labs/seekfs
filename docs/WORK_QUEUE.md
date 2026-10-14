@@ -14,7 +14,10 @@ refer to `docs/REFERENCE_TOOLS.md`.
 
 Merged so far this round: `perf/content-underfill`, `perf/name-fuzzy`,
 `fix/cli-silent-empty`, `content/idle-governor`, `content/spool-peak`, `perf/ranking-signals` (G7, G8, G13), `content/inclusion-policy` (G3, §6z,
-format v10), `perf/name-lessons` (G11: `'exact ^prefix suffix$`, `**`/brace globs,
+format v10), `perf/freshness-footprint` (G4/G5/G6 name side: walk changes visible in
+about 0.3 s, meta in about 0.6 s, restart serves in about 0.3 s, idle memory
+about 72 MB for 1.46M names, `--under` folder-first search),
+`perf/name-lessons` (G11: `'exact ^prefix suffix$`, `**`/brace globs,
 `in:`, accent folding for names, `--current`, regex letter masks),
 `test/suite-speed` (default suite ~3–5 min; soak tier
 `SEEKFS_TEST_SOAK=1` in CI), `fix/short-term-postings` (direct-index LOWR writer
@@ -24,7 +27,6 @@ corruption, exact required sources, auto-fuzzy only on zero exact hits).
 |---|---|---|
 | `perf/static-ranking` | staticrank | Queued item 0b: static ranker (no usage) right-file-first above 39% top-1, on two labeled sets; sets and counts unchanged (G13) |
 | `integ/filter-tier-merge` | tiermerge | Merging `content/filter-tier` (no stored text by default) with inclusion v10 + spool-peak; one format v11; dedupe under no-stored-text; re-measure; list regressions |
-| `perf/freshness-footprint` | footprint | Name-side change visibility (fsearch ~15 ms), restart/load time (~40 s for 1.46M), resident memory (~500 MB), idle release, on-demand folder-first indexing (G4, G5, G6) |
 | `feat/ui-input-and-user-signals` | uiinput | seekfs-ui reports user-session input time to the service (governor input signal); per-user ranking store keyed by caller SID |
 
 ## Queued, in order
@@ -66,6 +68,9 @@ corruption, exact required sources, auto-fuzzy only on zero exact hits).
   coverage on dense corpora for roughly +4 s of serial encode (§6x).
 - **JSON-lines stdio mode (G12):** optional and low priority. **No MCP
   server**: the owner ruled it out on 2026-10-13.
+- **Live restart validation:** the deferred USN catch-up (restart serves in
+  about 0.3 s) was measured on a copy. Validate it on the live E: service at
+  the next relaunch (elevated), since the live load used to take about 40 s.
 - **Content accent folding:** names fold accents (`resume` → `résumé`), but
   content matching is still case-folded only. Folding content needs an
   index-format change; fold it into the next format bump.

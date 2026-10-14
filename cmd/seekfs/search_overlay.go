@@ -633,6 +633,46 @@ func filesystemUnderFallbackSearch(opts queryOptions, countOnly bool) ([]Entry, 
 	return filesystemUnderFallbackSearchLimited(opts, countOnly, filesystemFallbackMaxVisited, filesystemFallbackMaxDuration)
 }
 
+// serviceOnDemandFolderResponse answers a search from a bounded walk of the
+// request's --under folder when the service holds no index at all (fresh
+// volume, first run). It reuses the same bounded folder-first walk the
+// single-volume path uses as a zero-hit backstop, so an unindexed folder is
+// searchable the moment it is queried while the full index builds
+// elsewhere. Only --under searches qualify (the fallback declines
+// everything else, including counts and volume roots); counts and
+// folder-less queries keep the no-index error contract.
+func serviceOnDemandFolderResponse(s *goSearchService, req *serviceRequest) (serviceResponse, bool) {
+	if s == nil || req == nil || req.CountOnly {
+		return serviceResponse{}, false
+	}
+	opts := requestToOptionsFromService(*req)
+	if opts.DeadlineUnix == 0 {
+		opts.DeadlineUnix = time.Now().Add(serviceQueryTimeout - 250*time.Millisecond).UnixNano()
+	}
+	trace := &searchTrace{}
+	opts.Trace = trace
+	start := time.Now()
+	fallback, ok, complete := filesystemUnderFallbackSearch(opts, false)
+	if !ok {
+		return serviceResponse{}, false
+	}
+	trace.setFallback("filesystem-under-fallback")
+	trace.setSource("filesystem-under-fallback", len(fallback))
+	trace.setComplete(complete)
+	searchMS := float64(time.Since(start).Nanoseconds()) / 1_000_000
+	resp := serviceResponse{OK: true, Count: len(fallback), SearchMS: searchMS, Source: trace.Source, Fallback: trace.Fallback, Complete: trace.completePtr()}
+	resp.Results = make([]string, len(fallback))
+	for i, entry := range fallback {
+		resp.Results[i] = entry.Path
+	}
+	resp.Rows = entriesToJSON(fallback)
+	if pq, perr := parseQuery(opts); perr == nil {
+		annotateJSONGitStatus(resp.Rows, fallback, pq)
+	}
+	resp.Content = s.searchContentHealth(trace)
+	return resp, true
+}
+
 func filesystemUnderFallbackSearchLimited(opts queryOptions, countOnly bool, maxVisited int, maxDuration time.Duration) ([]Entry, bool, bool) {
 	if countOnly || opts.Under == "" || isVolumeRoot(opts.Under) {
 		return nil, false, true
