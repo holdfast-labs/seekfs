@@ -24,14 +24,6 @@ format v10).
 
 ## Queued, in order
 
-0. **Correctness first: lossy short-term postings.** Short-term `planned:term:X`
-   postings are lossy when used as a required source: `go type:file` and
-   `go --exists` return too few results on any index. The ranked-posting
-   filename lane also returns rank-neighbor false positives on tiny
-   direct-walk indexes. Both bugs predate this round and were found by
-   `perf/ranking-signals`. Fix these before more features, with tests that
-   fail first. The `git:` filter on short or broad terms inherits the first
-   bug.
 1. **Grep features (G10, G9, G11).** Plain-literal grep via SIMD memmem and
    multi-pattern OR via Aho-Corasick (fff); fuzzy grep (Smith-Waterman per
    line); context lines; a per-query time budget (fff default 150 ms) with
