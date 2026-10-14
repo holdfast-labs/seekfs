@@ -187,6 +187,11 @@ type jsonResult struct {
 	IndexSource string `json:"index_source,omitempty"`
 	Snippet     string `json:"snippet,omitempty"`
 	Exists      *bool  `json:"exists,omitempty"`
+	// GitStatus is the git worktree status of the hit (modified, staged,
+	// untracked, ignored, conflict, clean, tracked). Empty when git was not
+	// resolved for the query (no git: filter and no usage signals) or the
+	// file sits outside any git worktree.
+	GitStatus string `json:"git_status,omitempty"`
 }
 
 func boolPtr(v bool) *bool {
@@ -463,13 +468,16 @@ type appConfig struct {
 }
 
 type queryOptions struct {
-	Query         string       `json:"query"`
-	MatchPath     bool         `json:"match_path"`
-	Limit         int          `json:"limit"`
-	Under         string       `json:"under,omitempty"`
-	Exists        bool         `json:"exists,omitempty"`
-	CWDBias       string       `json:"cwd_bias,omitempty"`
-	RootBias      string       `json:"root_bias,omitempty"`
+	Query     string `json:"query"`
+	MatchPath bool   `json:"match_path"`
+	Limit     int    `json:"limit"`
+	Under     string `json:"under,omitempty"`
+	Exists    bool   `json:"exists,omitempty"`
+	CWDBias   string `json:"cwd_bias,omitempty"`
+	RootBias  string `json:"root_bias,omitempty"`
+	// Near is a proximity anchor path (CLI --near / near: token): within a
+	// match-quality band, files fewer path hops away rank first.
+	Near          string       `json:"near,omitempty"`
 	Recent        string       `json:"recent,omitempty"`
 	ModifiedAfter string       `json:"modified_after,omitempty"`
 	CaseSensitive bool         `json:"case_sensitive,omitempty"`
@@ -549,11 +557,21 @@ type parsedQuery struct {
 	NotGroups         []parsedQuery
 	CWDBias           string
 	RootBias          string
-	Limit             int
-	CountOnly         bool
-	DeadlineUnix      int64
-	Cancel            func() bool
-	Trace             *searchTrace
+	// Near is the proximity anchor (normalized absolute path, "" when none).
+	Near string
+	// GitFilters holds git: filter alternatives (modified, staged,
+	// untracked, ignored, conflict, clean, tracked); a hit must satisfy at
+	// least one. Empty means no git filtering (result sets unchanged).
+	GitFilters []string
+	// gitCtx is the per-query git resolution context (stat-generation gate
+	// so each repo stats HEAD/index at most once per query). Nil for
+	// hand-built trees; lookups stay correct, only less cached.
+	gitCtx       *queryGitContext
+	Limit        int
+	CountOnly    bool
+	DeadlineUnix int64
+	Cancel       func() bool
+	Trace        *searchTrace
 	// Per-query content budgets copied from queryOptions; 0 means use default.
 	ContentCandidateBudget int
 	ContentScanVisitBudget int

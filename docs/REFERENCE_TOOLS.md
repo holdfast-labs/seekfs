@@ -94,10 +94,28 @@ Coverage and size (top priority: small index, content search everywhere):
 
 Accuracy and ranking (fff parity):
 
-7. **No usage signals:** no open/frecency tracking, no `near`, no
-   recently-used list, no query-history boost.
-8. **No git awareness:** no `git:` filter (modified, staged, untracked …), no
-   git-status boost, no recent-commit boost.
+7. **Usage signals: done (`perf/ranking-signals`).** `seekfs open <path>
+    [--query q]` records access events (the UI's Open action reports them
+    with the current query); `seekfs recent` lists recently opened files. A
+    bounded persisted frecency store (top 5000 files / 2000 queries, 30-day
+    half-life, `ranking_signals.json` next to the service state, local only)
+    plus a normalized-query → pick combo boost (≥ 3 repeats, fff's
+    threshold). `near:<path>` / `--near` ranks fewer path hops first. All
+    blend as within-band tie-breakers (see 13).
+8. **Git awareness: done (`perf/ranking-signals`).** A `git:` filter
+    (modified, staged, untracked, ignored, conflict, clean, tracked;
+    comma-OR, `!` negation) with per-hit `git_status` in `--json`. Status
+    resolves per path from `.git/index` + HEAD via go-git (already in
+    go.mod) — never a `git` spawn, never a worktree walk; per-repo cache
+    invalidated by HEAD/index/packed-refs/branch-ref stat checks (≤ 1 batch
+    per repo per query; the USN/walk feed observes the same `.git`
+    changes). Ignored uses the existing contentGitIgnore matcher. Boosts: git
+    dirt (dirty first within a band) and recent-commit files (last 10
+    commits, skipping commits touching > 50 files, small tree diffs only).
+    Approximations: dirs never report modified/staged/conflict; unreadable
+    repos resolve unknown (positive predicates fail closed); short/broad
+    terms on tiny indexes inherit the planned term posting's known underfill
+    (pre-existing, base-identical — same as `--exists` there).
 9. **No `sym:`** (definition search) and no definition-line bonus in content
    ranking.
 10. **Grep features:** no fuzzy (Smith-Waterman) grep, no multi-pattern OR
@@ -109,9 +127,13 @@ Accuracy and ranking (fff parity):
 12. **Integration:** no JSON-lines stdio mode (optional, low priority).
     **Out of scope: an MCP server.** The owner ruled it out on 2026-10-13;
     do not build one, even though fsearch and fff ship MCP tools.
-13. **Reported metrics:** we measure one-typo and two-typo top-1 on Chromium
-    (99.5% / 93.0%). Add a "right file first" metric for plain name queries,
-    matching fsearch's report.
+13. **Reported metrics: right-file-first added (`perf/ranking-signals`).**
+    One-typo / two-typo top-1 stay 99.5% / 93.0% (N=200 seed 42 / N=100 seed
+    7, chromium). New path-level metric on 100 labeled chromium targets at
+    `-n 100` (`E:\bench\scratch\ranking\rightfile.py`, scratch-only): plain
+    top-1 39.0% → 66.0% after opening half the targets (opened 20→47/50,
+    control 19→19), partial top-1 2.0% → 13.0%; typo shapes unchanged by
+    usage (fuzzy distance bands never invert). See docs/BENCHMARKS.md.
 
 Where seekfs is already ahead or equal: NTFS USN change feed and resident
 service on Windows; 100% recall against ripgrep inside indexed roots (real E:

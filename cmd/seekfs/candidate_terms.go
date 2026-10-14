@@ -40,7 +40,7 @@ func capBroadCandidates(ids []int, pq parsedQuery) []int {
 	}
 	if pq.Type != "" || len(pq.Exts) > 0 || len(pq.Globs) > 0 ||
 		len(pq.SizeFilters) > 0 || len(pq.DateFilters) > 0 || len(pq.AttrFilters) > 0 ||
-		len(pq.NotGroups) > 0 || pq.HasModAfter || pq.Exists {
+		len(pq.NotGroups) > 0 || pq.HasModAfter || pq.lateVerified() {
 		return ids
 	}
 	if len(ids) <= pq.Limit {
@@ -223,7 +223,7 @@ func (vol *serviceVolumeIndex) limitedPathTermCandidates(pq parsedQuery) ([]int,
 
 func (vol *serviceVolumeIndex) limitedDottedPathScanCandidates(pq parsedQuery) ([]int, bool) {
 	if vol == nil || vol.index == nil || !pq.MatchPath || pq.CountOnly || pq.Limit <= 0 ||
-		pq.CaseSensitive || pq.Under != "" || pq.Type != "" || pq.HasModAfter || pq.Exists ||
+		pq.CaseSensitive || pq.Under != "" || pq.Type != "" || pq.HasModAfter || pq.lateVerified() ||
 		pq.CWDBias != "" || pq.RootBias != "" ||
 		len(pq.Exts) > 0 || len(pq.Dirs) > 0 || len(pq.Globs) > 0 || len(pq.Regexps) > 0 ||
 		len(pq.SizeFilters) > 0 || len(pq.DateFilters) > 0 || len(pq.AttrFilters) > 0 ||
@@ -254,7 +254,7 @@ func (vol *serviceVolumeIndex) limitedDottedPathScanCandidates(pq parsedQuery) (
 func (vol *serviceVolumeIndex) pathDirectoryTermTopCandidates(pq parsedQuery) ([]int, bool) {
 	if vol == nil || vol.index == nil || !vol.hasDescendantIndex() ||
 		!pq.MatchPath || pq.CountOnly || pq.Limit <= 0 ||
-		pq.CaseSensitive || pq.Under != "" || pq.Type != "" || pq.HasModAfter || pq.Exists ||
+		pq.CaseSensitive || pq.Under != "" || pq.Type != "" || pq.HasModAfter || pq.lateVerified() ||
 		pq.CWDBias != "" || pq.RootBias != "" ||
 		len(pq.Exts) != 1 || len(pq.Dirs) > 0 || len(pq.Globs) > 0 || len(pq.Regexps) > 0 ||
 		len(pq.SizeFilters) > 0 || len(pq.DateFilters) > 0 || len(pq.AttrFilters) > 0 ||

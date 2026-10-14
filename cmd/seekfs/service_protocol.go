@@ -79,6 +79,9 @@ type serviceResponse struct {
 	Health                   string              `json:"health,omitempty"`
 	HealthMessage            string              `json:"health_message,omitempty"`
 	Content                  *contentHealth      `json:"content,omitempty"`
+	// Recent carries the `recent` op rows (most recently opened files, newest
+	// first). Only set on the recent command.
+	Recent []recentFileJSON `json:"recent,omitempty"`
 	// Governor reports which content-build governor signals are live in
 	// this process vs unavailable, so "no user activity" is never confused
 	// with "cannot see user activity" (notably input in session 0).

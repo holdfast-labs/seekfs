@@ -37,7 +37,7 @@ func (vol *serviceVolumeIndex) limitedSingleTermCandidates(pq parsedQuery) ([]in
 	if vol == nil || vol.index == nil || pq.CountOnly || pq.Limit <= 0 || pq.CaseSensitive ||
 		pq.Under != "" || pq.Type != "" || len(pq.Exts) > 0 || len(pq.Globs) > 0 ||
 		len(pq.Regexps) > 0 || len(pq.SizeFilters) > 0 || len(pq.DateFilters) > 0 || len(pq.AttrFilters) > 0 ||
-		len(pq.OrGroups) > 0 || len(pq.NotGroups) > 0 || pq.HasModAfter || pq.Exists ||
+		len(pq.OrGroups) > 0 || len(pq.NotGroups) > 0 || pq.HasModAfter || pq.lateVerified() ||
 		pq.CWDBias != "" || pq.RootBias != "" || pq.SortColumn != "" || pq.hiddenBlocksTruncation() {
 		return nil, false
 	}
@@ -214,7 +214,7 @@ func (vol *serviceVolumeIndex) multiNameTermCandidates(terms []string) []int {
 
 func (vol *serviceVolumeIndex) plannerCandidates(pq parsedQuery) ([]int, bool) {
 	globExts, globsOK := simpleGlobExts(pq.Globs)
-	if vol == nil || vol.index == nil || vol.queryIndex == nil || pq.CaseSensitive || pq.Under != "" || pq.Exists || pq.HasModAfter || !globsOK {
+	if vol == nil || vol.index == nil || vol.queryIndex == nil || pq.CaseSensitive || pq.Under != "" || pq.lateVerified() || pq.HasModAfter || !globsOK {
 		return nil, false
 	}
 	strong := make([][]uint32, 0, len(pq.Terms)+len(pq.Exts)+len(globExts)+2)

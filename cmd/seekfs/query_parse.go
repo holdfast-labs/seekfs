@@ -159,7 +159,18 @@ func (pq parsedQuery) isEmpty() bool {
 		len(pq.Globs) == 0 && len(pq.Regexps) == 0 && pq.Type == "" &&
 		len(pq.Parents) == 0 && pq.Under == "" && !pq.HasModAfter && len(pq.SizeFilters) == 0 &&
 		len(pq.DateFilters) == 0 && len(pq.AttrFilters) == 0 && len(pq.Content) == 0 && len(pq.Features) == 0 &&
+		len(pq.GitFilters) == 0 &&
 		len(pq.OrGroups) == 0 && len(pq.NotGroups) == 0
+}
+
+// lateVerified reports whether the query carries a predicate decidable only
+// at the materialized-entry gate: Exists stats the filesystem, and git:
+// resolves worktree status from the entry path. Rank-truncating candidate
+// lanes must decline when true (they verify at the record level and would
+// otherwise underfill the page); the full verify loop then decides exactly.
+// Near is ranking-only and never sets this.
+func (pq parsedQuery) lateVerified() bool {
+	return pq.Exists || len(pq.GitFilters) > 0
 }
 
 // applyQueryToken parses a single whitespace-delimited token and folds it into
@@ -270,6 +281,20 @@ func applyQueryToken(pq *parsedQuery, raw string) error {
 		if glob != "" {
 			pq.Globs = append(pq.Globs, normalizeCase(glob, pq.CaseSensitive))
 		}
+	case strings.HasPrefix(raw, "git:"):
+		spec := strings.TrimPrefix(raw, "git:")
+		filters, err := parseGitFilters(spec)
+		if err != nil {
+			return err
+		}
+		pq.GitFilters = append(pq.GitFilters, filters...)
+	case strings.HasPrefix(raw, "near:"):
+		anchor := strings.TrimSpace(strings.TrimPrefix(raw, "near:"))
+		if anchor != "" {
+			// A near: anchor uses the same normalization as --under and the
+			// bias roots, so query and flag forms compare identically.
+			pq.Near = normalizeFilterPath(anchor)
+		}
 	case strings.HasPrefix(raw, "regex:"):
 		pat := strings.TrimPrefix(raw, "regex:")
 		if pat == "" {
@@ -335,7 +360,7 @@ func applyQueryToken(pq *parsedQuery, raw string) error {
 		}
 		return nil
 	case isUnknownFilterToken(raw):
-		return fmt.Errorf("unsupported filter %q; supported: path: parent: ext: dir: glob: regex: type: case: size: dm: attrib: content: (needs SEEKFS_CONTENT_SEARCH=1) sort:size sort:modified sort:extension sort:type sort:path (and !term, a|b)", raw)
+		return fmt.Errorf("unsupported filter %q; supported: path: parent: ext: dir: glob: regex: type: case: size: dm: attrib: git: near: content: (needs SEEKFS_CONTENT_SEARCH=1) sort:size sort:modified sort:extension sort:type sort:path (and !term, a|b)", raw)
 	case looksLikeImplicitFilenameGlob(raw):
 		pq.Globs = append(pq.Globs, normalizeCase(raw, pq.CaseSensitive))
 	default:
@@ -378,8 +403,12 @@ func mergeSubquery(dst *parsedQuery, src parsedQuery) {
 	dst.SizeFilters = append(dst.SizeFilters, src.SizeFilters...)
 	dst.DateFilters = append(dst.DateFilters, src.DateFilters...)
 	dst.AttrFilters = append(dst.AttrFilters, src.AttrFilters...)
+	dst.GitFilters = append(dst.GitFilters, src.GitFilters...)
 	dst.Content = append(dst.Content, src.Content...)
 	dst.Features = append(dst.Features, src.Features...)
+	if src.Near != "" && dst.Near == "" {
+		dst.Near = src.Near
+	}
 	if src.Type != "" {
 		dst.Type = src.Type
 	}
@@ -660,6 +689,9 @@ func entryMatchesScalar(entry Entry, pq parsedQuery, matchPath bool) bool {
 		if !df.matches(entry.ModUnix) {
 			return false
 		}
+	}
+	if !pq.gitFiltersMatch(entry) {
+		return false
 	}
 	return attrFiltersMatch(entry.Mode, pq.AttrFilters)
 }

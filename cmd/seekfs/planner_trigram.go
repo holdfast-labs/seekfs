@@ -21,7 +21,7 @@ func (vol *serviceVolumeIndex) filenameTrigramCandidates(pq parsedQuery) ([]int,
 	if vol == nil || vol.index == nil || (trigrams == nil && vol.index.Derived.SelfNameTrigrams == nil) || pq.CaseSensitive ||
 		pq.MatchPath || pq.Under != "" || pq.Type != "" ||
 		len(pq.Dirs) > 0 || len(pq.Regexps) > 0 ||
-		len(pq.OrGroups) > 0 || len(pq.NotGroups) > 0 || pq.HasModAfter || pq.Exists ||
+		len(pq.OrGroups) > 0 || len(pq.NotGroups) > 0 || pq.HasModAfter || pq.lateVerified() ||
 		pq.CWDBias != "" || pq.RootBias != "" {
 		return nil, false
 	}
@@ -212,7 +212,7 @@ func (vol *serviceVolumeIndex) componentTrigramCandidates(pq parsedQuery) ([]int
 	}
 	if pq.CaseSensitive || !pq.MatchPath || len(pq.Terms) == 0 || pq.Under != "" || pq.Type != "" ||
 		len(pq.Exts) > 0 || len(pq.Globs) > 0 || len(pq.Dirs) > 0 || len(pq.Regexps) > 0 ||
-		len(pq.OrGroups) > 0 || len(pq.NotGroups) > 0 || pq.HasModAfter || pq.Exists ||
+		len(pq.OrGroups) > 0 || len(pq.NotGroups) > 0 || pq.HasModAfter || pq.lateVerified() ||
 		pq.CWDBias != "" || pq.RootBias != "" {
 		pq.Trace.setDecline("component-trigram:unsupported-query")
 		return nil, false
@@ -290,7 +290,7 @@ func (vol *serviceVolumeIndex) nameTrigramPathNameTopCandidates(pq parsedQuery) 
 		!pq.MatchPath || pq.CountOnly || pq.Limit <= 0 || len(pq.Terms) == 0 ||
 		pq.Under != "" || pq.Type != "" || len(pq.Exts) > 0 || len(pq.Globs) > 0 ||
 		len(pq.Dirs) > 0 || len(pq.Regexps) > 0 || len(pq.OrGroups) > 0 ||
-		len(pq.NotGroups) > 0 || pq.HasModAfter || pq.Exists ||
+		len(pq.NotGroups) > 0 || pq.HasModAfter || pq.lateVerified() ||
 		pq.CWDBias != "" || pq.RootBias != "" || countNonVolumeTerms(pq.Terms) != 1 || pq.hiddenBlocksTruncation() {
 		pq.Trace.replaceDecline("path-name-trigram-top:unsupported-query")
 		return nil, false

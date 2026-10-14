@@ -12,17 +12,31 @@ refer to `docs/REFERENCE_TOOLS.md`.
 ## Running (2026-10-13)
 
 Merged so far this round: `perf/content-underfill`, `perf/name-fuzzy`,
-`fix/cli-silent-empty`, `content/idle-governor`, `content/spool-peak`.
+`fix/cli-silent-empty`, `content/idle-governor`, `content/spool-peak`, `perf/ranking-signals` (G7, G8, G13).
 
 | Branch | Worktree | Scope |
 |---|---|---|
 | `test/suite-speed` | suitespeed | `cmd/seekfs` suite under ~5 min; harden `TestHeadlessFrameCost`; gofmt drift |
 | `content/filter-tier` | tier2 | **Owner decision 2026-10-13: fsearch model is the default.** No stored text; trigram postings plus a per-file filter; matches and snippets verified from disk; edited files read directly. Stored text only as a justified opt-in (G1, G4 partial, §6y) |
 | `content/inclusion-policy` | inclusion | Queued item 1: main-checkout-only worktrees, lower caps, lockfile/JSON/minified/cache skips, user skip list, content-hash dedupe (G3, §6z) |
-| `perf/ranking-signals` | ranking | Queued item 1: open/frecency/recent, query-history boost, `git:` filter + status/commit boosts, `near:`, right-file-first metric (G7, G8, G13) |
 
 ## Queued, in order
 
+0. **Correctness first: lossy short-term postings.** Short-term `planned:term:X`
+   postings are lossy when used as a required source: `go type:file` and
+   `go --exists` return too few results on any index. The ranked-posting
+   filename lane also returns rank-neighbor false positives on tiny
+   direct-walk indexes. Both bugs predate this round and were found by
+   `perf/ranking-signals`. Fix these before more features, with tests that
+   fail first. The `git:` filter on short or broad terms inherits the first
+   bug.
+0b. **Static ranking accuracy (G13).** With no usage history, plain-name
+   right-file-first top-1 is only 39% (partial-name 2%) on 100 labeled
+   Chromium targets (`E:/bench/scratch/ranking/rightfile.py`). fsearch
+   reports 93–97% for names (different metric). Improve the static ranker:
+   exact basename first, shallower or shorter paths, source over generated
+   files, test/vendor demotion, and so on. Typo top-1 (99.5% / 93.0%) must
+   not regress.
 1. **Grep features (G10, G9, G11).** Plain-literal grep via SIMD memmem and
    multi-pattern OR via Aho-Corasick (fff); fuzzy grep (Smith-Waterman per
    line); context lines; a per-query time budget (fff default 150 ms) with
@@ -71,6 +85,9 @@ Merged so far this round: `perf/content-underfill`, `perf/name-fuzzy`,
   coverage on dense corpora for roughly +4 s of serial encode (§6x).
 - **JSON-lines stdio mode (G12):** optional and low priority. **No MCP
   server**: the owner ruled it out on 2026-10-13.
+- **Ranking store scope:** `ranking_signals.json` lives next to the service
+  state (the LocalSystem service holds one store for all local users). Decide
+  whether it should be per-user before shipping on multi-user machines.
 - **Slow differential test:** `TestContentGlobalLaneScopeDifferential` takes
   300–666 s. `test/suite-speed` tiers it; confirm CI still runs the full tier.
 

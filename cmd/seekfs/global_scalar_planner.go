@@ -196,7 +196,7 @@ func firstModifiedBoundary(order []uint32, idx *Index, bound time.Time, strict b
 func scalarRangeForVolume(vol *serviceVolumeIndex, pq parsedQuery) (scalarRange, bool) {
 	if vol == nil || vol.index == nil || len(pq.OrGroups) != 0 || len(pq.NotGroups) != 0 ||
 		len(pq.Terms) != 0 || len(pq.Exts) != 0 || len(pq.Dirs) != 0 || len(pq.Globs) != 0 ||
-		len(pq.Regexps) != 0 || len(pq.RegexTerms) != 0 || len(pq.Parents) != 0 || pq.Under != "" || pq.Exists {
+		len(pq.Regexps) != 0 || len(pq.RegexTerms) != 0 || len(pq.Parents) != 0 || pq.Under != "" || pq.lateVerified() {
 		return scalarRange{}, false
 	}
 	if len(pq.SizeFilters) == 1 && len(pq.DateFilters) == 0 && !pq.HasModAfter {
@@ -273,7 +273,7 @@ func globalScalarQuerySupported(pq parsedQuery) bool {
 	if queryHasAnyContentLeaf(pq) {
 		return false
 	}
-	if pq.Exists || pq.Under != "" || len(nonVolumeTerms(pq.Terms)) != 0 ||
+	if pq.lateVerified() || pq.Under != "" || len(nonVolumeTerms(pq.Terms)) != 0 ||
 		len(pq.Exts) != 0 || len(pq.Dirs) != 0 || len(pq.Globs) != 0 ||
 		len(pq.Regexps) != 0 || len(pq.RegexTerms) != 0 || len(pq.Parents) != 0 ||
 		len(pq.AttrFilters) != 0 || len(pq.OrGroups) != 0 || len(pq.NotGroups) != 0 {

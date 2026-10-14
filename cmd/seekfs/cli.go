@@ -90,6 +90,10 @@ func run(args []string) error {
 		return cmdSearch(args[1:], false)
 	case "count":
 		return cmdSearch(args[1:], true)
+	case "open":
+		return cmdOpen(args[1:])
+	case "recent":
+		return cmdRecent(args[1:])
 	case "content-index":
 		return cmdContentIndex(args[1:])
 	case "content":
@@ -125,6 +129,7 @@ func looksLikeSearchWithoutSubcommand(args []string) bool {
 			arg == "-service" || arg == "--service" || arg == "-local" || arg == "--local" ||
 			arg == "--exists" || arg == "-exists" || arg == "--cwd-bias" || arg == "-cwd-bias" ||
 			arg == "-root-bias" || arg == "--root-bias" || strings.HasPrefix(arg, "-root-bias=") || strings.HasPrefix(arg, "--root-bias=") ||
+			arg == "-near" || arg == "--near" || strings.HasPrefix(arg, "-near=") || strings.HasPrefix(arg, "--near=") ||
 			arg == "-recent" || arg == "--recent" || strings.HasPrefix(arg, "-recent=") || strings.HasPrefix(arg, "--recent=") ||
 			arg == "-modified-after" || arg == "--modified-after" || strings.HasPrefix(arg, "-modified-after=") || strings.HasPrefix(arg, "--modified-after=") ||
 			arg == "-case" || arg == "--case" {
@@ -145,6 +150,7 @@ func normalizeSearchArgs(args []string) []string {
 		"--under": true, "-db": true, "--db": true, "-n": true, "--n": true,
 		"-config": true, "--config": true, "-pipe": true, "--pipe": true,
 		"-root-bias": true, "--root-bias": true, "-recent": true, "--recent": true,
+		"-near": true, "--near": true,
 		"-modified-after": true, "--modified-after": true,
 		"-interval": true, "--interval": true,
 		"-exec": true, "--exec": true, "-exec-on": true, "--exec-on": true,
@@ -207,6 +213,8 @@ func printUsage(w io.Writer) {
   seekfs agent
   seekfs search [-db seekfs.db...] [--json] [-n 100] [-path] <query>
   seekfs count [-db seekfs.db...] [--json] [-path] <query>
+  seekfs open <path> [--query "query"] [--json] [-pipe ...]
+  seekfs recent [-n 20] [--json] [-pipe ...]
   seekfs content-index (-root <dir> | -db <gsi>) [-out content.gsx] [-under <path>] [-ext .go,.md]
   seekfs content -db content.gsx [-n 100] [--json] <term>
   seekfs watch "<query>" [-interval 2s] [-n 10000] [-under PATH] [-exec CMD] [-pipe \\.\pipe\seekfs-service]
@@ -252,6 +260,8 @@ Supported today:
   --exists          Verify result paths still exist on disk.
   --cwd-bias        Rank paths under the current directory first.
   --root-bias path  Rank paths under a specific root first.
+  --near <path>     Rank files fewer path hops from this path higher
+                    (within a match-quality band; see near: below).
   --recent 24h      Only return entries modified within a duration.
   --modified-after  Only return entries modified after RFC3339 or YYYY-MM-DD.
   --case            Case-sensitive matching.
@@ -266,6 +276,14 @@ Query filters:
   size:>100mb       Match file sizes with >, >=, <, <=, = and k/m/g/t units.
   dm:today          Match modification date macros, durations, or YYYY-MM-DD.
   attrib:H          Match file attributes; flags R,H,S,D,A are supported.
+  git:modified      Match git worktree status: modified, staged, untracked,
+                    ignored, conflict, clean, tracked (comma-separated for OR,
+                    e.g. git:modified,staged; !git:ignored to exclude).
+                    Matching hits carry a git_status field in --json output.
+  near:<path>       Rank files fewer path hops from this path higher. Like
+                    --cwd-bias/--root-bias it only reorders within a
+                    match-quality band: an exact name match always beats a
+                    mere substring match regardless of proximity.
   sort:size         Rank results by file size ascending.
   sort:modified     Rank results by modification time, newest first.
   sort:extension    Rank results by extension, then name.
@@ -280,6 +298,16 @@ Query filters:
                     match for word boundaries or alternation.
   a|b               OR alternatives within a term, such as ext:png|jpg.
   !term, -term      Exclude a term or filter.
+
+Usage signals (local only; feed the ranking boosts below):
+  seekfs open <path> [--query "q"]   Record that the user opened a result.
+  seekfs recent [-n 20]               List recently opened files, newest first.
+
+Ranking: exact name matches outrank prefix, substring and fuzzy matches;
+  usage signals (open/frecency, recent, same-query picks >= 3), git dirt and
+  recent commits, and near: proximity reorder only within a band, never
+  across one. Result sets and counts never change (only order), unless a
+  git: filter narrows them.
 
 Examples:
   seekfs search "gh.exe"

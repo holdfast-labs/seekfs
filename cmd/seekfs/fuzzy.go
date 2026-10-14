@@ -338,9 +338,9 @@ func foldFuzzyText(s string) string {
 // (tens of thousands of candidates per typo query), so hot callers thread one
 // scratch through every candidate instead of allocating per candidate.
 type fuzzyDistanceScratch struct {
-	wPrev2, wPrev, wCur     []int
-	wPrev2S, wPrevS, wCurS  []int
-	dPrev2, dPrev, dCur     []int
+	wPrev2, wPrev, wCur    []int
+	wPrev2S, wPrevS, wCurS []int
+	dPrev2, dPrev, dCur    []int
 	nameRunes              []rune
 	nameRunes2             []rune
 	asciiLower             []byte
@@ -902,6 +902,12 @@ func appendFuzzyServiceMatches(volumes []*serviceVolumeIndex, opts queryOptions,
 			group = append(group, entry)
 		}
 		sort.Slice(group, func(a, b int) bool { return group[a].Path < group[b].Path })
+		// Usage/git/proximity signals reorder within this equal-distance
+		// group only (rank_blend.go band rule); distance order never inverts,
+		// and with no signals the path order above stands.
+		if signalReorderActive(pq) {
+			reorderFuzzyGroup(group, buildSignalPageCtx(group, pq))
+		}
 		for _, entry := range group {
 			if len(appended) >= need {
 				break

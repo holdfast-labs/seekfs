@@ -23,6 +23,7 @@ func serviceRequestFromOptions(opts queryOptions, countOnly bool) serviceRequest
 		Exists:        opts.Exists,
 		CWDBias:       opts.CWDBias,
 		RootBias:      opts.RootBias,
+		Near:          opts.Near,
 		Recent:        opts.Recent,
 		ModifiedAfter: opts.ModifiedAfter,
 		CaseSensitive: opts.CaseSensitive,
@@ -41,6 +42,7 @@ func requestToOptionsFromService(req serviceRequest) queryOptions {
 		Exists:        req.Exists,
 		CWDBias:       req.CWDBias,
 		RootBias:      req.RootBias,
+		Near:          req.Near,
 		Recent:        req.Recent,
 		ModifiedAfter: req.ModifiedAfter,
 		CaseSensitive: req.CaseSensitive,
@@ -210,7 +212,8 @@ func searchAll(indexes []*Index, opts queryOptions, countOnly bool) ([]Entry, er
 		if err != nil {
 			return nil, err
 		}
-		return filterImplicitUnderExisting(matches, opts, countOnly), nil
+		matches = filterImplicitUnderExisting(matches, opts, countOnly)
+		return applySignalReorderDirect(matches, opts, countOnly), nil
 	}
 	limit := normalizedLimit(opts.Limit, countOnly)
 	results := make([]Entry, 0, min(limit, 1024))
@@ -237,7 +240,20 @@ func searchAll(indexes []*Index, opts queryOptions, countOnly bool) ([]Entry, er
 	if !countOnly && limit > 0 && len(results) > limit {
 		results = results[:limit]
 	}
-	return results, nil
+	return applySignalReorderDirect(results, opts, countOnly), nil
+}
+
+// applySignalReorderDirect reorders a direct (local-index) result page within
+// match-quality bands. Counts and errors pass through untouched.
+func applySignalReorderDirect(results []Entry, opts queryOptions, countOnly bool) []Entry {
+	if countOnly || len(results) < 2 {
+		return results
+	}
+	pq, err := parseQuery(opts)
+	if err != nil {
+		return results
+	}
+	return applySignalReorder(results, pq)
 }
 
 func entriesSpanMultipleVolumes(entries []Entry) bool {
@@ -366,6 +382,21 @@ func entryTypeRank(entry Entry) int {
 }
 
 func searchServiceVolumes(volumes []*serviceVolumeIndex, opts queryOptions, countOnly bool) ([]Entry, error) {
+	matches, err := searchServiceVolumesInner(volumes, opts, countOnly)
+	if err != nil || countOnly || len(matches) < 2 {
+		return matches, err
+	}
+	// Usage/git/proximity signals reorder the exact-tier page within
+	// match-quality bands only (rank_blend.go); with no signals the page
+	// returns untouched, so base order and every existing test are intact.
+	pq, perr := parseQuery(opts)
+	if perr != nil {
+		return matches, err
+	}
+	return applySignalReorder(matches, pq), err
+}
+
+func searchServiceVolumesInner(volumes []*serviceVolumeIndex, opts queryOptions, countOnly bool) ([]Entry, error) {
 	pq, err := parseQuery(opts)
 	if err != nil {
 		return nil, err

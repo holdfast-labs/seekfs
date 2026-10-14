@@ -15,7 +15,7 @@ func globalExtOnlySupported(pq parsedQuery) bool {
 	extFilters, ok := globalExtPostingFilters(pq)
 	if !ok || len(extFilters) != 1 || len(nonVolumeTerms(pq.Terms)) != 0 || len(pq.Dirs) != 0 ||
 		len(pq.Regexps) != 0 || len(pq.RegexTerms) != 0 ||
-		len(pq.Parents) != 0 || pq.Under != "" || pq.Exists || pq.HasModAfter || len(pq.SizeFilters) != 0 ||
+		len(pq.Parents) != 0 || pq.Under != "" || pq.lateVerified() || pq.HasModAfter || len(pq.SizeFilters) != 0 ||
 		len(pq.DateFilters) != 0 || len(pq.AttrFilters) != 0 || len(pq.OrGroups) != 0 || len(pq.NotGroups) != 0 ||
 		queryHasAnyContentLeaf(pq) ||
 		pq.CaseSensitive {
@@ -154,7 +154,7 @@ func globalComponentDefaultHasRoot(pq parsedQuery) bool {
 		len(pq.Dirs) != 0 || len(pq.Parents) != 0 || pq.Under != "" || len(pq.AttrFilters) != 0 ||
 		globalRegexLiteralSupported(pq) ||
 		(extOK && len(extFilters) != 0 &&
-			(pq.Type != "" || pq.Exists || pq.HasModAfter || len(pq.SizeFilters) != 0 || len(pq.DateFilters) != 0)) {
+			(pq.Type != "" || pq.lateVerified() || pq.HasModAfter || len(pq.SizeFilters) != 0 || len(pq.DateFilters) != 0)) {
 		return true
 	}
 	// Validate every alternative in every OR group, matching the per-group
@@ -375,7 +375,7 @@ func queryIsPureSubstringRegex(pq parsedQuery) bool {
 		len(pq.Terms) != 0 || len(pq.Exts) != 0 || len(pq.Globs) != 0 || len(pq.Dirs) != 0 ||
 		len(pq.Parents) != 0 || len(pq.OrGroups) != 0 || len(pq.NotGroups) != 0 ||
 		len(pq.SizeFilters) != 0 || len(pq.DateFilters) != 0 || len(pq.AttrFilters) != 0 ||
-		pq.Type != "" || pq.Under != "" || pq.Exists || pq.HasModAfter ||
+		pq.Type != "" || pq.Under != "" || pq.lateVerified() || pq.HasModAfter ||
 		pq.RootBias != "" || pq.CWDBias != "" {
 		return false
 	}

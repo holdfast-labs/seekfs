@@ -45,6 +45,10 @@ type UIApp struct {
 	serviceStart atomic.Bool
 	servicePID   atomic.Int64
 	serviceSince atomic.Int64
+	// lastQuery remembers the most recent search query so Open can attribute
+	// the usage signal (frecency + query-history combo) to it. Best-effort:
+	// a pick is usually opened right after the search that led to it.
+	lastQuery atomic.Value // string
 }
 
 type UISearchRequest struct {
@@ -578,6 +582,7 @@ func upsertEnv(env []string, key, value string) []string {
 
 func (a *UIApp) searchServiceUI(query string, req UISearchRequest, limit int, seq int64) (serviceResponse, error) {
 	serviceQuery, matchPath := normalizeUIQueryForService(query, req.MatchPath)
+	a.lastQuery.Store(serviceQuery)
 	opts := queryOptions{
 		Query:      serviceQuery,
 		MatchPath:  matchPath,
@@ -777,7 +782,23 @@ func normalizePrefixedEverythingValue(neg, value string) []string {
 }
 
 func (a *UIApp) Open(path string) error {
-	return shellOpen("", path, "", "")
+	err := shellOpen("", path, "", "")
+	// Report the usage signal so opened results rank higher next time.
+	// Best-effort: async, short timeout, errors ignored, never blocks Open.
+	a.reportOpenSignal(path)
+	return err
+}
+
+// reportOpenSignal records an `open` event with the service for path,
+// attributed to the most recent UI query for the combo boost.
+func (a *UIApp) reportOpenSignal(path string) {
+	if a == nil || a.pipeName == "" || strings.TrimSpace(path) == "" {
+		return
+	}
+	query, _ := a.lastQuery.Load().(string)
+	go func() {
+		_, _ = callServiceWithTimeout(a.pipeName, serviceRequest{Command: "open", Path: path, OpenQuery: query}, 2*time.Second)
+	}()
 }
 
 func (a *UIApp) Reveal(path string) error {

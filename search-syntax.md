@@ -21,10 +21,20 @@
   `dm:lastweek`, a duration such as `dm:24h` / `dm:7d`, or a date `dm:2026-05-01`.
 - Case-sensitive matching with `case:` or `--case`.
 - Type filters with `type:file` and `type:dir`.
+- Git status filters with `git:modified`, `git:staged`, `git:untracked`,
+  `git:ignored`, `git:conflict`, `git:clean`, or `git:tracked`
+  (comma-separated for OR, e.g. `git:modified,staged`; `!git:ignored` to
+  exclude). Status resolves from `.git/index` + HEAD with pure-Go reads (no
+  `git` spawn); matching hits carry a `git_status` field in `--json` output.
+- Proximity anchor with `near:<path>` (or `--near <path>`): within a
+  match-quality band, files fewer path hops from the anchor rank first. A
+  file anchor measures from its own directory, so `near:<file>` favors its
+  siblings.
 - Workspace scoping with `--under <path>`.
 - Stale-result verification with `--exists`.
 - Recency filters with `--recent 24h` or `--modified-after 2026-05-22`.
 - Ranking bias with `--cwd-bias` or `--root-bias <path>`.
+- Proximity anchor with `--near <path>` (see `near:` above).
 - Fuzzy matching: when a single-term query returns fewer than 10 results,
   close matches (Damerau-Levenshtein distance, accent/fullwidth-folded) are
   appended below the exact results and ranked by edit distance, then prefix
@@ -45,11 +55,14 @@
 .\seekfs.exe search -service -path --under F:\git\seekfs "type:file ext:go"
 .\seekfs.exe search -service -path --exists --recent 24h "ext:md"
 .\seekfs.exe search -service -path --cwd-bias "main"
+.\seekfs.exe search -service --json -n 20 "edit.go git:modified"
+.\seekfs.exe search -service -n 20 "deep.go near:F:\git\seekfs\src"
+.\seekfs.exe open F:\git\seekfs\src\main.go --query "main"
+.\seekfs.exe recent -n 20
 .\seekfs.exe count  -service -path "type:dir docs"
 ```
 
 ## Notes
-
 - `ext:` matches exact file extensions without the leading dot.
 - `glob:` currently matches the file name, not the full path.
 - Bare wildcard filename tokens such as `*_test.go` are treated as filename
@@ -72,6 +85,29 @@
   than no results.
 - Unsupported `name:` style filters are rejected with an error instead of being
   treated as literal text.
+
+## Ranking signals
+
+`seekfs open <path>` (or opening a result in the UI) records a usage event
+in a small local store (`ranking_signals.json` next to the service state;
+top 5000 files / 2000 queries, 30-day score half-life, local only). Signals
+blend into name ranking as bounded within-band tie-breakers:
+
+- Bands, best first: for single-term filename queries, exact name, name
+  prefix, name substring, then matched-via-other-constraints; multi-term and
+  `-path` queries band by file name; fuzzy top-up entries band by distance
+  group (distance order never inverts). A weak band never outranks a strong
+  one, no matter the signals.
+- Within a band: same-query picks (≥ 3 repeats), `near:` hop distance,
+  frecency, git dirt (dirty before clean), recent-commit membership,
+  modification recency, then path.
+- Result sets and counts never change (only order), unless a `git:` filter
+  narrows them. Explicit `sort:` and content queries never reorder. With an
+  empty store and no `git:`/`near:`, order is byte-identical to the base
+  ranker.
+- `git:` status needs `.git/index` + HEAD; repos that cannot be read resolve
+  as unknown (positive predicates do not match). Directories never report
+  modified/staged/conflict (file-only properties).
 
 ## Not Implemented Yet
 

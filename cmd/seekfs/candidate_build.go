@@ -44,7 +44,7 @@ func (vol *serviceVolumeIndex) plannedCandidates(pq parsedQuery) ([]int, bool) {
 func (vol *serviceVolumeIndex) exactTopPlannedCandidates(pq parsedQuery) ([]int, bool) {
 	if vol == nil || vol.queryIndex == nil || pq.Limit <= 0 || pq.hiddenBlocksTruncation() ||
 		len(pq.Exts) != 1 || len(pq.Globs) > 0 || len(pq.Dirs) > 0 ||
-		pq.Type != "" || pq.Under != "" || pq.HasModAfter || pq.Exists ||
+		pq.Type != "" || pq.Under != "" || pq.HasModAfter || pq.lateVerified() ||
 		(pq.SortColumn != "" && pq.SortColumn != "size" && pq.SortColumn != "modified" && pq.SortColumn != "extension" && pq.SortColumn != "type" && pq.SortColumn != "path") ||
 		len(pq.SizeFilters) > 0 || len(pq.DateFilters) > 0 || len(pq.AttrFilters) > 0 ||
 		len(pq.OrGroups) > 0 || len(pq.NotGroups) > 0 {
@@ -88,7 +88,7 @@ func (vol *serviceVolumeIndex) plannedCountHidden(pq parsedQuery, hidden hiddenB
 	// short/broad term like `x` matches millions of names, so building the full
 	// name posting just to count it is wasteful.
 	if terms := nonVolumeTerms(pq.Terms); len(terms) == 1 && !pq.MatchPath &&
-		pq.Type == "" && pq.Under == "" && !pq.Exists && !pq.HasModAfter &&
+		pq.Type == "" && pq.Under == "" && !pq.lateVerified() && !pq.HasModAfter &&
 		len(pq.Exts) == 0 && len(pq.Dirs) == 0 && len(pq.Globs) == 0 &&
 		len(pq.Regexps) == 0 && len(pq.RegexTerms) == 0 && len(pq.Parents) == 0 &&
 		len(pq.SizeFilters) == 0 && len(pq.DateFilters) == 0 && len(pq.AttrFilters) == 0 &&
@@ -189,7 +189,7 @@ func queryNeedsPath(pq parsedQuery) bool {
 	if len(pq.Dirs) > 0 || len(pq.Regexps) > 0 || len(pq.Parents) > 0 {
 		return true
 	}
-	if pq.Under != "" || pq.Exists || len(pq.Features) > 0 {
+	if pq.Under != "" || pq.lateVerified() || len(pq.Features) > 0 {
 		return true
 	}
 	for _, group := range pq.OrGroups {
