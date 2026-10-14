@@ -64,7 +64,10 @@ re-measured (the scale run stopped at the budget); re-measure after
    multi-pattern OR via Aho-Corasick (fff); fuzzy grep (Smith-Waterman per
    line); context lines; a per-query time budget (fff default 150 ms) with
    cursor pagination; smart case for content; ripgrep line semantics for
-   regex (fsearch); `sym:` definition search and a definition-line bonus;
+   regex (fsearch — v11 verify already anchors `^`/`$` per line; the
+   `content/regex-prune` branch also fixed the regex required-literal
+   prune: literals constrain tier-1/tier-2/verify in all queries, DONE);
+   `sym:` definition search and a definition-line bonus;
    extension and single-file filters for grep.
 
 ## Smaller follow-ups

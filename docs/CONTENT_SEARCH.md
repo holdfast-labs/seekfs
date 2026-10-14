@@ -1647,11 +1647,14 @@ block touches × decode + folds, e.g. relevance 454 hits + 1320 misses
   before it shipped). struct-20 13.7→7.1, compound-20 125.7→77.9,
   relevance 820→521 ms.
 - **Trigram prefilter for regex leaves** (`content_verify.go`,
-  `search_compact.go`): pure-regex queries intersect the required
-  literals' posting streams (`regexRequiredLiteralAlternatives`, also
-  inside OR alternatives) instead of full-scanning; leaves without
-  provable literals still scan, mixed term+regex keeps term-driven
-  behavior, and prefiltered candidates keep scan order
+  `search_compact.go`): every regex leaf with provable literals
+  constrains through them — tier-1 trigram postings ANDed across the
+  leaf's required runs (OR across alternation disjuncts, ANDed with any
+  term/phrase constraints), the CXFL bloom gate over all required-literal
+  trigrams, then a verify-time memmem on the cheapest disjunct's runs
+  before the regexp engine; verify matches on the folded text with
+  ripgrep per-line `^`/`$` semantics. Leaves without provable literals
+  still scan, and pure-regex prefiltered candidates keep scan order
   (`sortCandidateIDsByScanOrder`) so results are byte-identical on
   volumes where rank and scan orders differ (the fixture does).
   Regex-20 19.5 s→387 ms warm (50×), 21.5 s→403 ms cold. pprof showed
@@ -2330,7 +2333,15 @@ refused rather than burning minutes, exactly the §6m lesson. Regex
 `mutex_\w+` 8 hits / 512 verifies / 885 ms incomplete;
 `cityhash_\w+` 2 / 512 / 3.77 s incomplete (cold files);
 `zzz\d+qqq` zero-result 0 / 512 / 1.27 s incomplete (bounded, vs v9's ~15 s
-full scan). Compound `ext:cc content:mutex` (offline approx): 13 hits /
+full scan). Fixed on branch `content/regex-prune`: regex leaves with
+provable literals now prune like term/phrase leaves (tier-1 postings AND
+across required literals, CXFL bloom over all literal trigrams, memmem
+before the engine), so `zzz\d+qqq` with absent literals prunes to ~0
+candidates and completes in ms; mixed term+regex ANDs the literals with
+the terms. Proven by `TestContentRegexVerifyCountsBounded` /
+`TestContentRegexZeroLiteralZeroVerifies` (DiskVerified == gate-pass
+files; 0 verifies + complete for the absent-literal shape).
+Compound `ext:cc content:mutex` (offline approx): 13 hits /
 512 verifies / 117 ms incomplete.
 
 v9 baselines for the same shapes (§6s warm: cityhash-20 2.1 ms, struct-20
