@@ -18,6 +18,17 @@ import (
 // in well under 100 ms plus the re-walk itself.
 var walkWatcherDebounce = 50 * time.Millisecond
 
+// walkWatcherMetaDebounce is the coalescing wait for metadata-only
+// notifications (writes, attribute touches: no name changed) — longer
+// than the name path so save bursts merge, short enough that size:/dm:
+// filters, sorts, and content re-extraction lag a single edit by well
+// under a second plus the re-walk. The refresh itself is still a full
+// re-walk: per-record Size/ModUnix feed filters, size/modified sorts
+// (load-built rank vectors), --recent, and the content walk reconcile
+// fingerprints together, and only a rebuild refreshes all of them.
+// Continuous churn serializes on walkMu regardless of this value.
+var walkWatcherMetaDebounce = 500 * time.Millisecond
+
 func validateUSNCheckpoint(vol *serviceVolumeIndex, journal usnJournalDataV0) error {
 	if vol.journalID != 0 && vol.journalID != journal.UsnJournalID {
 		return staleIndexError{reason: fmt.Sprintf("journal id changed from %d to %d", vol.journalID, journal.UsnJournalID), rebuild: true}
@@ -318,20 +329,11 @@ func (s *goSearchService) watchWalkRoot(vol *serviceVolumeIndex, root string) {
 				continue
 			}
 		}
-		reason := "watch-change"
-		if bytesReturned == 0 {
-			reason = "watch-overflow"
-		} else if !walkNotifyHasNameAction(buffer[:bytesReturned]) {
-			// Size/attribute/last-write-only churn carries no name change,
-			// and the name index has nothing new to report: skip the
-			// debounce and the full re-walk instead of rebuilding on every
-			// file write under a large walk root.
-			continue
-		}
+		reason, debounce := walkRebuildPlan(buffer[:bytesReturned], bytesReturned == 0)
 		select {
 		case <-s.stop:
 			return
-		case <-time.After(walkWatcherDebounce):
+		case <-time.After(debounce):
 		}
 		if err := s.rebuildWalkVolumeInPlace(vol, reason); err != nil {
 			serviceLog("walk watcher rebuild error root=%s db=%s err=%v", root, vol.dbPath, err)
@@ -339,30 +341,74 @@ func (s *goSearchService) watchWalkRoot(vol *serviceVolumeIndex, root string) {
 	}
 }
 
-// walkNotifyHasNameAction reports whether a ReadDirectoryChangesW buffer
-// holds at least one name action (added/removed/renamed-old/renamed-new).
-// Each entry is a FILE_NOTIFY_INFORMATION record: NextEntryOffset (u32),
-// Action (u32), FileNameLength (u32), then the UTF-16 name. Only the action
-// field is inspected, so malformed names cannot mislead the verdict; any
-// framing doubt declines false (rebuild) to stay correct.
-func walkNotifyHasNameAction(buf []byte) bool {
+// walkNotifyClass is the verdict on one ReadDirectoryChangesW batch: what
+// the watcher must do about it.
+type walkNotifyClass int
+
+const (
+	// walkNotifyUnknown means the buffer could not be proven to be
+	// metadata-only (empty batch, truncation, bad offsets, unknown
+	// actions). It fails SAFE: the caller rebuilds, exactly as if a name
+	// had changed.
+	walkNotifyUnknown walkNotifyClass = iota
+	// walkNotifyName means at least one entry adds, removes, or renames.
+	walkNotifyName
+	// walkNotifyMeta means every entry is metadata-only (modified:
+	// writes, attribute or timestamp touches) with no name change.
+	walkNotifyMeta
+)
+
+// walkClassifyNotify inspects a ReadDirectoryChangesW buffer and reports
+// whether it carries a name change. Each entry is a
+// FILE_NOTIFY_INFORMATION record: NextEntryOffset (u32), Action (u32),
+// FileNameLength (u32), then the UTF-16 name. Only the action field is
+// inspected, so malformed names cannot mislead the verdict; any framing
+// doubt reports Unknown, and Unknown rebuilds.
+func walkClassifyNotify(buf []byte) walkNotifyClass {
 	off := 0
 	for {
 		if len(buf)-off < 12 {
-			return false
+			return walkNotifyUnknown
 		}
 		next := int(binary.LittleEndian.Uint32(buf[off:]))
 		action := binary.LittleEndian.Uint32(buf[off+4:])
-		if action == 1 || action == 2 || action == 4 || action == 5 {
-			return true
+		switch action {
+		case 1, 2, 4, 5:
+			return walkNotifyName
+		case 3:
+			// Modified: keep scanning for a name action later in the batch.
+		default:
+			// Not a documented action (0, or a future addition): fail
+			// safe — a rename must never be mistaken for a write.
+			return walkNotifyUnknown
 		}
 		if next == 0 {
-			return false
+			return walkNotifyMeta
 		}
 		if next < 12 || off+next >= len(buf) {
-			return false
+			return walkNotifyUnknown
 		}
 		off += next
+	}
+}
+
+// walkRebuildPlan maps one watcher batch to its rebuild reason and
+// debounce. Name changes and anything doubtful (overflow, garbled
+// framing) rebuild fast; metadata-only batches rebuild on the longer
+// meta debounce so write bursts coalesce — the refresh itself is still
+// a full re-walk either way, because Size/ModUnix feed filters, sorts,
+// recency, and the content reconcile fingerprints together.
+func walkRebuildPlan(batch []byte, overflow bool) (string, time.Duration) {
+	if overflow {
+		return "watch-overflow", walkWatcherDebounce
+	}
+	switch walkClassifyNotify(batch) {
+	case walkNotifyName:
+		return "watch-change", walkWatcherDebounce
+	case walkNotifyMeta:
+		return "watch-meta", walkWatcherMetaDebounce
+	default:
+		return "watch-unknown", walkWatcherDebounce
 	}
 }
 

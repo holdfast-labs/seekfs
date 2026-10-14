@@ -96,12 +96,15 @@ Coverage and size (top priority: small index, content search everywhere):
    build lines).
 4. **Freshness:** name side mostly done (`perf/freshness-footprint`).
    The USN wake is event-driven (blocking journal read, ~0 idle CPU);
-   the overlay now publishes before the WAL fsync, so fsync latency is
+   the overlay now publishes before the WAL fsync, so    fsync latency is
    off the visibility path (durability unchanged — crash replays from
-   the journal). Walk volumes: debounce 250 ms → 50 ms, and
-   size/attribute/write-only notifications skip the full re-walk
-   (200-file scratch: create 685→83 ms, rename 360→82 ms, delete
-   642→59 ms). A restart replays only `[checkpoint, head)` and now
+   the journal). Walk volumes: debounce 250 ms → 50 ms for name
+   changes; write-only batches rebuild on a 500 ms coalescing debounce
+   so Size/ModUnix stay fresh for filters, sorts, and the content walk
+   reconcile (200-file scratch: create 685→~100–350 ms, rename 360→82
+   ms, delete 642→59 ms, write-only edit → `size:` ~600 ms); the batch
+   classifier fails safe (any framing doubt rebuilds). A restart
+   replays only `[checkpoint, head)` and now
    serves the mmapped base + WAL overlay while the catch-up drains
    behind queries (1.46M copy: base load ~0.3 s, first query ~1.1 s;
    the live 40 s catch-up block moves off the query path). Remaining:

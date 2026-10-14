@@ -280,19 +280,34 @@ on E: includes the content build; name-side numbers below isolate the
 name index). Harness scripts lived in `E:\bench\scratch\footprint\`
 (scratch-only, deleted after).
 
-Visibility latency (walk scratch volume, 200 files, `measure_fresh.py`
-create/rename/delete → visible in `count`):
+Visibility latency (walk scratch volume, 200 files, name changes →
+visible in `count`; db outside the watched root):
 
 | change | before | after |
 | --- | --- | --- |
-| create | 685 ms | 83 ms |
+| create | 685 ms | 83–350 ms (box noise; fast path) |
 | rename (new name) | 360 ms | 82 ms |
 | delete (gone) | 642 ms | 59 ms |
+| write-only edit → `size:` filter | never without a later name change* | ~600 ms |
 
-Drivers: walk watcher debounce 250 ms → 50 ms (`walkWatcherDebounce`),
-and the watcher now skips the debounce + full re-walk when the
-notification buffer holds no name action (added/removed/renamed), so
-size/attribute/write-only churn no longer rebuilds large walk roots.
+\* Review fix: the first cut skipped metadata-only batches entirely,
+which would have left Size/ModUnix stale forever — breaking `size:` /
+`dm:` filters, size/modified sorts (load-built rank vectors),
+`--recent`, and the content walk reconcile fingerprints
+(`content_walk.go` diffs `rec.Size`/`rec.ModUnix`). Metadata-only
+batches now rebuild on a 500 ms coalescing debounce
+(`walkWatcherMetaDebounce`, reason `watch-meta`): save bursts merge,
+while filters, sorts, and content re-extraction lag a single edit by
+~0.5 s plus the re-walk. Pinned by
+`TestWalkMetaRefreshUpdatesSizeAndMod` and
+`TestWalkMetaRefreshRearmsContent`.
+
+Drivers: walk watcher debounce 250 ms → 50 ms (`walkWatcherDebounce`)
+for name changes; the batch classifier (`walkClassifyNotify`) is
+tri-state and fails safe — truncation, garbled offsets, unknown
+actions, and overflow all rebuild on the fast path
+(`TestWalkClassifyNotify`, `TestWalkRebuildPlan`; a missed rebuild
+would silently drop a rename, a spurious one only costs a re-walk).
 The USN steady-state wake was already event-driven (blocking
 `FSCTL_READ_USN_JOURNAL` with `BytesToWaitFor=1`, ~0 idle CPU); the WAL
 open/write/fsync/close moved after the overlay apply + publish, so the
@@ -302,6 +317,11 @@ a crash before the WAL lands replays the same USN range). USN end-
 to-end latency was not measurable here (volume handles need elevation);
 the publish-before-fsync order and the synchronous-publish invariant
 are pinned by `TestOverlayApplyIsImmediatelyVisible`.
+
+Operational note: a walk db stored under its own watched root
+self-triggers (each rebuild stages a uniquely-named tmp → ADDED).
+Pre-existing wart, not introduced here; keep walk dbs outside the
+indexed root.
 
 Restart (1.46M-entry copy of the live E: index,
 `seekfs_e_copy.gsi`, 274 MB file):
@@ -361,11 +381,13 @@ index for the folder is deliberately not started (it would race the
 budgeted builder and stall the query behind a build); pinned by
 `TestOnDemandFolderFirstSearch`.
 
-Result parity for all of the above: `parity.py` base-vs-new over the
-chromium copy, 76 queries × search 20/300/count: 0 differences (209
-non-empty base results); recall 100% on 20 terms; one-typo top-1 99.5%
-(N=200 seed 42) and two-typo top-1 93.0% (N=100 seed 7) with zero
-non-timing per-query diffs.
+Result parity for all of the above, re-run after the review fix
+(fail-safe classifier + metadata rebuild path): `parity.py` base-vs-new
+over the chromium copy, 76 queries × search 20/300/count: 0 differences
+(209 non-empty base results); recall 100% on 20 terms; one-typo top-1
+99.5% (N=200 seed 42) and two-typo top-1 93.0% (N=100 seed 7) with zero
+non-timing per-query diffs. Full suite green
+(`go test -p 1 -timeout 40m ./...`).
 
 ## R5 Lazy-Source Validation Notes
 
