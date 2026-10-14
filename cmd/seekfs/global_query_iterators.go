@@ -11,6 +11,13 @@ func globalPathTermIterator(volumes []*serviceVolumeIndex, term string) (globalI
 	if term == "" {
 		return nil, false
 	}
+	for _, vol := range volumes {
+		// A volume-satisfied term matches every path there; no posting side
+		// is complete for it. Decline so callers keep the verified scan.
+		if vol != nil && vol.index != nil && vol.pathTermSatisfiedByVolume(term) {
+			return nil, false
+		}
+	}
 	children := make([]globalIDIterator, 0, len(volumes))
 	for volumeIndex, vol := range volumes {
 		if vol == nil || vol.index == nil {
@@ -93,7 +100,7 @@ func globalPathTermIterator(volumes []*serviceVolumeIndex, term string) (globalI
 // total past serviceComponentTrigramExpansionMaxIDs. Callers fall back to
 // their bounded scan on decline, exactly as before.
 func (vol *serviceVolumeIndex) bridgePathTermIDs(term string) ([]int, bool) {
-	if vol == nil || vol.index == nil || len(term) < 3 || !asciiOnlyString(term) {
+	if vol == nil || vol.index == nil || len(term) < 3 || !asciiOnlyString(term) || vol.pathTermSatisfiedByVolume(term) {
 		return nil, false
 	}
 	// Drive from names only (never MatchPath: the filename lane declines
@@ -486,6 +493,28 @@ func underScopedTermPrefix(volumes []*serviceVolumeIndex, pq parsedQuery, underR
 	}
 	scoped := make([]underScopedTerm, 0, len(terms))
 	for _, term := range terms {
+		vacuousAll, vacuousAny := true, false
+		for _, vol := range volumes {
+			if vol == nil || vol.index == nil {
+				return nil, false
+			}
+			if vol.pathTermSatisfiedByVolume(term) {
+				vacuousAny = true
+			} else {
+				vacuousAll = false
+			}
+		}
+		if vacuousAll {
+			// Holds on every path on every volume; verification
+			// re-checks it, so it constrains nothing here.
+			continue
+		}
+		if vacuousAny {
+			// Mixed scope: no single scoped side is complete for this
+			// term. Decline so the legacy assembly (which declines
+			// vacuous terms itself) keeps the verified scan.
+			return nil, false
+		}
 		estimate, satisfied, ok := scopedTermEstimate(volumes, underByVolume, term)
 		if !ok {
 			return nil, false

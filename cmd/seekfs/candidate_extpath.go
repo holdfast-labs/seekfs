@@ -486,6 +486,12 @@ func (vol *serviceVolumeIndex) pathPlanTermPostingLimited(term string, pq parsed
 		countNonVolumeTerms(pq.Terms) != 1 || term == "" || strings.ContainsAny(term, `\/*?[]:`) {
 		return nil, false
 	}
+	if vol.pathTermSatisfiedByVolume(term) {
+		// The volume prefix alone satisfies the term, so name/subtree
+		// sources below are incomplete by construction. Decline so the
+		// verified scan decides.
+		return nil, false
+	}
 	roots := vol.pathTermRootIDs(term)
 	if len(roots) == 0 || len(vol.subtreeStart) == 0 || len(vol.subtreeEnd) == 0 || len(vol.subtreeOrder) == 0 {
 		return nil, false

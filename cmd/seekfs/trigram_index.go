@@ -581,6 +581,13 @@ func (ti *compressedTrigramIndex) selectiveCandidateIDs(term string, maxIDs int)
 		if ti.isOmittedGram(gram) {
 			return nil, false, false
 		}
+		if !ti.hasStoredPosting(gram) {
+			// Counted but not stored (a dropped common posting): the
+			// posting is a capped hint, not an exact source. Decline so
+			// callers fall back to a verified scan instead of serving a
+			// false empty.
+			return nil, false, false
+		}
 		if maxIDs <= 0 || count <= maxIDs {
 			filtered = append(filtered, gram)
 		}

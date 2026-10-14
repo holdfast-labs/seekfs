@@ -87,36 +87,18 @@ func pathPlanProbeTerms(terms []string) []string {
 }
 
 func (vol *serviceVolumeIndex) namePlanTermPosting(term string) []int {
-	if strings.Contains(term, ".") {
-		if exact := vol.exactNameIDs(term); len(exact) > 0 {
-			return exact
-		}
-	}
+	// This posting is a REQUIRED plan source: it must be the complete
+	// substring set, never just the exact-name hits. An exact-name shortcut
+	// here underfills every query where an exact hit coexists with wider
+	// substring matches (e.g. `main.cc --exists` missing agent_main.cc).
 	return vol.nameTermPosting(term)
 }
 
 func (vol *serviceVolumeIndex) pathPlanTermPosting(term string) []int {
-	if strings.Contains(term, ".") {
-		if exact := vol.exactNameIDs(term); len(exact) > 0 {
-			out := make([]int, 0, len(exact))
-			for _, id := range exact {
-				if id < 0 || vol == nil || vol.index == nil || id >= vol.index.compactRecordCount() {
-					continue
-				}
-				rec := vol.index.compactRecord(id)
-				if rec.Deleted {
-					continue
-				}
-				if rec.Mode&uint32(os.ModeDir) == 0 {
-					out = append(out, id)
-					continue
-				}
-				out = append(out, vol.underDescendants(id)...)
-			}
-			sort.Ints(out)
-			return uniqueSortedInts(out)
-		}
-	}
+	// Required plan source: the complete path-substring set. pathTermPosting
+	// already covers exact-name hits (directly, plus descendant expansion of
+	// exact-name dirs via pathTermRootIDs), so an exact-name shortcut here
+	// would only underfill coexisting wider substring matches.
 	return vol.pathTermPosting(term)
 }
 
@@ -270,6 +252,12 @@ func (vol *serviceVolumeIndex) pathDirectoryTermTopCandidates(pq parsedQuery) ([
 		}
 	}
 	if len(term) < 3 || strings.ContainsAny(term, `\/*?[]:`) {
+		return nil, false
+	}
+	if vol.pathTermSatisfiedByVolume(term) {
+		// Volume-only matches have no name hit or directory root here; both
+		// the exact-empty shortcut and the subtree walk below would miss
+		// them.
 		return nil, false
 	}
 	if vol.pathTermIsUsableExtensionCandidate(term) {
