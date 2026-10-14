@@ -32,13 +32,20 @@ corruption, exact required sources, auto-fuzzy only on zero exact hits).
    cursor pagination; smart case for content; ripgrep line semantics for
    regex (fsearch); `sym:` definition search and a definition-line bonus;
    extension and single-file filters for grep.
-2. **Freshness and footprint (G4, G5, G6).** Name-side changes visible in
-   milliseconds (fsearch about 15 ms; dirty content reads land with the
-   filter tier); on-demand indexing (searched folder first, fsearch); a
-   restart replays only what changed; service resident memory (about 500 MB
-   for 1.46M names, versus fsearch's 21–35 MB daemon), returned to the OS
-   when idle; startup load time (about 40 s for 1.46M entries); a
-   memory-mapped content cache (fff).
+2. **Freshness and footprint (G4, G5, G6).** Done on the name side on
+   `perf/freshness-footprint` (4 commits: freshness, restart,
+   memory, ondemand; parity 0 diffs, recall 100%, typo 99.5%/93.0%
+   unchanged, full suite green): walk visibility 685→83 ms create /
+   360→82 ms rename / 642→59 ms delete, overlay publishes before WAL
+   fsync, restart serves the mmapped base while USN catch-up drains
+   behind queries (replay-only-what-changed verified), idle release
+   drops the block LRU + query caches (1.46M: heap 73→50 MB, WS
+   251→~72 MB idle), `--under` with no index answers from a bounded
+   folder walk. Needs elevated-box validation (USN end-to-end latency,
+   40 s → ~1 s time-to-first-query). Left for content-side work
+   (`content/filter-tier`): dirty-file direct reads, content build
+   footprint (dominates the 500 MB E: WS), content on-demand, mmap
+   content cache (fff).
 
 ## Smaller follow-ups
 

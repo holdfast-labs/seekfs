@@ -272,6 +272,101 @@ Active-path cost is bounded by `BenchmarkSignalReorderPage`: ~112 µs for a
 100-entry page with half the hits carrying frecency evidence (~1 µs/hit +
 page sort); the empty-store gate is a few map lookups.
 
+## Freshness and footprint (`perf/freshness-footprint`, G4/G5/G6 name side)
+
+2026-10-14 standalone-service measurements, `GOMAXPROCS=2`, content
+disabled via an isolated `SEEKFS_DIR` (production's ~500 MB working set
+on E: includes the content build; name-side numbers below isolate the
+name index). Harness scripts lived in `E:\bench\scratch\footprint\`
+(scratch-only, deleted after).
+
+Visibility latency (walk scratch volume, 200 files, `measure_fresh.py`
+create/rename/delete → visible in `count`):
+
+| change | before | after |
+| --- | --- | --- |
+| create | 685 ms | 83 ms |
+| rename (new name) | 360 ms | 82 ms |
+| delete (gone) | 642 ms | 59 ms |
+
+Drivers: walk watcher debounce 250 ms → 50 ms (`walkWatcherDebounce`),
+and the watcher now skips the debounce + full re-walk when the
+notification buffer holds no name action (added/removed/renamed), so
+size/attribute/write-only churn no longer rebuilds large walk roots.
+The USN steady-state wake was already event-driven (blocking
+`FSCTL_READ_USN_JOURNAL` with `BytesToWaitFor=1`, ~0 idle CPU); the WAL
+open/write/fsync/close moved after the overlay apply + publish, so the
+fsync no longer sits between the change and the query-visible snapshot
+(durability unchanged: the on-disk checkpoint advances only on fold, so
+a crash before the WAL lands replays the same USN range). USN end-
+to-end latency was not measurable here (volume handles need elevation);
+the publish-before-fsync order and the synchronous-publish invariant
+are pinned by `TestOverlayApplyIsImmediatelyVisible`.
+
+Restart (1.46M-entry copy of the live E: index,
+`seekfs_e_copy.gsi`, 274 MB file):
+
+| stage | before | after |
+| --- | --- | --- |
+| base load (`loaded ... elapsed=`) | 118 ms | 286 ms (noise; mmap, no catch-up in either non-elevated run) |
+| first query | 0.55 s | 1.17 s (process start + pipe; same shape) |
+| USN catch-up vs first query | catch-up blocks the swap (the live 40 s restart) | catch-up runs behind serving (`loaded` logs before `catch-up complete`) |
+
+`loadConfiguredVolume` no longer calls `catchUpServiceVolume`
+synchronously; `backgroundCatchUpVolume` drains `[checkpoint, head)`
+after the base + WAL overlay are already served (each batch publishes
+as it applies), then attaches content (`featuresVolumeReady`) and
+starts the replay/persist loops or stale recovery, logging
+`catch-up complete ... replayed_usn=N elapsed=... state=...`. Restart
+still replays only what changed (WAL replay stays synchronous and
+bounded; file checkpoint advances only on fold) — verified by code,
+pinned for the serve-early half by
+`TestLoadConfiguredVolumeDefersUSNCatchUp`. Elevated-box validation of
+the 40 s → ~1 s time-to-first-query is owner work (needs the live
+journal).
+
+Resident memory (same 1.46M copy, lowmem, 40 warm-up queries, idle
+release at `SEEKFS_IDLE_RELEASE_SECONDS=90`):
+
+| metric | before release | after release |
+| --- | --- | --- |
+| heap_alloc | 73.2 MB | 50.1 MB |
+| heap_released | 4.3 MB | 28.2 MB |
+| working set | 250.9 MB | 200.6 MB → ~72 MB after a few idle minutes |
+| decoded posting-block cache | 5.5 MB | 0 MB |
+
+The idle loop now clears the global posting-block LRU (new
+`clear`/`liveBytes`; default cap 128 MB heap) plus every volume's
+term/path-term/ext/under caches (`clearSearchCachesLocked` previously
+had no caller) before `debug.FreeOSMemory`. All of it re-decodes from
+mmap, so results are unchanged; search and count both note query
+activity, so the release cannot fire mid-benchmark. `loaded --json`
+gains `memory.cache_bytes` (per-volume posting-list caches, folded
+into `known_bytes`) and `runtime.block_cache_bytes`. On a service the
+per-volume term caches stay ~0 (each request searches through a
+short-lived view with its own maps); the persistent service-side cache
+is the global block LRU. `lowmem` vs `resident` meanings unchanged (no
+default flipped; `GOMEMLIMIT` stays opt-in via
+`SEEKFS_GO_MEM_LIMIT_MB`). For reference, same-index load with the
+default content-enabled config measured heap 130 MB / WS 218 MB on the
+556k chromium index (content build adds ~100 MB heap) — content-side
+footprint belongs to the filter-tier work.
+
+On-demand (G6 name side): with no index loaded, a search scoped
+`--under` a real folder now answers from the same bounded folder-first
+walk (100k entries / 2 s, read-only) the single-volume path uses as
+its zero-hit backstop, instead of erroring. Counts and folder-less
+queries keep `service has no search indexes loaded`. A full background
+index for the folder is deliberately not started (it would race the
+budgeted builder and stall the query behind a build); pinned by
+`TestOnDemandFolderFirstSearch`.
+
+Result parity for all of the above: `parity.py` base-vs-new over the
+chromium copy, 76 queries × search 20/300/count: 0 differences (209
+non-empty base results); recall 100% on 20 terms; one-typo top-1 99.5%
+(N=200 seed 42) and two-typo top-1 93.0% (N=100 seed 7) with zero
+non-timing per-query diffs.
+
 ## R5 Lazy-Source Validation Notes
 
 2026-07-08 local validation used a throwaway binary built from the working tree
