@@ -174,8 +174,14 @@ past 4 GiB are safe. A volume already at or below its reserve selects nothing
 more (allowance 0 — no fail-open); the same reserve governs the write-time
 guard, so selection and writes agree. Set `[content]`
 `budget_bytes` (or `[content."E:"]` per volume, or
-`SEEKFS_CONTENT_BUDGET_BYTES`) to pin an explicit extracted-text budget,
-which is enforced exactly as before and wins over the reserve. Only an
+`SEEKFS_CONTENT_BUDGET_BYTES`) to pin an explicit budget on the final
+index size. Each admitted doc is charged its projected index bytes
+(`contentIndexCostEstimate`: 256 B + 0.15 × extracted text, ~14% above the
+measured v10 mean of 1238 B/doc on Chromium), because the index stores no
+text (§6y); charging extracted text admitted only 77.7k of 468k Chromium
+files under a 600 MB budget and published ~130 MB. The reserve-derived
+transient allowance (extracted-text units, the spool peak) applies under an
+explicit budget too; selection stops at whichever bites first. Only an
 explicit budget joins the sidecar identity: the reserve derives from live
 disk figures, and fingerprinting it would rebuild on every drift. When a
 limit does bite (explicit budget or reserve), the build still extracts the
@@ -1749,8 +1755,10 @@ fraction, which rebuilt and truncated the same way: a loop on any busy
 volume.
 
 Both reconciles now hold keys new to the base to the budget the build used
-(`content_reconcile_budget.go`): the explicit `budget_bytes` minus the text
-the base holds, or the reserve allowance on the sidecar volume. They are
+(`content_reconcile_budget.go`): the explicit `budget_bytes` minus the
+base's projected index bytes (charged per file with the build's
+`contentIndexCostEstimate`), and the reserve allowance on the sidecar volume
+in extracted-text bytes; a file must fit both. They are
 admitted in the build's priority order (`contentBuildItemLess`) while their
 file sizes fit, with the same latch as the build (once one misses, the rest
 stay out). Changed docs already in the base always re-extract. The scope

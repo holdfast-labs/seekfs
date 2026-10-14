@@ -18,36 +18,54 @@ package main
 
 import "sort"
 
-// contentReconcileNewAllowance returns the bytes of not-yet-indexed files a
-// reconcile may add to base on vol: the explicit budget minus the text the
-// base already holds, or the reserve allowance on the sidecar's volume.
-// MaxInt64 means unlimited (unknown free space).
-func contentReconcileNewAllowance(vol *serviceVolumeIndex, base *contentIndex, scope *contentScopeResolved) int64 {
+// contentReconcileLimits are the two limits a reconcile holds new files to,
+// matching the build: text is the transient disk allowance in extracted-text
+// bytes (the reserve on the sidecar's volume), index is what remains of an
+// explicit budget_bytes in projected index bytes (contentIndexCostEstimate).
+// MaxInt64 means unlimited.
+type contentReconcileLimits struct {
+	text  int64
+	index int64
+}
+
+const contentReconcileUnlimited = int64(^uint64(0) >> 1)
+
+// contentReconcileNewLimits returns the limits for files a reconcile may add
+// to base on vol: the reserve allowance on the sidecar's volume, and the
+// explicit budget minus the base's projected index bytes.
+func contentReconcileNewLimits(vol *serviceVolumeIndex, base *contentIndex, scope *contentScopeResolved) contentReconcileLimits {
+	lim := contentReconcileLimits{text: contentReconcileUnlimited, index: contentReconcileUnlimited}
+	if vol != nil && vol.dbPath != "" {
+		lim.text = contentScopeAllowance(contentIndexPathForDB(vol.dbPath), 0)
+	}
 	if scope != nil && scope.BudgetExplicit && scope.BudgetBytes > 0 {
 		var used int64
 		if base != nil {
 			for i := range base.Docs {
-				used += int64(base.Docs[i].TextLen)
+				used += contentIndexCostEstimate(int64(base.Docs[i].TextLen))
 			}
 		}
-		if used >= scope.BudgetBytes {
-			return 0
+		lim.index = 0
+		if used < scope.BudgetBytes {
+			lim.index = scope.BudgetBytes - used
 		}
-		return scope.BudgetBytes - used
 	}
-	if vol == nil || vol.dbPath == "" {
-		return int64(^uint64(0) >> 1)
-	}
-	return contentScopeAllowance(contentIndexPathForDB(vol.dbPath), 0)
+	return lim
 }
 
-// contentReconcileTrimNew keeps the keys of newKeys that fit allowance in
-// build priority order, using each file's size as its extracted-text
-// estimate. rank reports a key's build ordering and size; keys it does not
-// know sort last and are admitted only while room remains. It returns the
-// admitted keys (ascending) and the files and bytes left out.
+// contentReconcileTrimNew keeps the keys of newKeys that fit allowance (in
+// extracted-text bytes) in build priority order; see contentReconcileTrimNewLimits.
 func contentReconcileTrimNew(newKeys []uint64, rank map[uint64]contentScopeMember, allowance int64) (admitted []uint64, droppedFiles int, droppedBytes int64) {
-	if allowance == int64(^uint64(0)>>1) {
+	return contentReconcileTrimNewLimits(newKeys, rank, contentReconcileLimits{text: allowance, index: contentReconcileUnlimited})
+}
+
+// contentReconcileTrimNewLimits keeps the keys of newKeys that fit both
+// limits in build priority order, using each file's size as its
+// extracted-text estimate. rank reports a key's build ordering and size; keys
+// it does not know sort last and are admitted only while room remains. It
+// returns the admitted keys (ascending) and the files and bytes left out.
+func contentReconcileTrimNewLimits(newKeys []uint64, rank map[uint64]contentScopeMember, lim contentReconcileLimits) (admitted []uint64, droppedFiles int, droppedBytes int64) {
+	if lim.text == contentReconcileUnlimited && lim.index == contentReconcileUnlimited {
 		return newKeys, 0, 0
 	}
 	type cand struct {
@@ -64,11 +82,13 @@ func contentReconcileTrimNew(newKeys []uint64, rank map[uint64]contentScopeMembe
 		cands = append(cands, cand{item: contentBuildItem{frn: key, path: m.path, priority: m.priority}, size: m.size})
 	}
 	sort.Slice(cands, func(i, j int) bool { return contentBuildItemLess(cands[i].item, cands[j].item) })
-	var used int64
+	var used, indexUsed int64
 	full := false
 	for _, c := range cands {
-		if !full && c.size <= allowance-used {
+		cost := contentIndexCostEstimate(c.size)
+		if !full && c.size <= lim.text-used && cost <= lim.index-indexUsed {
 			used += c.size
+			indexUsed += cost
 			admitted = append(admitted, c.item.frn)
 			continue
 		}

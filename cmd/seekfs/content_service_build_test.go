@@ -960,7 +960,8 @@ func TestContentServiceBuildBudgetUsesExtractedTextAndPriority(t *testing.T) {
 		{FRN: 4, Parent: 1, ParentFRN: 2, Name: "z.txt", Size: 8},
 	})
 	s := contentTestService(t)
-	s.contentCfg.Content.BudgetBytes = 16
+	// Budgets are in projected index bytes (contentIndexCostEstimate).
+	s.contentCfg.Content.BudgetBytes = 2 * contentIndexCostEstimate(8)
 	s.ensureContentBuild(vol)
 	built, err := contentLoadFile(gsx)
 	if err != nil {
@@ -970,9 +971,10 @@ func TestContentServiceBuildBudgetUsesExtractedTextAndPriority(t *testing.T) {
 	if len(built.Docs) != 2 || built.Policy.ScopeDropped != 0 {
 		t.Fatalf("budgeted index docs=%d dropped=%d; want both short extracted texts", len(built.Docs), built.Policy.ScopeDropped)
 	}
-	// A single extracted-text allowance must choose the repo, even though the
+	// A single-doc allowance must choose the repo, even though the
 	// explicit-root file comes first in the record index and by path.
-	s.contentCfg.Content.BudgetBytes = 8
+	oneDoc := contentIndexCostEstimate(8)
+	s.contentCfg.Content.BudgetBytes = oneDoc
 	s.scheduleContentRebuild(vol)
 	built, err = contentLoadFile(gsx)
 	if err != nil {
@@ -983,8 +985,8 @@ func TestContentServiceBuildBudgetUsesExtractedTextAndPriority(t *testing.T) {
 		t.Fatalf("priority index docs=%+v dropped=%d; want only repo file", built.Docs, built.Policy.ScopeDropped)
 	}
 	// The enforced budget is recorded for health.
-	if built.Policy.BudgetBytes != 8 {
-		t.Fatalf("priority index policy = %+v; want budget=8", built.Policy)
+	if built.Policy.BudgetBytes != oneDoc {
+		t.Fatalf("priority index policy = %+v; want budget=%d", built.Policy, oneDoc)
 	}
 }
 
@@ -1015,8 +1017,10 @@ func TestContentServiceBuildBudgetDropsExactFilesAndBytes(t *testing.T) {
 		{FRN: 3, Parent: -1, Name: "c.txt", Size: 8},
 	})
 	s := contentTestService(t)
-	// Fits a.txt + b.txt (5+6=11), drops c.txt (8 bytes of extracted text).
-	s.contentCfg.Content.BudgetBytes = 11
+	// Fits a.txt + b.txt in projected index bytes, drops c.txt (8 bytes of
+	// extracted text).
+	budget := contentIndexCostEstimate(5) + contentIndexCostEstimate(6)
+	s.contentCfg.Content.BudgetBytes = budget
 	s.ensureContentBuild(vol)
 	built, err := contentLoadFile(gsx)
 	if err != nil {
@@ -1026,11 +1030,11 @@ func TestContentServiceBuildBudgetDropsExactFilesAndBytes(t *testing.T) {
 	if len(built.Docs) != 2 || built.Policy.ScopeDropped != 1 {
 		t.Fatalf("budgeted index docs=%d dropped=%d; want 2 docs, 1 dropped", len(built.Docs), built.Policy.ScopeDropped)
 	}
-	if built.Policy.ScopeDroppedBytes != int64(len("charlie?")) || built.Policy.BudgetBytes != 11 {
-		t.Fatalf("budgeted index policy = %+v; want dropped_bytes=%d budget=11", built.Policy, len("charlie?"))
+	if built.Policy.ScopeDroppedBytes != int64(len("charlie?")) || built.Policy.BudgetBytes != budget {
+		t.Fatalf("budgeted index policy = %+v; want dropped_bytes=%d budget=%d", built.Policy, len("charlie?"), budget)
 	}
 	h := vol.content.healthSnapshot(0)
-	if h.ScopeDropped != 1 || h.ScopeDroppedBytes != int64(len("charlie?")) || h.BudgetBytes != 11 {
+	if h.ScopeDropped != 1 || h.ScopeDroppedBytes != int64(len("charlie?")) || h.BudgetBytes != budget {
 		t.Fatalf("budget health = %+v; want exact dropped files/bytes/budget", h)
 	}
 	if !h.Incomplete {

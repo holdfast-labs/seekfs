@@ -79,7 +79,7 @@ exclude = ["E:\\work\\scratch"]
 exts = [".go", ".md"]    # optional verbatim allowlist; unset means sniff
 git = true               # follow worktree .gitignore rules
 system_excludes = true
-budget_bytes = 8589934592  # explicit extracted-text budget
+budget_bytes = 1073741824  # explicit cap on the final index size (projected)
 ```
 
 File selection is ripgrep-style by default: every file the scope admits is
