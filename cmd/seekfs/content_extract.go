@@ -390,6 +390,13 @@ func contentSlurpNoRecall(path string, maxRaw int64) (*contentSlurpedFile, error
 	if maxRaw <= 0 {
 		maxRaw = contentExtractMaxRawBytes
 	}
+	// Test seam for synthetic-path fixtures (see contentResolveForRead):
+	// production always reads path as given.
+	if contentResolveForRead != nil {
+		if mapped := contentResolveForRead(path); mapped != "" {
+			path = mapped
+		}
+	}
 	f, err := contentOpenNoRecall(path)
 	if err != nil {
 		return nil, err

@@ -23,7 +23,6 @@ func contentTestDocs() []contentDoc {
 			RawSize:          int64(1000 + frn),
 			DocLen:           id + 7,
 			ModUnix:          mod,
-			TextOff:          uint64(id) * 128,
 			TextLen:          uint32(120 + id),
 		}
 	}
@@ -40,7 +39,7 @@ func TestContentIndexRoundTrip(t *testing.T) {
 	idx.BuiltAt = time.Unix(0, 1_700_000_000_000_000_000)
 	idx.Docs = contentTestDocs()
 	idx.Sections[contentSectionGrams] = []byte("gram-payload")
-	idx.Sections[contentSectionText] = []byte("some stored text")
+	idx.Sections[contentSectionFilter] = []byte("filter-payload")
 
 	data := contentIndexEncode(idx)
 	got, err := contentIndexDecode(data)
@@ -51,8 +50,9 @@ func TestContentIndexRoundTrip(t *testing.T) {
 		t.Fatalf("docs = %d, want %d", len(got.Docs), len(idx.Docs))
 	}
 	for i := range idx.Docs {
-		// v9 drops RawSize/DocLen/ModUnix from the wire (no query path reads
-		// them); they decode as zero while every other field round-trips.
+		// v9 drops RawSize/DocLen/ModUnix from the wire and v10 drops
+		// TextOff with the text store (no query path reads them); they
+		// decode as zero while every other field round-trips.
 		want := idx.Docs[i]
 		want.RawSize, want.DocLen, want.ModUnix = 0, 0, 0
 		if got.Docs[i] != want {
@@ -62,8 +62,8 @@ func TestContentIndexRoundTrip(t *testing.T) {
 	if !bytes.Equal(got.Sections[contentSectionGrams], []byte("gram-payload")) {
 		t.Fatalf("grams section = %q", got.Sections[contentSectionGrams])
 	}
-	if !bytes.Equal(got.Sections[contentSectionText], []byte("some stored text")) {
-		t.Fatalf("text section = %q", got.Sections[contentSectionText])
+	if !bytes.Equal(got.Sections[contentSectionFilter], []byte("filter-payload")) {
+		t.Fatalf("filter section = %q", got.Sections[contentSectionFilter])
 	}
 	if !got.BuiltAt.Equal(idx.BuiltAt) {
 		t.Fatalf("BuiltAt = %v, want %v", got.BuiltAt, idx.BuiltAt)

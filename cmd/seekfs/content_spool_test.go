@@ -317,7 +317,7 @@ func TestContentSpoolAssembleIdentical(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		idx, err := assembleContentIndexStream(source, tmp)
+		idx, err := assembleContentIndexStream(source, tmp, contentFilterID{})
 		if err != nil {
 			t.Fatal(err)
 		}

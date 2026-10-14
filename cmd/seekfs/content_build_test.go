@@ -43,7 +43,7 @@ func TestContentBuildExcludesIndexFiles(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if hits := r.search("alpha", 0); len(hits) != 1 || hits[0].Path != "a.txt" {
+	if hits, _ := r.search("alpha", 0); len(hits) != 1 || hits[0].Path != "a.txt" {
 		t.Fatalf("search = %v", contentPathsOf(hits))
 	}
 }
@@ -74,7 +74,7 @@ func TestContentWalkBuildTalliesBinary(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if hits := r.search("needle", 0); len(hits) != 2 {
+	if hits, _ := r.search("needle", 0); len(hits) != 2 {
 		t.Fatalf("search = %v; want both text files", contentPathsOf(hits))
 	}
 }
@@ -178,7 +178,10 @@ func TestContentBuildBoundedMemory(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if hits := r.search("needle", 0); len(hits) != docs {
+	// Uncapped: this test proves all-doc recall (1500 tiny disk reads);
+	// boundedness is proven separately by cap tests.
+	uncappedDiskVerify(t)
+	if hits, _ := r.search("needle", 0); len(hits) != docs {
 		t.Fatalf("search returned %d hits; want %d", len(hits), docs)
 	}
 	// Documented offline-build budget: this in-memory assembly is bounded by

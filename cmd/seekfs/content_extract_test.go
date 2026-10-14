@@ -163,7 +163,7 @@ func TestContentBuildEncodingOverride(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if hits := r.search("Ą", 0); len(hits) != 1 {
+	if hits, _ := r.search("Ą", 0); len(hits) != 1 {
 		t.Fatalf("explicit encoding term not findable: %v", contentPathsOf(hits))
 	}
 }
@@ -184,7 +184,7 @@ func TestContentBuildDecodesLegacyEncoding(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	hits := r.search("café", 0)
+	hits, _ := r.search("café", 0)
 	if len(hits) != 1 || hits[0].Path != "latin.txt" {
 		t.Fatalf("accented term not findable: %v", contentPathsOf(hits))
 	}
@@ -211,7 +211,7 @@ func TestContentBuildLegacyLeadByteAtEOFIsSearchable(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if hits := r.search("café", 0); len(hits) != 1 || hits[0].Path != "latin.txt" {
+	if hits, _ := r.search("café", 0); len(hits) != 1 || hits[0].Path != "latin.txt" {
 		t.Fatalf("legacy lead-like tail lost: %v", contentPathsOf(hits))
 	}
 }
@@ -237,7 +237,7 @@ func TestContentBuildTruncatedUTF8PrefixStaysUTF8(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if hits := r.search("café", 0); len(hits) != 1 || hits[0].Path != "utf8.txt" {
+	if hits, _ := r.search("café", 0); len(hits) != 1 || hits[0].Path != "utf8.txt" {
 		t.Fatalf("accented term lost on truncated UTF-8: %v", contentPathsOf(hits))
 	}
 }

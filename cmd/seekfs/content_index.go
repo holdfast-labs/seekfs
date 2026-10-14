@@ -66,13 +66,13 @@ func contentSectionTagName(tag uint32) string {
 
 // contentSectionEagerVerify reports whether a section's checksum is verified
 // immediately on load. Small sections (doc table, paths, policy, scope,
-// manifest) are hashed at decode; the large text/term/gram sections are
-// verified by a background pass after attach so startup does not page in
-// gigabytes. Any other checksummed section is small by construction and
-// verifies eagerly.
+// manifest, filter directory) are hashed at decode; the large
+// terms/grams/filter-bits sections are verified by a background pass after
+// attach so startup does not page in gigabytes. Any other checksummed
+// section is small by construction and verifies eagerly.
 func contentSectionEagerVerify(tag uint32) bool {
 	switch tag {
-	case contentSectionText, contentSectionTerms, contentSectionGrams:
+	case contentSectionText, contentSectionTerms, contentSectionGrams, contentSectionFilter:
 		return false
 	default:
 		return true
@@ -98,22 +98,26 @@ func contentSectionEagerVerify(tag uint32) bool {
 // singleton entries, prefix-summed block offsets; see content_postings.go),
 // nibble-packs the CXTR front-code lengths (see content_termsdict.go), and
 // drops the unread RawSize/DocLen/ModUnix doc fields from the wire
-// (80 -> 60 byte records); the 10 bump adds content-hash dedupe (§6z,
-// see content_dedupe.go: identical files are stored once, with an alias
-// map in the self-contained CXAL section) plus the CXIS inclusion-stats
-// section. Nothing else changes encoding: for a duplicate-free corpus the
-// v10 sections are byte-identical to v9 apart from the version, CXAL is
-// omitted when empty, and CXIS is always written. A sidecar whose version
-// does not match is rejected on load, so it can never be attached stale:
-// the service sees no usable base and its PF-3 build path rebuilds it.
+// (80 -> 60 byte records); the 11 bump is the filter-tier/inclusion merge:
+// it adopts the fsearch model as the default — NO stored text (CXST/CXTD
+// sections are gone, matches and snippets verify by reading the file from
+// disk), a per-file bloom filter section (CXFL, §6y) over the same folded
+// trigrams, and slimmer doc records (TextOff gone, 60 -> 52 bytes) —
+// plus the CXIS inclusion-stats section (§6z) and the CXAL content-hash
+// dedupe map (§6z, see content_dedupe.go: identical files share one
+// postings entry and one filter derivation, with a full doc-table row
+// per path, each verifying from its own bytes). Nothing else changes
+// encoding: CXAL is omitted when empty and CXIS is always written. A
+// sidecar whose version does not match is rejected on load, so it can
+// never be attached stale: the service sees no usable base and its PF-3
+// build path rebuilds it. Both parents' v10 sidecars (stored-text
+// v10 and no-text v10 are different formats under one number) rebuild.
 // (05 is the sharded-manifest version, which carries no doc table;
-// manifests are unaffected by the 06/07/08/09/10 bumps: a manifest names
-// shard files, and each shard carries the doc-table version itself. If
-// content/filter-tier (§6y) also bumps the format, renumber at merge:
-// this change is the version line plus CXAL/CXIS only.)
+// manifests are unaffected by the 06/07/08/09/10/11 bumps: a manifest names
+// shard files, and each shard carries the doc-table version itself.)
 var contentIndexMagic = [8]byte{'G', 'O', 'S', 'C', 'X', '0', '0', '4'}
 
-const contentIndexVersion = 10
+const contentIndexVersion = 11
 
 // contentOrigin records what the doc keys are, so a `.gsx` can never be
 // attached to a key space it does not join.
@@ -145,6 +149,9 @@ func (e *contentGSXSizeError) Error() string {
 }
 
 // Content section tags. Same 4-byte tag discipline as the v9 index.
+// CXST/CXTD are retired since v10 (no stored text): the constants stay defined
+// so the tag space reads completely, but no v11 writer emits them and no v11
+// reader accepts them. CXFL is the per-file bloom filter (§6y, since v10).
 const (
 	contentSectionDocTable uint32 = 'C'<<24 | 'X'<<16 | 'D'<<8 | 'T'
 	contentSectionTerms    uint32 = 'C'<<24 | 'X'<<16 | 'T'<<8 | 'R'
@@ -156,6 +163,7 @@ const (
 	contentSectionPolicy   uint32 = 'C'<<24 | 'X'<<16 | 'P'<<8 | 'L'
 	contentSectionScope    uint32 = 'C'<<24 | 'X'<<16 | 'S'<<8 | 'C'
 	contentSectionPruned   uint32 = 'C'<<24 | 'X'<<16 | 'G'<<8 | 'P'
+	contentSectionFilter   uint32 = 'C'<<24 | 'X'<<16 | 'F'<<8 | 'L'
 )
 
 // contentBuildPolicy is the extraction policy a `.gsx` was built with and the
@@ -235,9 +243,11 @@ const contentHashLen = 16
 // stable identity (FRN for USN volumes, a path hash for walk volumes).
 //
 // v1 keeps exactly one document per FRN. DocID must equal the document's index
-// in the FRN-sorted table; decode enforces it. Cross-file content dedup is
-// deferred (see the plan), so ContentHash is change detection, not a shared-doc
-// key, and the resolver's docID -> recordID map is unambiguous.
+// in the FRN-sorted table; decode enforces it. Identical files share one
+// postings entry through the CXAL alias map (§6z, v11): every duplicate path
+// keeps its own full doc-table row (DocID/FRN/path/fingerprint) and verifies
+// from its own bytes on disk, so all duplicate paths still appear in results
+// with correct snippets and counts.
 type contentDoc struct {
 	DocID            uint32
 	FRN              uint64
@@ -247,8 +257,10 @@ type contentDoc struct {
 	RawSize          int64
 	DocLen           uint32 // byte length of the case-folded text, for scoring
 	ModUnix          int64
-	TextOff          uint64 // offset into the case-preserving CXST text store
-	TextLen          uint32
+	// TextLen is the extracted-text byte length: v10 keeps it for budget
+	// accounting (reconcile allowance, uncovered-bytes health) but drops
+	// TextOff — there is no text store anymore (matches verify from disk).
+	TextLen uint32
 	// FileSize and FileModNano are the source file's byte size and nanosecond
 	// mtime at extraction time. The walk reconcile (no USN journal) diffs them
 	// against the filename index for change detection; USN volumes stamp them
@@ -462,11 +474,10 @@ func contentDocTableBytes(docs []contentDoc) []byte {
 		_ = binary.Write(&buf, binary.LittleEndian, d.ContentType)
 		_ = binary.Write(&buf, binary.LittleEndian, d.ExtractorVersion)
 		buf.Write(d.ContentHash[:])
-		// v9 drops RawSize/DocLen/ModUnix from the wire: no query path reads
-		// them (they are stamped in memory and carried through folds, but the
-		// persisted record omits them). FileSize/FileModNano stay: the walk
-		// reconcile diffs them for change detection without a journal.
-		_ = binary.Write(&buf, binary.LittleEndian, d.TextOff)
+		// v10 drops TextOff from the wire with the text store: verification
+		// reads the file from disk. TextLen stays for budget accounting.
+		// FileSize/FileModNano stay: the walk reconcile diffs them for
+		// change detection without a journal.
 		_ = binary.Write(&buf, binary.LittleEndian, d.TextLen)
 		_ = binary.Write(&buf, binary.LittleEndian, d.FileSize)
 		_ = binary.Write(&buf, binary.LittleEndian, d.FileModNano)
@@ -475,8 +486,8 @@ func contentDocTableBytes(docs []contentDoc) []byte {
 }
 
 // contentDocFixedSize is the encoded width of one doc record:
-// docID(4)+frn(8)+type(2)+extractor(2)+hash(16)+textOff(8)+textLen(4)+fileSize(8)+fileModNano(8)
-const contentDocFixedSize = 60
+// docID(4)+frn(8)+type(2)+extractor(2)+hash(16)+textLen(4)+fileSize(8)+fileModNano(8)
+const contentDocFixedSize = 52
 
 func contentDecodeDocTable(data []byte) ([]contentDoc, error) {
 	if len(data) < 4 {
@@ -497,11 +508,11 @@ func contentDecodeDocTable(data []byte) ([]contentDoc, error) {
 		copy(d.ContentHash[:], data[off+16:off+16+contentHashLen])
 		p := off + 16 + contentHashLen
 		// RawSize/DocLen/ModUnix are v8 wire fields, absent since v9: they
-		// decode as zero (see contentDocTableBytes).
-		d.TextOff = binary.LittleEndian.Uint64(data[p:])
-		d.TextLen = binary.LittleEndian.Uint32(data[p+8:])
-		d.FileSize = int64(binary.LittleEndian.Uint64(data[p+12:]))
-		d.FileModNano = int64(binary.LittleEndian.Uint64(data[p+20:]))
+		// decode as zero (see contentDocTableBytes). TextOff is a v9 wire
+		// field, absent since v10 (no text store): it decodes as zero too.
+		d.TextLen = binary.LittleEndian.Uint32(data[p:])
+		d.FileSize = int64(binary.LittleEndian.Uint64(data[p+4:]))
+		d.FileModNano = int64(binary.LittleEndian.Uint64(data[p+12:]))
 		off += contentDocFixedSize
 	}
 	return docs, nil
@@ -689,7 +700,7 @@ func contentIndexDecode(data []byte) (*contentIndex, error) {
 		}
 	}
 	idx.Docs = docs
-	// v10 sections (self-contained; a missing CXAL is no aliases, a
+	// v11 sections (self-contained; a missing CXAL is no aliases, a
 	// missing CXIS is zero stats). Aliases validate against the doc
 	// table, so a corrupt map fails the load instead of misresolving.
 	if len(docs) > 0 {

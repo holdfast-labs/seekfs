@@ -413,7 +413,7 @@ func buildContentIndexFromDir(ctx context.Context, root string, opts contentBuil
 	for i := range order {
 		order[i] = i
 	}
-	idx, err := assembleContentIndexFromSpool(spool, spooled, order, tmpDir)
+	idx, err := assembleContentIndexFromSpool(spool, spooled, order, tmpDir, contentFilterID{MaxRaw: settings.maxRaw, MaxText: settings.maxText, CapsExplicit: settings.capsExplicit, Root: absRootOrig, Encoding: opts.Encoding})
 	if err != nil {
 		return nil, err
 	}
@@ -434,12 +434,12 @@ func buildContentIndexFromDir(ctx context.Context, root string, opts contentBuil
 // and materializes the in-memory index (tests and small-corpus CLI builds).
 // Production sharded paths use assembleContentIndexStreamed + the streaming
 // save instead of materializing.
-func assembleContentIndexFromSpool(spool *os.File, spooled []contentWalkDoc, order []int, tmpDir string) (*contentIndex, error) {
+func assembleContentIndexFromSpool(spool *os.File, spooled []contentWalkDoc, order []int, tmpDir string, filterID contentFilterID) (*contentIndex, error) {
 	src, err := contentWalkSpool(spool, spooled, order)
 	if err != nil {
 		return nil, err
 	}
-	return assembleContentIndexStream(src, tmpDir)
+	return assembleContentIndexStream(src, tmpDir, filterID)
 }
 
 // contentBuildArenaBytes bounds the external builder's raw-posting buffer; when
@@ -466,18 +466,17 @@ var contentAssembleStreamHook = func(docID int) {}
 // assembleContentIndexStream is the streaming core of assembleContentIndex. It
 // consumes documents from source in ascending (frn, path) order, assigning
 // DocID = arrival position, and never retains the raw extracted corpus: each
-// doc's text is normalized into the text store and tokenized into the bounded
-// external posting builders as it arrives, then released. Postings spill to
-// disk (contentBuildArenaBytes per builder). Peak transient heap is therefore
-// one document's raw text plus the two posting arenas (plus O(docs) metadata:
-// the doc table and paths) and the text store being assembled; the returned
-// index is bounded by its encoded sections (text + postings + doc table +
-// paths).
-func assembleContentIndexStream(source contentBuildSource, tmpDir string) (*contentIndex, error) {
+// doc's text is tokenized into the bounded external posting builders as it
+// arrives, then released. Postings spill to disk (contentBuildArenaBytes per
+// builder). Peak transient heap is therefore one document's raw text plus the
+// two posting arenas (plus O(docs) metadata: the doc table and paths); the
+// returned index is bounded by its encoded sections (filter + postings + doc
+// table + paths). (v11: no text store.)
+func assembleContentIndexStream(source contentBuildSource, tmpDir string, filterID contentFilterID) (*contentIndex, error) {
 	if source == nil {
 		return nil, errors.New("nil content build source")
 	}
-	built, err := assembleContentIndexStreamed(source, tmpDir)
+	built, err := assembleContentIndexStreamed(source, tmpDir, filterID)
 	if err != nil {
 		return nil, err
 	}
@@ -508,24 +507,19 @@ func assembleContentIndexStream(source contentBuildSource, tmpDir string) (*cont
 		}
 		idx.Sections[contentSectionPruned] = pruned
 	}
-	if built.dictPath != "" {
-		dict, err := os.ReadFile(built.dictPath)
+	if built.filterPath != "" {
+		filter, err := os.ReadFile(built.filterPath)
 		if err != nil {
 			return nil, err
 		}
-		idx.Sections[contentSectionDictText] = dict
+		idx.Sections[contentSectionFilter] = filter
 	}
-	text, err := os.ReadFile(built.textPath)
-	if err != nil {
-		return nil, err
-	}
-	idx.Sections[contentSectionText] = text
 	idx.Sections[contentSectionPaths] = encodeContentPaths(built.paths)
 	return idx, nil
 }
 
 // contentStreamedBuild is the assembled form of one shard: the doc table and
-// paths in memory, the text store and posting sections spooled to temp files.
+// paths in memory, the posting and filter sections spooled to temp files.
 // It is what the production build/fold/reshard paths save with
 // contentSaveAssembled and then reload through the mmap loader; the in-memory
 // assembleContentIndexStream above stays for tests and small corpora.
@@ -533,10 +527,8 @@ type contentStreamedBuild struct {
 	docs []contentDoc
 	// paths parallels docs by DocID.
 	paths []string
-	// textPath holds the exact CXST section bytes (v7: header + block
-	// table + zstd frames); textSize is the logical (decompressed) stream
-	// length the doc table addresses.
-	textPath string
+	// textSize is the extracted corpus size: shard planning and the reshard
+	// threshold budget work by corpus size, not by encoded bytes.
 	textSize uint64
 	// termPath/gramPath hold the exact CXTR/CXGR section bytes, or "" when
 	// the corpus has no terms/grams.
@@ -545,12 +537,11 @@ type contentStreamedBuild struct {
 	// prunePath holds the exact CXGP pruned-gram section bytes, or "" when
 	// no gram exceeded contentGramPruneDF.
 	prunePath string
-	// dictPath holds the exact CXTD section bytes (the shard's trained
-	// text dictionary), or "" when the shard encodes plain.
-	dictPath string
+	// filterPath holds the exact CXFL filter section bytes.
+	filterPath string
 	// aliasPairs holds the §6z dedupe map (alias DocID -> primary
 	// DocID); dedupeFiles/Bytes tally the shared documents and the
-	// extracted-text bytes storing them once saved.
+	// extracted-text bytes sharing one postings entry.
 	aliasPairs  []contentAliasPair
 	dedupeFiles int64
 	dedupeBytes int64
@@ -569,15 +560,16 @@ var (
 )
 
 // contentTokenizedDoc is one document after the parallel normalize stage:
-// case-preserving stored bytes, the folded length for the doc table, the
-// content hash, and the precomputed term/gram sets the serial emit stage
-// merges into the posting builders in docID order.
+// the extracted length and content hash plus the precomputed term/gram sets
+// the serial emit stage merges into the posting builders in docID order. The
+// normalized bytes themselves are transient (v11 stores no text); the filter
+// row derives from the gram set.
 type contentTokenizedDoc struct {
-	stored []byte
-	docLen uint32
-	hash   [contentHashLen]byte
-	terms  map[string]uint32
-	grams  map[uint32]struct{}
+	textLen uint32
+	docLen  uint32
+	hash    [contentHashLen]byte
+	terms   map[string]uint32
+	grams   map[uint32]struct{}
 }
 
 // contentTokenizeDocForBuild normalizes one extracted document exactly the
@@ -587,11 +579,11 @@ func contentTokenizeDocForBuild(text []byte) contentTokenizedDoc {
 	stored := contentStoredText(text)
 	folded := contentFoldText(stored)
 	return contentTokenizedDoc{
-		stored: stored,
-		docLen: uint32(len(folded)),
-		hash:   sha256Of(stored),
-		terms:  contentTermsOfFolded(folded),
-		grams:  contentGramsOfU32(folded),
+		textLen: uint32(len(stored)),
+		docLen:  uint32(len(folded)),
+		hash:    sha256Of(stored),
+		terms:   contentTermsOfFolded(folded),
+		grams:   contentGramsOfU32(folded),
 	}
 }
 
@@ -605,12 +597,28 @@ func contentGramU32String(g uint32) string {
 	return string(b[:])
 }
 
+// contentFilterID carries the filter section's build identity: the caps the
+// disk verification re-applies, the root relative document paths resolve
+// against ("" for service builds, which verify through the live record-index
+// path), and the encoding label the query decodes with. CapsExplicit records
+// whether the caps are uniform operator values (verified exactly) or policy
+// defaults (verified with the repo-aware per-file caps, failing open to the
+// in-repo caps when membership is unknown). Fresh builds fill it from their
+// extraction settings; folds copy it from the base section they replace.
+type contentFilterID struct {
+	MaxRaw       int64
+	MaxText      int64
+	CapsExplicit bool
+	Root         string
+	Encoding     string
+}
+
 // assembleContentIndexStreamed consumes documents like assembleContentIndexStream
-// but never retains the corpus: the text store is spooled to a temp file as
-// docs arrive and the posting sections merge straight into section files, so
-// peak heap is one document's text plus the two posting arenas plus O(docs)
-// metadata and the posting entry/block tables.
-func assembleContentIndexStreamed(source contentBuildSource, tmpDir string) (*contentStreamedBuild, error) {
+// but never retains the corpus: postings merge straight into section files
+// and filter rows spool to a temp file as docs arrive, so peak heap is one
+// document's text plus the two posting arenas plus O(docs) metadata and the
+// posting entry/block tables. (v11: no text store, no text dictionary.)
+func assembleContentIndexStreamed(source contentBuildSource, tmpDir string, filterID contentFilterID) (*contentStreamedBuild, error) {
 	if source == nil {
 		return nil, errors.New("nil content build source")
 	}
@@ -628,65 +636,29 @@ func assembleContentIndexStreamed(source contentBuildSource, tmpDir string) (*co
 	}
 	defer gramBuilder.Close()
 
-	// The text store compresses incrementally as docs arrive; the writer
-	// spools compressed frames and finalizes the section file at the end,
-	// so peak heap stays one block plus one document. Encoding runs on the
-	// pipe thread (see content_textpipe.go) while emit keeps doing posting
-	// work; frames, cuts and offsets are byte-identical to serial assembly.
-	textWriter, err := newContentTextBlockWriter(tmpDir)
+	// The per-file filter rows spool in DocID order as docs arrive (one
+	// class byte plus the class bits per doc, self-delimiting); the finish
+	// step frames them with filterID into the CXFL section file.
+	filterRows, err := os.Create(filepath.Join(tmpDir, "cxfilter.rows"))
 	if err != nil {
 		return nil, err
 	}
-	textPipe := startContentTextPipe(textWriter)
-	// textLogical mirrors the writer's logical size on the emit thread: the
-	// doc table's TextOff assignments, which must stay in send order.
-	var textLogical uint64
+	defer filterRows.Close()
 
 	built := &contentStreamedBuild{}
 	var docs []contentDoc
 	var paths []string
-	// Content-hash dedupe (§6z): stored-text length + sha256 (already
+	// Content-hash dedupe (§6z): extracted-text length + sha256 (already
 	// computed per doc as the doc table's ContentHash) maps to the
-	// primary's text location. Later identical documents become aliases:
-	// full doc-table rows sharing the primary's bytes with no postings.
-	dedupeSeen := make(map[contentDedupeKey]contentDedupeSeen)
+	// primary's docID. Later identical documents become aliases:
+	// full doc-table rows sharing the primary's postings entry (no
+	// postings of their own) with their own filter row derivation, each
+	// verifying from its own bytes on disk. Empty text never aliases.
+	dedupeSeen := make(map[contentDedupeKey]uint32)
 	var aliasPairs []contentAliasPair
 	var dedupeFiles, dedupeBytes int64
-	// Dictionary sampling (v8): the first contentDictSampleBytes of stored
-	// text train the shard's dictionary, then later blocks encode against
-	// it. Sampling rides the normal emit path — every document is still
-	// emitted exactly once, in order — so it changes no offsets and costs
-	// one 8 MiB memcpy plus ~40 ms of training. dictForSection carries the
-	// trained bytes to the CXTD file below (nil for plain).
-	sampling := true
-	var sample []byte
-	var dictForSection []byte
-	var dictID uint32
-	trainAndSet := func() error {
-		t0 := time.Now()
-		defer func() {
-			if pc := contentAssemblePhaseCapture; pc != nil {
-				contentPhaseAdd(&pc.train, time.Since(t0))
-			}
-		}()
-		sampling = false
-		if textLogical < contentDictMinLogical {
-			sample = nil
-			return nil
-		}
-		if trained := contentTrainTextDict(sample, contentDictBudget); len(trained) > 0 {
-			// Ordered with the appended docs: blocks cut before this
-			// point encode plain, later ones with the dictionary,
-			// exactly as the serial setDict. A pipe-side failure
-			// surfaces at finish instead of here; either way the
-			// build fails rather than publishing mixed output.
-			textPipe.sendSetDict(contentTextDictID, trained)
-			dictForSection = trained
-			dictID = contentTextDictID
-		}
-		sample = nil
-		return nil
-	}
+	var textSize uint64
+
 	asmErr := func() error {
 		workers := contentBuildWorkerCount()
 		if workers < 1 {
@@ -701,14 +673,12 @@ func assembleContentIndexStreamed(source contentBuildSource, tmpDir string) (*co
 			// across pulls would alias overwritten bytes.
 			var raws []contentBuildDoc
 			var rawBytes int64
-			exhausted := false
 			for len(raws) < contentAssembleBatchDocs && rawBytes < contentAssembleBatchBytes {
 				d, ok, err := source()
 				if err != nil {
 					return err
 				}
 				if !ok {
-					exhausted = true
 					break
 				}
 				d.text = bytes.Clone(d.text)
@@ -721,14 +691,6 @@ func assembleContentIndexStreamed(source contentBuildSource, tmpDir string) (*co
 				}
 			}
 			if len(raws) == 0 {
-				// The source ended exactly on a batch boundary with
-				// sampling still open (small corpus): train on what the
-				// head holds, or stay plain.
-				if sampling {
-					if err := trainAndSet(); err != nil {
-						return err
-					}
-				}
 				break
 			}
 			toks := make([]contentTokenizedDoc, len(raws))
@@ -763,172 +725,125 @@ func assembleContentIndexStreamed(source contentBuildSource, tmpDir string) (*co
 				t := &toks[i]
 				docID := uint32(len(docs))
 				paths = append(paths, d.path)
-				// Identical content is stored once: the alias keeps its
-				// own identity (DocID, FRN, path, fingerprint, hash) and
-				// addresses the primary's bytes, contributing no text or
-				// postings of its own. Empty stored text never aliases.
-				if len(t.stored) > 0 {
-					key := contentDedupeKey{length: len(t.stored), hash: t.hash}
+				// Identical content shares one postings entry (§6z): the
+				// alias keeps its own identity (DocID, FRN, path,
+				// fingerprint, hash) and its own filter row, contributing
+				// no postings of its own; it verifies from its own bytes
+				// on disk. Empty text never aliases.
+				isAlias := false
+				if t.textLen > 0 {
+					key := contentDedupeKey{length: int(t.textLen), hash: t.hash}
 					if prim, dup := dedupeSeen[key]; dup {
-						docs = append(docs, contentDoc{
-							DocID:            docID,
-							FRN:              d.frn,
-							ContentType:      d.class,
-							ExtractorVersion: d.version,
-							DocLen:           t.docLen,
-							RawSize:          int64(len(t.stored)),
-							ModUnix:          d.modUnix,
-							ContentHash:      t.hash,
-							TextOff:          prim.textOff,
-							TextLen:          prim.textLen,
-							FileSize:         d.fileSize,
-							FileModNano:      d.fileModNano,
-						})
-						aliasPairs = append(aliasPairs, contentAliasPair{Alias: docID, Primary: prim.docID})
+						aliasPairs = append(aliasPairs, contentAliasPair{Alias: docID, Primary: prim})
 						dedupeFiles++
-						dedupeBytes += int64(len(t.stored))
-						contentAssembleStreamHook(int(docID))
-						continue
-					}
-					dedupeSeen[key] = contentDedupeSeen{docID: docID, textOff: textLogical, textLen: uint32(len(t.stored))}
-				}
-				// Dictionary sampling rides along: accumulate stored text
-				// until the sample cap or the exhausted source, then train
-				// once and keep emitting. Emission itself never pauses, so
-				// offsets, order and blocking are identical with or without
-				// a dictionary; only later frames reference it.
-				if sampling {
-					sample = append(sample, t.stored...)
-					sample = append(sample, '\n')
-					if len(sample) >= contentDictSampleBytes {
-						if err := trainAndSet(); err != nil {
-							return err
-						}
+						dedupeBytes += int64(t.textLen)
+						isAlias = true
+					} else {
+						dedupeSeen[key] = docID
 					}
 				}
-				// Store case-preserving repaired text (PF-6a): a case-sensitive query
-				// verifies against these exact bytes, and snippets show the real case.
-				// The index (terms and grams) is built from a case-folded copy, so the
-				// case-insensitive prefilter stays a superset of every case-sensitive
-				// match (tgrep's merged-case index, case-aware verify).
-				//
-				// TextOff/TextLen address the logical (decompressed) stream, so
-				// the doc table is identical with or without block compression;
-				// only the CXST section bytes change. Offsets come from the
-				// emit-side running sum (identical to the writer's logical
-				// size); the bytes move to the pipe thread, which encodes
-				// while emit continues with posting Adds.
-				textOff := textLogical
-				storedLen := len(t.stored)
-				textLogical += uint64(storedLen)
-				textPipe.sendAppend(t.stored)
+
 				docs = append(docs, contentDoc{
 					DocID:            docID,
 					FRN:              d.frn,
 					ContentType:      d.class,
 					ExtractorVersion: d.version,
 					DocLen:           t.docLen,
-					RawSize:          int64(storedLen),
+					RawSize:          int64(t.textLen),
 					ModUnix:          d.modUnix,
 					ContentHash:      t.hash,
-					TextOff:          textOff,
-					TextLen:          uint32(storedLen),
+					TextLen:          t.textLen,
 					FileSize:         d.fileSize,
 					FileModNano:      d.fileModNano,
 				})
-				// Documents arrive in ascending docID order, so each key's Adds arrive
-				// in ascending docID order as the builder requires. The per-doc
-				// term set is identical to the serial path's, and the builder
-				// sorts on spill, so Add order within a doc cannot change the
-				// encoded bytes. Each term is added once per document, so the
-				// dict builder's Add count is exactly the document frequency.
+			// Documents arrive in ascending docID order, so each key's Adds arrive
+			// in ascending docID order as the builder requires. The per-doc
+			// term set is identical to the serial path's, and the builder
+			// sorts on spill, so Add order within a doc cannot change the
+			// encoded bytes. Each term is added once per document, so the
+			// dict builder's Add count is exactly the document frequency.
+			// Aliases contribute no postings (they share the primary's
+			// entry); their filter row below still derives from the same
+			// gram set, so every row stays dense in DocID order.
+			if !isAlias {
 				for term := range t.terms {
 					dictBuilder.Add(term)
 				}
 				for gram := range t.grams {
 					gramBuilder.Add(contentGramU32String(gram), docID)
 				}
+			}
+				// The filter row derives from the same gram set (no extra
+				// pass): class by measured distinct count, bits set inline.
+				// Rows spool in DocID order (one class byte plus the class
+				// bits per doc, self-delimiting); the finish step frames
+				// them with filterID into the CXFL section file.
+				class := contentFilterClassForGrams(len(t.grams))
+				bits := make([]byte, contentFilterClassBits[class]/8)
+				contentFilterBitsOfU32(bits, t.grams)
+				if _, err := filterRows.Write([]byte{byte(class)}); err != nil {
+					return err
+				}
+				if _, err := filterRows.Write(bits); err != nil {
+					return err
+				}
+				textSize += uint64(t.textLen)
 				contentAssembleStreamHook(int(docID))
 			}
 			if pc := contentAssemblePhaseCapture; pc != nil {
 				contentPhaseAdd(&pc.emit, time.Since(emitStart))
 			}
-			// The source ended mid-batch with sampling still open: train on
-			// the whole accumulation now (a per-doc exhausted check would
-			// train on one doc — the pull phase already knows the stream
-			// is done, but the emit phase must still consume the batch).
-			if sampling && exhausted {
-				if err := trainAndSet(); err != nil {
-					return err
-				}
-			}
 		}
 		return nil
 	}()
-	textPath := filepath.Join(tmpDir, "cxtext.sec")
 	if asmErr != nil {
-		textPipe.abort()
 		return nil, asmErr
 	}
+	// The rows spool is complete: close the writer so the framer reads a
+	// stable file (the deferred Close is only the backstop).
+	if err := filterRows.Close(); err != nil {
+		return nil, err
+	}
+	rowsPath := filepath.Join(tmpDir, "cxfilter.rows")
 	termPath := filepath.Join(tmpDir, "cxterm.sec")
 	gramPath := filepath.Join(tmpDir, "cxgram.sec")
-	dictPath := filepath.Join(tmpDir, "cxdict.sec")
-	// The text, term, gram and dict sections are independent files;
-	// finishing them concurrently uses spare cores for the historically
-	// serial FinishFile phase. The bytes of each file are unaffected.
+	filterPath := filepath.Join(tmpDir, "cxfilter.sec")
+	// The term, gram and filter sections are independent files; finishing
+	// them concurrently uses spare cores for the historically serial
+	// FinishFile phase. The bytes of each file are unaffected.
 	var finishWG sync.WaitGroup
-	var textErr, termErr, gramErr, dictErr error
-	finishWG.Add(4)
-	go func() { defer finishWG.Done(); textErr = textPipe.finish(textPath) }()
+	var termErr, gramErr, filterErr error
+	finishWG.Add(3)
 	go func() { defer finishWG.Done(); termErr = dictBuilder.FinishFile(termPath) }()
 	go func() { defer finishWG.Done(); gramErr = gramBuilder.FinishFile(gramPath) }()
 	go func() {
 		defer finishWG.Done()
-		if len(dictForSection) == 0 {
-			_ = os.Remove(dictPath)
-			return
-		}
-		sec := encodeContentTextDict(dictID, dictForSection)
-		if len(sec) == 0 {
-			_ = os.Remove(dictPath)
-			return
-		}
-		dictErr = os.WriteFile(dictPath, sec, 0o600)
+		filterErr = frameContentFilterFile(rowsPath, filterPath, filterID, len(docs))
 	}()
 	finishWG.Wait()
-	if textErr != nil {
-		_ = os.Remove(termPath)
-		_ = os.Remove(gramPath)
-		_ = os.Remove(dictPath)
-		return nil, textErr
-	}
 	if termErr != nil {
-		_ = os.Remove(textPath)
 		_ = os.Remove(gramPath)
-		_ = os.Remove(dictPath)
+		_ = os.Remove(filterPath)
 		return nil, termErr
 	}
 	if gramErr != nil {
-		_ = os.Remove(textPath)
 		_ = os.Remove(termPath)
-		_ = os.Remove(dictPath)
+		_ = os.Remove(filterPath)
 		return nil, gramErr
 	}
-	if dictErr != nil {
-		_ = os.Remove(textPath)
+	if filterErr != nil {
 		_ = os.Remove(termPath)
 		_ = os.Remove(gramPath)
-		return nil, dictErr
+		return nil, filterErr
 	}
 	// The pruned-gram set rides its own section file, written once the gram
 	// merge (which decides the prunes) is done.
 	prunePath := filepath.Join(tmpDir, "cxprune.sec")
 	if sec := encodeContentPrunedGrams(gramBuilder.PrunedKeys()); len(sec) > 0 {
 		if err := os.WriteFile(prunePath, sec, 0o600); err != nil {
-			_ = os.Remove(textPath)
 			_ = os.Remove(termPath)
 			_ = os.Remove(gramPath)
-			_ = os.Remove(dictPath)
+			_ = os.Remove(filterPath)
 			return nil, err
 		}
 		built.prunePath = prunePath
@@ -938,19 +853,15 @@ func assembleContentIndexStreamed(source contentBuildSource, tmpDir string) (*co
 	built.aliasPairs = aliasPairs
 	built.dedupeFiles = dedupeFiles
 	built.dedupeBytes = dedupeBytes
-	built.textPath = textPath
-	// textSize stays the logical (decompressed) stream length: shard
-	// planning and the reshard threshold budget memory and work by corpus
-	// size, not by compressed bytes.
-	built.textSize = textLogical
+	// textSize is the extracted corpus size: shard planning and the reshard
+	// threshold budget work by corpus size, not by encoded bytes.
+	built.textSize = textSize
+	built.filterPath = filterPath
 	if st, err := os.Stat(termPath); err == nil && st.Size() > 0 {
 		built.termPath = termPath
 	}
 	if st, err := os.Stat(gramPath); err == nil && st.Size() > 0 {
 		built.gramPath = gramPath
-	}
-	if st, err := os.Stat(dictPath); err == nil && st.Size() > 0 {
-		built.dictPath = dictPath
 	}
 	return built, nil
 }
@@ -974,7 +885,7 @@ func assembleContentIndex(build []contentBuildDoc, tmpDir string) (*contentIndex
 		d := build[i]
 		i++
 		return d, true, nil
-	}, tmpDir)
+	}, tmpDir, contentFilterID{})
 }
 
 // buildContentIndexForIndex builds an FRN-keyed `.gsx` from a record index by
@@ -1116,7 +1027,7 @@ func buildContentIndexForIndex(ctx context.Context, idx *Index, opts contentBuil
 	for i := range order {
 		order[i] = i
 	}
-	cidx, err := assembleContentIndexFromSpool(spool, spooled, order, tmpDir)
+	cidx, err := assembleContentIndexFromSpool(spool, spooled, order, tmpDir, contentFilterID{MaxRaw: settings.maxRaw, MaxText: settings.maxText, CapsExplicit: settings.capsExplicit, Encoding: opts.Encoding})
 	if err != nil {
 		return nil, err
 	}

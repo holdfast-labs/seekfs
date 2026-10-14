@@ -1,7 +1,7 @@
 package main
 
-// Tests for content-hash dedupe (§6z): identical files stored once, every
-// path listed with correct snippets and counts.
+// Tests for content-hash dedupe (§6z): identical files share one postings
+// entry, every path listed with correct snippets and counts.
 
 import (
 	"context"
@@ -38,7 +38,7 @@ func dedupeTestCorpus(t *testing.T) *contentIndex {
 	return idx
 }
 
-func TestContentDedupeStoresSharedTextOnce(t *testing.T) {
+func TestContentDedupeSharesOnePostingsEntry(t *testing.T) {
 	idx := dedupeTestCorpus(t)
 	if len(idx.Docs) != 3 {
 		t.Fatalf("docs = %d; want 3 (a, b, c; empty declined)", len(idx.Docs))
@@ -51,8 +51,11 @@ func TestContentDedupeStoresSharedTextOnce(t *testing.T) {
 		t.Fatal("alias names itself")
 	}
 	a, p := idx.Docs[alias], idx.Docs[primary]
-	if a.TextOff != p.TextOff || a.TextLen != p.TextLen {
-		t.Fatalf("alias text %d+%d != primary %d+%d", a.TextOff, a.TextLen, p.TextOff, p.TextLen)
+	// Same content: same extracted length and hash. There is no stored
+	// text to share (v11 verifies from disk); the alias shares the
+	// primary's postings entry instead.
+	if a.TextLen != p.TextLen || a.ContentHash != p.ContentHash {
+		t.Fatalf("alias content %d/%x != primary %d/%x", a.TextLen, a.ContentHash, p.TextLen, p.ContentHash)
 	}
 	if a.FRN == p.FRN {
 		t.Fatal("alias must keep its own FRN (path-hash key)")
@@ -71,7 +74,7 @@ func TestContentDedupeListsEveryPath(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	hits := r.search("shared needle", 0)
+	hits, _ := r.search("shared needle", 0)
 	var paths []string
 	for _, h := range hits {
 		paths = append(paths, h.Path)
@@ -88,8 +91,14 @@ func TestContentDedupeListsEveryPath(t *testing.T) {
 	if len(cands) != 2 {
 		t.Fatalf("candidates = %v; want primary + alias", cands)
 	}
+	// The raw posting stream nominates only the primary: the alias shares
+	// the primary's entry and contributes nothing of its own.
+	raw := collectDocIDStream(r.candidateStream("shared"), 0)
+	if len(raw) != 1 {
+		t.Fatalf("raw posting candidates = %v; want only the primary", raw)
+	}
 	// The unique document still resolves alone.
-	if hits := r.search("unique needle", 0); len(hits) != 1 {
+	if hits, _ := r.search("unique needle", 0); len(hits) != 1 {
 		t.Fatalf("unique hits = %v; want 1", contentPathsOf(hits))
 	}
 }
@@ -112,7 +121,7 @@ func TestContentDedupeRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if hits := r.search("shared needle", 0); len(hits) != 2 {
+	if hits, _ := r.search("shared needle", 0); len(hits) != 2 {
 		t.Fatalf("reloaded hits = %d; want 2", len(hits))
 	}
 }

@@ -1107,7 +1107,7 @@ func (s *goSearchService) runContentBuild(vol *serviceVolumeIndex, reuseSidecar 
 			return nil, nil, "", err
 		}
 		src, rdr := sourceOf(rf, order)
-		built, err := assembleContentIndexStreamed(src, shardTmp)
+		built, err := assembleContentIndexStreamed(src, shardTmp, contentFilterID{MaxRaw: settings.maxRaw, MaxText: settings.maxText, CapsExplicit: settings.capsExplicit, Encoding: contentServiceEncodingLabel()})
 		if rdr != nil {
 			rdr.Close()
 		}

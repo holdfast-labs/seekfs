@@ -74,8 +74,10 @@ func boundPathCache(cache map[int]string) map[int]string {
 // existing for the exists: shape to have a non-empty set on both arms.
 var contentStatExists = os.Stat
 
-// errContentIncomplete refuses a count whose candidate superset was capped: a
-// partial number would look exact.
+// errContentIncomplete refuses a count whose evaluation was capped: a
+// partial number would look exact. It covers both the candidate-superset cap
+// and the v11 per-query disk verification cap; the operator action is the
+// same either way (narrow the query).
 var errContentIncomplete = errors.New("content count is incomplete: candidate budget exceeded; add a more selective term or filter")
 
 // contentLeafMatcher precompiles the query's content leaves once so evaluating
@@ -95,6 +97,14 @@ type contentLeafMatcher struct {
 	// test it without allocating the full fold (asciiCaseIndex); anything
 	// else takes the historical fold path with identical results.
 	needleASCII map[int]bool
+	// grams records, per term/phrase leaf, the folded distinct trigram keys
+	// constraining the v11 per-file filter prefilter (empty for sub-3-byte
+	// leaves: no constraint). regexGrams records, per regex leaf, the
+	// required-literal grams per disjunct per run (nil = no sound prefilter:
+	// no provable literals, or a disjunct a match may take unconstrained).
+	// Both are computed once here so the per-record gate is bit tests only.
+	grams      map[int][]uint32
+	regexGrams map[int][][][]uint32
 }
 
 // isASCIIBytes reports whether b has no byte >= 0x80.
@@ -191,6 +201,33 @@ func newContentLeafMatcher(pq parsedQuery) *contentLeafMatcher {
 				m.regex = make(map[int]*regexp.Regexp)
 			}
 			m.regex[leaf.LeafID] = re
+			// Prefilter grams for the v11 filter gate: per disjunct, the
+			// trigram-safe runs' grams (runs arrive lowercased, matching
+			// the folded grams the builder indexed). A disjunct with no
+			// safe run constrains nothing, so the whole leaf is
+			// unconstrained — mirroring contentRegexLeafStream exactly.
+			var disjuncts [][][]uint32
+			constrained := true
+			for _, runs := range regexRequiredLiteralAlternatives(leaf.Text) {
+				var rg [][]uint32
+				for _, run := range runs {
+					if !contentTermTrigramSafe(run) {
+						continue
+					}
+					rg = append(rg, contentFilterGramsOf([]byte(run)))
+				}
+				if len(rg) == 0 {
+					constrained = false
+					break
+				}
+				disjuncts = append(disjuncts, rg)
+			}
+			if constrained && len(disjuncts) > 0 {
+				if m.regexGrams == nil {
+					m.regexGrams = make(map[int][][][]uint32)
+				}
+				m.regexGrams[leaf.LeafID] = disjuncts
+			}
 			continue
 		}
 		if m.needle == nil {
@@ -205,8 +242,32 @@ func newContentLeafMatcher(pq parsedQuery) *contentLeafMatcher {
 			m.needleASCII = make(map[int]bool)
 		}
 		m.needleASCII[leaf.LeafID] = isASCIIBytes(b)
+		if m.grams == nil {
+			m.grams = make(map[int][]uint32)
+		}
+		// The prefilter folds every leaf (a raw match implies the folded
+		// match), so the grams always derive from the folded needle.
+		m.grams[leaf.LeafID] = contentFilterGramsOf(contentFoldText([]byte(leaf.Text)))
 	}
 	return m
+}
+
+// leafGrams returns the precomputed filter grams constraining a term/phrase
+// leaf (nil-safe: no matcher state means no constraint).
+func (m *contentLeafMatcher) filterGramsFor(leafID int) []uint32 {
+	if m == nil {
+		return nil
+	}
+	return m.grams[leafID]
+}
+
+// regexGrams returns the precomputed required-literal grams for a regex leaf
+// (nil = no sound prefilter).
+func (m *contentLeafMatcher) filterRegexGramsFor(leafID int) [][][]uint32 {
+	if m == nil {
+		return nil
+	}
+	return m.regexGrams[leafID]
 }
 
 // needleOf returns the precomputed bytes a term/phrase leaf matches: the raw
@@ -306,8 +367,19 @@ func entryMatchesWithContentMatcher(vol *serviceVolumeIndex, entry Entry, pq par
 	if m == nil {
 		m = newContentLeafMatcher(pq)
 	}
+	// v11 filter gate (§6y): the per-file bloom bits decide whether the
+	// positive content constraints can hold before any disk read. A gate
+	// miss evaluates the predicate with all content leaves false — exact,
+	// because the gate only fails an unsatisfiable positive constraint (a
+	// content-free OR alternative still matches, NOT exclusions still hold;
+	// see contentFilterGateOk). The gate is skipped for delta-covered keys:
+	// delta text is fresher than the filter bits, so stale bits must never
+	// reject fresh text.
+	if contentFilterGateRejects(vol, entry, pq, m) {
+		return entryMatchesContentAt(entry, pq, matchPath, make([]bool, m.size))
+	}
 	matched := make([]bool, m.size)
-	if text, ok := vol.contentTextForEntry(&entry); ok {
+	if text, ok := vol.contentTextForEntryTrace(&entry, pq.Trace); ok {
 		// Fold the document at most once for the whole entry, and only if a
 		// case-insensitive leaf actually needs it; case-sensitive leaves read
 		// the raw text. No per-leaf allocation.
@@ -318,6 +390,49 @@ func entryMatchesWithContentMatcher(vol *serviceVolumeIndex, entry Entry, pq par
 		}
 	}
 	return entryMatchesContentAt(entry, pq, matchPath, matched)
+}
+
+// contentFilterGateRejects reports whether a volume's per-file filter proves
+// the entry cannot satisfy the query's positive content constraints, so the
+// caller evaluates the predicate with content-false instead of reading the
+// file. It never rejects a delta-covered key (fresh text beats stale bits),
+// a key outside the base docs (a new file the delta may cover), or a volume
+// without a usable filter — those fall through to verification, which
+// decides exactly.
+func contentFilterGateRejects(vol *serviceVolumeIndex, entry Entry, pq parsedQuery, m *contentLeafMatcher) bool {
+	if vol == nil || vol.content == nil || m == nil || !queryHasAnyContentLeaf(pq) {
+		return false
+	}
+	key := entry.FRN
+	if vol.contentWalkOriginAttached() {
+		var ok bool
+		key, ok = contentWalkKeyOfEntry(&entry)
+		if !ok {
+			return false
+		}
+	} else if key == 0 {
+		return false
+	}
+	if delta := vol.content.deltaView(); delta != nil {
+		if _, found, _ := delta.textFor(key); found {
+			return false
+		}
+	}
+	reader, resolver := vol.content.readerResolverView()
+	if reader == nil || resolver == nil {
+		return false
+	}
+	docIndex, ok := resolver.docForFRN(key)
+	if !ok {
+		return false
+	}
+	row, ok := reader.filterRow(uint32(docIndex))
+	if !ok {
+		// No filter row: verify from disk without narrowing (a builder that
+		// never wrote the section still answers, only slower).
+		return false
+	}
+	return !contentFilterGateOk(row, pq, m)
 }
 
 // entryMatchesContentAt is entryMatches over a document whose content-leaf
@@ -355,11 +470,33 @@ func entryMatchesContentAt(entry Entry, pq parsedQuery, matchPath bool, matched 
 }
 
 // contentTextForEntry resolves an entry's normalized content text. The delta
-// wins over the base for a changed FRN; a tombstoned delta doc means absent.
-// On a walk-origin volume the key is the stable path hash derived from the
-// entry's path (walk record FRNs are positional and renumber on every
-// rescan); on USN volumes it is the entry's FRN.
+// wins over disk for a changed key; a tombstoned delta doc means absent.
+// Otherwise (v11: no stored text) the file is read fresh from disk and
+// extracted with the service policy — verify-direct freshness: a size/mtime
+// mismatch against the indexed fingerprint means stale postings/filter, but
+// the bytes on disk still decide, and the drain re-extracts the file through
+// the existing pipeline. A missing/unreadable/unextractable file reads as
+// absent, never an error.
+//
+// Disk reads count against the query's trace budget (contentDiskVerifyBudget;
+// delta hits never count): past it verification short-circuits to absent and
+// the trace is marked capped+incomplete, so the result is a visible subset
+// (search) or a refused tally (count), never silent. A nil trace disables
+// the cap for bounded callers (snippet attach runs post-limit).
+func (vol *serviceVolumeIndex) contentTextForEntryTrace(entry *Entry, trace *searchTrace) ([]byte, bool) {
+	return vol.contentTextForEntryPath(entry, "", trace)
+}
+
+// contentTextForEntry is contentTextForEntryTrace without a trace (uncapped,
+// for bounded callers).
 func (vol *serviceVolumeIndex) contentTextForEntry(entry *Entry) ([]byte, bool) {
+	return vol.contentTextForEntryTrace(entry, nil)
+}
+
+// contentTextForEntryPath resolves an entry's text, verifying livePath
+// instead of the entry path when non-empty (callers that resolved a fresher
+// path than the entry carries).
+func (vol *serviceVolumeIndex) contentTextForEntryPath(entry *Entry, livePath string, trace *searchTrace) ([]byte, bool) {
 	if vol == nil || vol.content == nil {
 		return nil, false
 	}
@@ -373,7 +510,6 @@ func (vol *serviceVolumeIndex) contentTextForEntry(entry *Entry) ([]byte, bool) 
 	} else if key == 0 {
 		return nil, false
 	}
-	reader, resolver := vol.content.readerResolverView()
 	if delta := vol.content.deltaView(); delta != nil {
 		if text, found, deleted := delta.textFor(key); found {
 			if deleted {
@@ -382,18 +518,62 @@ func (vol *serviceVolumeIndex) contentTextForEntry(entry *Entry) ([]byte, bool) 
 			return text, true
 		}
 	}
-	if reader == nil || resolver == nil {
+	path := livePath
+	if path == "" {
+		path = entry.Path
+	}
+	if path == "" {
 		return nil, false
+	}
+	read := func(p string) ([]byte, bool) {
+		if trace != nil {
+			if trace.DiskCapped {
+				return nil, false
+			}
+			if trace.DiskVerified >= contentDiskVerifyBudget {
+				trace.DiskCapped = true
+				trace.setContentIncomplete()
+				return nil, false
+			}
+			trace.DiskVerified++
+		}
+		return contentDiskReadForVerify(p, contentServiceExtractSettings())
+	}
+	if text, ok := read(path); ok {
+		return text, true
+	}
+	// The live path is missing: fall back to the doc table's stored path.
+	// This heals rename races where the record index lags the content index
+	// (the record still names the old path while the fold already carries
+	// the new one) and vice versa. Only a missing file falls back — an
+	// extraction failure of a present file is final, so a corrupt file can
+	// never serve another path's bytes.
+	if _, serr := contentStatExists(path); serr != nil && os.IsNotExist(serr) {
+		if docPath := vol.contentDocPathForKey(key); docPath != "" && docPath != path {
+			if text, ok := read(docPath); ok {
+				return text, true
+			}
+		}
+	}
+	return nil, false
+}
+
+// contentDocPathForKey returns the base doc table's stored path for a
+// content key ("", when the key has no doc). It backs the rename-race
+// fallback in contentTextForEntryPath.
+func (vol *serviceVolumeIndex) contentDocPathForKey(key uint64) string {
+	if vol == nil || vol.content == nil {
+		return ""
+	}
+	reader, resolver := vol.content.readerResolverView()
+	if reader == nil || resolver == nil {
+		return ""
 	}
 	docIndex, ok := resolver.docForFRN(key)
 	if !ok {
-		return nil, false
+		return ""
 	}
-	text := reader.docText(uint32(docIndex))
-	if len(text) == 0 {
-		return nil, false
-	}
-	return text, true
+	return reader.docPath(uint32(docIndex))
 }
 
 // contentLeafFirstOffset returns the byte offset of needle in text, or -1 when
@@ -1102,6 +1282,12 @@ func (vol *serviceVolumeIndex) countContentVolume(opts queryOptions) (int, error
 	opts.contentCount = &count
 	if _, err := vol.searchContentVolume(opts, true); err != nil {
 		return 0, err
+	}
+	// A disk verification cap hit during the tally means the count is
+	// partial: refuse it outright, like the candidate-budget overrun — never
+	// a silent partial number.
+	if opts.Trace != nil && opts.Trace.DiskCapped {
+		return 0, errContentIncomplete
 	}
 	// The base scan counted base matches; add the overlay count here so a
 	// cancellation inside the overlay walk can be surfaced.

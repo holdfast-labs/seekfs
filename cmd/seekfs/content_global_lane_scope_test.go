@@ -276,6 +276,10 @@ func contentLaneScopeVolume(t *testing.T, volume string, recs []contentVolRecord
 
 func TestContentGlobalLaneScopeDifferential(t *testing.T) {
 	t.Setenv("SEEKFS_CONTENT_SEARCH", "1")
+	// Uncapped: logic equivalence over hundreds of verifies per query
+	// (including limit-1<<30 full-set runs); boundedness is proven
+	// separately by cap tests.
+	uncappedDiskVerify(t)
 	queries := contentLaneScopeQueries()
 	// Soak tier (SEEKFS_TEST_SOAK=1, run by CI) exercises the full
 	// seed x scope x query x sort x limit matrix below; the default tier
@@ -835,7 +839,24 @@ func newShardedContentRecordVolume(t *testing.T, volume string, recs []contentVo
 	gsx := filepath.Join(tmpDir, "test.gsx")
 	header := newContentIndex()
 	header.Origin = contentOriginUSN
-	if _, err := contentReshardAndSave(gsx, whole, header, tmpDir); err != nil {
+	// v11 stores no text: reshard from the in-memory build docs (frn→doc)
+	// instead of re-splitting assembled text.
+	byFRN := make(map[uint64]contentBuildDoc, len(build))
+	for _, d := range build {
+		byFRN[d.frn] = d
+	}
+	wr, err := openContentReader(whole)
+	if err != nil {
+		t.Fatalf("open whole reader: %v", err)
+	}
+	var items []contentFoldItem
+	for _, d := range whole.Docs {
+		items = append(items, contentFoldItem{frn: d.FRN, path: wr.docPath(d.DocID), size: int64(d.TextLen)})
+	}
+	if _, err := contentReshardAndSave(gsx, items, func(it contentFoldItem) (contentBuildDoc, bool) {
+		d, ok := byFRN[it.frn]
+		return d, ok
+	}, header, contentFilterID{}, tmpDir); err != nil {
 		t.Fatalf("reshard: %v", err)
 	}
 	composite, err := contentLoadFile(gsx)
@@ -858,6 +879,13 @@ func newShardedContentRecordVolume(t *testing.T, volume string, recs []contentVo
 		ids[i] = uint32(contentRecordIndexForFRN(idx, composite.Docs[i].FRN))
 	}
 	vol.content.setReady(composite, reader, buildContentResolver(composite.Docs, frns, ids))
+	// v11 verifies from disk: serve the synthetic corpus through the stub,
+	// keyed by reconstructed index paths (which follow the parent chains).
+	texts := make([]string, len(recs))
+	for i := range recs {
+		texts[i] = recs[i].content
+	}
+	stubContentDiskTextForIndex(t, idx, texts)
 	buildOrders(vol.index)
 	vol.rebuildNameTrigramsLocked()
 	return vol

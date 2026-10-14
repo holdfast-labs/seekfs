@@ -64,6 +64,12 @@ func newContentQueryVolumeNamed(t testing.TB, volume string, files []contentFixt
 		ids[i] = uint32(contentRecordIndexForFRN(idx, cidx.Docs[i].FRN))
 	}
 	vol.content.setReady(cidx, reader, buildContentResolver(cidx.Docs, frns, ids))
+	// v11 verifies from disk: serve the synthetic corpus through the stub.
+	texts := make([]string, len(files))
+	for i := range files {
+		texts[i] = files[i].text
+	}
+	stubContentDiskTextForIndex(t, idx, texts)
 	return vol
 }
 

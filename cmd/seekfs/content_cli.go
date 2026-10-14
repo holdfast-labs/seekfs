@@ -259,11 +259,19 @@ func cmdContent(args []string) error {
 	if err != nil {
 		return err
 	}
-	hits := r.search(term, *n)
+	// v11 verifies from disk with the build's extraction policy (caps from
+	// CXPL, encoding from CXFL), so the query decodes exactly as the build
+	// did without extra flags.
+	hits, complete := r.search(term, *n)
+	if !complete {
+		// The scan stopped at the verification cap with records unvisited:
+		// the answer is a visible subset, never silent.
+		fmt.Fprintf(os.Stderr, "content: incomplete results (disk verification cap reached; narrow the term)\n")
+	}
 	fuzzy := ""
 	if len(hits) == 0 {
 		if corrected, show, ok := contentFuzzyCorrectOfflineText(r, term); ok {
-			if retry := r.search(corrected, *n); len(retry) > 0 {
+			if retry, _ := r.search(corrected, *n); len(retry) > 0 {
 				hits, fuzzy = retry, show
 			}
 		}

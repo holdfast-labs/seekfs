@@ -24,9 +24,12 @@ func contentParallelShapes() []string {
 }
 
 // runContentParallelCase runs one query at workers-forcing GOMAXPROCS and
-// returns paths, snippets and the trace completeness signal.
+// returns paths, snippets and the trace completeness signal. Disk
+// verification runs uncapped: these cases prove parallel≡serial logic over
+// thousand-doc corpora, while boundedness is proven separately by cap tests.
 func runContentParallelCase(t *testing.T, vols []*serviceVolumeIndex, query string, limit int, gomax int) ([]Entry, int, searchTrace) {
 	t.Helper()
+	uncappedDiskVerify(t)
 	prev := runtime.GOMAXPROCS(gomax)
 	defer runtime.GOMAXPROCS(prev)
 	trace := &searchTrace{}
@@ -82,6 +85,9 @@ func TestContentParallelContentMatchesSerial(t *testing.T) {
 // count must equal the full search.
 func TestContentParallelCountMatchesSearchSum(t *testing.T) {
 	t.Setenv("SEEKFS_CONTENT_BENCH_DOCS", "5000")
+	// Uncapped: this test proves exact tallies over a 5000-doc corpus;
+	// boundedness is proven separately by cap tests.
+	uncappedDiskVerify(t)
 	vols := contentBenchVolumes(t, 1)
 	prev := runtime.GOMAXPROCS(4)
 	defer runtime.GOMAXPROCS(prev)

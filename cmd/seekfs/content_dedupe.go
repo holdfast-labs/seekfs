@@ -1,20 +1,23 @@
 package main
 
-// Content-hash dedupe (§6z, WORK_QUEUE item 1): identical files (stored-text
-// length + sha256 of the stored text, both computed during extraction) are
-// extracted and stored ONCE. Every path still appears in results.
+// Content-hash dedupe (§6z, WORK_QUEUE item 1): identical files
+// (extracted-text length + sha256 of the extracted text, both computed
+// during extraction) share one postings entry. Every path still appears
+// in results.
 //
 // Mechanism: the streaming assembler (assembleContentIndexStreamed) keeps
-// the first document of each content group as the primary — full text in
-// the CXST store plus term/gram postings — and records every later
-// identical document as an alias: a full doc-table row (own DocID, FRN,
-// path, fingerprint and hash, so resolution, reconcile and counts keep
-// working per path) whose TextOff/TextLen point at the primary's bytes and
-// which contributes no postings of its own. The alias pairs ride a
-// self-contained CXAL section (v10; nothing else changes encoding), and
-// readers expand posting-derived candidate sets over the alias map before
-// verification, so every duplicate path verifies (against the shared
-// bytes), snippets and counts list each path, and scan-shaped queries
+// the first document of each content group as the primary — the only one
+// contributing term/gram postings — and records every later identical
+// document as an alias: a full doc-table row (own DocID, FRN, path,
+// fingerprint and hash, so resolution, reconcile and counts keep working
+// per path) with its own filter row derived from the shared gram set,
+// contributing no postings of its own. There is no stored text to share
+// (v11 verifies from disk); each path verifies against its own bytes, so
+// a duplicate edited after indexing still matches its current content.
+// The alias pairs ride a self-contained CXAL section (nothing else
+// changes encoding), and readers expand posting-derived candidate sets
+// over the alias map before verification, so every duplicate path
+// verifies, snippets and counts list each path, and scan-shaped queries
 // (which enumerate documents, not postings) need no expansion at all.
 //
 // Shards dedupe within themselves: each shard assembles independently, so
@@ -35,7 +38,7 @@ import (
 	"sort"
 )
 
-// contentSectionAlias and contentSectionInclusion are the v10 sections.
+// contentSectionAlias and contentSectionInclusion are the v11 sections.
 // CXAL maps alias DocIDs to their primary; CXIS carries the inclusion
 // stats. Both verify eagerly (small sections).
 const (
@@ -43,8 +46,8 @@ const (
 	contentSectionInclusion uint32 = 'C'<<24 | 'X'<<16 | 'I'<<8 | 'S'
 )
 
-// contentAliasPair maps one alias DocID to the primary whose text and
-// postings it shares.
+// contentAliasPair maps one alias DocID to the primary whose postings
+// entry it shares.
 type contentAliasPair struct {
 	Alias   uint32
 	Primary uint32
@@ -52,8 +55,7 @@ type contentAliasPair struct {
 
 // encodeContentAliases encodes sorted alias pairs: uvarint count, then
 // (alias, primary) uvarint pairs. Empty input encodes to empty (the
-// section is then omitted, keeping dup-free builds byte-identical to v9
-// apart from the version).
+// section is then omitted, keeping dup-free builds free of CXAL).
 func encodeContentAliases(pairs []contentAliasPair) []byte {
 	if len(pairs) == 0 {
 		return nil
@@ -178,7 +180,7 @@ func encodeContentInclusionStats(s contentInclusionStats) []byte {
 }
 
 // decodeContentInclusionStats decodes a CXIS section. A missing section is
-// zero stats (hand-built v10 fixtures); trailing bytes fail the load.
+// zero stats (hand-built v11 fixtures); trailing bytes fail the load.
 func decodeContentInclusionStats(data []byte) (contentInclusionStats, error) {
 	var s contentInclusionStats
 	if len(data) == 0 {
@@ -243,9 +245,9 @@ func decodeContentInclusionStats(data []byte) (contentInclusionStats, error) {
 }
 
 // contentDedupeTotalsForIndex recomputes the dedupe savings for a loaded
-// index from its alias map: aliases count files, their shared text length
-// counts saved extracted-text bytes. Folds use it for retained (clean)
-// shards whose assembler counts are gone with their build.
+// index from its alias map: aliases count files, their extracted-text
+// length counts the bytes sharing one postings entry. Folds use it for
+// retained (clean) shards whose assembler counts are gone with their build.
 func contentDedupeTotalsForIndex(idx *contentIndex) (files, bytes int64) {
 	if idx == nil || len(idx.Aliases) == 0 {
 		return 0, 0
@@ -263,17 +265,9 @@ func contentDedupeTotalsForIndex(idx *contentIndex) (files, bytes int64) {
 	return files, bytes
 }
 
-// contentDedupeKey identifies identical content: stored-text length plus
-// the sha256 of the stored text (the doc table's ContentHash).
+// contentDedupeKey identifies identical content: extracted-text length plus
+// the sha256 of the extracted text (the doc table's ContentHash).
 type contentDedupeKey struct {
 	length int
 	hash   [contentHashLen]byte
-}
-
-// contentDedupeSeen maps content keys to the primary doc's text location
-// within one assembly.
-type contentDedupeSeen struct {
-	docID   uint32
-	textOff uint64
-	textLen uint32
 }
