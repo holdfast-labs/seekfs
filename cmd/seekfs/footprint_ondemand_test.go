@@ -29,7 +29,7 @@ func TestOnDemandFolderFirstSearch(t *testing.T) {
 	search := func(req *serviceRequest) serviceResponse {
 		t.Helper()
 		var buf bytes.Buffer
-		s.serviceCommandSearch(&buf, serviceCapabilities{}, req)
+		s.serviceCommandSearch(&buf, serviceCapabilities{}, servicePrincipal{}, req)
 		var resp serviceResponse
 		if err := json.Unmarshal(buf.Bytes(), &resp); err != nil {
 			t.Fatalf("decode on-demand response: %v (raw %q)", err, buf.String())
