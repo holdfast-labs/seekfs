@@ -13,7 +13,6 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -121,13 +120,16 @@ type contentBuildDoc struct {
 }
 
 // contentWalkDoc is one extracted file awaiting assembly: the spool offset of
-// its extracted text plus the identity the doc table needs. The walk builders
+// its compressed frame plus the identity the doc table needs. The walk builders
 // spool text to disk during the walk and assemble in FRN order afterwards, so
-// a large corpus never sits in memory as raw text.
+// a large corpus never sits in memory as raw text. offset addresses the
+// frame in the compressed spool (see content_spool.go); spoolLen is the
+// frame's compressed length and length the doc's original length.
 type contentWalkDoc struct {
 	item    contentBuildItem
 	offset  int64
 	length  int
+	spoolLen int
 	modUnix int64
 	class   uint16
 	version uint16
@@ -138,9 +140,13 @@ type contentWalkDoc struct {
 	fileModNano int64
 }
 
-// contentWalkSpool streams extracted documents back out of a spool file in the
-// order order lists (indexes into spooled).
-func contentWalkSpool(f *os.File, spooled []contentWalkDoc, order []int) contentBuildSource {
+// contentWalkSpool streams extracted documents back out of a compressed spool
+// file in the order order lists (indexes into spooled).
+func contentWalkSpool(f *os.File, spooled []contentWalkDoc, order []int) (contentBuildSource, error) {
+	r, err := newContentSpoolReader(f)
+	if err != nil {
+		return nil, err
+	}
 	next := 0
 	return func() (contentBuildDoc, bool, error) {
 		if next == len(order) {
@@ -148,12 +154,12 @@ func contentWalkSpool(f *os.File, spooled []contentWalkDoc, order []int) content
 		}
 		s := spooled[order[next]]
 		next++
-		text := make([]byte, s.length)
-		if _, err := f.ReadAt(text, s.offset); err != nil {
+		text, err := r.Read(s.offset, s.spoolLen, s.length)
+		if err != nil {
 			return contentBuildDoc{}, false, err
 		}
 		return contentBuildDoc{path: s.item.path, frn: s.item.frn, text: text, modUnix: s.modUnix, class: s.class, version: s.version, fileSize: s.fileSize, fileModNano: s.fileModNano}, true, nil
-	}
+	}, nil
 }
 
 // buildContentIndexFromDir builds an in-memory `.gsx` for root.
@@ -170,6 +176,11 @@ func buildContentIndexFromDir(ctx context.Context, root string, opts contentBuil
 		return nil, err
 	}
 	defer spool.Close()
+	spoolWriter, err := newContentSpoolWriter(spool)
+	if err != nil {
+		return nil, err
+	}
+	defer spoolWriter.Close()
 	var spooled []contentWalkDoc
 	var scanned int
 	var skipped, truncated, declined, binary int64
@@ -316,17 +327,15 @@ func buildContentIndexFromDir(ctx context.Context, root string, opts contentBuil
 			rel = path
 		}
 		rel = filepath.ToSlash(rel)
-		offset, serr := spool.Seek(0, io.SeekCurrent)
+		offset, compLen, serr := spoolWriter.Append(res.Text)
 		if serr != nil {
 			return serr
-		}
-		if _, werr := spool.Write(res.Text); werr != nil {
-			return werr
 		}
 		spooled = append(spooled, contentWalkDoc{
 			item:        contentBuildItem{frn: contentPathKey(rel), path: rel},
 			offset:      offset,
 			length:      len(res.Text),
+			spoolLen:    compLen,
 			modUnix:     modUnix,
 			class:       res.Class,
 			version:     e.Version(),
@@ -363,7 +372,11 @@ func buildContentIndexFromDir(ctx context.Context, root string, opts contentBuil
 // Production sharded paths use assembleContentIndexStreamed + the streaming
 // save instead of materializing.
 func assembleContentIndexFromSpool(spool *os.File, spooled []contentWalkDoc, order []int, tmpDir string) (*contentIndex, error) {
-	return assembleContentIndexStream(contentWalkSpool(spool, spooled, order), tmpDir)
+	src, err := contentWalkSpool(spool, spooled, order)
+	if err != nil {
+		return nil, err
+	}
+	return assembleContentIndexStream(src, tmpDir)
 }
 
 // contentBuildArenaBytes bounds the external builder's raw-posting buffer; when
@@ -874,6 +887,11 @@ func buildContentIndexForIndex(ctx context.Context, idx *Index, opts contentBuil
 		return nil, err
 	}
 	defer spool.Close()
+	spoolWriter, err := newContentSpoolWriter(spool)
+	if err != nil {
+		return nil, err
+	}
+	defer spoolWriter.Close()
 	var spooled []contentWalkDoc
 	var skipped, truncated, binary int64
 	var scopeBytes int64
@@ -916,17 +934,15 @@ func buildContentIndexForIndex(ctx context.Context, idx *Index, opts contentBuil
 				}
 				scopeBytes += n
 			}
-			offset, serr := spool.Seek(0, io.SeekCurrent)
+			offset, compLen, serr := spoolWriter.Append(doc.text)
 			if serr != nil {
 				return nil, serr
-			}
-			if _, werr := spool.Write(doc.text); werr != nil {
-				return nil, werr
 			}
 			spooled = append(spooled, contentWalkDoc{
 				item:        item,
 				offset:      offset,
 				length:      len(doc.text),
+				spoolLen:    compLen,
 				modUnix:     doc.modUnix,
 				class:       doc.class,
 				version:     doc.version,

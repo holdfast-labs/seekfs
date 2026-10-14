@@ -470,6 +470,15 @@ func TestContentScopeReserve(t *testing.T) {
 	if got, want := contentScopeAllowance(vol, 30<<30), int64(float64(headroom)/contentScopePeakMultiplier); got != want {
 		t.Fatalf("allowance with spool credited = %d; want %d", got, want)
 	}
+	// The credit is staged disk bytes, not extracted bytes: a compressed
+	// spool stages fewer bytes than it indexes. With 30 GiB extracted but
+	// only 8 GiB staged (free fell to 92 GiB) the allowance is the same as
+	// with nothing spooled — crediting extracted bytes instead would double
+	// count the 22 GiB the spool never occupied and admit past the peak.
+	contentFreeBytesFn = func(_ string) (uint64, error) { return 92 << 30, nil }
+	if got, want := contentScopeAllowance(vol, 8<<30), int64(float64(headroom)/contentScopePeakMultiplier); got != want {
+		t.Fatalf("allowance with compressed spool credited = %d; want %d", got, want)
+	}
 	// At or below the reserve nothing more is selected: less free space
 	// never means more indexing.
 	contentFreeBytesFn = func(_ string) (uint64, error) { return 1 << 30, nil }
@@ -480,14 +489,14 @@ func TestContentScopeReserve(t *testing.T) {
 		t.Fatal("below the reserve nothing fits")
 	}
 	// The fits check agrees with the allowance: 100 GiB free, 20 GiB
-	// reserve: 40 GiB extracted peaks at 60 GiB (fits in ~80 GiB of
-	// headroom); 60 GiB peaks at 90 GiB (breaches).
+	// reserve: 90 GiB extracted peaks at 72 GiB (fits in ~80 GiB of
+	// headroom); 110 GiB peaks at 88 GiB (breaches).
 	contentFreeBytesFn = func(_ string) (uint64, error) { return 100 << 30, nil }
-	if !contentScopeFitsReserve(vol, 40<<30) {
-		t.Fatal("40 GiB extracted must fit: a 60 GiB peak leaves the 20 GiB reserve")
+	if !contentScopeFitsReserve(vol, 90<<30) {
+		t.Fatal("90 GiB extracted must fit: a 72 GiB peak leaves the 20 GiB reserve")
 	}
-	if contentScopeFitsReserve(vol, 60<<30) {
-		t.Fatal("60 GiB extracted must not fit: a 90 GiB peak breaches the reserve")
+	if contentScopeFitsReserve(vol, 110<<30) {
+		t.Fatal("110 GiB extracted must not fit: an 88 GiB peak breaches the reserve")
 	}
 	// Anchors: bare volumes anchor at the root, absolute paths at themselves,
 	// anything else anchors nowhere.

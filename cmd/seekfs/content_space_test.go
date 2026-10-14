@@ -161,3 +161,61 @@ func TestContentSnapshotWaitsForInFlightPersist(t *testing.T) {
 		t.Fatalf("state = %q; want ready once the in-flight persist finished", got)
 	}
 }
+
+// The effective peak multiplier adapts to the observed spool ratio but only
+// ever tightens within a build and never drops below the measured-normal
+// floor: normal text stays at 0.8 (the 1.875x coverage gain), dense text
+// budgets its real peak (spool + output) instead of tripping the guard.
+func TestContentEffectivePeakMultiplier(t *testing.T) {
+	oldTrust := contentSpoolTrustBytes
+	contentSpoolTrustBytes = 1 << 10
+	t.Cleanup(func() { contentSpoolTrustBytes = oldTrust })
+	const floor = contentScopePeakMultiplier // 0.8
+	eq := func(got, want float64) bool {
+		d := got - want
+		return d < 1e-6 && d > -1e-6
+	}
+	// Below the trust threshold the floor governs alone.
+	if got := contentEffectivePeakMultiplier(floor, 512, 100); !eq(got, floor) {
+		t.Fatalf("untrusted mult = %v; want floor %v", got, floor)
+	}
+	const used = int64(10 << 20)
+	// Normal text (r~0.265, split runs): twice the staged ratio plus margin
+	// stays under the floor.
+	if got := contentEffectivePeakMultiplier(floor, used, 2778726); !eq(got, floor) {
+		t.Fatalf("normal-text mult = %v; want floor %v", got, floor)
+	}
+	// Just under the split cap the split-spike term binds slightly above it.
+	if got, want := contentEffectivePeakMultiplier(floor, used, 3565158), 2*0.34+contentAdaptiveMargin; !eq(got, want) {
+		t.Fatalf("near-cap mult = %v; want %v", got, want)
+	}
+	// Past the cap the split is skipped: staged ratio plus the encoded
+	// output plus margin.
+	if got, want := contentEffectivePeakMultiplier(floor, used, 3774873), 0.36+contentScopeEncodedMultiplier+contentAdaptiveMargin; !eq(got, want) {
+		t.Fatalf("dense mult = %v; want %v", got, want)
+	}
+	if got, want := contentEffectivePeakMultiplier(floor, used, 6291456), 0.6+contentScopeEncodedMultiplier+contentAdaptiveMargin; !eq(got, want) {
+		t.Fatalf("minified mult = %v; want %v", got, want)
+	}
+	// A pinned multiplier never loosens when the ratio improves later.
+	if got := contentEffectivePeakMultiplier(1.25, used, 2778726); !eq(got, 1.25) {
+		t.Fatalf("pinned mult = %v; want 1.25 (only tightens)", got)
+	}
+	if got := contentEffectivePeakMultiplier(floor, used, 6291456); !eq(got, 1.25) {
+		t.Fatalf("rising mult = %v; want 1.25", got)
+	}
+}
+
+// The split test matches the save-time decision: the projection and the
+// reframe agree on which side of the cap a spool falls.
+func TestContentSpoolWillSplit(t *testing.T) {
+	if !contentSpoolWillSplit(1000, 340) {
+		t.Fatal("0.34x spool must split")
+	}
+	if contentSpoolWillSplit(1000, 360) {
+		t.Fatal("0.36x spool must skip the split")
+	}
+	if !contentSpoolWillSplit(600<<20, 158<<20) {
+		t.Fatal("Chromium-like 0.26x spool must split")
+	}
+}
