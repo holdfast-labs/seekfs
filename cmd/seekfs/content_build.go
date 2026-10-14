@@ -40,6 +40,11 @@ type contentBuildOptions struct {
 	// resolved auto scope (roots, excludes, git worktrees, extension registry).
 	// The caller resolves it (contentScope.resolve) after detecting repos.
 	Scope *contentScopeResolved
+	// Tier2Budget, when positive, partitions the sorted walk corpus at that
+	// many extracted-text bytes: the head assembles tier 1 (see
+	// buildContentIndexFromDirFiltered) and the tail becomes the tier-2
+	// filter. Zero (the default) builds tier 1 alone, exactly as before.
+	Tier2Budget int64
 }
 
 func defaultContentBuildOptions() contentBuildOptions {
@@ -158,16 +163,27 @@ func contentWalkSpool(f *os.File, spooled []contentWalkDoc, order []int) content
 
 // buildContentIndexFromDir builds an in-memory `.gsx` for root.
 func buildContentIndexFromDir(ctx context.Context, root string, opts contentBuildOptions) (*contentIndex, error) {
+	idx, _, err := buildContentIndexFromDirFiltered(ctx, root, opts)
+	return idx, err
+}
+
+// buildContentIndexFromDirFiltered builds like buildContentIndexFromDir, but
+// when opts.Tier2Budget > 0 it partitions the sorted corpus at that many
+// extracted-text bytes: the head assembles tier 1 and the tail returns as a
+// tier-2 filter (nil when nothing falls past the budget). The filter reuses
+// the spooled extracted text, so covering dropped files costs only the gram
+// pass. A non-positive budget builds tier 1 alone, exactly as before.
+func buildContentIndexFromDirFiltered(ctx context.Context, root string, opts contentBuildOptions) (*contentIndex, *contentFilter, error) {
 	settings := opts.extractSettings()
 	ctx = contentWithExtractSettings(ctx, settings)
 	tmpDir, err := os.MkdirTemp("", "seekfs-content-*")
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	defer os.RemoveAll(tmpDir)
 	spool, err := os.Create(filepath.Join(tmpDir, "text.spool"))
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	defer spool.Close()
 	var spooled []contentWalkDoc
@@ -336,7 +352,7 @@ func buildContentIndexFromDir(ctx context.Context, root string, opts contentBuil
 		return nil
 	})
 	if walkErr != nil {
-		return nil, walkErr
+		return nil, nil, walkErr
 	}
 	sort.Slice(spooled, func(i, j int) bool {
 		if spooled[i].item.frn != spooled[j].item.frn {
@@ -344,18 +360,41 @@ func buildContentIndexFromDir(ctx context.Context, root string, opts contentBuil
 		}
 		return spooled[i].item.path < spooled[j].item.path
 	})
-	order := make([]int, len(spooled))
-	for i := range order {
-		order[i] = i
+	var flt *contentFilter
+	order := make([]int, 0, len(spooled))
+	if opts.Tier2Budget > 0 {
+		// Filter records store absolute paths (verification opens them from
+		// any directory); the filter Root re-relativizes them for display so
+		// tier-2 hits read like tier-1's root-relative hits.
+		fb := newContentFilterBuilder(contentOriginWalk, settings.maxRaw, settings.maxText, [32]byte{}, absRootOrig)
+		var used int64
+		for i := range spooled {
+			s := &spooled[i]
+			if used+int64(s.length) <= opts.Tier2Budget {
+				used += int64(s.length)
+				order = append(order, i)
+				continue
+			}
+			text := make([]byte, s.length)
+			if _, rerr := spool.ReadAt(text, s.offset); rerr != nil {
+				return nil, nil, rerr
+			}
+			fb.Add(s.item.frn, filepath.Join(absRootOrig, filepath.FromSlash(s.item.path)), s.fileSize, s.fileModNano, text)
+		}
+		flt = fb.Finish()
+	} else {
+		for i := range spooled {
+			order = append(order, i)
+		}
 	}
 	idx, err := assembleContentIndexFromSpool(spool, spooled, order, tmpDir)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	idx.Policy = contentBuildPolicy{MaxRaw: settings.maxRaw, MaxText: settings.maxText, Skipped: skipped, Truncated: truncated, Binary: binary}
 	idx.Scanned = int64(scanned)
 	idx.Declined = declined
-	return idx, nil
+	return idx, flt, nil
 }
 
 // assembleContentIndexFromSpool runs the streaming assembler over spooled docs

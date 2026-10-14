@@ -33,9 +33,14 @@ func releaseVolumeContentOnCleanup(t *testing.T, vols ...*serviceVolumeIndex) {
 			vol.content.mu.Lock()
 			idx := vol.content.idx
 			vol.content.idx = nil
+			flt := vol.content.filter
+			vol.content.filter = nil
 			vol.content.mu.Unlock()
 			if idx != nil {
 				idx.Release()
+			}
+			if flt != nil {
+				flt.Release()
 			}
 		}
 	})

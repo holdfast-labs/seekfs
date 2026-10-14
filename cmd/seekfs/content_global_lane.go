@@ -136,6 +136,18 @@ func collectContentLaneEntries(it globalIDIterator, volumes []*serviceVolumeInde
 	}
 	biasRoot := firstNonEmpty(pq.CWDBias, pq.RootBias)
 	pathCaches := make([]map[int]string, len(volumes))
+	// Tier-2 fallback (§6y): lane-driven records with no tier-1 doc verify
+	// from the filter + disk, collected separately and key-ordered after the
+	// rank-sorted tier-1 buckets — the same tier-1 order + key-ordered tier-2
+	// the per-volume path produces, so the lane answers identically with the
+	// lane off. The fallback is drive-bounded (only iterator misses pay disk)
+	// and shares the per-query verification cap; hitting it marks the trace
+	// incomplete instead of silently truncating.
+	positive := contentPositiveLeaves(pq)
+	settings := contentServiceExtractSettings()
+	var tier2 []contentLaneTier2Hit
+	filterVerified := 0
+	fallbackCapped := false
 	verified := 0
 	for {
 		id, ok := it.Next()
@@ -162,6 +174,21 @@ func collectContentLaneEntries(it globalIDIterator, volumes []*serviceVolumeInde
 		dropSatisfiedVolumeTerms(&volumePQ, vol.index.Volume)
 		entry, ok := compactCandidateEntryIfMatchIn(vol, vol.index, volumePQ, id.local, pathCaches[id.volume], true, false, matcher)
 		verified++
+		if !ok && !fallbackCapped && queryHasAnyContentLeaf(pq) {
+			key, e2, hit, didDisk, capped := contentLaneFilterFallback(vol, vol.index, id.local, pathCaches[id.volume], volumePQ, matcher, positive, settings, &filterVerified)
+			if capped {
+				fallbackCapped = true
+				if pq.Trace != nil {
+					pq.Trace.setContentIncomplete()
+				}
+			} else if hit {
+				if didDisk {
+					verified++
+				}
+				tier2 = append(tier2, contentLaneTier2Hit{volume: id.volume, key: key, local: id.local, entry: e2})
+				continue
+			}
+		}
 		if !ok {
 			continue
 		}
@@ -196,6 +223,10 @@ func collectContentLaneEntries(it globalIDIterator, volumes []*serviceVolumeInde
 		}
 		ranked = append(ranked, bucket...)
 	}
+	// Tier-2 hits collected during the drive append key-ordered after the
+	// rank-ordered tier-1 buckets: the same shape the per-volume path
+	// produces, so the lane answers identically with the lane off.
+	ranked = appendLaneTier2Hits(ranked, tier2, rankers)
 	if globalRankedEntriesSpanMultipleVolumes(ranked) {
 		sortGlobalRankedEntries(ranked, pq)
 	}

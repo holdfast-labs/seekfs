@@ -7,6 +7,7 @@ package main
 
 import (
 	"fmt"
+	"os"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -97,9 +98,13 @@ func (s *goSearchService) attachContentForVolume(vol *serviceVolumeIndex) {
 	// not held by a dead index (the finalizer would eventually, but this is
 	// prompt).
 	attached := false
+	var flt *contentFilter
 	defer func() {
 		if !attached {
 			idx.Release()
+			if flt != nil {
+				flt.Release()
+			}
 		}
 	}()
 	if idx.Origin != wantOrigin {
@@ -195,6 +200,19 @@ func (s *goSearchService) attachContentForVolume(vol *serviceVolumeIndex) {
 		serviceLog("content index unreadable for volume %s: %v", vol.volume, err)
 		return
 	}
+	// Tier-2 filter (§6y): best-effort. A missing, corrupt, version- or
+	// scope-mismatched sidecar only disables tier 2; the base still attaches.
+	// Loaded here (no locks held) so no file read happens under indexMu.
+	if f, ferr := contentLoadFilter(contentFilterPathForGSX(gsx)); ferr != nil {
+		if !os.IsNotExist(ferr) {
+			serviceLog("content filter for volume %s unusable: %v", vol.volume, ferr)
+		}
+	} else if f.Origin != idx.Origin || (f.ScopeHash != ([32]byte{}) && idx.ScopeHash != ([32]byte{}) && f.ScopeHash != idx.ScopeHash) {
+		serviceLog("content filter for volume %s is not keyed for this base; leaving tier 2 off", vol.volume)
+		f.Release()
+	} else {
+		flt = f
+	}
 	// Validate and publish under indexMu for writing: every base rebuild and
 	// content invalidation runs under indexMu.Lock, and queries hold
 	// indexMu.RLock for their whole duration (serviceCommandSearch). Holding the
@@ -255,6 +273,9 @@ func (s *goSearchService) attachContentForVolume(vol *serviceVolumeIndex) {
 	// empty corpus.
 	if len(idx.Docs) > 0 && resolver.liveDocCount() == 0 {
 		s.indexMu.Unlock()
+		if flt != nil {
+			flt.Release()
+		}
 		reason := "content docs do not join the base key column"
 		serviceLog("content index for volume %s %s; leaving stale", vol.volume, reason)
 		vol.content.markStale(reason)
@@ -266,6 +287,11 @@ func (s *goSearchService) attachContentForVolume(vol *serviceVolumeIndex) {
 		// so a concurrent finalizer is harmless.
 		old.Release()
 	}
+	// Install the tier-2 filter beside the base under the same write lock, so
+	// no query observes the new base with the previous base's filter (or vice
+	// versa). setFilter validates scope/origin and recomputes the
+	// drop/coverage health; a nil filter reports tier 1 alone.
+	vol.content.setFilter(flt)
 	attached = true
 	s.indexMu.Unlock()
 	if vol.contentCoord != nil {

@@ -833,6 +833,8 @@ func countGlobalVerifiedIterator(it globalIDIterator, volumes []*serviceVolumeIn
 func countGlobalVerifiedRange(ids []globalRecordID, volumes []*serviceVolumeIndex, snapshots []*volumeSnapshot, volumePQs []parsedQuery, pq parsedQuery, stopped *atomic.Bool, matcher *contentLeafMatcher) (int, int, bool) {
 	pathCaches := make([]map[int]string, len(volumes))
 	count, verified := 0, 0
+	var positive []contentLeaf
+	var laneSettings *contentExtractSettings
 	for _, id := range ids {
 		if verified&1023 == 0 && (stopped != nil && stopped.Load() || queryCanceled(pq)) {
 			if stopped != nil {
@@ -853,6 +855,25 @@ func countGlobalVerifiedRange(ids []globalRecordID, volumes []*serviceVolumeInde
 		pathCaches[id.volume] = boundPathCache(pathCaches[id.volume])
 		_, ok := compactCandidateEntryIfMatchIn(vol, vol.index, volumePQs[id.volume], id.local, pathCaches[id.volume], true, false, matcher)
 		verified++
+		if !ok && queryHasAnyContentLeaf(pq) {
+			// Tier-2 fallback (§6y): the record is in the filename side
+			// but has no tier-1 doc. The drive bounds the verification
+			// (only iterator misses pay disk), so the tally stays exact
+			// with no cap: a nil counter disables it. The volume-adjusted
+			// query matches the tier-1 verify exactly.
+			vpq := volumePQs[id.volume]
+			if positive == nil {
+				positive = contentPositiveLeaves(vpq)
+			}
+			if laneSettings == nil {
+				s := contentServiceExtractSettings()
+				laneSettings = &s
+			}
+			_, _, hit, _, _ := contentLaneFilterFallback(vol, vol.index, id.local, pathCaches[id.volume], vpq, matcher, positive, *laneSettings, nil)
+			if hit {
+				ok = true
+			}
+		}
 		if ok {
 			count++
 		}

@@ -1021,6 +1021,23 @@ func (vol *serviceVolumeIndex) searchContentVolume(opts queryOptions, countOnly 
 		return nil, err
 	}
 	matches = vol.mergeOverlayMatches(matches, opts, countOnly, pathCache)
+	// Tier-2 filter (§6y): files the text budget dropped answer from disk
+	// behind tier 1, in filter key order up to the caller's limit. Tier-1
+	// results and their order are untouched; a capped verification scan marks
+	// the trace incomplete (search) or refuses the tally (count), never a
+	// silent truncation. A query without content leaves (the filename-only
+	// fallback) skips tier 2; an unparseable query leaves tier-1 behavior
+	// exactly as before.
+	if pq, perr := parseQuery(opts); perr == nil && queryHasAnyContentLeaf(pq) {
+		var ferr error
+		matches, ferr = vol.appendFilterTier(matches, opts, pq, pathCache, countOnly)
+		if ferr != nil {
+			if locked {
+				vol.searchMu.Unlock()
+			}
+			return nil, ferr
+		}
+	}
 	vol.trimSearchCachesLocked()
 	if locked {
 		vol.searchMu.Unlock()

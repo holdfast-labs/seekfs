@@ -155,6 +155,12 @@ type contentHealth struct {
 	ScopeDroppedBytes int64 `json:"scope_dropped_bytes,omitempty"`
 	BudgetBytes       int64 `json:"budget_bytes,omitempty"`
 	ReserveBytes      int64 `json:"reserve_bytes,omitempty"`
+	// FilterFiles/FilterBytes are the tier-2 filter coverage (§6y): dropped
+	// files the per-file bloom filter covers with verification from disk.
+	// ScopeDropped above counts only files with NO coverage at all
+	// (build-dropped minus filter-covered, floored at zero).
+	FilterFiles int   `json:"filter_files,omitempty"`
+	FilterBytes int64 `json:"filter_bytes,omitempty"`
 	// Binary counts files that sniffed as binary at build time (NUL in the
 	// head window, like ripgrep): expected rejections, not drops.
 	Binary int `json:"binary,omitempty"`
@@ -496,6 +502,13 @@ type contentVolumeState struct {
 	// every write leaves the volume stale instead of spinning rebuilds. It
 	// survives setReady (attach happens before the pass runs) and markStale.
 	integrityFailures int
+	// filter is the attached tier-2 filter sidecar (§6y): bloom signatures
+	// for the build-dropped files tier 1 does not cover, verified from disk
+	// at query time. Nil when no filter is attached (no drops, or a
+	// missing/corrupt/scope-mismatched sidecar). Replaced only where the
+	// base index is replaced (attach/publish/fold), under the same locks,
+	// with the old mapping released by the replacer.
+	filter *contentFilter
 }
 
 // walkDeclinedNote records that key extracted to nothing at print. A later
@@ -601,6 +614,8 @@ func mergeContentHealth(dst *contentHealth, src contentHealth) {
 	dst.Binary += src.Binary
 	dst.ScopeDropped += src.ScopeDropped
 	dst.ScopeDroppedBytes += src.ScopeDroppedBytes
+	dst.FilterFiles += src.FilterFiles
+	dst.FilterBytes += src.FilterBytes
 	// Budgets can differ per volume; the aggregate names the largest so the
 	// operator action ("raise budget_bytes past this") stays meaningful.
 	if src.BudgetBytes > dst.BudgetBytes {
@@ -817,11 +832,7 @@ func (s *contentVolumeState) setReady(idx *contentIndex, reader *contentReader, 
 	// A freshly attached base is complete as of its checkpoint; any earlier
 	// catch-up truncation belonged to the replaced base.
 	s.health.Incomplete = false
-	if idx.Policy.ScopeDropped > 0 {
-		s.health.Incomplete = true
-		s.state = contentStateDegraded
-		s.health.State = contentStateDegraded
-	}
+	s.refreshCoverageHealthLocked()
 	s.catchUpFailed = false
 	s.health.BuildPhase = ""
 	s.reconcileActive = false
@@ -846,11 +857,12 @@ func (s *contentVolumeState) setReady(idx *contentIndex, reader *contentReader, 
 		s.health.MaxText = idx.Policy.MaxText
 		s.health.Skipped = int(idx.Policy.Skipped)
 		s.health.Truncated = int(idx.Policy.Truncated)
-		s.health.ScopeDropped = int(idx.Policy.ScopeDropped)
-		s.health.ScopeDroppedBytes = idx.Policy.ScopeDroppedBytes
 		s.health.BudgetBytes = idx.Policy.BudgetBytes
 		s.health.ReserveBytes = idx.Policy.ReserveBytes
 		s.health.Binary = int(idx.Policy.Binary)
+		// ScopeDropped/ScopeDroppedBytes/Filter*/Incomplete come from
+		// refreshCoverageHealthLocked above (no-coverage remainder, not the
+		// raw policy drop count).
 	}
 	// A targeted extractor-version refresh (WP11) keeps the volume usable: its
 	// text is a valid, if older, extraction. The refresh signal is only raised
@@ -1335,6 +1347,96 @@ func (s *contentVolumeState) setFoldError(msg string) {
 	s.mu.Lock()
 	s.health.FoldError = msg
 	s.mu.Unlock()
+}
+
+// filterView returns the attached tier-2 filter, if any.
+func (s *contentVolumeState) filterView() *contentFilter {
+	if s == nil {
+		return nil
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.filter
+}
+
+// setFilter installs a freshly loaded or rebuilt tier-2 filter, releasing the
+// replaced mapping, and recomputes the drop/coverage health. A filter whose
+// scope or origin does not match the attached base is dropped (tier 2
+// disabled), never served: coverage from another selection would
+// systematically skip files it should verify. Callers replace the filter only
+// where they replace the base index (attach/publish/fold); nil installs "no
+// tier 2" and releases the old mapping. Call with s.mu held OR from a site
+// that already excludes queries (attach/publish under indexMu write); the
+// release mirrors the base mapping it shadows.
+func (s *contentVolumeState) setFilter(f *contentFilter) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if f != nil && s.idx != nil {
+		if f.Origin != s.idx.Origin || (f.ScopeHash != ([32]byte{}) && s.idx.ScopeHash != ([32]byte{}) && f.ScopeHash != s.idx.ScopeHash) {
+			f.Release()
+			f = nil
+		}
+	}
+	if old := s.filter; old != nil {
+		old.Release()
+	}
+	s.filter = f
+	s.refreshCoverageHealthLocked()
+}
+
+// refreshCoverageHealthLocked recomputes the drop/coverage health from the
+// attached base policy and filter. ScopeDropped counts only files with NO
+// coverage at all (build-dropped files and bytes minus filter-covered ones,
+// floored at zero); FilterFiles/FilterBytes report the tier-2 coverage
+// separately. The Incomplete/degraded signal follows the uncovered remainder,
+// so a build whose every dropped file is filter-covered attaches ready. Call
+// with s.mu held.
+func (s *contentVolumeState) refreshCoverageHealthLocked() {
+	var dropped, droppedBytes int64
+	if s.idx != nil {
+		dropped = s.idx.Policy.ScopeDropped
+		droppedBytes = s.idx.Policy.ScopeDroppedBytes
+	}
+	var coveredFiles, coveredBytes int64
+	if s.filter != nil {
+		s.health.FilterFiles = len(s.filter.Records)
+		s.health.FilterBytes = s.filter.EncodedSize
+		for i := range s.filter.Records {
+			coveredFiles++
+			coveredBytes += s.filter.Records[i].TextLen
+		}
+	} else {
+		s.health.FilterFiles = 0
+		s.health.FilterBytes = 0
+	}
+	uncovered := dropped - coveredFiles
+	if uncovered < 0 {
+		uncovered = 0
+	}
+	uncoveredBytes := droppedBytes - coveredBytes
+	if uncoveredBytes < 0 {
+		uncoveredBytes = 0
+	}
+	s.health.ScopeDropped = int(uncovered)
+	s.health.ScopeDroppedBytes = uncoveredBytes
+	if uncovered > 0 {
+		s.health.Incomplete = true
+		if s.state == contentStateReady {
+			s.state = contentStateDegraded
+			s.health.State = contentStateDegraded
+		}
+	} else if s.idx != nil {
+		// Every dropped file is filter-covered (or nothing was dropped):
+		// the base + filter answer every in-scope file, so a drop-driven
+		// degradation clears. Other Incomplete sources (catch-up truncation,
+		// delta ceiling) set the flag through their own paths and are
+		// untouched here — this only clears what the drop count raised.
+		if s.health.Incomplete && s.state == contentStateDegraded && s.health.State == contentStateDegraded {
+			s.health.Incomplete = false
+			s.state = contentStateReady
+			s.health.State = contentStateReady
+		}
+	}
 }
 
 func (s *contentVolumeState) healthSnapshot(queueDepth int) contentHealth {

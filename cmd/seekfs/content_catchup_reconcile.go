@@ -262,7 +262,7 @@ func (s *goSearchService) reconcileMetadataPass(vol *serviceVolumeIndex, idx *co
 	// Changed base docs always re-extract; files new to the base are held to
 	// the budget the build used (see content_reconcile_budget.go), so a
 	// reserve-truncated base does not re-enqueue everything it dropped.
-	admitted, leftOut, leftOutBytes := contentReconcileTrimNew(fresh, ranks, contentReconcileNewAllowance(vol, idx, &scope))
+	admitted, leftOut, leftOutBytes := contentReconcileTrimNewWithFilter(fresh, ranks, contentReconcileNewAllowance(vol, idx, &scope), vol.content.filterView())
 	enqueue = append(enqueue, admitted...)
 	if leftOut > 0 {
 		serviceLog("content metadata reconcile volume=%s left out %d files (%d bytes) past the budget", vol.volume, leftOut, leftOutBytes)

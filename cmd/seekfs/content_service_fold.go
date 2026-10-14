@@ -141,6 +141,49 @@ func (s *goSearchService) runContentFold(vol *serviceVolumeIndex) {
 	base := reader.idx
 	contentFoldSnapshotHook(vol)
 
+	// Tier-2 filter maintenance (§6y): delta docs for filter-covered keys
+	// refresh the filter instead of joining tier 1 — they were dropped from
+	// tier 1 by budget, and promoting them would grow tier 1 past its
+	// allowance file by file. Partition the snapshot before assembly:
+	// foldSnap feeds the existing tier-1 paths below, filterSnap recomputes
+	// filter records from delta text once tier 1 publishes (or alone when
+	// tier 1 has nothing to fold). Keys in the base stay tier 1 even if the
+	// filter also names them (tier 1 wins); unknown keys join tier 1 exactly
+	// as before, so a nil filter behaves byte-identically to today.
+	fltOld := vol.content.filterView()
+	var foldSnap, filterSnap []contentDeltaDoc
+	if fltOld != nil && len(fltOld.Records) > 0 {
+		for _, d := range snap {
+			if _, inBase := contentLookupFRN(base.Docs, d.FRN); inBase {
+				foldSnap = append(foldSnap, d)
+				continue
+			}
+			if _, inFilter := fltOld.lookup(d.FRN); inFilter {
+				filterSnap = append(filterSnap, d)
+				continue
+			}
+			foldSnap = append(foldSnap, d)
+		}
+	} else {
+		fltOld = nil
+		foldSnap = snap
+	}
+	if len(foldSnap) == 0 {
+		// Filter-only fold: tier 1 is unchanged, so no base is rewritten;
+		// the refresh persists against the current base. The delta still
+		// drains (commitFold) and the retry backoff clears, so a steady
+		// stream of filter-only changes folds cheaply instead of rewriting
+		// the base every drain tick. The persisted base checkpoint lags
+		// until the next tier-1 fold; a restart replays the committed range
+		// idempotently (fingerprints converge on the refreshed filter).
+		if fltOld != nil && len(filterSnap) > 0 {
+			s.publishFilterRefresh(vol, gen, base, fltOld, filterSnap)
+		}
+		vol.contentCoord.commitFold(snap)
+		vol.contentCoord.foldSucceeded()
+		return
+	}
+
 	tmpDir, err := contentMkdirWork(contentIndexPathForDB(vol.dbPath))
 	if err != nil {
 		vol.contentCoord.foldFailed(contentFoldRetryBackoff)
@@ -210,7 +253,7 @@ func (s *goSearchService) runContentFold(vol *serviceVolumeIndex) {
 	var rewritten int
 	var saveErr error
 	if base.shards == nil {
-		source := newContentFoldSource(reader, snap)
+		source := newContentFoldSource(reader, foldSnap)
 		built, shard, err := foldShard(source.next)
 		if err != nil {
 			serviceLog("content fold assemble failed volume=%s err=%v", vol.volume, err)
@@ -250,7 +293,7 @@ func (s *goSearchService) runContentFold(vol *serviceVolumeIndex) {
 	} else {
 		// Sharded: rewrite only the shards the delta touches; the others are
 		// named unchanged by the new manifest.
-		plan := planContentShardedFold(reader, resolver, snap)
+		plan := planContentShardedFold(reader, resolver, foldSnap)
 		infos := make([]contentShardInfo, len(base.shards))
 		for i, sh := range base.shards {
 			infos[i] = sh.info
@@ -313,7 +356,132 @@ func (s *goSearchService) runContentFold(vol *serviceVolumeIndex) {
 	// health to ready).
 	vol.content.clearReconcileActive()
 	contentSweepShards(gsx)
+	// Tier-2 refresh (§6y): tombstoned filter keys drop their records and
+	// changed keys recompute bits + fingerprints from the delta text the fold
+	// just consumed. The new base's scope restamps the filter identity.
+	if fltOld != nil && len(filterSnap) > 0 {
+		if fp, ok := vol.content.scopeReconciledFP(); ok {
+			header.ScopeHash = fp
+		}
+		s.publishFilterRefresh(vol, gen, header, fltOld, filterSnap)
+	}
 	serviceLog("content fold volume=%s rewritten_docs=%d checkpoint=%d", vol.volume, rewritten, checkpoint)
+}
+
+// publishFilterRefresh persists a filter generation and installs it under
+// indexMu for writing, so no query reads the replaced mapping mid-swap. The
+// file save is guarded by the same reserve; a save failure keeps the old
+// filter (its stale records skip by fingerprint) and only logs — the delta
+// still drained, so a lost refresh is re-covered by the file's next change.
+// A generation that moved under the fold drops the refresh instead of
+// installing it past a newer base.
+func (s *goSearchService) publishFilterRefresh(vol *serviceVolumeIndex, gen uint64, header *contentIndex, old *contentFilter, refresh []contentDeltaDoc) {
+	if vol == nil || old == nil && len(refresh) == 0 {
+		return
+	}
+	var scope [32]byte
+	var origin uint32
+	var maxRaw, maxText int64
+	if header != nil {
+		scope, origin, maxRaw, maxText = header.ScopeHash, header.Origin, header.Policy.MaxRaw, header.Policy.MaxText
+	} else if old != nil {
+		scope, origin, maxRaw, maxText = old.ScopeHash, old.Origin, old.MaxRaw, old.MaxText
+	}
+	next := contentFilterApplyRefresh(old, refresh, origin, scope, maxRaw, maxText)
+	if next == nil {
+		return
+	}
+	gsx := contentIndexPathForDB(vol.dbPath)
+	if gsx == "" {
+		next.Release()
+		return
+	}
+	if err := contentCheckDiskReserve(gsx); err != nil {
+		serviceLog("content filter refresh skipped volume=%s: %v", vol.volume, err)
+		next.Release()
+		return
+	}
+	if err := contentSaveFilter(contentFilterPathForGSX(gsx), next); err != nil {
+		serviceLog("content filter refresh save failed volume=%s: %v", vol.volume, err)
+		next.Release()
+		return
+	}
+	s.indexMu.Lock()
+	defer s.indexMu.Unlock()
+	// Re-validate the generation and journal under the write lock, inline:
+	// contentBuildCurrent takes indexMu.RLock itself and must not be called
+	// nested here (Go RWMutex is not reentrant — that self-deadlocks).
+	// replayGen is atomic; journalID is safe under the write lock, exactly
+	// as publishFoldedContent reads it.
+	if s.contentStopped(vol) || vol.replayGen.Load() != gen || vol.journalID != header.JournalID {
+		next.Release()
+		return
+	}
+	vol.content.setFilter(next)
+}
+
+// contentFilterApplyRefresh folds delta docs into a filter generation: live
+// docs for covered keys recompute bits + fingerprints from the delta text,
+// tombstoned covered keys drop their records, and every other record carries
+// over verbatim. The result restamps the given identity (the fold's header).
+// It returns nil when there is nothing to carry (no old filter and no live
+// refresh), so no empty sidecar is written.
+func contentFilterApplyRefresh(old *contentFilter, refresh []contentDeltaDoc, origin uint32, scope [32]byte, maxRaw, maxText int64) *contentFilter {
+	drop := make(map[uint64]bool, len(refresh))
+	var live []contentDeltaDoc
+	for _, d := range refresh {
+		drop[d.FRN] = true
+		if !d.Deleted {
+			live = append(live, d)
+		}
+	}
+	var kept []contentFilterRecord
+	if old != nil {
+		kept = make([]contentFilterRecord, 0, len(old.Records))
+		for _, r := range old.Records {
+			if !drop[r.Key] {
+				kept = append(kept, r)
+			}
+		}
+	}
+	if len(kept) == 0 && len(live) == 0 {
+		return nil
+	}
+	made := make([]contentFilterRecord, 0, len(live))
+	for _, d := range live {
+		stored := contentStoredText(d.Text)
+		folded := contentFoldText(stored)
+		grams := contentGramsOfU32(folded)
+		class := contentFilterClassForGrams(len(grams))
+		bits := make([]byte, contentFilterClassBits[class]/8)
+		contentFilterBitsOfU32(bits, grams)
+		made = append(made, contentFilterRecord{Key: d.FRN, FileSize: d.FileSize, FileModNano: d.FileModNano, TextLen: int64(len(d.Text)), Class: class, Path: d.Path, Bits: bits})
+	}
+	sort.Slice(made, func(i, j int) bool { return made[i].Key < made[j].Key })
+	// Both halves are key-sorted: merge, with the refreshed records winning
+	// ties (a key cannot be in both — the partition drops refreshed keys
+	// from kept — but the merge stays total regardless).
+	out := make([]contentFilterRecord, 0, len(kept)+len(made))
+	i, j := 0, 0
+	for i < len(kept) && j < len(made) {
+		if kept[i].Key < made[j].Key {
+			out = append(out, kept[i])
+			i++
+		} else {
+			out = append(out, made[j])
+			j++
+		}
+	}
+	out = append(out, kept[i:]...)
+	out = append(out, made[j:]...)
+	if len(out) == 0 {
+		return nil
+	}
+	root := ""
+	if old != nil {
+		root = old.Root
+	}
+	return &contentFilter{Version: contentFilterVersion, Origin: origin, MaxRaw: maxRaw, MaxText: maxText, ScopeHash: scope, Root: root, BuiltAt: time.Now(), Records: out}
 }
 
 // publishFoldedContent attaches the freshly saved `.gsx` under indexMu. Unlike

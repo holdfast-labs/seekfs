@@ -209,7 +209,7 @@ func (s *goSearchService) scopeReconcile(vol *serviceVolumeIndex, idx *contentIn
 	// The threshold then weighs only what will actually be applied.
 	var leftOut int
 	var leftOutBytes int64
-	diff.enqueue, leftOut, leftOutBytes = contentReconcileTrimNew(diff.enqueue, ranks, contentReconcileNewAllowance(vol, idx, &scope))
+	diff.enqueue, leftOut, leftOutBytes = contentReconcileTrimNewWithFilter(diff.enqueue, ranks, contentReconcileNewAllowance(vol, idx, &scope), vol.content.filterView())
 	if leftOut > 0 {
 		serviceLog("content scope reconcile volume=%s left out %d files (%d bytes) past the budget", vol.volume, leftOut, leftOutBytes)
 	}
