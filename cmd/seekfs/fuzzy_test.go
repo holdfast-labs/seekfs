@@ -496,13 +496,15 @@ func TestFuzzyPigeonholePieces(t *testing.T) {
 func TestAppendFuzzyServiceMatchesKeepsExactResultsFirst(t *testing.T) {
 	vol := buildFuzzyTestVolume(t)
 
-	// Simulate a partial exact result set (below the auto-fuzzy threshold):
-	// fuzzy entries must be appended strictly after every exact entry.
+	// Explicitly marked partial exact sets still top up (the marker is the
+	// user asking for close matches); unmarked partial sets never auto-top,
+	// so their rows stay exact-only. Fuzzy entries must be appended strictly
+	// after every exact entry.
 	exact := []Entry{{Path: `Q:\exact-tonic.txt`, Name: "exact-tonic.txt"}}
-	opts := queryOptions{Query: "tonics", Limit: 10}
+	opts := queryOptions{Query: "tonics~", Limit: 10}
 	matches, added := appendFuzzyServiceMatches([]*serviceVolumeIndex{vol}, opts, exact)
 	if !added {
-		t.Fatal("partial result set below threshold should trigger the fuzzy tier")
+		t.Fatal("explicitly marked partial result set should trigger the fuzzy tier")
 	}
 	for i, m := range matches {
 		if i < len(exact) {

@@ -22,14 +22,19 @@ Merged so far this round: `perf/content-underfill`, `perf/name-fuzzy`,
 
 ## Queued, in order
 
-0. **Correctness first: lossy short-term postings.** Short-term `planned:term:X`
-   postings are lossy when used as a required source: `go type:file` and
-   `go --exists` return too few results on any index. The ranked-posting
-   filename lane also returns rank-neighbor false positives on tiny
-   direct-walk indexes. Both bugs predate this round and were found by
-   `perf/ranking-signals`. Fix these before more features, with tests that
-   fail first. The `git:` filter on short or broad terms inherits the first
-   bug.
+0. **Correctness first: lossy short-term postings — done (`fix/short-term-postings`,
+    queued item 0).** Short-term `planned:term:X` postings were lossy when used
+    as a required source (`go type:file`, `go --exists` underfilled): the
+    `seekfs direct` LOWR section was interleaved per record instead of split
+    per token, so every token-addressed lower-name read on a mapped direct
+    index was garbage. Fixed the writer to the canonical split layout, made
+    the reader discard corrupt sections (exact fallback), and swept the same
+    required-source rule everywhere (exact-name shortcuts, dropped postings,
+    component self-hits, volume-satisfied terms). The ranked-posting filename
+    lane was audited exact; its reported "rank-neighbor false positives" were
+    auto-fuzzy top-up on partial exact sets, now zero-exact-only (explicit
+    `~`/`--fuzzy` still tops up). Recall 100%, one-typo 99.5% / two-typo
+    93.0% unchanged; chromium parity 0 diffs.
 0b. **Static ranking accuracy (G13).** With no usage history, plain-name
    right-file-first top-1 is only 39% (partial-name 2%) on 100 labeled
    Chromium targets (`E:/bench/scratch/ranking/rightfile.py`). fsearch
