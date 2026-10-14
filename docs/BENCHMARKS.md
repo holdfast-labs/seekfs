@@ -272,6 +272,129 @@ Active-path cost is bounded by `BenchmarkSignalReorderPage`: ~112 µs for a
 100-entry page with half the hits carrying frecency evidence (~1 µs/hit +
 page sort); the empty-store gate is a few map lookups.
 
+## Name-search lessons (`perf/name-lessons`, G11)
+
+2026-10-14 local profile, chromium walk index (555,849 records),
+standalone resident services on private pipes (base `01abdf3` vs new),
+`GOMAXPROCS` unset on services, content builds off
+(`SEEKFS_CONTENT_SCOPE=off`). Numbers are min-of-7 server-side
+`search_ms` (`abms.py`, scratch-only): planner sources identical
+base→new on every old-shape query, so lanes are unchanged; result sets
+identical except the four new-operator shapes below (base returns empty).
+
+| query | source | before | after |
+| --- | --- | --- | --- |
+| exact `BUILD.gn` | global:filename-pngr | 0.53 | 0.52 |
+| substring `chrome` | global:filename-pngr | 1.06 | 1.58 |
+| substring `browser` | global:filename-pngr | 1.05 | 1.58 |
+| substring broad `test` | global:filename-pngr | 3.71 | 4.78 |
+| multi-term `chrome browser` | global:filename-trigram | 4.77 | 4.48 |
+| multi-term `net url` | global:filename-trigram | 1.57 | 2.62 |
+| `ext:cc main` | global:filename-pngr | 7.30 | 6.79 |
+| `ext:md` | global:ext:md | 0.52 | 0.52 |
+| fuzzy 1-typo `chorme`/`broswer`/`browsre` | fuzzy tier | 7.9–8.4 | 7.8–8.4 |
+| fuzzy 2-typo long `doccumnet` | fuzzy tier | 7.42 | 6.83 |
+| short `a`/`go` | limited-single-term | 0.52–0.54 | 0.52–0.56 |
+| short `lg` | limited-single-term | 7.60 | 6.25 |
+| `car` | global:filename-pngr | 0.53 | 0.52 |
+| `chrome sort:size` / `sort:modified` | global:filename-pngr | 2.17/1.05 | 2.09/1.06 |
+| `ext:cc sort:extension` | global:ext:cc | 8.78 | 10.05 |
+| `glob:*.mojom` | global:glob-ext:mojom | 0.52 | 0.52 |
+| `ext:h` | global:ext:h | 0.52 | 0.52 |
+| `-path src` | path-component-direct-top | 12.61 | 14.33 |
+| `-path third_party blink` | path-component-multi-top | 28.93 | 27.24 |
+| `-path go` | bounded-scan | 10.58 | 11.17 |
+| `-path regex:chrome.*browser` | bounded-scan | 66.12 | 68.16 |
+| `-path regex:.*test.*\.cc` | bounded-scan | 98.02 | 103.37 |
+| `-path ext:cc dir:renderer frame` | global:components | 5.80 | 6.29 |
+| `'OWNERS` (new) | exact-empty → global:filename-pngr | 5.23 (empty) | 2.08 |
+| `^chrome` (new) | exact-empty → global:filename-pngr | 5.78 (empty) | 2.07 |
+| `main.cc$` (new) | exact-empty → global:filename-pngr | 4.86 (empty) | 0.51 |
+| `glob:*.{c,h}` (new) | glob-ext:{c,h} → planned:or-group | 0.56 (0 results) | 25.68 |
+| `glob:src/**/*.{c,h}` (new) | planned:empty → global:boolean-iterator | 0.52 (0 results) | 41.74 |
+
+Read the small deltas as machine noise, not code effects. Four min-of-7
+runs (two binaries × resident/lowmem, same index) flip signs on identical
+binaries: `lg` +5% → −47% → −16% → −18%, `car` +101% → −0% → −0% → −2%,
+`chrome sort:modified` +50% → +0% → +1% → +1%, `ext:cc main` −5% → +12% →
+−9% → −7%, `chrome browser` +14% → +11% → +32% → −6%. Other agents share
+the box, and sub-ms rows quantize at the 0.52 ms timer tick. A
+same-process benchmark of the verify path bounded the real per-entry cost
+at +10–16% with a byte-loop scan; serving the SIMD substring first (hits
+cost exactly one Contains, misses add only the ASCII flag scan) cut that
+back, after which old-shape lanes are instruction-identical on ASCII input
+plus a few length checks. Counts match 20/20 everywhere; `bench` result
+hashes match except the four justified new-operator shapes (base returns
+empty: it looked up a literal `'owners` term, a `{c,h}` extension, and
+unsatisfiable brace patterns).
+
+What drove the numbers (adopted vs rejected):
+
+- Adopted, accent folding (comparison-side only, no `.gsi` change):
+  folded verification in `entryMatchesScalar`, `compactRecordPrecheck`,
+  `recordMatchesNonPath`, and the parent-chain walk; the accent union in
+  `nameTermPosting` (inherited by `pathTermPosting`) plus/AddsMatches
+  lane declines that fire only when the union would add a candidate, so
+  ASCII corpora keep byte-identical lanes. Same-process verify bench:
+  +10–16% per entry with a byte-loop scan, cut back by serving the SIMD
+  substring first (hits cost exactly one Contains; only misses pay the
+  ASCII flag scan, only non-ASCII haystacks pay NFD).
+- Adopted, operators: `'exact`/`^prefix`/`suffix$` append their stripped
+  text to Terms (posting lanes engage; the anchor is verified on the
+  name), so anchored queries answer from postings — faster than the base
+  exact-empty scans above. `in:` merges into Under at parse (nesting
+  rule; disjoint roots are impossible with no scan). `**`/brace path
+  globs verify from precomputed expansions and contribute brace-common
+  literals to Dirs plus an ext OR for the posting lanes; `*.{ext}`
+  filename braces rewrite to an ext OR group. `glob:*.{c,h}` (64k
+  ext-union candidates, ~26 ms) and `glob:src/**/*.{c,h}` (2 results,
+  38–46 ms) cost with the ext-posting union, not with volume size: no
+  full scans, bounded by posting sizes.
+- Adopted, regex letter-mask prefilter: per-regex masks over
+  provably-required literal disjuncts (`regexRequiredLiteralAlternatives`,
+  widening-sound; case-blind `memoMaskOf`), checked before MatchString.
+  Same-process microbench over 2000 sampled chromium paths, identical
+  hit counts on/off: sparse `chrome.*browser` −13%, dense
+  `.*test.*\.cc` −3%, alternation `README\.(md|txt)` −4%. Never loses
+  (masks are a necessary condition); service-level regex rows land
+  within noise because literal postings already narrow them.
+- Adopted as specified, typo budget: the tree already implements the
+  fsearch rule (1 edit, 2 for 8+ via `fuzzyThresholdForTerm`, Damerau
+  transpositions); pinned by unit tests, no code change. Anchored and
+  `"quoted"` terms never fuzzy-correct (exact-tier intent).
+- Adopted, `--current` demotion: last within-band key in rank_blend.go
+  (fff `current_file`); sets/counts provably unchanged (reorder-only,
+  empty-Current pages byte-identical).
+- Rejected, per-record letter mask in substring scan verify: strictly
+  weaker than the existing exact-substring precheck — it would add a
+  pass with zero pruning. No code change.
+- Rejected, letter masks for 1–2 char terms: 1–2 bits are ubiquitous,
+  the subset test is vacuous (`a`/`go` flat ±2%). No code change.
+- Rejected, per-record path masks in broad-path scans: needs full path
+  reconstruction per record, defeating the purpose; the memo lane's
+  folded dir-bits already cover this design point. No code change.
+- Not persisted: every mask is computed on the fly (ns) or held in the
+  existing background identity; the `.gsi` format is untouched, so old
+  readers need no ignore/rebuild path. The per-index foldable-ID list
+  builds lazily once per generation (one linear pass over lower names;
+  empty on ASCII corpora, where every gate short-circuits).
+
+Correctness gates (same services/index): `parity.py` (76 queries ×
+search 20/300/count) 0 set/count differences — the only 3 diffs are the
+`case:Makefile` rejection message, which now lists the new `in:` filter
+(same exit 1); recall 100% on 14 terms incl. broad `test` (51,684);
+one-typo top-1 99.5% (N=200 seed 42), two-typo 93.0% (N=100 seed 7);
+right-file-first byte-identical to the Table above (plain 39.0/95.0,
+partial 2.0/12.0, typo 39.0/98.0 and 38.5/92.7; seeded 66.0/95.0 and
+13.0/21.0; opened 20→47, control 19→19).
+
+Caveats: services ran `SEEKFS_MEMORY_MODE=resident`
+(`build_flavor: cli,service`); lowmem runs show the same lanes at
+similar times. The `-path regex` rows (~70–120 ms bounded-scan here vs
+0.5 ms in the profile harness) reflect this box's cold resident
+structures, identically on both builds — compare base↔new, not against
+the harness table.
+
 ## R5 Lazy-Source Validation Notes
 
 2026-07-08 local validation used a throwaway binary built from the working tree

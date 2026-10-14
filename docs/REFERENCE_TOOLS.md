@@ -133,9 +133,30 @@ Accuracy and ranking (fff parity):
 10. **Grep features:** no fuzzy (Smith-Waterman) grep, no multi-pattern OR
     grep, no context lines, no per-query time budget or cursor pagination, and
     no smart case for content. Regex is Go RE2 with no lookaround.
-11. **Query language:** no `'exact`, `^prefix` or `suffix$` operators, no
-    `**` path globs with brace sets, no `in:` alias. Accent folding for names
-    is unverified.
+11. **Query language: done (`perf/name-lessons`, §G11-notes).**
+    `'exact`, `^prefix`, `suffix$` name anchors (always on the file name;
+    stripped text joins Terms so posting lanes engage); `**` path globs
+    with brace sets (`glob:src/**/*.{c,h}`, bare `src/**/*.{c,h}`,
+    `**/OWNERS`; relative patterns match at any depth; `*.{ext}`
+    filename sets ride the ext postings as an ext OR); `in:<dir>` alias
+    of `--under` (nested roots collapse, disjoint are impossible,
+    `!in:` excludes); `"quoted"` phrases (one literal term, byte-exact);
+    accent folding for names (`resume` finds `résumé`, NFD/NFC-insensitive,
+    comparison-side only, no index change; `case:`/quoted stay exact).
+    Multi-word queries already AND across separators/camelCase in any
+    order; path-vs-name spanning needs `-path` (documented). Typo budget
+    already matches fsearch (1 edit, 2 for 8+ letters, Damerau
+    transpositions; `chromium_eval.py` one-typo 99.5% / two-typo 93.0%
+    unchanged). `--current <path>` demotes the open file within its band
+    (fff `current_file`; sets/counts unchanged). Letter bitmaps: adopted
+    in the fuzzy verifier, the memo lane, and a new regex-verify
+    prefilter (provably-required disjunct literals; −13% sparse, no loss
+    dense); rejected for substring scans (weaker than the substring
+    precheck), 1–2 char terms (vacuous), and per-record path masks
+    (needs path reconstruction; memo dir-bits cover it). Nothing
+    persisted: `.gsi` format untouched. Parity vs `01abdf3`:
+    0 set/count diffs (76 queries × search 20/300/count); recall 100%;
+    latency table in `docs/BENCHMARKS.md`.
 12. **Integration:** no JSON-lines stdio mode (optional, low priority).
     **Out of scope: an MCP server.** The owner ruled it out on 2026-10-13;
     do not build one, even though fsearch and fff ship MCP tools.

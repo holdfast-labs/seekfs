@@ -30,11 +30,14 @@ corruption, exact required sources, auto-fuzzy only on zero exact hits).
    cursor pagination; smart case for content; ripgrep line semantics for
    regex (fsearch); `sym:` definition search and a definition-line bonus;
    extension and single-file filters for grep.
-2. **Name-search lessons (G11).** A per-name letter bitmap that rules out
-   most names before scoring (fsearch); several words spelling one name
-   (fsearch); accent folding; `'exact`, `^prefix`, `suffix$`, `**` and brace
-   globs, `in:` alias (fsearch); typo budget of one edit, or two for words of
-   8+ letters (compare with ours); current-file deprioritization (fff).
+2. **Name-search lessons (G11): DONE (`perf/name-lessons`, 2026-10-14).**
+   Per-name letter bitmap measured (adopted in fuzzy verifier, memo lane,
+   new regex-verify prefilter; rejected elsewhere with numbers); multi-word
+   single-name AND pinned by tests; accent folding for names (content
+   verified case-only, unchanged); `'exact`/`^prefix`/`suffix$`/`**`+braces/
+   `in:`/`"quoted"` operators with posting-lane integration; fsearch typo
+   budget confirmed (no change); `--current` band demotion. Parity 0 diffs,
+   recall/typo/rightfile gates hold, latency table in BENCHMARKS.md.
 3. **Freshness and footprint (G4, G5, G6).** Name-side changes visible in
    milliseconds (fsearch about 15 ms; dirty content reads land with the
    filter tier); on-demand indexing (searched folder first, fsearch); a
