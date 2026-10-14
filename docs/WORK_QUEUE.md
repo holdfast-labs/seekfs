@@ -1,27 +1,55 @@
 # Work queue
 
-This is the single list of open work on `integ/content-main`. Up to 4 agents
-run at once (more exhausted commit memory on the dev box). Agents are Paseo
-`opencode/opencode-go/muse-spark-1.3-contributor` in `build` mode, created in
-the seekfs workspace. Each gets its own worktree at `E:\bench\wt\<name>` on its
-own branch from integ. When a slot frees, start the next queued item. Every
-merge needs a review plus a parity or recall check where results could change.
-Run the full suite with `-timeout 40m` after merges. Gap numbers (G1 … G13)
-refer to `docs/REFERENCE_TOOLS.md`.
+This is the single list of open work on `integ/content-main`. Agents are Paseo
+`opencode/command-code/meta/muse-spark-1.3-contributor` in `build` mode, created in
+the seekfs workspace. The `opencode-go/` route hit its weekly limit on 2026-10-14
+and resets about 2026-10-18. Each agent gets its own worktree at `E:\bench\wt\<name>`
+on its own branch from integ. Every merge needs a review plus a parity or recall
+check where results could change. The coordinator runs the full suite with
+`-timeout 40m` after merges; the default tier takes about 3–5 min, and CI also
+runs the soak tier. Gap numbers (G1 … G13) refer to `docs/REFERENCE_TOOLS.md`.
+
+## Coordinator rules (provider usage is nearly exhausted)
+
+The owner approved these rules on 2026-10-14. The biggest past costs were
+long debugging loops with no checkpoint, multi-hour sessions resending a
+growing context, full-suite output pasted into context, polling, coordinator
+"FYI"/"continue" prompts, and 4 agents re-reading the same files.
+
+- Run 1–2 agents at a time, not 4. Do not enable paid provider balance without
+  asking the owner.
+- Give each agent a narrow brief with an explicit stopping point: "commit and stop
+  when X passes".
+- Agents commit as soon as a piece works. After about 2 failed attempts at the
+  same problem, they commit WIP, write what they tried in `NOTES.md` in the
+  worktree, and stop.
+- Agents run only targeted tests (`go test -run <pattern>` on the affected
+  area). The coordinator runs the full suite once, at merge time.
+- Send test, build and benchmark output to a file and read only the tail or
+  failures. Wait on the process instead of polling.
+- Coordinators send no FYI messages to agents; only prompts that contain work.
+- Prefer a fresh session with a short handoff note over resuming a very long one.
+- The coordinator does small finishing work (commit, merge, suite run)
+  directly instead of spawning an agent for it.
 
 ## Running (2026-10-13)
 
 Merged so far this round: `perf/content-underfill`, `perf/name-fuzzy`,
 `fix/cli-silent-empty`, `content/idle-governor`, `content/spool-peak`, `perf/ranking-signals` (G7, G8, G13), `content/inclusion-policy` (G3, §6z,
-format v10), `fix/short-term-postings` (direct-index LOWR writer
+format v10), `perf/freshness-footprint` (G4/G5/G6 name side: walk changes visible in
+about 0.3 s, meta in about 0.6 s, restart serves in about 0.3 s, idle memory
+about 72 MB for 1.46M names, `--under` folder-first search),
+`perf/name-lessons` (G11: `'exact ^prefix suffix$`, `**`/brace globs,
+`in:`, accent folding for names, `--current`, regex letter masks),
+`test/suite-speed` (default suite ~3–5 min; soak tier
+`SEEKFS_TEST_SOAK=1` in CI), `fix/short-term-postings` (direct-index LOWR writer
 corruption, exact required sources, auto-fuzzy only on zero exact hits).
 
 | Branch | Worktree | Scope |
 |---|---|---|
-| `test/suite-speed` | suitespeed | `cmd/seekfs` suite under ~5 min; harden `TestHeadlessFrameCost`; gofmt drift |
-| `content/filter-tier` | tier2 | **Owner decision 2026-10-13: fsearch model is the default.** No stored text; trigram postings plus a per-file filter; matches and snippets verified from disk; edited files read directly. Stored text only as a justified opt-in (G1, G4 partial, §6y) |
-| `perf/static-ranking` | staticrank | Queued item 0b: static ranker (no usage) right-file-first above 39% top-1, on two labeled sets; sets and counts unchanged (G13) |
-| `perf/name-lessons` | namelessons | Name-search lessons: letter-bitmap prefilter, multi-word spelling, accent folding, `'exact ^prefix suffix$ ** {a,b} in:`, typo budget by word length, current-file demotion (G11) |
+| `perf/static-ranking` | staticrank | **Parked** at WIP commit `761db7b` (OR-lane case unresolved, suite not green); resume only with a fresh, narrow brief. Queued item 0b: static ranker (no usage) right-file-first above 39% top-1, on two labeled sets; sets and counts unchanged (G13) |
+| `integ/filter-tier-merge` | tiermerge | Merging `content/filter-tier` (no stored text by default) with inclusion v10 + spool-peak; one format v11; dedupe under no-stored-text; re-measure; list regressions |
+| `feat/ui-input-and-user-signals` | uiinput | seekfs-ui reports user-session input time to the service (governor input signal); per-user ranking store keyed by caller SID |
 
 ## Queued, in order
 
@@ -32,13 +60,6 @@ corruption, exact required sources, auto-fuzzy only on zero exact hits).
    cursor pagination; smart case for content; ripgrep line semantics for
    regex (fsearch); `sym:` definition search and a definition-line bonus;
    extension and single-file filters for grep.
-2. **Freshness and footprint (G4, G5, G6).** Name-side changes visible in
-   milliseconds (fsearch about 15 ms; dirty content reads land with the
-   filter tier); on-demand indexing (searched folder first, fsearch); a
-   restart replays only what changed; service resident memory (about 500 MB
-   for 1.46M names, versus fsearch's 21–35 MB daemon), returned to the OS
-   when idle; startup load time (about 40 s for 1.46M entries); a
-   memory-mapped content cache (fff).
 
 ## Smaller follow-ups
 
@@ -69,14 +90,18 @@ corruption, exact required sources, auto-fuzzy only on zero exact hits).
   coverage on dense corpora for roughly +4 s of serial encode (§6x).
 - **JSON-lines stdio mode (G12):** optional and low priority. **No MCP
   server**: the owner ruled it out on 2026-10-13.
+- **Live restart validation:** the deferred USN catch-up (restart serves in
+  about 0.3 s) was measured on a copy. Validate it on the live E: service at
+  the next relaunch (elevated), since the live load used to take about 40 s.
+- **Content accent folding:** names fold accents (`resume` → `résumé`), but
+  content matching is still case-folded only. Folding content needs an
+  index-format change; fold it into the next format bump.
 - **Ranking store scope:** `ranking_signals.json` lives next to the service
   state (the LocalSystem service holds one store for all local users). Decide
   whether it should be per-user before shipping on multi-user machines.
 - **Single-line JSON follow-up:** the 1 MiB / 10 MiB caps and JSON skip from
   `content/inclusion-policy` should cover the 11.4 MB single-line
   `tokenizer.json`. Verify on the next real-index recall run.
-- **Slow differential test:** `TestContentGlobalLaneScopeDifferential` takes
-  300–666 s. `test/suite-speed` tiers it; confirm CI still runs the full tier.
 
 ## Owner actions (not agent work)
 

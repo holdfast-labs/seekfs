@@ -30,12 +30,18 @@ func searchServiceVolumesGlobalNameSnapshot(snapshot globalQuerySnapshot, opts q
 	if !globalNameQuerySupported(pq) {
 		return nil, false, nil
 	}
+	if anyVolumeAccentActive(snapshot.volumes, pq) {
+		// Trigram proposals read unfolded bytes and would miss accent
+		// matches; the posting-intersection and scan paths answer instead.
+		return nil, false, nil
+	}
 	// Top-ranked truncation is unsafe with path-needing predicates
 	// (Under/Dirs/Parents/Exists are invisible to recordMatchesNonPath, so
 	// top-N by rank filtered later can underfill); those queries use the
 	// complete path below.
 	if !countOnly && countNonVolumeTerms(pq.Terms) == 1 && pq.Limit > 0 &&
-		pq.Under == "" && len(pq.Dirs) == 0 && len(pq.Parents) == 0 && !pq.lateVerified() {
+		pq.Under == "" && len(pq.Dirs) == 0 && len(pq.Parents) == 0 && !pq.lateVerified() &&
+		!needsPathVerification(pq) {
 		if ranked, ok, err := globalNameTopRanked(snapshot, pq, opts.Trace); ok {
 			if err != nil {
 				return nil, true, err

@@ -276,7 +276,8 @@ func globalScalarQuerySupported(pq parsedQuery) bool {
 	if pq.lateVerified() || pq.Under != "" || len(nonVolumeTerms(pq.Terms)) != 0 ||
 		len(pq.Exts) != 0 || len(pq.Dirs) != 0 || len(pq.Globs) != 0 ||
 		len(pq.Regexps) != 0 || len(pq.RegexTerms) != 0 || len(pq.Parents) != 0 ||
-		len(pq.AttrFilters) != 0 || len(pq.OrGroups) != 0 || len(pq.NotGroups) != 0 {
+		len(pq.AttrFilters) != 0 || len(pq.OrGroups) != 0 || len(pq.NotGroups) != 0 ||
+		needsPathVerification(pq) {
 		return false
 	}
 	if pq.Type != "" && pq.Type != "file" && pq.Type != "dir" {

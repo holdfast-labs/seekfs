@@ -1835,8 +1835,38 @@ func cloneParsedQuery(pq parsedQuery) parsedQuery {
 	out.Exts = append([]string(nil), pq.Exts...)
 	out.Dirs = append([]string(nil), pq.Dirs...)
 	out.Globs = append([]string(nil), pq.Globs...)
+	out.PathGlobs = append([]string(nil), pq.PathGlobs...)
+	if pq.GlobAlts != nil {
+		out.GlobAlts = make([][]string, len(pq.GlobAlts))
+		for i, a := range pq.GlobAlts {
+			out.GlobAlts[i] = append([]string(nil), a...)
+		}
+	}
+	if pq.PathGlobAlts != nil {
+		out.PathGlobAlts = make([][]string, len(pq.PathGlobAlts))
+		for i, a := range pq.PathGlobAlts {
+			out.PathGlobAlts[i] = append([]string(nil), a...)
+		}
+	}
+	out.ExactTerms = append([]string(nil), pq.ExactTerms...)
+	out.Prefixes = append([]string(nil), pq.Prefixes...)
+	out.Suffixes = append([]string(nil), pq.Suffixes...)
+	out.InUnders = append([]string(nil), pq.InUnders...)
+	out.NotUnders = append([]string(nil), pq.NotUnders...)
+	if pq.QuotedTerms != nil {
+		out.QuotedTerms = make(map[string]struct{}, len(pq.QuotedTerms))
+		for k := range pq.QuotedTerms {
+			out.QuotedTerms[k] = struct{}{}
+		}
+	}
 	out.Regexps = append([]*regexp.Regexp(nil), pq.Regexps...)
 	out.RegexTerms = append([]string(nil), pq.RegexTerms...)
+	if pq.RegexMasks != nil {
+		out.RegexMasks = make([][]uint64, len(pq.RegexMasks))
+		for i, m := range pq.RegexMasks {
+			out.RegexMasks[i] = append([]uint64(nil), m...)
+		}
+	}
 	out.Parents = append([]string(nil), pq.Parents...)
 	out.GitFilters = append([]string(nil), pq.GitFilters...)
 	out.SizeFilters = append([]sizeFilter(nil), pq.SizeFilters...)
@@ -1899,6 +1929,7 @@ func parseQuery(opts queryOptions) (parsedQuery, error) {
 		CWDBias:                normalizeFilterPath(opts.CWDBias),
 		RootBias:               normalizeFilterPath(opts.RootBias),
 		Near:                   normalizeFilterPath(opts.Near),
+		Current:                normalizeFilterPath(opts.Current),
 		DeadlineUnix:           opts.DeadlineUnix,
 		Cancel:                 opts.Cancel,
 		Trace:                  opts.Trace,
@@ -1931,6 +1962,10 @@ func parseQuery(opts queryOptions) (parsedQuery, error) {
 		// content:"a b" and content:/a|b/ stay one constraint. Non-content
 		// queries keep the historical strings.Fields behavior.
 		tokens = contentTokenizeQuery(opts.Query)
+	} else {
+		// Name queries keep double-quoted phrases together (`"foo bar"`
+		// is one quoted term); without quotes this is strings.Fields.
+		tokens = splitNameQueryTokens(opts.Query)
 	}
 	for _, raw := range tokens {
 		if implicitPathSeparatorToken(raw) {
@@ -1941,6 +1976,7 @@ func parseQuery(opts queryOptions) (parsedQuery, error) {
 		}
 	}
 	promotePathExtensionTerms(&pq)
+	mergeInUnders(&pq)
 	// Assign deterministic content LeafIDs from the parsed tree, so the content
 	// verifier and relevance ordering can key on stable per-leaf IDs. A query
 	// with no content leaves is a no-op; a content: token only returns from

@@ -325,13 +325,13 @@ func (vol *serviceVolumeIndex) broadPathScanCandidates(pq parsedQuery) ([]int, b
 			if rec.Deleted {
 				continue
 			}
-			if vol.index.compactPathContainsAll(i, terms) {
+			if vol.index.compactPathContainsAllFolded(i, terms, pq) {
 				out = append(out, i)
 			}
 		}
 		out = vol.withRecentCandidates(out, 0, func(rec CompactRecord) bool {
 			id, ok := vol.idForFRN(rec.FRN)
-			return ok && vol.index.compactPathContainsAll(id, terms)
+			return ok && vol.index.compactPathContainsAllFolded(id, terms, pq)
 		})
 		sortCandidateIDs(out, pq, vol.index, vol.rankForQuery(pq))
 		return capBroadCandidates(out, pq), true
@@ -356,7 +356,7 @@ func (vol *serviceVolumeIndex) broadPathScanCandidates(pq parsedQuery) ([]int, b
 				if rec.Deleted {
 					continue
 				}
-				if vol.index.compactPathContainsAll(i, terms) {
+				if vol.index.compactPathContainsAllFolded(i, terms, pq) {
 					local = append(local, i)
 				}
 			}
@@ -378,7 +378,7 @@ func (vol *serviceVolumeIndex) broadPathScanCandidates(pq parsedQuery) ([]int, b
 	}
 	out = vol.withRecentCandidates(out, 0, func(rec CompactRecord) bool {
 		id, ok := vol.idForFRN(rec.FRN)
-		return ok && vol.index.compactPathContainsAll(id, terms)
+		return ok && vol.index.compactPathContainsAllFolded(id, terms, pq)
 	})
 	sortCandidateIDs(out, pq, vol.index, vol.rankForQuery(pq))
 	return capBroadCandidates(out, pq), true
@@ -1129,6 +1129,13 @@ func (vol *serviceVolumeIndex) plainTermPostingWorthBuilding(term string) bool {
 // scan runs.
 func (vol *serviceVolumeIndex) boundedScanPrefilter(pq parsedQuery, filter **boundedScanMembershipFilter) (exactEmpty, filterOK bool) {
 	if vol == nil || vol.index == nil || pq.CaseSensitive {
+		return false, false
+	}
+	if vol.accentUnionActive(pq) {
+		// Gram-absence proofs and posting membership filters read unfolded
+		// bytes: mark-stripping can create adjacencies (x+mark+y+z folds to
+		// xyz) that unfolded proofs cannot disprove, and postings miss
+		// accent names. Run the unfiltered scan; its verifier folds.
 		return false, false
 	}
 	if vol.plainTermNameTrigramExactEmpty(pq) {

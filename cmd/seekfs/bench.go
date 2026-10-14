@@ -209,6 +209,8 @@ type serviceRequest struct {
 	RootBias     string `json:"root_bias,omitempty"`
 	// Near is the proximity anchor for search (CLI --near / near: token).
 	Near string `json:"near,omitempty"`
+	// Current is the demotion path for search (CLI --current).
+	Current string `json:"current,omitempty"`
 	// Path + OpenQuery carry the `open` command (recorded access event for
 	// Path, attributed to normalized query OpenQuery when non-empty).
 	Path          string              `json:"path,omitempty"`

@@ -771,6 +771,15 @@ func appendFuzzyServiceMatches(volumes []*serviceVolumeIndex, opts queryOptions,
 	if err != nil || pq.CaseSensitive || pq.MatchPath || queryHasAnyContentLeaf(pq) || len(pq.Terms) != 1 || len(pq.OrGroups) > 0 || len(pq.Regexps) > 0 || len(pq.Globs) > 0 {
 		return matches, false
 	}
+	// Name anchors describe exact-tier intent: a typo'd anchor is a
+	// different question, and "close matches" that violate the stated
+	// anchor would mislead. Quoted terms keep exact-match semantics and
+	// never correct. Path globs constrain the path, which the name-based
+	// fuzzy tier cannot verify.
+	if len(pq.ExactTerms)+len(pq.Prefixes)+len(pq.Suffixes) > 0 || len(pq.PathGlobs) > 0 ||
+		len(pq.NotUnders) > 0 || isQuotedTerm(pq, pq.Terms[0]) {
+		return matches, false
+	}
 	// Auto-fuzzy: a query that matched nothing is the strongest typo signal,
 	// so the fallback tier fires without needing the explicit ~ marker or
 	// --fuzzy flag. Explicit markers additionally allow topping up partially

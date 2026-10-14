@@ -351,7 +351,7 @@ func searchCompactWithCacheHidden(idx *Index, opts queryOptions, countOnly bool,
 		if !compactRecordPrecheck(rec, pq, pq.MatchPath) {
 			continue
 		}
-		if queryPathTermPrecheckSafe(pq) && !idx.compactPathContainsAll(recIndex, pq.Terms) {
+		if queryPathTermPrecheckSafe(pq) && !idx.compactPathContainsAllFolded(recIndex, pq.Terms, pq) {
 			continue
 		}
 		// Bound the path memo: full scans would otherwise retain every
@@ -408,7 +408,18 @@ func compactCandidateCanSkipEntryMatches(pq parsedQuery, usedCandidates bool) bo
 		len(pq.AttrFilters) > 0 ||
 		len(pq.OrGroups) > 0 ||
 		len(pq.NotGroups) > 0 ||
-		len(pq.Features) > 0 {
+		len(pq.Features) > 0 ||
+		// Name anchors, path globs, negated in: roots, quoted terms and
+		// case-sensitive matching all narrow beyond the posting the
+		// candidates came from (the accent union is a superset for the
+		// latter two), so the entry gate must run.
+		len(pq.ExactTerms) > 0 ||
+		len(pq.Prefixes) > 0 ||
+		len(pq.Suffixes) > 0 ||
+		len(pq.PathGlobs) > 0 ||
+		len(pq.NotUnders) > 0 ||
+		len(pq.QuotedTerms) > 0 ||
+		pq.CaseSensitive {
 		return false
 	}
 	if len(pq.Terms) == 0 {
@@ -775,7 +786,7 @@ func compactCandidateEntryIfMatchIn(vol *serviceVolumeIndex, idx *Index, pq pars
 	if !compactRecordPrecheck(rec, pq, pq.MatchPath) {
 		return Entry{}, false
 	}
-	if queryPathTermPrecheckSafe(pq) && !idx.compactPathContainsAll(recIndex, pq.Terms) {
+	if queryPathTermPrecheckSafe(pq) && !idx.compactPathContainsAllFolded(recIndex, pq.Terms, pq) {
 		return Entry{}, false
 	}
 	if skipEntryMatches {
@@ -945,7 +956,12 @@ func queryNeedsAttrs(pq parsedQuery) bool {
 func compactRecordPrecheck(rec CompactRecord, pq parsedQuery, matchPath bool) bool {
 	name := rec.Name
 	cmpName := normalizeCase(name, pq.CaseSensitive)
-	if !matchPath && !containsAll(cmpName, pq.Terms) {
+	if !matchPath && !containsAllFolded(cmpName, nil, pq.Terms, pq) {
+		return false
+	}
+	// Anchors constrain the file name with the record at hand, in both
+	// modes; path globs need the full path and stay with the entry gate.
+	if !matchNameAnchors(cmpName, nil, pq) {
 		return false
 	}
 	if pq.Type == "file" && rec.Mode&uint32(os.ModeDir) != 0 {
@@ -968,9 +984,21 @@ func compactRecordPrecheck(rec CompactRecord, pq parsedQuery, matchPath bool) bo
 			return false
 		}
 	}
-	for _, glob := range pq.Globs {
-		ok, err := filepath.Match(glob, cmpName)
-		if err != nil || !ok {
+	for gi, glob := range pq.Globs {
+		if matchNameAlts(globAltsFor(pq.GlobAlts, gi, glob), cmpName) {
+			continue
+		}
+		if pq.CaseSensitive || (!nameNeedsFold(glob) && !nameNeedsFold(cmpName)) {
+			return false
+		}
+		fp, fn := glob, cmpName
+		if nameNeedsFold(glob) {
+			fp = foldAccentLower(glob)
+		}
+		if nameNeedsFold(cmpName) {
+			fn = foldAccentLower(cmpName)
+		}
+		if !matchNameGlob(fp, fn) {
 			return false
 		}
 	}
@@ -1093,66 +1121,98 @@ func (vol *serviceVolumeIndex) nameTermCandidates(pq parsedQuery) ([]int, bool) 
 		}
 	}
 	if pq.MatchPath {
-		if candidates, ok := vol.extensionShapedPathTopCandidates(pq); ok {
-			pq.Trace.setSource("path-extension-top", len(candidates))
-			return candidates, true
-		}
-		if candidates, ok := vol.bareExtensionMultiPathTopCandidates(pq); ok {
-			pq.Trace.setSource("path-bare-extension-multi-top", len(candidates))
-			return candidates, true
-		}
-		if candidates, ok := vol.selectiveNamePathTermCandidates(pq); ok {
-			pq.Trace.setSource("path-selective-name-term", len(candidates))
-			return candidates, true
-		}
-		if candidates, ok := vol.pathDirectoryTermTopCandidates(pq); ok {
-			pq.Trace.setSource("path-directory-term-top", len(candidates))
-			return candidates, true
-		}
-		if candidates, ok := vol.componentDirectTopCandidates(pq); ok {
-			pq.Trace.setSource("path-component-direct-top", len(candidates))
-			return candidates, true
-		}
-		if candidates, ok := vol.componentRootTopCandidates(pq); ok {
-			pq.Trace.setSource("path-component-root-top", len(candidates))
-			return candidates, true
-		}
-		if candidates, ok := vol.componentMultiTermTopCandidates(pq); ok {
-			pq.Trace.setSource("path-component-multi-top", len(candidates))
-			return candidates, true
-		}
-		if candidates, ok := vol.multiTermEmptyPathCandidates(pq); ok {
-			pq.Trace.setSource("path-multi-empty", len(candidates))
-			return candidates, true
-		}
-		if candidates, ok := vol.nameTrigramCandidates(pq); ok {
-			// See hiddenBlocksTruncation: never truncate before the verify
-			// loop can drop hidden ids.
-			if compactCandidateCanSkipEntryMatches(pq, true) && pq.Limit > 0 && !pq.hiddenBlocksTruncation() {
-				candidates = topCandidateIDsByRank(candidates, pq.Limit, vol.index, vol.rankForQuery(pq))
-			} else {
-				sortCandidateIDs(candidates, pq, vol.index, vol.rankForQuery(pq))
+		// With foldable names, unfolded-proposal lanes (component/trigram
+		// postings, rank-truncated scans) would miss accent matches. Skip
+		// them so the posting intersection (planned, with the accent
+		// union), the filtered intersection, and the bounded scans answer
+		// instead. ASCII corpora never take this branch.
+		accentActive := vol.accentUnionActive(pq)
+		if !accentActive {
+			if candidates, ok := vol.extensionShapedPathTopCandidates(pq); ok {
+				pq.Trace.setSource("path-extension-top", len(candidates))
+				return candidates, true
 			}
-			pq.Trace.setSource("path-component-trigram", len(candidates))
-			return candidates, true
 		}
-		if candidates, ok := vol.nameTrigramPathNameTopCandidates(pq); ok {
-			pq.Trace.setSource("path-name-trigram-top", len(candidates))
-			return candidates, true
+		if !accentActive {
+			if candidates, ok := vol.bareExtensionMultiPathTopCandidates(pq); ok {
+				pq.Trace.setSource("path-bare-extension-multi-top", len(candidates))
+				return candidates, true
+			}
 		}
-		if candidates, ok := vol.limitedPathTermCandidates(pq); ok {
-			pq.Trace.setSource("path-term-limited", len(candidates))
-			return candidates, true
+		if !accentActive {
+			if candidates, ok := vol.selectiveNamePathTermCandidates(pq); ok {
+				pq.Trace.setSource("path-selective-name-term", len(candidates))
+				return candidates, true
+			}
 		}
-		if candidates, ok := vol.limitedDottedPathScanCandidates(pq); ok {
-			pq.Trace.setSource("path-dotted-limited-scan", len(candidates))
-			return candidates, true
+		if !accentActive {
+			if candidates, ok := vol.pathDirectoryTermTopCandidates(pq); ok {
+				pq.Trace.setSource("path-directory-term-top", len(candidates))
+				return candidates, true
+			}
+		}
+		if !accentActive {
+			if candidates, ok := vol.componentDirectTopCandidates(pq); ok {
+				pq.Trace.setSource("path-component-direct-top", len(candidates))
+				return candidates, true
+			}
+		}
+		if !accentActive {
+			if candidates, ok := vol.componentRootTopCandidates(pq); ok {
+				pq.Trace.setSource("path-component-root-top", len(candidates))
+				return candidates, true
+			}
+		}
+		if !accentActive {
+			if candidates, ok := vol.componentMultiTermTopCandidates(pq); ok {
+				pq.Trace.setSource("path-component-multi-top", len(candidates))
+				return candidates, true
+			}
+		}
+		if !accentActive {
+			if candidates, ok := vol.multiTermEmptyPathCandidates(pq); ok {
+				pq.Trace.setSource("path-multi-empty", len(candidates))
+				return candidates, true
+			}
+		}
+		if !accentActive {
+			if candidates, ok := vol.nameTrigramCandidates(pq); ok {
+				// See hiddenBlocksTruncation: never truncate before the verify
+				// loop can drop hidden ids.
+				if compactCandidateCanSkipEntryMatches(pq, true) && pq.Limit > 0 && !pq.hiddenBlocksTruncation() {
+					candidates = topCandidateIDsByRank(candidates, pq.Limit, vol.index, vol.rankForQuery(pq))
+				} else {
+					sortCandidateIDs(candidates, pq, vol.index, vol.rankForQuery(pq))
+				}
+				pq.Trace.setSource("path-component-trigram", len(candidates))
+				return candidates, true
+			}
+		}
+		if !accentActive {
+			if candidates, ok := vol.nameTrigramPathNameTopCandidates(pq); ok {
+				pq.Trace.setSource("path-name-trigram-top", len(candidates))
+				return candidates, true
+			}
+		}
+		if !accentActive {
+			if candidates, ok := vol.limitedPathTermCandidates(pq); ok {
+				pq.Trace.setSource("path-term-limited", len(candidates))
+				return candidates, true
+			}
+		}
+		if !accentActive {
+			if candidates, ok := vol.limitedDottedPathScanCandidates(pq); ok {
+				pq.Trace.setSource("path-dotted-limited-scan", len(candidates))
+				return candidates, true
+			}
 		}
 	} else {
-		if candidates, ok := vol.nameTrigramCandidates(pq); ok {
-			sortCandidateIDs(candidates, pq, vol.index, vol.rankForQuery(pq))
-			pq.Trace.setSource("name-trigram", len(candidates))
-			return candidates, true
+		if !vol.accentUnionActive(pq) {
+			if candidates, ok := vol.nameTrigramCandidates(pq); ok {
+				sortCandidateIDs(candidates, pq, vol.index, vol.rankForQuery(pq))
+				pq.Trace.setSource("name-trigram", len(candidates))
+				return candidates, true
+			}
 		}
 	}
 	if candidates, ok := vol.limitedSingleTermCandidates(pq); ok {
@@ -1166,18 +1226,20 @@ func (vol *serviceVolumeIndex) nameTermCandidates(pq parsedQuery) ([]int, bool) 
 		}
 	}
 	if pq.MatchPath {
-		if candidates, ok := vol.nameTrigramCandidates(pq); ok {
-			// A truncated top-N here would underfill the page once the
-			// verify loop drops hidden ids; keep the complete rank order
-			// instead so later base matches backfill (see
-			// hiddenBlocksTruncation).
-			if compactCandidateCanSkipEntryMatches(pq, true) && pq.Limit > 0 && !pq.hiddenBlocksTruncation() {
-				candidates = topCandidateIDsByRank(candidates, pq.Limit, vol.index, vol.rankForQuery(pq))
-			} else {
-				sortCandidateIDs(candidates, pq, vol.index, vol.rankForQuery(pq))
+		if !vol.accentUnionActive(pq) {
+			if candidates, ok := vol.nameTrigramCandidates(pq); ok {
+				// A truncated top-N here would underfill the page once the
+				// verify loop drops hidden ids; keep the complete rank order
+				// instead so later base matches backfill (see
+				// hiddenBlocksTruncation).
+				if compactCandidateCanSkipEntryMatches(pq, true) && pq.Limit > 0 && !pq.hiddenBlocksTruncation() {
+					candidates = topCandidateIDsByRank(candidates, pq.Limit, vol.index, vol.rankForQuery(pq))
+				} else {
+					sortCandidateIDs(candidates, pq, vol.index, vol.rankForQuery(pq))
+				}
+				pq.Trace.setSource("path-component-trigram", len(candidates))
+				return candidates, true
 			}
-			pq.Trace.setSource("path-component-trigram", len(candidates))
-			return candidates, true
 		}
 	}
 	if candidates, ok := vol.plannedCandidates(pq); ok {
@@ -1185,9 +1247,11 @@ func (vol *serviceVolumeIndex) nameTermCandidates(pq parsedQuery) ([]int, bool) 
 		return candidates, true
 	}
 	if pq.MatchPath {
-		if candidates, ok := vol.componentTrigramCandidates(pq); ok {
-			pq.Trace.setSource("component-trigram", len(candidates))
-			return candidates, true
+		if !vol.accentUnionActive(pq) {
+			if candidates, ok := vol.componentTrigramCandidates(pq); ok {
+				pq.Trace.setSource("component-trigram", len(candidates))
+				return candidates, true
+			}
 		}
 	}
 	if candidates, ok := vol.underCandidates(pq); ok {
@@ -1202,21 +1266,31 @@ func (vol *serviceVolumeIndex) nameTermCandidates(pq parsedQuery) ([]int, bool) 
 		pq.Trace.setSource("legacy-planner", len(candidates))
 		return candidates, true
 	}
-	if candidates, ok := vol.pathDirFilterCandidates(pq); ok {
-		pq.Trace.setSource("path-dir-filter", len(candidates))
-		return candidates, true
+	if !vol.accentUnionActive(pq) {
+		if candidates, ok := vol.pathDirFilterCandidates(pq); ok {
+			pq.Trace.setSource("path-dir-filter", len(candidates))
+			return candidates, true
+		}
 	}
 	if candidates, ok := vol.filterCandidates(pq); ok {
 		pq.Trace.setSource("filter", len(candidates))
 		return candidates, true
 	}
-	if candidates, ok := vol.pathRootLimitedCandidates(pq); ok {
-		pq.Trace.setSource("path-root-limited", len(candidates))
-		return candidates, true
+	// The lanes below propose from unfolded name bytes (component roots,
+	// exact dir/name IDs) and would miss accent matches; the posting
+	// intersection at the end of this function (with the accent union)
+	// answers those shapes instead on foldable indexes.
+	if !vol.accentUnionActive(pq) {
+		if candidates, ok := vol.pathRootLimitedCandidates(pq); ok {
+			pq.Trace.setSource("path-root-limited", len(candidates))
+			return candidates, true
+		}
 	}
-	if candidates, ok := vol.pathTermSubtreeCandidates(pq); ok {
-		pq.Trace.setSource("path-term-subtree", len(candidates))
-		return candidates, true
+	if !vol.accentUnionActive(pq) {
+		if candidates, ok := vol.pathTermSubtreeCandidates(pq); ok {
+			pq.Trace.setSource("path-term-subtree", len(candidates))
+			return candidates, true
+		}
 	}
 	if candidates, ok := vol.regexLiteralCandidates(pq); ok {
 		pq.Trace.setSource("regex-literal", len(candidates))

@@ -363,6 +363,13 @@ type Index struct {
 	// memoGen is bumped on every identity reset so a memo built from a
 	// previous identity can never be stored or served afterwards.
 	memoGen atomic.Uint64
+	// accentIDs caches the record IDs whose lowercased name changes under
+	// accent folding (see fold.go), with the record count at build.
+	// accentBuilt reports whether the cache is valid for accentCount.
+	// Reset together with the name identity; nil on ASCII corpora.
+	accentIDs    []int32
+	accentCount  int
+	accentBuilt  bool
 	// nameMemo is the single-entry per-query memo cache (name bits plus
 	// folded dir bits with the identity it was built from). It carries its
 	// own lock; entries are validated by query signature, record count and
@@ -477,7 +484,10 @@ type queryOptions struct {
 	RootBias  string `json:"root_bias,omitempty"`
 	// Near is a proximity anchor path (CLI --near / near: token): within a
 	// match-quality band, files fewer path hops away rank first.
-	Near          string       `json:"near,omitempty"`
+	Near string `json:"near,omitempty"`
+	// Current is the CLI --current demotion path: the file the user already
+	// has open ranks last within its match-quality band.
+	Current       string `json:"current,omitempty"`
 	Recent        string       `json:"recent,omitempty"`
 	ModifiedAfter string       `json:"modified_after,omitempty"`
 	CaseSensitive bool         `json:"case_sensitive,omitempty"`
@@ -539,6 +549,38 @@ type parsedQuery struct {
 	Exts              []string
 	Dirs              []string
 	Globs             []string
+	// GlobAlts parallels Globs: precomputed brace expansions per pattern
+	// (exactly [pattern] when braceless), so verification never expands
+	// per candidate. Falls back to live expansion when short (hand-built
+	// queries in tests).
+	GlobAlts [][]string
+	// PathGlobs holds glob patterns that match against the full path (they
+	// contain a separator or `**`, possibly with brace sets). A hit matches
+	// when ANY brace expansion matches the normalized full path.
+	PathGlobs []string
+	// PathGlobAlts parallels PathGlobs with precomputed brace expansions.
+	PathGlobAlts [][]string
+	// RegexMasks holds per-regex letter-mask prefilters, parallel to
+	// Regexps: each entry lists one combined mask per provably-required
+	// literal disjunct (nil when unprovable). The entry gate skips
+	// MatchString when no disjunct mask is a subset of the path mask.
+	RegexMasks [][]uint64
+	// ExactTerms holds `'exact` name constraints: the folded file name must
+	// equal the term. Prefixes (`^prefix`) and Suffixes (`suffix$`) anchor
+	// the file name the same way. The stripped text is also appended to
+	// Terms so posting lanes engage; these fields only narrow.
+	ExactTerms []string
+	Prefixes   []string
+	Suffixes   []string
+	// InUnders holds `in:<dir>` roots (normalized absolute paths), merged
+	// into Under at the end of parseQuery. NotUnders holds negated
+	// `!in:<dir>` roots, which no single Under can express.
+	InUnders  []string
+	NotUnders []string
+	// QuotedTerms holds normalized terms from double-quoted phrases. They
+	// match literally (no accent folding), preserving exact-match
+	// semantics for quoted input like `case:` does.
+	QuotedTerms map[string]struct{}
 	Regexps           []*regexp.Regexp
 	RegexTerms        []string
 	Type              string
@@ -559,6 +601,11 @@ type parsedQuery struct {
 	RootBias          string
 	// Near is the proximity anchor (normalized absolute path, "" when none).
 	Near string
+	// Current is the `--current` demotion path (normalized absolute path,
+	// "" when none): the file the user already has open. It only reorders
+	// within a match-quality band, never across one, and never changes
+	// result sets or counts.
+	Current string
 	// GitFilters holds git: filter alternatives (modified, staged,
 	// untracked, ignored, conflict, clean, tracked); a hit must satisfy at
 	// least one. Empty means no git filtering (result sets unchanged).

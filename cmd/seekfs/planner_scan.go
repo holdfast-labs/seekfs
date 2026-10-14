@@ -38,7 +38,13 @@ func (vol *serviceVolumeIndex) limitedSingleTermCandidates(pq parsedQuery) ([]in
 		pq.Under != "" || pq.Type != "" || len(pq.Exts) > 0 || len(pq.Globs) > 0 ||
 		len(pq.Regexps) > 0 || len(pq.SizeFilters) > 0 || len(pq.DateFilters) > 0 || len(pq.AttrFilters) > 0 ||
 		len(pq.OrGroups) > 0 || len(pq.NotGroups) > 0 || pq.HasModAfter || pq.lateVerified() ||
-		pq.CWDBias != "" || pq.RootBias != "" || pq.SortColumn != "" || pq.hiddenBlocksTruncation() {
+		pq.CWDBias != "" || pq.RootBias != "" || pq.SortColumn != "" || pq.hiddenBlocksTruncation() ||
+		// The ordered scans below truncate at the limit before the entry
+		// gate runs: name anchors reject past the term, path globs and
+		// negated roots are invisible to them, and unfolded bytes miss
+		// accent matches. Decline all three so the page cannot underfill.
+		len(pq.ExactTerms)+len(pq.Prefixes)+len(pq.Suffixes) > 0 ||
+		needsPathVerification(pq) || vol.accentUnionActive(pq) {
 		return nil, false
 	}
 	if !pq.MatchPath && len(pq.Terms) == 1 && len(pq.Dirs) == 0 {
@@ -314,6 +320,11 @@ func simpleGlobExts(globs []string) ([]string, bool) {
 	}
 	exts := make([]string, 0, len(globs))
 	for _, glob := range globs {
+		// Brace sets are OR over extensions (`*.{c,h}`); no single ext
+		// is required, so decline to the literal lane.
+		if strings.Contains(glob, "{") {
+			return nil, false
+		}
 		if !strings.HasPrefix(glob, "*.") || strings.Count(glob, "*") != 1 || strings.ContainsAny(strings.TrimPrefix(glob, "*."), `\/*?[]:`) {
 			return nil, false
 		}

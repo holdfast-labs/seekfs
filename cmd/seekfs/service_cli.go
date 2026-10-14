@@ -933,7 +933,7 @@ func (s *goSearchService) Execute(args []string, r <-chan svc.ChangeRequest, cha
 	if s.processMode == "" {
 		s.processMode = "windows-service"
 	}
-	applyServiceRuntimeMemoryTuning()
+	applyServiceRuntimeMemoryTuning(s)
 	changes <- svc.Status{State: svc.StartPending}
 	done := make(chan struct{})
 	go func() {
