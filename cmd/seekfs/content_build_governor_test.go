@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bytes"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -23,6 +25,9 @@ func stubGovernorSignals(t *testing.T) {
 	restoreDrive := contentSystemDriveLetter
 	restorePause := contentBuildBatchPause
 	restoreWindow := contentBuildQueryQuietWindow
+	restoreSID := contentCurrentSessionID
+	restoreWTS := contentWTSLastInput
+	restoreGLII := contentGLIILastInput
 	contentOnBatteryNow = func() bool { return false }
 	// Query signals keep production-equivalent probes over reset state (see
 	// below): the busy cases exercise the real recency/counter logic.
@@ -40,6 +45,12 @@ func stubGovernorSignals(t *testing.T) {
 	contentBuildPauseModeOverride = func() string { return "" }
 	contentSystemDriveLetter = func() string { return "Z:" }
 	contentBuildBatchPause = 25 * time.Millisecond
+	// Input sources default to an interactive session with no input anywhere:
+	// source-selection tests override per case.
+	contentCurrentSessionID = func() (uint32, bool) { return 1, true }
+	contentWTSLastInput = func() (time.Time, bool) { return time.Time{}, false }
+	contentGLIILastInput = func() (time.Time, bool) { return time.Time{}, false }
+	contentResetInputSample()
 	contentBuildPausesTaken.Store(0)
 	contentBuildPauseSkips.Store(0)
 	contentBuildPauseReasonsMu.Lock()
@@ -58,6 +69,10 @@ func stubGovernorSignals(t *testing.T) {
 		contentSystemDriveLetter = restoreDrive
 		contentBuildBatchPause = restorePause
 		contentBuildQueryQuietWindow = restoreWindow
+		contentCurrentSessionID = restoreSID
+		contentWTSLastInput = restoreWTS
+		contentGLIILastInput = restoreGLII
+		contentResetInputSample()
 		contentBuildPausesTaken.Store(0)
 		contentBuildPauseSkips.Store(0)
 		contentBuildPauseReasonsMu.Lock()
@@ -130,6 +145,141 @@ func TestContentBuildPauseReasonsAttribute(t *testing.T) {
 	}
 	if got := contentBuildBusyReason(`E:\idx\vol.gsx`); got != "input" {
 		t.Fatalf("busy reason = %q; want input", got)
+	}
+}
+
+// The service runs in session 0, which never receives input: there the WTS
+// session enumeration is the only input source and GetLastInputInfo must be
+// ignored. Elsewhere both sources count and the most recent wins.
+func TestContentInputSourceSelection(t *testing.T) {
+	stubGovernorSignals(t)
+	recent := time.Now().Add(-time.Second)
+	older := time.Now().Add(-time.Minute)
+	cases := []struct {
+		name       string
+		sid        uint32
+		sidOK      bool
+		glii       time.Time
+		gliiOK     bool
+		wts        time.Time
+		wtsOK      bool
+		wantActive bool
+		wantSource string
+	}{
+		{"serviceIgnoresCallingSession", 0, true, recent, true, time.Time{}, false, false, ""},
+		{"serviceUsesWTS", 0, true, time.Time{}, false, recent, true, true, "wts"},
+		{"serviceBlindWithNoWTSTime", 0, true, recent, true, time.Time{}, false, false, ""},
+		{"interactiveUsesCallingSession", 1, true, recent, true, time.Time{}, false, true, "lastinput"},
+		{"interactivePrefersNewerWTS", 1, true, older, true, recent, true, true, "wts"},
+		{"interactivePrefersNewerGLII", 1, true, recent, true, older, true, true, "lastinput"},
+		{"interactiveBlindWithNoSource", 1, true, time.Time{}, false, time.Time{}, false, false, ""},
+		{"unknownSessionConsultsCallingSession", 0, false, recent, true, time.Time{}, false, true, "lastinput"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			contentCurrentSessionID = func() (uint32, bool) { return tc.sid, tc.sidOK }
+			contentGLIILastInput = func() (time.Time, bool) { return tc.glii, tc.gliiOK }
+			contentWTSLastInput = func() (time.Time, bool) { return tc.wts, tc.wtsOK }
+			contentResetInputSample()
+			gotT, gotOK, gotSrc := contentSampleInputTime()
+			if gotOK != (tc.wantSource != "") {
+				t.Fatalf("sample ok=%v source=%q; want source %q", gotOK, gotSrc, tc.wantSource)
+			}
+			if gotOK && gotSrc != tc.wantSource {
+				t.Fatalf("sample source=%q; want %q", gotSrc, tc.wantSource)
+			}
+			if got, want := contentSystemInputActive(), tc.wantActive; got != want {
+				t.Fatalf("active=%v (sample %v); want %v", got, gotT, want)
+			}
+			// A second call inside the sample interval must reuse the cache,
+			// not resample (the sampler would otherwise enumerate per batch).
+			contentWTSLastInput = func() (time.Time, bool) {
+				t.Error("resampled inside the cache interval")
+				return time.Time{}, false
+			}
+			contentGLIILastInput = func() (time.Time, bool) {
+				t.Error("resampled inside the cache interval")
+				return time.Time{}, false
+			}
+			if got, want := contentSystemInputActive(), tc.wantActive; got != want {
+				t.Fatalf("cached active=%v; want %v", got, want)
+			}
+		})
+	}
+}
+
+// Health must distinguish "no user activity" from "cannot see user
+// activity": with no input source yielding a time, input reports
+// live=false/unavailable while the decision still fails open (inactive).
+func TestContentGovernorHealthInputUnavailable(t *testing.T) {
+	stubGovernorSignals(t)
+	contentCurrentSessionID = func() (uint32, bool) { return 0, true }
+	contentWTSLastInput = func() (time.Time, bool) { return time.Time{}, false }
+	contentGLIILastInput = func() (time.Time, bool) { return time.Now(), true }
+	contentResetInputSample()
+	// Pin the other probes live so the test asserts only the input mapping
+	// without depending on real PDH/power/counters.
+	cpuOK, diskOK, battOK := contentCPULastOK.Load(), contentDiskLastOK.Load(), contentBatteryLastOK.Load()
+	contentCPULastOK.Store(true)
+	contentDiskLastOK.Store(true)
+	contentBatteryLastOK.Store(true)
+	t.Cleanup(func() {
+		contentCPULastOK.Store(cpuOK)
+		contentDiskLastOK.Store(diskOK)
+		contentBatteryLastOK.Store(battOK)
+	})
+	if contentSystemInputActive() {
+		t.Fatal("session-0 with no WTS time must read inactive even with calling-session input")
+	}
+	h := contentGovernorHealthSnapshot()
+	if h.Input.Live || h.Input.Detail != "unavailable" {
+		t.Fatalf("input health = %+v; want live=false unavailable", h.Input)
+	}
+	if !h.CPU.Live || !h.Disk.Live || !h.Battery.Live {
+		t.Fatalf("health = %+v; want cpu/disk/battery live", h)
+	}
+	if h.Mode != "auto" {
+		t.Fatalf("mode = %q; want auto", h.Mode)
+	}
+}
+
+// ... with a valid WTS time the same session-0 process reports input live.
+func TestContentGovernorHealthInputLive(t *testing.T) {
+	stubGovernorSignals(t)
+	contentCurrentSessionID = func() (uint32, bool) { return 0, true }
+	contentWTSLastInput = func() (time.Time, bool) { return time.Now(), true }
+	contentResetInputSample()
+	if !contentSystemInputActive() {
+		t.Fatal("session-0 with a fresh WTS time must read active")
+	}
+	h := contentGovernorHealthSnapshot()
+	if !h.Input.Live || h.Input.Detail != "wts" {
+		t.Fatalf("input health = %+v; want live wts", h.Input)
+	}
+}
+
+// The info command (`loaded --json`) must carry the governor signal status
+// so operators can tell "no user activity" from "cannot see user activity".
+func TestContentGovernorHealthInLoadedJSON(t *testing.T) {
+	stubGovernorSignals(t)
+	contentWTSLastInput = func() (time.Time, bool) { return time.Time{}, false }
+	contentGLIILastInput = func() (time.Time, bool) { return time.Time{}, false }
+	contentResetInputSample()
+	s := contentTestService(t)
+	var buf bytes.Buffer
+	s.serviceCommandInfo(&buf, &serviceRequest{})
+	var resp serviceResponse
+	if err := json.Unmarshal(buf.Bytes(), &resp); err != nil {
+		t.Fatalf("decode loaded response: %v", err)
+	}
+	if resp.Governor == nil {
+		t.Fatal("loaded response has no governor section")
+	}
+	if resp.Governor.Mode != "auto" {
+		t.Fatalf("governor mode = %q; want auto", resp.Governor.Mode)
+	}
+	if resp.Governor.Input.Live || resp.Governor.Input.Detail != "unavailable" {
+		t.Fatalf("governor input = %+v; want live=false unavailable", resp.Governor.Input)
 	}
 }
 
@@ -329,4 +479,3 @@ func TestContentServiceBuildIdenticalAcrossGovernorModes(t *testing.T) {
 		}
 	}
 }
-

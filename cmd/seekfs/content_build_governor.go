@@ -21,8 +21,12 @@ package main
 //     now (atomic count around the search commands, not just recent).
 //   - contentOnBatteryNow: discharging (existing probe).
 //   - contentInputActiveNow: keyboard/mouse input within
-//     contentBuildInputQuietWindow (GetLastInputInfo; someone is at the
-//     machine even if they have not queried).
+//     contentBuildInputQuietWindow. The installed service runs in session 0,
+//     which never receives input, so the WTS session enumeration covers the
+//     interactive sessions from any session and GetLastInputInfo is only the
+//     fallback for the calling session elsewhere; with no valid source the
+//     signal reads idle for decisions and reports unavailable in health
+//     (contentGovernorHealthSnapshot) instead of silently assuming idleness.
 //   - contentSystemBusyNow: other processes burn > contentBuildCPUBusyFraction
 //     of the machine over the sample window (GetSystemTimes minus our own
 //     GetProcessTimes, cached for contentBuildCPUSampleInterval).
@@ -81,8 +85,86 @@ var contentBuildQueriesActiveNow = func() bool {
 
 // contentInputActiveNow reports whether foreground keyboard/mouse input
 // arrived within contentBuildInputQuietWindow. A var so tests inject
-// presence without user32.
+// presence without the OS probes. Unknown reads as idle for decisions;
+// availability is reported via health (contentGovernorHealthSnapshot).
 var contentInputActiveNow = contentSystemInputActive
+
+// Input-source probes. The installed service runs in session 0, which never
+// receives input, so GetLastInputInfo alone always reads idle there; the WTS
+// session enumeration covers the interactive sessions from any session. Each
+// is a var so tests inject sources deterministically.
+var (
+	contentCurrentSessionID = contentCurrentSessionIDProbe
+	contentWTSLastInput     = contentWTSLastInputProbe
+	contentGLIILastInput    = contentGLIILastInputProbe
+)
+
+// contentInputSampleInterval bounds how often the input sampler enumerates
+// sessions: the quiet window is 60 s, so a 5 s sample is plenty, and WTS
+// enumeration per 64-doc batch would be wasteful.
+var contentInputSampleInterval = 5 * time.Second
+
+var contentInputSampleMu sync.Mutex
+var contentInputSampleAt time.Time
+var contentInputSampleT time.Time
+var contentInputSampleOK bool
+var contentInputSampleSource string
+
+// contentResetInputSample drops the cached input sample so tests sample
+// fresh sources.
+func contentResetInputSample() {
+	contentInputSampleMu.Lock()
+	defer contentInputSampleMu.Unlock()
+	contentInputSampleAt = time.Time{}
+	contentInputSampleT = time.Time{}
+	contentInputSampleOK = false
+	contentInputSampleSource = ""
+}
+
+// contentSampleInputTime returns the most recent valid last-input timestamp.
+// In session 0 (the service) only WTS is consulted — GetLastInputInfo would
+// read the inputless service session. Elsewhere both sources count and the
+// most recent wins (a neighbor RDP session's typing counts as presence).
+// ok is false when no source yields a time.
+func contentSampleInputTime() (t time.Time, ok bool, source string) {
+	var best time.Time
+	var bOK bool
+	var src string
+	if sid, sidOK := contentCurrentSessionID(); !sidOK || sid != 0 {
+		if lt, lok := contentGLIILastInput(); lok && (!bOK || lt.After(best)) {
+			best, bOK, src = lt, true, "lastinput"
+		}
+	}
+	if wt, wok := contentWTSLastInput(); wok && (!bOK || wt.After(best)) {
+		best, bOK, src = wt, true, "wts"
+	}
+	return best, bOK, src
+}
+
+// contentCachedInputSample serves the sampler with a bounded cache.
+func contentCachedInputSample() (time.Time, bool, string) {
+	contentInputSampleMu.Lock()
+	defer contentInputSampleMu.Unlock()
+	now := time.Now()
+	if contentInputSampleAt.IsZero() || now.Sub(contentInputSampleAt) >= contentInputSampleInterval {
+		t, ok, src := contentSampleInputTime()
+		contentInputSampleAt = now
+		contentInputSampleT, contentInputSampleOK, contentInputSampleSource = t, ok, src
+	}
+	return contentInputSampleT, contentInputSampleOK, contentInputSampleSource
+}
+
+// contentSystemInputActive reports whether keyboard/mouse input arrived within
+// contentBuildInputQuietWindow. Unknown (no source yields a time) reads as
+// idle for decisions — availability is reported via health, never silently
+// assumed.
+func contentSystemInputActive() bool {
+	last, ok, _ := contentCachedInputSample()
+	if !ok {
+		return false
+	}
+	return time.Since(last) < contentBuildInputQuietWindow
+}
 
 // contentSystemBusyNow reports whether other processes are burning the
 // machine. A var so tests inject load without sampling times.
@@ -91,6 +173,76 @@ var contentSystemBusyNow = contentSystemCPUBusy
 // contentDiskBusyNow reports whether the disks are busy. A var so tests
 // inject disk states without PDH.
 var contentDiskBusyNow = contentSystemDiskBusy
+
+// Probe availability for health: each latch is true once its mechanism has
+// produced a valid reading in this process (never on unsupported platforms).
+// Decisions fail open independently of these; health reports them so a
+// silently-dead probe (e.g. input in session 0 with no WTS time) is visible
+// instead of masquerading as an idle machine.
+var contentCPULastOK atomic.Bool
+var contentDiskLastOK atomic.Bool
+var contentBatteryLastOK atomic.Bool
+
+// governorSignalHealth is one probe's live/unavailable status for `loaded`.
+type governorSignalHealth struct {
+	Live   bool   `json:"live"`
+	Detail string `json:"detail,omitempty"`
+}
+
+// governorHealth reports which build-governor signals are live in this
+// process. A signal that has never produced a valid reading reports
+// live=false (e.g. input when neither WTS nor the calling session yields a
+// time) so operators can tell "no user activity" apart from "cannot see user
+// activity".
+type governorHealth struct {
+	Mode    string               `json:"mode"`
+	Input   governorSignalHealth `json:"input"`
+	CPU     governorSignalHealth `json:"cpu"`
+	Disk    governorSignalHealth `json:"disk"`
+	Battery governorSignalHealth `json:"battery"`
+}
+
+// contentGovernorHealthSnapshot samples the governor probes' availability.
+// A latch that never fired triggers one live attempt (cheap; `loaded` is
+// infrequent) so a fresh process reports working probes as live instead of
+// unknown. The attempts' only side effects are resetting the CPU delta
+// window (fail-open for one interval) and shifting a PDH interval.
+func contentGovernorHealthSnapshot() *governorHealth {
+	h := &governorHealth{Mode: contentBuildPauseModeOverride()}
+	if h.Mode == "" {
+		h.Mode = "auto"
+	}
+	if _, ok, src := contentCachedInputSample(); ok {
+		h.Input = governorSignalHealth{Live: true, Detail: src}
+	} else {
+		h.Input = governorSignalHealth{Live: false, Detail: "unavailable"}
+	}
+	if !contentCPULastOK.Load() {
+		contentSystemCPUBusy()
+	}
+	if contentCPULastOK.Load() {
+		h.CPU = governorSignalHealth{Live: true, Detail: "system-times"}
+	} else {
+		h.CPU = governorSignalHealth{Live: false, Detail: "unavailable"}
+	}
+	if !contentDiskLastOK.Load() {
+		contentDiskIdlePct()
+	}
+	if contentDiskLastOK.Load() {
+		h.Disk = governorSignalHealth{Live: true, Detail: "pdh"}
+	} else {
+		h.Disk = governorSignalHealth{Live: false, Detail: "unavailable"}
+	}
+	if !contentBatteryLastOK.Load() {
+		contentBatteryProbe()
+	}
+	if contentBatteryLastOK.Load() {
+		h.Battery = governorSignalHealth{Live: true, Detail: "power-status"}
+	} else {
+		h.Battery = governorSignalHealth{Live: false, Detail: "unavailable"}
+	}
+	return h
+}
 
 // contentBuildPausesTaken and contentBuildPauseSkips count batch boundaries
 // that slept vs skipped, for harness reporting and tests.

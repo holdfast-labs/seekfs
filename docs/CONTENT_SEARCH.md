@@ -1850,6 +1850,28 @@ adaptation (1 worker while queries are active at build start) serializes a
 build to 60+ min under continuous query load — out of scope here, but the
 next lever if loaded builds matter.
 
+**Session-0 input blindness (fixed).** The installed service runs as
+LocalSystem in session 0, which never receives keyboard/mouse input, so the
+original `GetLastInputInfo` probe always read idle in production and could
+never back off while the user typed (in-process measurements from a user
+session masked this). The input signal now enumerates terminal sessions via
+WTS (`WTSEnumerateSessions` + `WTSSessionInfoEx.LastInputTime`) from any
+session and keeps `GetLastInputInfo` only as the calling-session fallback
+elsewhere (most recent valid time wins; session 0 skips the fallback).
+Measured on this box: the `WTSINFOEX` layout validates (232 bytes, level 1,
+SessionId echo matches) but `LastInputTime` is **zero on every session** —
+as is `WTSIdleTime` (class 17 fails) — while `query user` likewise reports
+IDLE TIME `none` against a 10.5 h `GetLastInputInfo` idle: this Windows build
+populates no session-layer input time, so from session 0 there is currently
+no documented mechanism to see interactive input. The governor therefore
+fails the decision open (idle) but reports `input: live=false/unavailable`
+in health instead of silently assuming idleness: `loaded --json` carries a
+`governor` section (`mode` plus live/unavailable for input/cpu/disk/battery
+— `TestContentGovernorHealthInLoadedJSON`). Where a build populates WTS
+times the source engages with no code change (covered by
+`TestContentInputSourceSelection`, including the session-0 skip). The WTS
+sample is cached 5 s; zero times are skipped, never treated as recent.
+
 ## 7. Carried debt / known gaps
 
 - **Snippet case is preserved; no fixup-aware path remains.** The `.gsx` text

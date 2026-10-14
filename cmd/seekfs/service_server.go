@@ -267,7 +267,7 @@ func (s *goSearchService) serviceCommandInfo(w io.Writer, req *serviceRequest) {
 		message = loadErr
 	}
 	health, healthMessage := classifyServiceHealth(loading, loadErr, infos)
-	_ = json.NewEncoder(w).Encode(serviceInfoResponseFor(serviceResponse{OK: loadErr == "", Message: message, Entries: total, Loading: loading, DBs: infos, Runtime: runtimeMemorySnapshot(), Health: health, HealthMessage: healthMessage, Content: s.contentHealthSnapshot(), Features: s.featureHealthSnapshot(), PluginAPI: 1, PluginConfig: s.pluginFilePath()}, s.pipeName, s.processMode))
+	_ = json.NewEncoder(w).Encode(serviceInfoResponseFor(serviceResponse{OK: loadErr == "", Message: message, Entries: total, Loading: loading, DBs: infos, Runtime: runtimeMemorySnapshot(), Health: health, HealthMessage: healthMessage, Content: s.contentHealthSnapshot(), Governor: contentGovernorHealthSnapshot(), Features: s.featureHealthSnapshot(), PluginAPI: 1, PluginConfig: s.pluginFilePath()}, s.pipeName, s.processMode))
 }
 
 func (s *goSearchService) serviceCommandSearch(w io.Writer, caps serviceCapabilities, req *serviceRequest) {
@@ -537,7 +537,7 @@ func (s *goSearchService) serviceCommandIndexUSN(w io.Writer, req *serviceReques
 }
 
 func (s *goSearchService) serviceCommandStatus(w io.Writer) {
-	_ = json.NewEncoder(w).Encode(serviceInfoResponseFor(serviceResponse{OK: true, Message: "service running", Content: s.contentHealthSnapshot()}, s.pipeName, s.processMode))
+	_ = json.NewEncoder(w).Encode(serviceInfoResponseFor(serviceResponse{OK: true, Message: "service running", Content: s.contentHealthSnapshot(), Governor: contentGovernorHealthSnapshot()}, s.pipeName, s.processMode))
 }
 
 func serviceResidentBackgroundLoading(volumes []*serviceVolumeIndex) bool {

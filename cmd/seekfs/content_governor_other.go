@@ -11,9 +11,16 @@ import (
 // reads as idle, so background builds never pause off-platform. The decision
 // matrix (contentBuildBusyReason) stays testable everywhere.
 
-// contentSystemInputActive is a no-op off Windows: foreground input
-// observation is a Windows-only probe (GetLastInputInfo).
-func contentSystemInputActive() bool { return false }
+// contentCurrentSessionIDProbe is a no-op off Windows.
+func contentCurrentSessionIDProbe() (uint32, bool) { return 0, false }
+
+// contentGLIILastInputProbe is a no-op off Windows: GetLastInputInfo is a
+// Windows-only probe.
+func contentGLIILastInputProbe() (time.Time, bool) { return time.Time{}, false }
+
+// contentWTSLastInputProbe is a no-op off Windows: session enumeration is a
+// Windows-only probe.
+func contentWTSLastInputProbe() (time.Time, bool) { return time.Time{}, false }
 
 // contentSystemCPUBusy is a no-op off Windows: CPU-pressure observation is a
 // Windows-only probe (GetSystemTimes).

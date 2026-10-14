@@ -10,6 +10,7 @@ package main
 // each probe is a few syscalls per batch — noise next to the 64 opens.
 
 import (
+	"encoding/binary"
 	"sync"
 	"time"
 	"unsafe"
@@ -24,33 +25,143 @@ var (
 	procGetSystemTimesGov  = modkernel32ForGovernor.NewProc("GetSystemTimes")
 	procGetProcessTimesGov = modkernel32ForGovernor.NewProc("GetProcessTimes")
 	procGetTickCount64Gov  = modkernel32ForGovernor.NewProc("GetTickCount64")
+	procProcessIDToSession = modkernel32ForGovernor.NewProc("ProcessIdToSessionId")
+)
+
+// Session-0 note: the installed service runs as LocalSystem in session 0,
+// which never receives keyboard/mouse input, so GetLastInputInfo there always
+// reads idle. The WTS probes below query the interactive sessions instead
+// and work from any session; GetLastInputInfo stays as the fallback for the
+// calling session when not running as a service.
+
+var (
+	modwtsapi32ForGovernor   = windows.NewLazySystemDLL("wtsapi32.dll")
+	procWTSEnumerateSessions = modwtsapi32ForGovernor.NewProc("WTSEnumerateSessionsW")
+	procWTSQuerySessionInfo  = modwtsapi32ForGovernor.NewProc("WTSQuerySessionInformationW")
+	procWTSFreeMemory        = modwtsapi32ForGovernor.NewProc("WTSFreeMemory")
+)
+
+// wtsSessionInfoExClass is WTS_INFO_CLASS WTSSessionInfoEx.
+const wtsSessionInfoExClass = 25
+
+// Offsets into the WTSINFOEX Level-1 payload (WTS_INFOEX wrapper: Level @0,
+// Data @8; LEVEL1: SessionId @8, LastInputTime FILETIME @184, CurrentTime
+// FILETIME @192). Validated live against SessionId echo + CurrentTime skew
+// (see the governor WTS probe); struct sizes: WinStationName 33 + UserName 21
+// + Domain 16 wide chars, then 8-byte-aligned LARGE_INTEGERs from @160.
+const (
+	wtsInfoExLevelOff     = 0
+	wtsInfoExDataOff      = 8
+	wtsL1SessionIDOff     = 8
+	wtsL1LastInputOff     = 184
+	wtsL1CurrentOff       = 192
+	wtsInfoExMinBytes     = 200
+	wtsSessionEntryStride = 24
+	wtsSessionEntryState  = 16
 )
 
 // lastInputInfo mirrors LASTINPUTINFO: the tick count of the last foreground
-// input event.
+// input event in the calling session.
 type lastInputInfo struct {
 	cbSize uint32
 	dwTime uint32
 }
 
-// contentSystemInputActive reports whether keyboard/mouse input arrived within
-// contentBuildInputQuietWindow. Unknown (a failed probe) reads as idle.
-func contentSystemInputActive() bool {
+// contentCurrentSessionIDProbe reports our terminal-services session ID
+// (0 for the service session) via ProcessIdToSessionId.
+func contentCurrentSessionIDProbe() (uint32, bool) {
+	var session uint32
+	r1, _, _ := procProcessIDToSession.Call(
+		uintptr(windows.GetCurrentProcessId()),
+		uintptr(unsafe.Pointer(&session)))
+	if r1 == 0 {
+		return 0, false
+	}
+	return session, true
+}
+
+// contentGLIILastInputProbe wraps GetLastInputInfo as an absolute UTC time.
+// It observes the calling session only: exact in an interactive session,
+// permanently idle in session 0 (see above).
+func contentGLIILastInputProbe() (time.Time, bool) {
 	var info lastInputInfo
 	info.cbSize = uint32(8)
 	r1, _, _ := procGetLastInputInfo.Call(uintptr(unsafe.Pointer(&info)))
 	if r1 == 0 {
-		return false
+		return time.Time{}, false
 	}
 	now, _, _ := procGetTickCount64Gov.Call()
 	if now == 0 {
-		return false
+		return time.Time{}, false
 	}
 	// now is the 64-bit tick (GetTickCount64) while dwTime is its low 32
 	// bits: compare in 32-bit unsigned arithmetic so the 49-day wrap is
 	// exact at any uptime.
 	idleMs := uint32(now) - info.dwTime
-	return time.Duration(idleMs)*time.Millisecond < contentBuildInputQuietWindow
+	return time.Now().UTC().Add(-time.Duration(idleMs) * time.Millisecond), true
+}
+
+// contentWTSLastInputProbe returns the most recent valid LastInputTime across
+// all enumerated sessions. It works from session 0 (LocalSystem may query any
+// session) and from interactive sessions alike. Sessions whose LastInputTime
+// is zero (never reported input on this Windows build, or never received
+// any) are skipped, never treated as recent.
+func contentWTSLastInputProbe() (time.Time, bool) {
+	var list unsafe.Pointer
+	var count uintptr
+	r1, _, _ := procWTSEnumerateSessions.Call(0, 0, 1,
+		uintptr(unsafe.Pointer(&list)),
+		uintptr(unsafe.Pointer(&count)))
+	if r1 == 0 || list == nil || count == 0 {
+		return time.Time{}, false
+	}
+	entries := unsafe.Slice((*byte)(list), count*wtsSessionEntryStride)
+	var best time.Time
+	found := false
+	for i := uintptr(0); i < count; i++ {
+		base := i * wtsSessionEntryStride
+		session := binary.LittleEndian.Uint32(entries[base:])
+		if t, ok := contentWTSSessionLastInput(session); ok && (!found || t.After(best)) {
+			best, found = t, true
+		}
+	}
+	_, _, _ = procWTSFreeMemory.Call(uintptr(list))
+	if !found {
+		return time.Time{}, false
+	}
+	return best, true
+}
+
+// contentWTSSessionLastInput queries one session's WTSSessionInfoEx and
+// returns its LastInputTime. Zero times and layout mismatches (the echoed
+// SessionId must match) read as unavailable, never as recent.
+func contentWTSSessionLastInput(session uint32) (time.Time, bool) {
+	var buf unsafe.Pointer
+	var bytesRet uintptr
+	r1, _, _ := procWTSQuerySessionInfo.Call(0, uintptr(session),
+		uintptr(wtsSessionInfoExClass),
+		uintptr(unsafe.Pointer(&buf)),
+		uintptr(unsafe.Pointer(&bytesRet)))
+	if r1 == 0 || buf == nil || bytesRet < wtsInfoExMinBytes {
+		if buf != nil {
+			_, _, _ = procWTSFreeMemory.Call(uintptr(buf))
+		}
+		return time.Time{}, false
+	}
+	raw := unsafe.Slice((*byte)(buf), bytesRet)
+	ok := false
+	var last time.Time
+	if binary.LittleEndian.Uint32(raw[wtsInfoExLevelOff:]) == 1 &&
+		binary.LittleEndian.Uint32(raw[wtsL1SessionIDOff:]) == session {
+		low := binary.LittleEndian.Uint32(raw[wtsL1LastInputOff:])
+		high := binary.LittleEndian.Uint32(raw[wtsL1LastInputOff+4:])
+		if low != 0 || high != 0 {
+			ft := windows.Filetime{LowDateTime: low, HighDateTime: high}
+			last, ok = time.Unix(0, ft.Nanoseconds()).UTC(), true
+		}
+	}
+	_, _, _ = procWTSFreeMemory.Call(uintptr(buf))
+	return last, ok
 }
 
 // filetimeToU64 folds a Windows FILETIME to a 100 ns tick count.
@@ -81,11 +192,13 @@ func contentSystemCPUBusy() bool {
 		uintptr(unsafe.Pointer(&kernel)),
 		uintptr(unsafe.Pointer(&user)))
 	if r1 == 0 {
+		contentCPULastOK.Store(false)
 		return false
 	}
 	var create, exit, procKernel, procUser windows.Filetime
 	proc, err := windows.GetCurrentProcess()
 	if err != nil {
+		contentCPULastOK.Store(false)
 		return false
 	}
 	r1, _, _ = procGetProcessTimesGov.Call(
@@ -95,8 +208,10 @@ func contentSystemCPUBusy() bool {
 		uintptr(unsafe.Pointer(&procKernel)),
 		uintptr(unsafe.Pointer(&procUser)))
 	if r1 == 0 {
+		contentCPULastOK.Store(false)
 		return false
 	}
+	contentCPULastOK.Store(true)
 	now := time.Now()
 	contentCPUSampleMu.Lock()
 	defer contentCPUSampleMu.Unlock()
@@ -164,6 +279,7 @@ var contentDiskPDHQuery, contentDiskPDHCounter uintptr
 func contentDiskIdlePct() (pct float64, ok bool) {
 	contentDiskPDHMu.Lock()
 	defer contentDiskPDHMu.Unlock()
+	defer func() { contentDiskLastOK.Store(ok) }()
 	if !contentDiskPDHTried {
 		contentDiskPDHTried = true
 		var query, counter uintptr
