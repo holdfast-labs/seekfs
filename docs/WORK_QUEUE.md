@@ -19,6 +19,7 @@ Merged so far this round: `perf/content-underfill`, `perf/name-fuzzy`,
 | `test/suite-speed` | suitespeed | `cmd/seekfs` suite under ~5 min; harden `TestHeadlessFrameCost`; gofmt drift |
 | `content/filter-tier` | tier2 | **Owner decision 2026-10-13: fsearch model is the default.** No stored text; trigram postings plus a per-file filter; matches and snippets verified from disk; edited files read directly. Stored text only as a justified opt-in (G1, G4 partial, §6y) |
 | `content/inclusion-policy` | inclusion | Queued item 1: main-checkout-only worktrees, lower caps, lockfile/JSON/minified/cache skips, user skip list, content-hash dedupe (G3, §6z) |
+| `fix/short-term-postings` | shortterm | Queued item 0: lossy short-term postings (underfill) and rank-neighbor false positives; exactness sweep plus differential test |
 
 ## Queued, in order
 
