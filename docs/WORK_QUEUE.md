@@ -12,7 +12,10 @@ refer to `docs/REFERENCE_TOOLS.md`.
 ## Running (2026-10-13)
 
 Merged so far this round: `perf/content-underfill`, `perf/name-fuzzy`,
-`fix/cli-silent-empty`, `content/idle-governor`, `content/spool-peak`.
+`fix/cli-silent-empty`, `content/idle-governor`, `content/spool-peak`,
+`perf/ranking-signals` (queued item 1: open/frecency + `recent` + combo
+boost, `near` proximity, `git:` filter + status/recent-commit boosts,
+right-file-first metric; G7, G8, G13).
 
 | Branch | Worktree | Scope |
 |---|---|---|
@@ -22,10 +25,12 @@ Merged so far this round: `perf/content-underfill`, `perf/name-fuzzy`,
 
 ## Queued, in order
 
-1. **fff ranking signals (G7, G8).** Open/frecency tracking with an `open`
+1. **fff ranking signals (G7, G8) — done on `perf/ranking-signals`.** Open/frecency tracking with an `open`
    API and boost; `near` proximity; a recently-used list; a query-history
    boost; a `git:` filter (modified/staged/untracked/…); git-status and
    recent-commit boosts; a "right file first" metric for name queries (G13).
+   See docs/BENCHMARKS.md ("Right file first") and search-syntax.md
+   ("Ranking signals").
 2. **Agent integration (G12).** An MCP server (find, grep, multi_grep) and a
    JSON-lines stdio mode.
 3. **Grep features (G10, G9, G11).** Fuzzy grep, multi-pattern OR, context

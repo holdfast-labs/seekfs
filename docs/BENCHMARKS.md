@@ -220,6 +220,58 @@ piece bigrams); pair-gram retrieval tightening for short variants
 verifications (cannot prove emptiness — recall risk); Myers
 bit-parallel distance (no transposition support — recall risk on swaps).
 
+## Right file first (`perf/ranking-signals`, G13)
+
+2026-10-14 local benchmark against the chromium walk index (555,849 records),
+standalone service on a private pipe (`seekfs service -pipe
+\\.\pipe\seekfs-ranking -db E:\bench\chromium.gsi`), `GOMAXPROCS=2`. Harness:
+`E:\bench\scratch\ranking\rightfile.py` (scratch-only, never committed)
+samples 100 labeled targets from `E:\bench\truth.tsv` (60 whose basename
+occurs ≥ 2×, deliberately not the alphabetically-first copy, plus 40 unique
+names; seed 20261014) and issues, per target at `-n 100`: a plain-name query
+(basename), a partial-name query (longest stem token ≥ 4 chars, else first 6
+of stem), a 1-typo and a 2-typo query (mutations as in
+`E:\bench\scripts\chromium_eval.py`). Top-1/top-5 mean the target PATH ranks
+first / in the first five — stricter than the typo table below, which scores
+the target NAME first.
+
+EMPTY runs with a fresh signals state; SEEDED runs after `seekfs open` on
+every other target (4× each with `--query <basename>`, so the ≥ 3 combo
+boost fires, plus partial-query opens for a quarter of targets):
+
+| query shape | n | EMPTY top-1/top-5 | SEEDED top-1/top-5 |
+| --- | --- | --- | --- |
+| plain name | 100 | 39.0% / 95.0% | 66.0% / 95.0% |
+| partial name | 100 | 2.0% / 12.0% | 13.0% / 21.0% |
+| 1-typo | 100 | 39.0% / 98.0% | 39.0% / 98.0% |
+| 2-typo | 96 | 38.5% / 92.7% | 38.5% / 92.7% |
+
+Opened targets (n=50): plain top-1 20 → 47, 27 rose; partial top-1 2 → 13,
+17 rose. Control targets (n=50, never opened): plain 19 → 19, partial 0 → 0 —
+no blast radius (pages without signal evidence return untouched). Typo
+queries keep distance order by design (fuzzy bands never invert), so usage
+neither helps nor hurts them here.
+
+No-regress check on the committed typo metric (name-level, per
+`chromium_eval.py`, EMPTY store): one-typo top-1 99.5% (N=200 seed 42) and
+two-typo top-1 93.0% (N=100 seed 7) — exactly the Table 1 baselines.
+
+Result-set parity vs the pre-signals build (`parity.py`, 50 queries ×
+search 20/300/count over the same index, empty signals): 147/150 identical;
+the 3 diffs are all the `case:Makefile` error case, where the base exits 0
+with no output (the old silent-empty bug) and the new build exits 1 with the
+rejection message — the pre-merged `fix/cli-silent-empty` behavior, not a
+ranking change. All 140 non-empty base results (search pages and counts) are
+identical including order.
+
+Latency: the 37-query name profile re-run on the signals build with an
+empty store lands within the box's run-to-run noise (repeat runs of the same
+binary swing ±40% under parallel-agent load, e.g. path-multi 32.08 →
+21.84 ms, sort-extension 13.45 → 8.50 ms; per-query allocations identical).
+Active-path cost is bounded by `BenchmarkSignalReorderPage`: ~112 µs for a
+100-entry page with half the hits carrying frecency evidence (~1 µs/hit +
+page sort); the empty-store gate is a few map lookups.
+
 ## R5 Lazy-Source Validation Notes
 
 2026-07-08 local validation used a throwaway binary built from the working tree
