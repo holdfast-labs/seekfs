@@ -1304,7 +1304,7 @@ type denseBuildResult struct {
 	maxPeak  uint64
 	hits     int
 	count    int
-	absentQ  int // queried absent marker index, or -1 when none was provable
+	absentQ  int   // queried absent marker index, or -1 when none was provable
 	splitSeq []int // per-group spool files alive at each shard save
 	incompl  bool
 	state    string

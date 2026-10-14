@@ -280,6 +280,7 @@ func TestContentSpoolSplitGroupsCleansUp(t *testing.T) {
 		}
 	}
 }
+
 // Assembly over a compressed spool produces byte-identical sections and doc
 // records to assembly over the same docs from memory.
 func TestContentSpoolAssembleIdentical(t *testing.T) {

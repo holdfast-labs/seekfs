@@ -147,13 +147,13 @@ type contentBuildDoc struct {
 // frame in the compressed spool (see content_spool.go); spoolLen is the
 // frame's compressed length and length the doc's original length.
 type contentWalkDoc struct {
-	item    contentBuildItem
-	offset  int64
-	length  int
+	item     contentBuildItem
+	offset   int64
+	length   int
 	spoolLen int
-	modUnix int64
-	class   uint16
-	version uint16
+	modUnix  int64
+	class    uint16
+	version  uint16
 	// fileSize and fileModNano are the source file's byte size and nanosecond
 	// mtime at extraction time (walk reconcile fingerprint); every producer
 	// stamps them from the same stat the extraction read.
@@ -756,23 +756,23 @@ func assembleContentIndexStreamed(source contentBuildSource, tmpDir string, filt
 					FileSize:         d.fileSize,
 					FileModNano:      d.fileModNano,
 				})
-			// Documents arrive in ascending docID order, so each key's Adds arrive
-			// in ascending docID order as the builder requires. The per-doc
-			// term set is identical to the serial path's, and the builder
-			// sorts on spill, so Add order within a doc cannot change the
-			// encoded bytes. Each term is added once per document, so the
-			// dict builder's Add count is exactly the document frequency.
-			// Aliases contribute no postings (they share the primary's
-			// entry); their filter row below still derives from the same
-			// gram set, so every row stays dense in DocID order.
-			if !isAlias {
-				for term := range t.terms {
-					dictBuilder.Add(term)
+				// Documents arrive in ascending docID order, so each key's Adds arrive
+				// in ascending docID order as the builder requires. The per-doc
+				// term set is identical to the serial path's, and the builder
+				// sorts on spill, so Add order within a doc cannot change the
+				// encoded bytes. Each term is added once per document, so the
+				// dict builder's Add count is exactly the document frequency.
+				// Aliases contribute no postings (they share the primary's
+				// entry); their filter row below still derives from the same
+				// gram set, so every row stays dense in DocID order.
+				if !isAlias {
+					for term := range t.terms {
+						dictBuilder.Add(term)
+					}
+					for gram := range t.grams {
+						gramBuilder.Add(contentGramU32String(gram), docID)
+					}
 				}
-				for gram := range t.grams {
-					gramBuilder.Add(contentGramU32String(gram), docID)
-				}
-			}
 				// The filter row derives from the same gram set (no extra
 				// pass): class by measured distinct count, bits set inline.
 				// Rows spool in DocID order (one class byte plus the class

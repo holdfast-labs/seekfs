@@ -100,12 +100,12 @@ const (
 // contentLockfileNames are exact (lowercase) basenames never indexed:
 // resolved dependency pins, not searchable source.
 var contentLockfileNames = map[string]struct{}{
-	"package-lock.json": {}, "npm-shrinkwrap.json": {}, "yarn.lock":           {},
-	"pnpm-lock.yaml":    {}, "bun.lockb":           {}, "bun.lock":            {},
-	"cargo.lock":        {}, "go.sum":              {}, "go.work.sum":        {},
-	"poetry.lock":       {}, "pdm.lock":            {}, "pipfile.lock":        {},
-	"composer.lock":     {}, "gemfile.lock":       {}, "cargo.lock.json":     {},
-	"mix.lock":          {}, "pubspec.lock":       {}, "packages.lock.json":  {},
+	"package-lock.json": {}, "npm-shrinkwrap.json": {}, "yarn.lock": {},
+	"pnpm-lock.yaml": {}, "bun.lockb": {}, "bun.lock": {},
+	"cargo.lock": {}, "go.sum": {}, "go.work.sum": {},
+	"poetry.lock": {}, "pdm.lock": {}, "pipfile.lock": {},
+	"composer.lock": {}, "gemfile.lock": {}, "cargo.lock.json": {},
+	"mix.lock": {}, "pubspec.lock": {}, "packages.lock.json": {},
 }
 
 // contentLargeJSONExts are the extensions the large-JSON skip applies to.
