@@ -422,6 +422,11 @@ func TestContentPrunedIndexMatchesUnpruned(t *testing.T) {
 	var docs []contentBuildDoc
 	for i := 0; i < 60; i++ {
 		text := "common filler deliberately shared across every document "
+		// Every document stays unique (the §6z dedupe would otherwise
+		// collapse the corpus to a handful of primaries and no gram
+		// could reach the prune threshold); the shared grams below
+		// still hit df=60.
+		text += "serial" + string(rune('a'+i/26)) + string(rune('a'+i%26)) + " "
 		switch {
 		case i == 5:
 			text += "uniquewordxyz "

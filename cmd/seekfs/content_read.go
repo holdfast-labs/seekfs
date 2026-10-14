@@ -357,17 +357,36 @@ func (r *contentReader) verifyDocContent(id uint32, needle []byte) *contentHit {
 }
 
 // searchSerial is the historical streaming search: candidates verify one at
-// a time in docID order, stopping at the limit. The candidate set
-// materializes first so §6z aliases expand into docID order before the
-// limit applies: every duplicate path is listed, not just the primary.
+// a time in docID order, stopping at the limit. With §6z aliases the
+// candidate set materializes first so duplicates expand into docID order
+// before the limit applies (every duplicate path is listed, not just the
+// primary); without aliases the stream stays lazy, so a small limit never
+// allocates an all-document slice.
 func (r *contentReader) searchSerial(t string, limit int) []contentHit {
 	if t == "" {
 		return nil
 	}
 	needle := []byte(t)
-	ids := r.expandAliasDocIDs(collectDocIDStream(r.candidateStream(t), 0))
+	if len(r.aliasExpand) > 0 {
+		ids := r.expandAliasDocIDs(collectDocIDStream(r.candidateStream(t), 0))
+		var hits []contentHit
+		for _, id := range ids {
+			if hit := r.verifyDocContent(id, needle); hit != nil {
+				hits = append(hits, *hit)
+				if limit > 0 && len(hits) >= limit {
+					break
+				}
+			}
+		}
+		return hits
+	}
+	next := r.candidateStream(t)
 	var hits []contentHit
-	for _, id := range ids {
+	for {
+		id, ok := next()
+		if !ok {
+			break
+		}
 		if hit := r.verifyDocContent(id, needle); hit != nil {
 			hits = append(hits, *hit)
 			if limit > 0 && len(hits) >= limit {
@@ -426,17 +445,22 @@ func (r *contentReader) searchParallel(t string, limit int, workers int) []conte
 		return r.searchSerial(t, limit)
 	}
 	needle := []byte(t)
-	// Materialized like the serial path (aliases expanded into docID
-	// order), so the ordered merger restores the exact serial result.
-	ids := r.expandAliasDocIDs(collectDocIDStream(r.candidateStream(t), 0))
-	nextIdx := 0
-	next := func() (uint32, bool) {
-		if nextIdx >= len(ids) {
-			return 0, false
+	// With aliases the candidates materialize like the serial path
+	// (expanded into docID order), so the ordered merger restores the
+	// exact serial result; without aliases the feeder pulls the lazy
+	// stream exactly as before.
+	next := r.candidateStream(t)
+	if len(r.aliasExpand) > 0 {
+		ids := r.expandAliasDocIDs(collectDocIDStream(next, 0))
+		nextIdx := 0
+		next = func() (uint32, bool) {
+			if nextIdx >= len(ids) {
+				return 0, false
+			}
+			id := ids[nextIdx]
+			nextIdx++
+			return id, true
 		}
-		id := ids[nextIdx]
-		nextIdx++
-		return id, true
 	}
 	quit := make(chan struct{})
 	var quitOnce sync.Once
