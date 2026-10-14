@@ -189,6 +189,12 @@ func searchServiceVolumesGlobalComponentsOnlySnapshot(snapshot globalQuerySnapsh
 	if !globalEnabled && !globalComponentDefaultSupported(pq, terms) {
 		return nil, false, nil
 	}
+	if anyVolumeAccentActive(volumes, pq) {
+		// Component iterators propose from unfolded bytes and would miss
+		// accent matches; the exhaustive paths below answer instead.
+		opts.Trace.replaceDecline("global-components:accent-union")
+		return nil, false, nil
+	}
 	if !globalComponentQuerySupportedMulti(pq, terms, len(volumes) > 1) {
 		opts.Trace.replaceDecline("global-components:unsupported-query")
 		return nil, false, nil

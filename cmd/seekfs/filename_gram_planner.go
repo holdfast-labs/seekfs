@@ -62,7 +62,10 @@ func (vol *serviceVolumeIndex) nameGramUnionUsesExtra(term string) bool {
 // name check keeps the posting source conservative.
 func (vol *serviceVolumeIndex) completeFilenameTopPosting(term string, limit int, pq parsedQuery) ([]int, bool) {
 	if vol == nil || vol.index == nil || limit <= 0 || pq.CountOnly || len(vol.recentIDs) > 0 ||
-		len(pq.Dirs) > 0 || len(pq.Globs) > 0 || len(pq.Regexps) > 0 {
+		len(pq.Dirs) > 0 || len(pq.Globs) > 0 || len(pq.Regexps) > 0 || vol.accentUnionActive(pq) {
+		// The rank-order walk below reads unfolded gram bytes; with
+		// foldable names it would truncate before accent matches.
+		// Decline so an exhaustive source answers instead.
 		return nil, false
 	}
 	if len(pq.Exts) == 1 {
@@ -591,6 +594,12 @@ func (vol *serviceVolumeIndex) completeMultiTermNameGramCandidates(terms []strin
 // It retains only one decoded posting block at a time.
 func (vol *serviceVolumeIndex) completeFilenameCountPosting(term string, pq parsedQuery) (int, bool) {
 	if vol == nil || vol.index == nil || len(vol.recentIDs) > 0 {
+		return 0, false
+	}
+	// The gram-intersection count reads unfolded bytes with no per-record
+	// verification: name anchors narrow beyond the term, and the accent
+	// union would add folded matches. Decline both so counts stay exact.
+	if len(pq.ExactTerms)+len(pq.Prefixes)+len(pq.Suffixes) > 0 || vol.accentUnionActive(pq) {
 		return 0, false
 	}
 	// The posting intersection counts name matches only; scalar predicates

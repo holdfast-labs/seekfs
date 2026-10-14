@@ -18,15 +18,17 @@ package main
 // Within a band, keys apply in order: query-history combo (same normalized
 // query -> same pick >= 3 times), near: hop distance, frecency (decayed open
 // score), git dirt (dirty before clean), recent-commit membership,
-// modification recency, then path as the deterministic final tie-break. An
+// modification recency, current-file demotion (--current sinks the open
+// file to the band bottom, fff current_file), then path as the
+// deterministic final tie-break. An
 // explicit sort: column, content queries (relevance owns their order), and
 // counts never reorder.
 //
 // Result sets and counts never change (only order); with no signals anywhere
-// (empty frecency store, no git: filter, no near: anchor) pages return
-// untouched, so order is byte-identical to the base ranker and the extra
-// cost is a few map lookups. The active path precomputes one evidence row
-// per hit and sorts indices, so the comparator itself never allocates.
+// (empty frecency store, no git: filter, no near: anchor, no --current)
+// pages return untouched, so order is byte-identical to the base ranker and
+// the extra cost is a few map lookups. The active path precomputes one
+// evidence row per hit and sorts indices, so the comparator itself never allocates.
 
 import (
 	"os"
@@ -49,7 +51,10 @@ type signalHitKeys struct {
 	recent    bool
 	biased    bool
 	mod       int64
-	name      string
+	// current marks the file the user already has open (--current): it
+	// demotes to the bottom of its match-quality band (fff current_file).
+	current bool
+	name    string
 }
 
 // signalPageCtx holds one result page's precomputed evidence rows.
@@ -67,7 +72,7 @@ func signalReorderActive(pq parsedQuery) bool {
 	if pq.SortColumn != "" || queryHasAnyContentLeaf(pq) {
 		return false
 	}
-	if len(pq.GitFilters) > 0 || pq.Near != "" {
+	if len(pq.GitFilters) > 0 || pq.Near != "" || pq.Current != "" {
 		return true
 	}
 	return !sharedSignalStore().empty()
@@ -92,6 +97,7 @@ func buildSignalPageCtx(entries []Entry, pq parsedQuery) *signalPageCtx {
 	ctx.hasBias = biasRoot != ""
 	needNear := pq.Near != ""
 	needGitFilter := len(pq.GitFilters) > 0
+	needCurrent := pq.Current != ""
 	cleanPaths := make([]string, len(entries))
 	for i := range entries {
 		clean := cleanPathIfNeeded(entries[i].Path)
@@ -100,6 +106,9 @@ func buildSignalPageCtx(entries []Entry, pq parsedQuery) *signalPageCtx {
 		k.clean = clean
 		k.lower = entryLowerPath(entries[i])
 		k.lowerName = entryLowerName(entries[i])
+		if needCurrent && strings.EqualFold(clean, pq.Current) {
+			k.current = true
+		}
 		if pq.CaseSensitive {
 			k.lowerName = entries[i].Name
 			if k.lowerName == "" {
@@ -166,7 +175,7 @@ func buildSignalPageCtx(entries []Entry, pq parsedQuery) *signalPageCtx {
 			}
 		}
 	}
-	ctx.active = needNear || needGitFilter || seenCombo || seenScore || seenGit || seenRecent
+	ctx.active = needNear || needGitFilter || needCurrent || seenCombo || seenScore || seenGit || seenRecent
 	return ctx
 }
 
@@ -289,6 +298,15 @@ func compareSignalKeys(ctx *signalPageCtx, i, j int) int {
 			return -1
 		}
 		return 1
+	}
+	// Current-file demotion (fff current_file, --current): the file the
+	// user already has open sinks to the bottom of its band, after every
+	// other signal. Bands never invert: this only orders within one.
+	if a.current != b.current {
+		if a.current {
+			return 1
+		}
+		return -1
 	}
 	return 0
 }

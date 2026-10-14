@@ -884,6 +884,7 @@ func cmdSearch(args []string, countOnly bool) error {
 	cwdBias := fs.Bool("cwd-bias", false, "rank paths under the current working directory first")
 	rootBias := fs.String("root-bias", "", "rank paths under this root first")
 	near := fs.String("near", "", "rank files fewer path hops from this path higher (within a match-quality band)")
+	current := fs.String("current", "", "demote this open file to the bottom of its match-quality band")
 	recent := fs.String("recent", "", "only return results modified within this duration, for example 24h")
 	modifiedAfter := fs.String("modified-after", "", "only return results modified after RFC3339 time or YYYY-MM-DD")
 	caseSensitive := fs.Bool("case", false, "case-sensitive query matching")
@@ -931,6 +932,7 @@ func cmdSearch(args []string, countOnly bool) error {
 		Exists:        *exists,
 		RootBias:      *rootBias,
 		Near:          *near,
+		Current:       *current,
 		Recent:        *recent,
 		ModifiedAfter: *modifiedAfter,
 		CaseSensitive: *caseSensitive,
@@ -942,6 +944,15 @@ func cmdSearch(args []string, countOnly bool) error {
 			return err
 		}
 		opts.CWDBias = cwd
+	}
+	if opts.Current != "" {
+		// The service resolves relative paths against its own working
+		// directory, so absolutize client-side (same treatment as --under
+		// roots, which parseQuery absolutizes server-side against the
+		// service cwd and therefore require absolute input to be exact).
+		if abs, err := filepath.Abs(opts.Current); err == nil {
+			opts.Current = abs
+		}
 	}
 	if *useService || autoService {
 		svcErr := searchService(*pipeName, opts, countOnly, *jsonOut)

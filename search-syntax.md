@@ -5,7 +5,17 @@
 `seekfs` supports a small agent-friendly query language:
 
 - Case-insensitive substring matching by default.
-- Whitespace-separated terms are ANDed.
+- Accent-insensitive matching by default: `resume` finds `résumé`,
+  NFD/NFC-insensitive. `case:` and `"quoted"` phrases stay byte-exact.
+- Whitespace-separated terms are ANDed. Several words may spell one name
+  across separators and camelCase (`chrome main` finds
+  `chrome_main_delegate.cc`, in any order); use `-path` when terms span
+  path vs name (`src main`).
+- Name anchors: `'exact` (whole file name equals), `^prefix` (name starts
+  with), `suffix$` (name ends with), `^both$` (both ends). Anchors always
+  name the file, in filename and `-path` modes alike.
+- Quoted phrases: `"foo bar"` is one literal term (spaces kept), with no
+  accent folding and no typo correction.
 - OR alternatives within a term with `a|b` (for example `ext:png|jpg`).
 - Negation with `!term` or `-term` (for example `main !test`).
 - Name search by default.
@@ -14,7 +24,12 @@
 - Count-only mode with `count`.
 - Extension filters with `ext:go`.
 - Directory/path segment filters with `dir:src`.
-- Glob filters with `glob:*.py`.
+- Subtree scoping with `in:<dir>` (alias of `--under`; multiple roots must
+  nest, disjoint roots match nothing; `!in:<dir>` excludes a subtree).
+- Glob filters with `glob:*.py`. Brace sets choose alternatives
+  (`glob:*.{c,h}`); a pattern containing `/` or `**` matches the full path
+  (`glob:src/**/*.{c,h}`, `glob:**/OWNERS`; relative patterns match at any
+  depth). Bare `src/**/*.{c,h}` works too.
 - Regular expressions with `regex:<pattern>`.
 - Size filters with `size:>100mb`, `size:>=1gb`, `size:<4k`, or `size:1024`.
 - Modified-date filters with `dm:today`, `dm:yesterday`, `dm:thisweek`,
@@ -30,6 +45,9 @@
   match-quality band, files fewer path hops from the anchor rank first. A
   file anchor measures from its own directory, so `near:<file>` favors its
   siblings.
+- Current-file demotion with `--current <path>`: the file the user already
+  has open ranks last within its match-quality band (fff `current_file`).
+  Sets and counts never change (only order).
 - Workspace scoping with `--under <path>`.
 - Stale-result verification with `--exists`.
 - Recency filters with `--recent 24h` or `--modified-after 2026-05-22`.
@@ -44,7 +62,11 @@
   (`reprot pdf` finds `report.pdf`, `discovery llog` finds `discovery log`);
   common terms stay as hard constraints. `term~` or `--fuzzy` opts in
   explicitly, regardless of how many exact results were found. Terms shorter
-  than 3 characters are not fuzzed.
+  than 3 characters are not fuzzed. Name anchors (`'exact`, `^prefix`,
+  `suffix$`) and `"quoted"` terms never fuzzy-correct: they describe
+  exact-tier intent and stay hard constraints. The typo budget is one edit
+  per word, two for words of 8+ letters (fsearch rule); adjacent
+  transpositions cost one (Damerau) and keep working.
 
 ## Examples
 
@@ -64,9 +86,11 @@
 
 ## Notes
 - `ext:` matches exact file extensions without the leading dot.
-- `glob:` currently matches the file name, not the full path.
+- `glob:` matches the file name, unless the pattern contains `/` or `**`,
+  in which case it matches the full path (relative patterns at any depth).
 - Bare wildcard filename tokens such as `*_test.go` are treated as filename
   globs too; use `glob:` when you want that behavior to be explicit.
+  Bare `**` paths (`src/**/*.{c,h}`) become path globs.
 - `dir:` is a path substring filter.
 - `parent:` matches entries whose immediate parent directory name equals the
   supplied value; it accepts one directory name, not a path or glob.
@@ -100,7 +124,8 @@ blend into name ranking as bounded within-band tie-breakers:
   one, no matter the signals.
 - Within a band: same-query picks (≥ 3 repeats), `near:` hop distance,
   frecency, git dirt (dirty before clean), recent-commit membership,
-  modification recency, then path.
+  modification recency, `--current` demotion (the open file sinks to the
+  band bottom), then path.
 - Result sets and counts never change (only order), unless a `git:` filter
   narrows them. Explicit `sort:` and content queries never reorder. With an
   empty store and no `git:`/`near:`, order is byte-identical to the base

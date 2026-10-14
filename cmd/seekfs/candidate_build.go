@@ -45,6 +45,7 @@ func (vol *serviceVolumeIndex) exactTopPlannedCandidates(pq parsedQuery) ([]int,
 	if vol == nil || vol.queryIndex == nil || pq.Limit <= 0 || pq.hiddenBlocksTruncation() ||
 		len(pq.Exts) != 1 || len(pq.Globs) > 0 || len(pq.Dirs) > 0 ||
 		pq.Type != "" || pq.Under != "" || pq.HasModAfter || pq.lateVerified() ||
+		needsPathVerification(pq) ||
 		(pq.SortColumn != "" && pq.SortColumn != "size" && pq.SortColumn != "modified" && pq.SortColumn != "extension" && pq.SortColumn != "type" && pq.SortColumn != "path") ||
 		len(pq.SizeFilters) > 0 || len(pq.DateFilters) > 0 || len(pq.AttrFilters) > 0 ||
 		len(pq.OrGroups) > 0 || len(pq.NotGroups) > 0 {
@@ -93,6 +94,9 @@ func (vol *serviceVolumeIndex) plannedCountHidden(pq parsedQuery, hidden hiddenB
 		len(pq.Regexps) == 0 && len(pq.RegexTerms) == 0 && len(pq.Parents) == 0 &&
 		len(pq.SizeFilters) == 0 && len(pq.DateFilters) == 0 && len(pq.AttrFilters) == 0 &&
 		len(pq.OrGroups) == 0 && len(pq.NotGroups) == 0 &&
+		len(pq.ExactTerms) == 0 && len(pq.Prefixes) == 0 && len(pq.Suffixes) == 0 &&
+		len(pq.PathGlobs) == 0 && len(pq.NotUnders) == 0 &&
+		!vol.accentUnionActive(pq) &&
 		pq.CWDBias == "" && pq.RootBias == "" && !pq.CaseSensitive {
 		if count, ok := vol.countBareTermParallel(terms[0], hidden, pq); ok {
 			pq.Trace.addTerm(traceTerm{Term: terms[0], Kind: "name-substring", Source: "parallel-name-count", CountHint: count, Exact: true})
@@ -189,6 +193,11 @@ func queryNeedsPath(pq parsedQuery) bool {
 	if len(pq.Dirs) > 0 || len(pq.Regexps) > 0 || len(pq.Parents) > 0 {
 		return true
 	}
+	// Path globs match the full path and negated in: roots test it; both
+	// need reconstruction even in filename mode.
+	if len(pq.PathGlobs) > 0 || len(pq.NotUnders) > 0 {
+		return true
+	}
 	if pq.Under != "" || pq.lateVerified() || len(pq.Features) > 0 {
 		return true
 	}
@@ -212,7 +221,10 @@ func queryNeedsPath(pq parsedQuery) bool {
 // record's own name/size/mtime/mode fields.
 func (vol *serviceVolumeIndex) recordMatchesNonPath(id int, rec CompactRecord, pq parsedQuery) bool {
 	cmpName := normalizeCase(rec.Name, pq.CaseSensitive)
-	if !pq.MatchPath && !containsAll(cmpName, pq.Terms) {
+	if !pq.MatchPath && !containsAllFolded(cmpName, nil, pq.Terms, pq) {
+		return false
+	}
+	if !matchNameAnchors(cmpName, nil, pq) {
 		return false
 	}
 	if pq.Type == "file" && rec.Mode&uint32(os.ModeDir) != 0 {
@@ -235,9 +247,21 @@ func (vol *serviceVolumeIndex) recordMatchesNonPath(id int, rec CompactRecord, p
 			return false
 		}
 	}
-	for _, glob := range pq.Globs {
-		ok, err := filepath.Match(glob, cmpName)
-		if err != nil || !ok {
+	for gi, glob := range pq.Globs {
+		if matchNameAlts(globAltsFor(pq.GlobAlts, gi, glob), cmpName) {
+			continue
+		}
+		if pq.CaseSensitive || (!nameNeedsFold(glob) && !nameNeedsFold(cmpName)) {
+			return false
+		}
+		fp, fn := glob, cmpName
+		if nameNeedsFold(glob) {
+			fp = foldAccentLower(glob)
+		}
+		if nameNeedsFold(cmpName) {
+			fn = foldAccentLower(cmpName)
+		}
+		if !matchNameGlob(fp, fn) {
 			return false
 		}
 	}

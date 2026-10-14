@@ -109,10 +109,16 @@ type nameIdentity struct {
 }
 
 func (idx *Index) resetNameIdentity() {
-	if idx == nil || idx.nameIdent.Load() == nil {
+	if idx == nil {
 		return
 	}
 	idx.nameIdentMu.Lock()
+	idx.accentIDs = nil
+	idx.accentBuilt = false
+	if idx.nameIdent.Load() == nil {
+		idx.nameIdentMu.Unlock()
+		return
+	}
 	idx.nameIdent.Store(nil)
 	idx.memoTopo.Store(nil)
 	idx.nameMemo.resetLocked(idx.memoGen.Add(1))
@@ -462,6 +468,12 @@ func memoSupported(pq parsedQuery) bool {
 	if len(pq.Parents) != 0 || len(pq.OrGroups) != 0 {
 		return false
 	}
+	if len(pq.PathGlobs) != 0 || len(pq.ExactTerms) != 0 || len(pq.Prefixes) != 0 ||
+		len(pq.Suffixes) != 0 || len(pq.NotUnders) != 0 {
+		// Path globs, name anchors and negated in: roots are decided by
+		// the entry verifier; the memo only decides name/scalar fields.
+		return false
+	}
 	if pq.RootBias != "" || pq.CWDBias != "" {
 		return false
 	}
@@ -513,6 +525,12 @@ func (vol *serviceVolumeIndex) memoFor(pq parsedQuery) (*queryMemo, *nameIdentit
 		return nil, nil
 	}
 	idx := vol.index
+	if accentQueryAddsMatches(idx, pq) {
+		// The memo decides unfolded names; accent-folded matches live
+		// outside its bits. Decline so the posting lanes (with the accent
+		// union) answer instead.
+		return nil, nil
+	}
 	gen := idx.memoGen.Load()
 	ident := idx.ensureNameIdentity()
 	if ident == nil {

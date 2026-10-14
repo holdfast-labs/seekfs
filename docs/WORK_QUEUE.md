@@ -14,14 +14,15 @@ refer to `docs/REFERENCE_TOOLS.md`.
 
 Merged so far this round: `perf/content-underfill`, `perf/name-fuzzy`,
 `fix/cli-silent-empty`, `content/idle-governor`, `content/spool-peak`, `perf/ranking-signals` (G7, G8, G13), `content/inclusion-policy` (G3, §6z,
-format v10), `test/suite-speed` (default suite ~3–5 min; soak tier
+format v10), `perf/name-lessons` (G11: `'exact ^prefix suffix$`, `**`/brace globs,
+`in:`, accent folding for names, `--current`, regex letter masks),
+`test/suite-speed` (default suite ~3–5 min; soak tier
 `SEEKFS_TEST_SOAK=1` in CI), `fix/short-term-postings` (direct-index LOWR writer
 corruption, exact required sources, auto-fuzzy only on zero exact hits).
 
 | Branch | Worktree | Scope |
 |---|---|---|
 | `perf/static-ranking` | staticrank | Queued item 0b: static ranker (no usage) right-file-first above 39% top-1, on two labeled sets; sets and counts unchanged (G13) |
-| `perf/name-lessons` | namelessons | Name-search lessons: letter-bitmap prefilter, multi-word spelling, accent folding, `'exact ^prefix suffix$ ** {a,b} in:`, typo budget by word length, current-file demotion (G11) |
 | `integ/filter-tier-merge` | tiermerge | Merging `content/filter-tier` (no stored text by default) with inclusion v10 + spool-peak; one format v11; dedupe under no-stored-text; re-measure; list regressions |
 | `perf/freshness-footprint` | footprint | Name-side change visibility (fsearch ~15 ms), restart/load time (~40 s for 1.46M), resident memory (~500 MB), idle release, on-demand folder-first indexing (G4, G5, G6) |
 
@@ -64,6 +65,9 @@ corruption, exact required sources, auto-fuzzy only on zero exact hits).
   coverage on dense corpora for roughly +4 s of serial encode (§6x).
 - **JSON-lines stdio mode (G12):** optional and low priority. **No MCP
   server**: the owner ruled it out on 2026-10-13.
+- **Content accent folding:** names fold accents (`resume` → `résumé`), but
+  content matching is still case-folded only. Folding content needs an
+  index-format change; fold it into the next format bump.
 - **Ranking store scope:** `ranking_signals.json` lives next to the service
   state (the LocalSystem service holds one store for all local users). Decide
   whether it should be per-user before shipping on multi-user machines.
