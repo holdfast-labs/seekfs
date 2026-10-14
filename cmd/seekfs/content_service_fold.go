@@ -435,7 +435,8 @@ func (s *goSearchService) publishFoldedContent(vol *serviceVolumeIndex, gen uint
 		// the unmap cannot race a read.
 		//
 		// The fold itself reads the base mapping WITHOUT indexMu (it captures the
-		// reader and streams docText/docPath lock-free for the whole assembly).
+		// reader and streams doc paths lock-free for the whole assembly; base
+		// text comes from disk, not the mapping).
 		// That is safe because this Release is the only unmap that can occur while
 		// a fold runs, and it happens only here, AFTER the fold's base reads are
 		// complete. A concurrent markStale→setReady cannot reach setReady during a
