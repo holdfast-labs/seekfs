@@ -1894,6 +1894,117 @@ second-dict generation) — the first three fail without the overlay fix.
 Serial/parallel identity for the newly parallelized gate is covered by the
 existing `TestContentParallelContentMatchesSerial` (limits × workers).
 
+## 6w. Idle-aware build governor (done)
+
+Branch `content/idle-governor`. The service build paused a fixed
+`contentBuildBatchPause` (25 ms) every `contentBuildBatchSize` (64) extracted
+docs — ~30 s on a 76k-file build, ~4 min on the real 650k-file E: build —
+whether the machine needed the politeness or not. The offline harnesses
+bypass the pause, so it was never measured. The pause is now adaptive:
+`contentBuildPauseNow` sleeps only while the machine is busy and skips on an
+idle machine with no foreground query load (`SEEKFS_CONTENT_BUILD_PAUSE`
+forces `never`/`always`/`auto`).
+
+**Service-path numbers** (600 MB Chromium sample through `runContentBuild`,
+not the offline harness: 468,772 scope files extracted, 71,502 docs /
+230.8 MB over 10 shards; GOMAXPROCS=4, 16 workers unless noted; warm page
+cache; min/median over same-session repeats where stated):
+
+| run | policy | load | total | pauses taken/skipped |
+|---|---|---|---|---|
+| baseline (old code) | fixed 25 ms | — | 12m36s | 7324 / 0 |
+| baseline (old code) | none | — | 11m28s | 0 / — |
+| auto | adaptive | — | 8m56s / 10m02s (min/repeat) | 17 / 7307, 168 / 7156 |
+| always (same session) | forced 25 ms | — | 10m59s | 7324 / 0 |
+| always | forced 25 ms | light* | 10m59s | 7324 / 0 |
+| auto | adaptive | light* | 10m48s | 5887 / 1437 |
+
+\* Light load = 1 CPU burner + a foreground filename query every 500 ms
+starting 90 s in (delayed so the one-time worker count is still sampled at
+16; without the delay the pre-existing worker adaptation drops to 1 worker
+and the build serializes to 60+ min — see below).
+
+Idle win, same session: always 10m59s → auto 8m56s (**−123 s, −19%**;
+7,307 skipped pauses × 25 ms = 183 s nominal, ~60 s absorbed by prefetch
+overlap). Under load the governor stays polite: auto takes 5,887
+`query-recent` pauses and lands within 11 s of forced-always (the 1,437
+skips are the idle prefix before the query loop starts). Built output is
+identical across all of these: same 71,502 doc records (doctab hash
+`40cd603b…` in all 11 full-corpus fingerprints), same per-shard sizes and
+policy tallies; byte-identical `.gsx` across never/always/auto on a fixed
+USN fixture (`TestContentServiceBuildIdenticalAcrossGovernorModes`).
+
+**Signals (cheapest-first, every one a var for tests).** Recent query
+activity (existing 30 s window) + in-flight foreground searches (new atomic
+around the two search commands that already note activity) + battery
+(existing) + foreground input recency (`GetLastInputInfo`, 60 s window) +
+other-process CPU (`GetSystemTimes` minus our own `GetProcessTimes`, >50%,
+sampled ≤ every 2 s) + disk busyness (PDH `PhysicalDisk(_Total)\% Idle Time`
+< 30%) + system-drive target (always pauses). Every probe fails open. Pause
+decisions are attributed per signal (`contentBuildPauseReasonCounts`;
+harness `PROGRESS` lines log the live reason).
+
+**Why PDH % Idle, not our own open latency.** First tried: mean/median of
+recent per-doc extraction latency > 2 ms. It fired on ~100% of batches even
+on a quiet box — cold AV-scanned opens cost milliseconds with nobody to
+yield to, and large-file decodes poisoned the mean (median fixed that half).
+Our experienced latency cannot tell cold/self-inflicted slowness from
+contention. % Idle Time is device-busy time: our small-read storm barely
+moves it (the milliseconds are AV/MFT CPU), bulk IO from another process
+pins it near zero. Calibrated: ~71% idle on a quiet box vs the 30%
+threshold; PDH costs two calls per 64-doc batch (<0.5 s over a full build).
+
+**Tried and rejected (measured).** `FILE_FLAG_SEQUENTIAL_SCAN`: 71→71
+µs/file warm, no win for open+single-read (the flag helps multi-read
+patterns). Dropping the post-open `stat`: it is ~46% of warm open cost
+(38 vs 33 µs/file) but the only post-open truth for size/mtime — widening
+the metadata race is not worth 33 µs. Narrower share modes: the service
+must not fail on files open for writing elsewhere. Skipping opens for
+unchanged files: moot for base builds (no prior); known-binary extensions
+are already rejected in `allows()` without opening, and the reconcile
+already print-gates. Worker counts 8 vs 16: identical (0.58 s at 120 MB
+both, one 19 s outlier proven to be transient contention on repeat) — 16
+already saturates this SSD at ~35 µs/file drain, so no headroom there.
+PDH per-volume instances: `_Total` needs no volume→disk mapping.
+
+**Correctness.** The pause is a sleep, never a selection/extraction/assembly
+input: reserve/budget accounting (§6t/§6u) is untouched and the policy
+tallies are identical across modes (Budget 600 MB, dropped 392,530 /
+2,463,330,527 B in every run). `go vet ./...` clean; full
+`go test -p 1 ./cmd/seekfs ./feature` green (minus known load-sensitive
+`TestHeadlessFrameCost`).
+
+**Remaining bottlenecks.** (1) The exact-drop rule extracts all 468,772
+scope files even when the budget keeps 71,502 — the 600 MB build is
+extraction-bound by design (§6t/§6u exactness; changing it would break the
+drop accounting). (2) Cold first-touch opens (~ms, Defender+MFT) dominate
+any full build; only the page cache fixes that. (3) The pre-existing worker
+adaptation (1 worker while queries are active at build start) serializes a
+build to 60+ min under continuous query load — out of scope here, but the
+next lever if loaded builds matter.
+
+**Session-0 input blindness (fixed).** The installed service runs as
+LocalSystem in session 0, which never receives keyboard/mouse input, so the
+original `GetLastInputInfo` probe always read idle in production and could
+never back off while the user typed (in-process measurements from a user
+session masked this). The input signal now enumerates terminal sessions via
+WTS (`WTSEnumerateSessions` + `WTSSessionInfoEx.LastInputTime`) from any
+session and keeps `GetLastInputInfo` only as the calling-session fallback
+elsewhere (most recent valid time wins; session 0 skips the fallback).
+Measured on this box: the `WTSINFOEX` layout validates (232 bytes, level 1,
+SessionId echo matches) but `LastInputTime` is **zero on every session** —
+as is `WTSIdleTime` (class 17 fails) — while `query user` likewise reports
+IDLE TIME `none` against a 10.5 h `GetLastInputInfo` idle: this Windows build
+populates no session-layer input time, so from session 0 there is currently
+no documented mechanism to see interactive input. The governor therefore
+fails the decision open (idle) but reports `input: live=false/unavailable`
+in health instead of silently assuming idleness: `loaded --json` carries a
+`governor` section (`mode` plus live/unavailable for input/cpu/disk/battery
+— `TestContentGovernorHealthInLoadedJSON`). Where a build populates WTS
+times the source engages with no code change (covered by
+`TestContentInputSourceSelection`, including the session-0 skip). The WTS
+sample is cached 5 s; zero times are skipped, never treated as recent.
+
 ## 7. Carried debt / known gaps
 
 - **Snippet case is preserved; no fixup-aware path remains.** The `.gsx` text

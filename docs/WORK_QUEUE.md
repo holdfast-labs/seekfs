@@ -11,9 +11,11 @@ refer to `docs/REFERENCE_TOOLS.md`.
 
 ## Running (2026-10-13)
 
+Merged so far this round: `perf/content-underfill`, `perf/name-fuzzy`,
+`fix/cli-silent-empty`, `content/idle-governor`.
+
 | Branch | Worktree | Scope |
 |---|---|---|
-| `content/idle-governor` | governor | Adaptive build pause (idle-aware) and cheaper file opens (docs §6w) |
 | `test/suite-speed` | suitespeed | `cmd/seekfs` suite under ~5 min; harden `TestHeadlessFrameCost`; gofmt drift |
 | `content/spool-peak` | spoolpeak | Build peak ≈ final size, so more coverage per GB (G2, §6x) |
 | `content/filter-tier` | tier2 | Filter tier with no stored text, verified from disk; evaluate it as the default (G1, §6y) |
@@ -58,6 +60,11 @@ refer to `docs/REFERENCE_TOOLS.md`.
 - **Single worker under load:** builds drop to 1 worker when queries are
   active at build start, which serializes a loaded build to 60+ min. Adapt
   workers during the build instead of fixing the count at the start.
+- **User input seen from the service:** the governor's input signal is
+  unavailable from session 0 on this Windows build (WTS `LastInputTime` is 0,
+  `GetLastInputInfo` sees only session 0; §6w, `loaded --json` governor
+  section). Fix it by having `seekfs-ui` (runs in the user session) report
+  its session's last-input time to the service over the pipe.
 - **Slow differential test:** `TestContentGlobalLaneScopeDifferential` takes
   300–666 s. `test/suite-speed` tiers it; confirm CI still runs the full tier.
 

@@ -31,9 +31,13 @@ package main
 //
 // IO governor. Extraction runs on contentBuildWorkerCount workers (dropped to
 // one while the user queries or the machine is on battery) with per-handle
-// low disk priority (contentOpenNoRecall), and pauses every batch so filename
-// search and USN replay keep the disk; the loop is cancelable through s.stop
-// and the per-volume build generation.
+// low disk priority (contentOpenNoRecall), and pauses at every
+// contentBuildBatchSize-doc batch boundary only while the machine is busy:
+// recent or in-flight foreground queries, foreground input, other-process CPU
+// pressure, disk busyness, battery, or a system-drive target
+// (contentBuildPauseNow; SEEKFS_CONTENT_BUILD_PAUSE forces it). An idle
+// build skips the pause entirely. The loop is cancelable through s.stop and
+// the per-volume build generation.
 //
 // Build vs catch-up. A base build extracts the base corpus while restart
 // catch-up and the drain loop may extract changed files into the in-memory
@@ -864,14 +868,18 @@ func (s *goSearchService) runContentBuild(vol *serviceVolumeIndex, reuseSidecar 
 				break
 			}
 			vol.content.setBuildProgress(done, total)
-			if contentBuildBatchPause > 0 {
+			// Idle-aware IO governor: skip the pause on an idle machine with
+			// no foreground query load; take it when anything is active (see
+			// contentBuildPauseNow). Cancelable through s.stop and the build
+			// generation, like the historical fixed pause.
+			if pause := contentBuildPauseNow(gsx); pause > 0 {
 				select {
 				case <-s.stop:
 					abortReason = "service stopping"
 					break
 				case <-contentActivationDone(vol):
 					abortReason = "content plugin stopping"
-				case <-time.After(contentBuildBatchPause):
+				case <-time.After(pause):
 				}
 			}
 		}

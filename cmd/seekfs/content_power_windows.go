@@ -24,16 +24,26 @@ var (
 	procGetSystemPowerStatus = modkernel32ForPower.NewProc("GetSystemPowerStatus")
 )
 
+// contentBatteryProbe reports whether the machine is discharging a battery,
+// plus whether the probe itself worked. Unknown (a failed probe) reads as
+// mains power for decisions (fail open); health reports the availability.
+func contentBatteryProbe() (onBattery, ok bool) {
+	var st systemPowerStatus
+	r1, _, _ := procGetSystemPowerStatus.Call(uintptr(unsafe.Pointer(&st)))
+	if r1 == 0 {
+		contentBatteryLastOK.Store(false)
+		return false, false
+	}
+	contentBatteryLastOK.Store(true)
+	// BatteryFlag 128 means no system battery; anything else with mains
+	// offline is a discharging (or unknown-state) battery.
+	return st.ACLineStatus == 0 && st.BatteryFlag != 128, true
+}
+
 // contentSystemOnBattery reports whether the machine is discharging a battery.
 // Unknown (a failed probe) reads as mains power: the probe must fail open so
 // a broken reading cannot throttle every build to one worker forever.
 func contentSystemOnBattery() bool {
-	var st systemPowerStatus
-	r1, _, _ := procGetSystemPowerStatus.Call(uintptr(unsafe.Pointer(&st)))
-	if r1 == 0 {
-		return false
-	}
-	// BatteryFlag 128 means no system battery; anything else with mains
-	// offline is a discharging (or unknown-state) battery.
-	return st.ACLineStatus == 0 && st.BatteryFlag != 128
+	onBattery, _ := contentBatteryProbe()
+	return onBattery
 }
