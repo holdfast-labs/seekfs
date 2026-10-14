@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -49,70 +50,60 @@ func TestContentBuildAndSearch(t *testing.T) {
 		t.Fatalf("document count = %d; want 3 (binary skipped)", got)
 	}
 
-	hits := r.search("needle", 0)
+	hits, _ := r.search("needle", 0)
 	got := contentPathsOf(hits)
 	want := []string{"a.txt", "c.md"}
 	if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
 		t.Fatalf("search needle = %v; want %v", got, want)
 	}
 
-	if hits := r.search("NEEDLE", 0); len(hits) != 2 {
+	if hits, _ := r.search("NEEDLE", 0); len(hits) != 2 {
 		t.Fatalf("case-insensitive search returned %d hits", len(hits))
 	}
-	if hits := r.search("zzznope", 0); len(hits) != 0 {
+	if hits, _ := r.search("zzznope", 0); len(hits) != 0 {
 		t.Fatalf("no-hit search returned %v", contentPathsOf(hits))
 	}
-	if hits := r.search("alpha", 0); len(hits) != 1 || hits[0].Path != "a.txt" {
+	if hits, _ := r.search("alpha", 0); len(hits) != 1 || hits[0].Path != "a.txt" {
 		t.Fatalf("alpha = %v", contentPathsOf(hits))
 	}
-	if hits := r.search("needle", 1); len(hits) != 1 {
+	if hits, _ := r.search("needle", 1); len(hits) != 1 {
 		t.Fatalf("limit=1 returned %d hits", len(hits))
 	}
 }
 
-// A small result limit must not allocate an all-document candidate slice.
+// A small result limit must not read the whole corpus: candidate enumeration
+// stays lazy and verification stops at the limit, so a one-hit query over
+// thousands of docs reads exactly one file.
 func TestContentOfflineLimitedSearchStreamsCandidates(t *testing.T) {
-	// 100k one-byte docs through the real blocked text store: the point is
-	// that candidate enumeration stays lazy (no O(docs) slice), not that
-	// verification is free (each verified doc decompresses its block once,
-	// then hits the block LRU).
 	dir := t.TempDir()
-	w, err := newContentTextBlockWriter(dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for i := 0; i < 100000; i++ {
-		if err := w.Append([]byte("a")); err != nil {
+	const n = 2000
+	for i := 0; i < n; i++ {
+		if err := os.WriteFile(filepath.Join(dir, "f"+strconv.Itoa(i)+".txt"), []byte("a"), 0o644); err != nil {
 			t.Fatal(err)
 		}
 	}
-	secPath := filepath.Join(dir, "cxtext.sec")
-	if err := w.FinishFile(secPath); err != nil {
-		t.Fatal(err)
+	idx, err := buildContentIndexFromDir(context.Background(), dir, defaultContentBuildOptions())
+	if err != nil {
+		t.Fatalf("build: %v", err)
 	}
-	sec, err := os.ReadFile(secPath)
+	r, err := openContentReader(idx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	store, err := openContentTextStore(sec)
-	if err != nil {
-		t.Fatal(err)
+	reads := 0
+	prev := contentDiskReadForVerify
+	contentDiskReadForVerify = func(path string, s contentExtractSettings) ([]byte, bool) {
+		reads++
+		return prev(path, s)
 	}
-	docs := make([]contentDoc, 100000)
-	for i := range docs {
-		docs[i].DocID = uint32(i)
-		docs[i].TextOff = uint64(i)
-		docs[i].TextLen = 1
+	t.Cleanup(func() { contentDiskReadForVerify = prev })
+	// One-byte "a" has no trigrams: no prefilter, every doc is a candidate,
+	// but the limit stops the scan at the first hit — one disk read.
+	if hits, complete := r.search("a", 1); len(hits) != 1 || !complete {
+		t.Fatalf("limited search = %d hits complete=%v", len(hits), complete)
 	}
-	r := &contentReader{idx: &contentIndex{Docs: docs}, store: store, paths: make([]string, len(docs))}
-	if hits := r.search("a", 1); len(hits) != 1 || hits[0].DocID != 0 {
-		t.Fatalf("limited search = %v", hits)
-	}
-	// The first search above warms the block LRU; steady-state verification
-	// of one doc is a copy plus a fold, with no per-document candidate
-	// materialization.
-	if allocs := testing.AllocsPerRun(10, func() { r.search("a", 1) }); allocs > 25 {
-		t.Fatalf("limited search allocated %.0f times; candidate enumeration should be lazy", allocs)
+	if reads != 1 {
+		t.Fatalf("limited search read %d files; want exactly 1 (early stop)", reads)
 	}
 }
 
@@ -124,7 +115,7 @@ func TestContentRepeatedTrigramsStillVerifyFullTerm(t *testing.T) {
 		t.Fatal(err)
 	}
 	for term, want := range map[string]string{"aaaaaa": "a.txt", "ababab": "c.txt"} {
-		if hits := r.search(term, 0); len(hits) != 1 || hits[0].Path != want {
+		if hits, _ := r.search(term, 0); len(hits) != 1 || hits[0].Path != want {
 			t.Errorf("search(%q) = %v; want %s", term, hits, want)
 		}
 	}
@@ -150,7 +141,7 @@ func TestContentOfflineSnippetOffsetMapsFoldedToRaw(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	hits := r.search("needle", 0)
+	hits, _ := r.search("needle", 0)
 	if len(hits) != 1 {
 		t.Fatalf("search returned %d hits; want 1", len(hits))
 	}
@@ -172,7 +163,7 @@ func TestContentSearchRejectsNonContiguousGrams(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if hits := r.search("abcd", 0); len(hits) != 0 {
+	if hits, _ := r.search("abcd", 0); len(hits) != 0 {
 		t.Fatalf("false-positive candidate accepted: %v", contentPathsOf(hits))
 	}
 }
@@ -206,7 +197,8 @@ func TestContentSearchParityWithBruteForce(t *testing.T) {
 
 	terms := []string{"packed", "index", "content", "needle", "to", "e", "zzz", "PACKED"}
 	for _, term := range terms {
-		got := contentPathsOf(r.search(term, 0))
+		hits, _ := r.search(term, 0)
+		got := contentPathsOf(hits)
 
 		// Brute force: read every file back and substring-match.
 		want := map[string]bool{}
@@ -291,7 +283,7 @@ func TestContentIndexFileBuildRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if hits := r.search("needle", 0); len(hits) != 1 || hits[0].Path != "x.txt" {
+	if hits, _ := r.search("needle", 0); len(hits) != 1 || hits[0].Path != "x.txt" {
 		t.Fatalf("reloaded search = %v", contentPathsOf(hits))
 	}
 }
@@ -419,6 +411,10 @@ func TestContentCandidatesStreamingMatchesFullDecode(t *testing.T) {
 // scans like a sub-3-byte term. The corpus shares dense grams across every
 // doc while rare terms pin subsets.
 func TestContentPrunedIndexMatchesUnpruned(t *testing.T) {
+	// v11 verifies from disk: materialize the corpus as real files with
+	// unique paths (FRNs stay unique and ascending, so DocID order still
+	// matches input order).
+	dir := t.TempDir()
 	var docs []contentBuildDoc
 	for i := 0; i < 60; i++ {
 		text := "common filler deliberately shared across every document "
@@ -436,7 +432,11 @@ func TestContentPrunedIndexMatchesUnpruned(t *testing.T) {
 		if i >= 10 && i < 30 {
 			text += "midwaymarker "
 		}
-		docs = append(docs, contentBuildDoc{frn: uint64(1000 + i), path: "d" + string(rune('a'+i%26)) + ".txt", text: []byte(text)})
+		name := "doc" + strconv.Itoa(i) + ".txt"
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(text), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		docs = append(docs, contentBuildDoc{frn: uint64(1000 + i), path: filepath.Join(dir, name), text: []byte(text)})
 	}
 	build := func(threshold int) *contentReader {
 		old := contentGramPruneDF
@@ -467,8 +467,11 @@ func TestContentPrunedIndexMatchesUnpruned(t *testing.T) {
 		}
 	}
 	for _, q := range []string{"common", "filler", "zebrastripe", "midwaymarker", "uniquewordxyz", "mm", "zzzabsent", "shared across"} {
-		want := plain.search(q, 0)
-		got := pruned.search(q, 0)
+		want, wantComplete := plain.search(q, 0)
+		got, gotComplete := pruned.search(q, 0)
+		if gotComplete != wantComplete {
+			t.Fatalf("query %q: pruned complete=%v, want %v", q, gotComplete, wantComplete)
+		}
 		if len(got) != len(want) {
 			t.Fatalf("query %q: pruned hits=%d, want %d", q, len(got), len(want))
 		}

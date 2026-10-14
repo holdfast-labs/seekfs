@@ -84,10 +84,10 @@ func TestContentMappedLoadMatchesHeapRead(t *testing.T) {
 		t.Fatalf("doc count mapped=%d heap=%d", mr.contentDocCount(), hr.contentDocCount())
 	}
 	for _, term := range []string{"needle", "NEEDLE", "alpha", "markdown", "zzznope", "needle beta"} {
-		got := mr.search(term, 0)
-		want := hr.search(term, 0)
-		if !reflect.DeepEqual(got, want) {
-			t.Fatalf("search %q mapped=%v heap=%v", term, got, want)
+		got, gotComplete := mr.search(term, 0)
+		want, wantComplete := hr.search(term, 0)
+		if !reflect.DeepEqual(got, want) || gotComplete != wantComplete {
+			t.Fatalf("search %q mapped=%v/%v heap=%v/%v", term, got, gotComplete, want, wantComplete)
 		}
 	}
 }
@@ -117,7 +117,8 @@ func TestContentMappedLoadFallsBackWhenMapFails(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	got := contentPathsOf(r.search("needle", 0))
+	hits, _ := r.search("needle", 0)
+	got := contentPathsOf(hits)
 	if len(got) != 1 || got[0] != "a.txt" {
 		t.Fatalf("fallback search = %v; want [a.txt]", got)
 	}
@@ -219,7 +220,7 @@ func TestContentMappedQueryConcurrentWithReplace(t *testing.T) {
 			s.indexMu.RLock()
 			reader, _ := st.readerResolverView()
 			if reader != nil {
-				_ = reader.search("needle", 3)
+				_, _ = reader.search("needle", 3)
 			}
 			s.indexMu.RUnlock()
 		}

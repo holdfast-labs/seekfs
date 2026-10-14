@@ -317,7 +317,7 @@ func TestContentMSGSimpleSubjectAndBody(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, term := range []string{"subjectneedle", "bodyneedle"} {
-		if hits := r.search(term, 0); len(hits) != 1 || hits[0].Path != "mail.msg" {
+		if hits, _ := r.search(term, 0); len(hits) != 1 || hits[0].Path != "mail.msg" {
 			t.Fatalf("term %q not findable: %v", term, contentPathsOf(hits))
 		}
 	}

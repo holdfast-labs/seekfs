@@ -64,13 +64,16 @@ var sharedBoundedFlatOnce struct {
 // sharedBoundedFlatVolumes returns the C:/F: pair over the flat 4300-doc
 // fixture (deliberately larger than contentRelevanceWindow so the broad path
 // is exercised). Same records and constructor as the per-test builds it
-// replaces; read-only sharing, see the contract above.
+// replaces; read-only sharing, see the contract above. Disk text rides a
+// suite-lifetime stub: shared reads outlive the building test, so the
+// test-scoped stub newContentRecordVolumeInDir installs would already be
+// gone (restored by that test's cleanup) and later reads would fail closed.
 func sharedBoundedFlatVolumes(t *testing.T) (c, f *serviceVolumeIndex) {
 	t.Helper()
 	sharedBoundedFlatOnce.Once.Do(func() {
 		dir := sharedContentTmpDir(t)
-		sharedBoundedFlatOnce.c = newContentRecordVolumeInDir(t, "C:", contentBoundedDifferentialRecords("C:", 4_300, 1_000_000), dir)
-		sharedBoundedFlatOnce.f = newContentRecordVolumeInDir(t, "F:", contentBoundedDifferentialRecords("F:", 4_300, 2_000_000), dir)
+		sharedBoundedFlatOnce.c = sharedRecordVolume(t, "C:", contentBoundedDifferentialRecords("C:", 4_300, 1_000_000), dir)
+		sharedBoundedFlatOnce.f = sharedRecordVolume(t, "F:", contentBoundedDifferentialRecords("F:", 4_300, 2_000_000), dir)
 	})
 	if sharedBoundedFlatOnce.c == nil || sharedBoundedFlatOnce.f == nil {
 		t.Fatal("shared flat fixture failed to build")
@@ -83,6 +86,16 @@ var sharedBoundedNestedOnce struct {
 	c, f *serviceVolumeIndex
 }
 
+// sharedRecordVolume builds one fixture volume with suite-lifetime disk
+// text (see sharedBoundedFlatVolumes for why the test-scoped stub is
+// wrong here).
+func sharedRecordVolume(t *testing.T, volume string, recs []contentVolRecord, tmpDir string) *serviceVolumeIndex {
+	t.Helper()
+	vol, idx, texts := makeRecordVolumeInDir(t, volume, recs, tmpDir)
+	stubContentDiskTextSuite(recordVolumeDiskTexts(idx, texts))
+	return vol
+}
+
 // sharedBoundedNestedVolumes returns the C:/F: pair over the nested fixture
 // (real <volume>\<dir>\<name> paths so bias roots actually reorder). Same
 // records and constructor as the per-test builds it replaces; read-only
@@ -91,8 +104,8 @@ func sharedBoundedNestedVolumes(t *testing.T) (c, f *serviceVolumeIndex) {
 	t.Helper()
 	sharedBoundedNestedOnce.Once.Do(func() {
 		dir := sharedContentTmpDir(t)
-		sharedBoundedNestedOnce.c = newContentRecordVolumeInDir(t, "C:", contentBiasedNestedRecords("C:", 1_000_000, 1_100), dir)
-		sharedBoundedNestedOnce.f = newContentRecordVolumeInDir(t, "F:", contentBiasedNestedRecords("F:", 2_000_000, 1_100), dir)
+		sharedBoundedNestedOnce.c = sharedRecordVolume(t, "C:", contentBiasedNestedRecords("C:", 1_000_000, 1_100), dir)
+		sharedBoundedNestedOnce.f = sharedRecordVolume(t, "F:", contentBiasedNestedRecords("F:", 2_000_000, 1_100), dir)
 	})
 	if sharedBoundedNestedOnce.c == nil || sharedBoundedNestedOnce.f == nil {
 		t.Fatal("shared nested fixture failed to build")

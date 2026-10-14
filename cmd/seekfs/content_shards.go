@@ -17,6 +17,7 @@ package main
 // base, so the reader, resolver and health code see one index.
 
 import (
+	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -415,7 +416,10 @@ func contentShardHeader(header *contentIndex, built *contentStreamedBuild) *cont
 // contentBuildFiles maps an assembled shard's spool files by section tag for
 // the streaming save.
 func contentBuildFiles(built *contentStreamedBuild) map[uint32]string {
-	files := map[uint32]string{contentSectionText: built.textPath}
+	files := map[uint32]string{}
+	if built.filterPath != "" {
+		files[contentSectionFilter] = built.filterPath
+	}
 	if built.termPath != "" {
 		files[contentSectionTerms] = built.termPath
 	}
@@ -424,9 +428,6 @@ func contentBuildFiles(built *contentStreamedBuild) map[uint32]string {
 	}
 	if built.prunePath != "" {
 		files[contentSectionPruned] = built.prunePath
-	}
-	if built.dictPath != "" {
-		files[contentSectionDictText] = built.dictPath
 	}
 	return files
 }
@@ -552,53 +553,37 @@ func (sh *contentShard) idxIn(shards []*contentShard) int {
 	return -1
 }
 
-// contentShardFoldSource merges one shard's base docs (minus every FRN the
-// delta touches) with the delta docs assigned to it, in ascending FRN order.
-func contentShardFoldSource(sh *contentShard, incoming []contentDeltaDoc, drop map[uint64]struct{}) contentBuildSource {
-	base := sh.idx.Docs
-	i, j := 0, 0
-	return func() (contentBuildDoc, bool, error) {
-		for {
-			for i < len(base) {
-				if _, gone := drop[base[i].FRN]; !gone {
-					break
-				}
-				i++
+// contentShardFoldDiskSource merges one shard's surviving base docs (re-read
+// from disk in parallel, in order) with its incoming delta docs. Base docs
+// named by drop (every FRN the delta replaces or deletes) never reach the
+// merge; ties resolve to the delta. See contentFoldDiskSource for the
+// re-read contract. Call stop when assembly ends or aborts.
+func contentShardFoldDiskSource(vol *serviceVolumeIndex, sh *contentShard, incoming []contentDeltaDoc, drop map[uint64]struct{}, settings contentExtractSettings, ctx context.Context, livePath func(frn uint64) string) *contentFoldDiskSource {
+	var base []contentDoc
+	var paths []string
+	if sh != nil && sh.idx != nil && sh.reader != nil {
+		for _, d := range sh.idx.Docs {
+			if _, gone := drop[d.FRN]; gone {
+				continue
 			}
-			haveBase, haveDelta := i < len(base), j < len(incoming)
-			switch {
-			case haveDelta && (!haveBase || incoming[j].FRN <= base[i].FRN):
-				d := incoming[j]
-				j++
-				return contentBuildDoc{frn: d.FRN, path: d.Path, text: d.Text, class: d.ContentType, version: d.ExtractorVersion, fileSize: d.FileSize, fileModNano: d.FileModNano}, true, nil
-			case haveBase:
-				doc := base[i]
-				i++
-				text := sh.reader.docText(doc.DocID)
-				if len(text) == 0 {
-					continue
-				}
-				return contentBuildDoc{frn: doc.FRN, path: sh.reader.docPath(doc.DocID), text: text, modUnix: doc.ModUnix, class: doc.ContentType, version: doc.ExtractorVersion, fileSize: doc.FileSize, fileModNano: doc.FileModNano}, true, nil
-			default:
-				return contentBuildDoc{}, false, nil
-			}
+			base = append(base, d)
+			paths = append(paths, sh.reader.docPath(d.DocID))
 		}
 	}
+	return newContentFoldDiskSource(vol, base, paths, incoming, settings, ctx, livePath)
 }
 
-// contentReshardAndSave splits an assembled single-file index into folder
-// shards and publishes them with a manifest at gsx. A fold uses it when an
-// unsharded base has grown well past the shard target, so a volume that
-// started small does not stay one ever-larger file.
-func contentReshardAndSave(gsx string, whole *contentIndex, header *contentIndex, tmpDir string) (int, error) {
-	reader, err := openContentReader(whole)
-	if err != nil {
-		return 0, err
-	}
-	paths := make([]string, len(whole.Docs))
-	sizes := make([]int64, len(whole.Docs))
-	for i, d := range whole.Docs {
-		paths[i], sizes[i] = reader.docPath(d.DocID), int64(d.TextLen)
+// contentReshardAndSave splits a corpus into folder shards and publishes
+// them with a manifest at gsx. items is the merged (frn, path, size) corpus
+// in ascending FRN order; readDoc produces each member's build doc (disk
+// re-reads in production, memory in tests — v11 stores no text to resplit).
+// A fold uses it when an unsharded base has grown well past the shard
+// target, so a volume that started small does not stay one ever-larger file.
+func contentReshardAndSave(gsx string, items []contentFoldItem, readDoc func(contentFoldItem) (contentBuildDoc, bool), header *contentIndex, filterID contentFilterID, tmpDir string) (int, error) {
+	paths := make([]string, len(items))
+	sizes := make([]int64, len(items))
+	for i, it := range items {
+		paths[i], sizes[i] = it.path, it.size
 	}
 	groups := contentGroupByShard(contentPlanShards(paths, sizes, contentShardTargetBytes), paths)
 	dir := contentShardDir(gsx)
@@ -610,13 +595,15 @@ func contentReshardAndSave(gsx string, whole *contentIndex, header *contentIndex
 	for _, g := range groups {
 		k := 0
 		built, err := assembleContentIndexStreamed(func() (contentBuildDoc, bool, error) {
-			if k == len(g.docs) {
-				return contentBuildDoc{}, false, nil
+			for k < len(g.docs) {
+				it := items[g.docs[k]]
+				k++
+				if doc, ok := readDoc(it); ok {
+					return doc, true, nil
+				}
 			}
-			d := whole.Docs[g.docs[k]]
-			k++
-			return contentBuildDoc{frn: d.FRN, path: paths[d.DocID], text: reader.docText(d.DocID), modUnix: d.ModUnix, class: d.ContentType, version: d.ExtractorVersion, fileSize: d.FileSize, fileModNano: d.FileModNano}, true, nil
-		}, tmpDir)
+			return contentBuildDoc{}, false, nil
+		}, tmpDir, filterID)
 		if err != nil {
 			return 0, err
 		}

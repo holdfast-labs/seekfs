@@ -33,10 +33,10 @@ non-path terms and other unsupported filename roots, multi-usable-volume
 queries, truncated catch-up (`healthIncomplete`), a missing overlay snapshot,
 and biased queries while the volume carries overlay activity (see the WP7
 section of the roadmap for the precise list and rationale). The documented §7
-residuals remain. `.gsx` doc tables are format **v9** (compact index with
-64 KiB text blocks and a per-shard trained dictionary, §6o, plus compact
-postings, terms and doc table with dense grams pruned, §6q — v8 and older
-sidecars fail the version gate and rebuild) and sharded manifests are
+residuals remain. `.gsx` doc tables are format **v10** (no stored text: the
+index is trigram postings plus a per-file bloom filter, and every match and
+snippet verifies by reading the file from disk — §6y; v9 and older sidecars
+fail the version gate and rebuild) and sharded manifests are
 **v5** (see §6i). P4 document-extraction
 quality remains deferred (see §7). Content search is off by default; with
 `[features.content] enabled = true` or `SEEKFS_CONTENT_SEARCH=1`, `content:`
@@ -207,12 +207,13 @@ or `plugin config content --root <path>`.
 
 A `content:` leaf is a **case-insensitive literal substring** match by default:
 the query text is folded with Unicode `strings.ToLower` and tested for a byte
-substring anywhere in the document's stored text (`bytes.Contains`). There is
+substring anywhere in the document's verified bytes (`bytes.Contains`; v10
+reads the file from disk — there is no stored text anymore, see §6y). There is
 **no tokenization, word-boundary check, or stemming**, so `content:foo` matches
 a document containing `foobar` or `xfoox` but does **not** match one containing
 only `fo` or `oo`. `content:"foo bar"` is a phrase: the space is part of the
 literal substring. `case:true` selects case-sensitive matching (the raw,
-case-preserving stored text is compared byte-for-byte with no fold). For
+case-preserving verified bytes are compared byte-for-byte with no fold). For
 precision the index cannot express literally — word boundaries, alternation,
 anchors — use the regex form `content:/pattern/`, which is compiled with `(?i)`
 unless `case:true` is set. The fold is the same on both sides because the
@@ -260,13 +261,14 @@ when none is usable the query errors rather than returning empty.
 | `content_extract.go` | `contentExtractor` interface, registry, `contentExtractorForPath` (extension → format sniffers → text fallback), binary sniff, size caps. |
 | `content_extract_text.go` / `_ooxml.go` / `_pdf.go` | Extractors: text/code; OOXML/ODF/EPUB; best-effort PDF (spike quality). |
 | `content_open_windows.go` / `_other.go` | `contentOpenNoRecall`: opens with `FILE_FLAG_OPEN_NO_RECALL` so cloud placeholders fail instead of hydrating. |
-| `content_build.go` | Offline builders + options. `buildContentIndexFromDir` (walk, `origin=walk`, path-hash keys), `buildContentIndexForIndex` (USN, `origin=usn`, record-FRN keys), `assembleContentIndex` (streams postings through the external builders), `contentRepairText` (case-preserving stored text), `contentFoldText` (case-folded index view), `contentPathKey`, `contentTermsOf`, `contentGramsOf`, v7 path table codec (sorted + front-coded + permutation). |
-| `content_textblock.go` | Blocked compressed text store (CXST v2/v3): 64 KiB zstd blocks cut at doc boundaries, logical offsets in the doc table, shared block cache + pooled decoders in the reader; v8 frames reference the shard's CXTD dictionary. |
-| `content_textdict.go` | Per-shard trained text dictionary (CXTD, v8): line-frequency trainer, section codec. |
+| `content_build.go` | Offline builders + options. `buildContentIndexFromDir` (walk, `origin=walk`, path-hash keys), `buildContentIndexForIndex` (USN, `origin=usn`, record-FRN keys), `assembleContentIndex` (streams postings through the external builders), `contentRepairText` (case-preserving extraction), `contentFoldText` (case-folded index view), `contentPathKey`, `contentTermsOf`, `contentGramsOf`, v7 path table codec (sorted + front-coded + permutation). |
+| `content_filter.go` | v10 per-file bloom filter (§6y): size classes, frozen hash, CXFL section codec, uniform prefilter gate over query leaves, verify-direct disk reader with sharing-violation retry, test seams. |
+| `content_textblock.go` | REMOVED in v10 (was: blocked compressed text store, CXST v2/v3). |
+| `content_textdict.go` | REMOVED in v10 (was: per-shard trained text dictionary, CXTD v8). |
 | `content_termsdict.go` | Dictionary-only terms section (CXTR v2): front-coded keys with restarts, u8 frequencies + sorted overflow table; serves the fuzzy dictionary. |
 | `content_dict_build.go` | Bounded external builder for the term dictionary (key counting, no postings). |
 | `content_shards.go` | Sharded sidecars: manifest codec (CXSH, format v5), folder shard planner and longest-prefix assigner, composite load, shard-aware candidate streams and `under:` shard mask, per-shard fold planning/source, shard file sweep. |
-| `content_read.go` | `contentReader`: decode sections, trigram-intersection candidates, substring verification, `contentHit{Path,DocID,Offset}`. |
+| `content_read.go` | `contentReader`: decode sections, trigram-intersection candidates, per-file filter gate, substring verification from disk, `contentHit{Path,DocID,Offset}`. |
 | `content_resolver.go` | `contentResolver`: merges FRN-sorted docs against the base FRN column → `docID -> recordID` (`contentNoRecordID` = dropped). |
 | `content_query.go` | `contentLeaf`, `contentSearchEnabled`, `contentUnavailableError`, `parseContentLeaf`, `queryHasPositiveContentLeaf`, deterministic `contentAssignLeafIDs`. |
 | `content_fuzzy.go` | Typo tolerance for zero-result `content:` queries: dictionary correction per word (pigeonhole/bitmap prefilters + bounded Damerau-Levenshtein, reusing `fuzzy.go`), merged across shards and the delta vocabulary, retried through the exact search/count paths; `fuzzy_correction` surfaces the corrected words. |
@@ -1025,7 +1027,7 @@ zstd dictionary per shard was not needed once 512 KiB blocks captured
 cross-file redundancy; dropping `RawSize`/`DocLen`/`ModUnix` (~20 B/doc)
 is deferred.
 
-**No stored text at all (measured, not shipped).** Verifying against the
+**No stored text at all (measured, then shipped as v10 in §6y).** Verifying against the
 files on disk shrinks the index to postings + tables only (81 MB, 0.147x)
 and warm verification costs ~0.11 ms/file — comparable to indexed warm —
 but cold verification pays Defender first-touch (~7.5 ms/file, §6l):
@@ -1034,8 +1036,11 @@ but cold verification pays Defender first-touch (~7.5 ms/file, §6l):
 It also trades the `ContentHash` change detection for stat-and-revalidate
 races on every verify (stale benevolence: a file rewritten between
 candidate generation and verification verifies wrong). Not worth it as a
-default or an opt-in: 2.3x smaller for 30–100x worse cold broad queries
-and unsound freshness. No code was added.
+default or an opt-in *in the §6m design* (no prefilter before reads):
+2.3x smaller for 30–100x worse cold broad queries
+and unsound freshness. No code was added *then*; §6y ships it WITH the
+per-file filter gate, per-query disk budget, and verify-direct freshness,
+which is what bounds the cold shapes the §6m sketch left unbounded.
 
 **Upgrade:** old sidecars fail the version gate on load and are never
 attached; the PF-3 path rebuilds them (covered by
@@ -2191,14 +2196,365 @@ the compressed-credit subtest in `TestContentScopeReserve`, and the
 re-targeted fits/reserve-truncation numbers. `go vet ./...` clean,
 `go test -p 1 -timeout 40m ./cmd/seekfs ./feature` passing.
 
+## 6y. No stored text by default: postings + per-file filter (done)
+
+Owner decision (2026-10-13): seekfs adopts fsearch's model as the DEFAULT —
+no stored file text. The index is trigram postings (CXGR, dense grams pruned
+into CXGP as before) plus a per-file bloom filter (new CXFL section) over the
+same folded trigrams, and every match and snippet is verified by reading the
+file from disk. The filter tier built as an overflow sidecar (§6y draft: a
+`<gsx>.filter` file covering only budget-dropped files) is superseded by this
+section: the filter is primary, covering (nearly) all files, and there is no
+tier split anymore.
+
+**Format v10** (v9 and older sidecars fail the version gate and rebuild
+through the PF-3 path; manifests stay v5). A v10 `.gsx` carries CXGR/CXGP
+(postings, unchanged codecs), CXTR (term dictionary, unchanged — fuzzy still
+needs it), CXPT (paths, unchanged), CXDT (doc table, 60 → 52 bytes: TextOff
+gone with the store; TextLen stays for budget accounting, FileSize/FileModNano
+stay for the walk reconcile), CXPL/CXSC (policy/scope, unchanged), and the new
+CXFL: count + build caps + walk root + encoding label, then one
+(class u8, class bits) row per document in DocID order. Rows carry no keys,
+paths, or fingerprints — they join by DocID to the doc table (keys), CXPT
+(paths) and the doc fingerprint. CXST/CXTD sections are gone (their tag
+constants stay defined, retired); the textblock/textdict/textpipe sources and
+their tests are deleted. The dedupe agent's alias section (`content/inclusion-
+policy`) is an additive tag beside CXFL by design, so that merge is a
+renumber, not a redesign.
+
+**Filter design.** One k=1 bloom signature per document over its folded
+trigrams (k=1 measured best at every size: k=2 saturates small filters and
+loses on every query shape). Classes are 1024<<c bits (128 B–2 KiB),
+sized by the MEASURED distinct trigram count (smallest class with bits ≥ 2n,
+n/m ≤ 0.5); past class 4 (n > 8192) the filter saturates gracefully (higher
+FP, never a false negative). Sizing by n — not by text length — was forced by
+measurement: text-length classes saturate dense files (minified assets, test
+data: distinct ≈ windows) into uselessness. The builder computes the gram set
+once and reuses it for postings and bits (no extra pass). The hash
+(SplitMix64, masked — power-of-two sizes, no modulo) is frozen by
+`TestContentFilterHashIsFrozen`; uniformity on 200k sequential trigrams at
+m=2048 is mean 97.7 / max 135 (ideal 97.7), so the residual FP below is
+trigram-inherent, not hash skew.
+
+**Query path.** Candidates come from the posting intersection exactly as
+before (pruned grams skipped as constraints). Every content verify then
+passes one uniform gate — the per-file bits must contain every positive
+leaf's grams (pure-regex leaves: some disjunct's runs; OR groups: some
+alternative; NOT leaves: no constraint; leaf grams precomputed once in the
+matcher, so the per-record cost is bit tests, ~130 ns/file) — and on a pass
+reads the file from disk (open → extract with the build policy → match with
+the exact historical predicate, ASCII fast path included). The gate is
+skipped for delta-covered keys (delta text is fresher than the bits) and
+never rejects a key outside the base docs. Snippets render from the verified
+bytes (original case preserved); `sort:relevance` and fuzzy re-verify through
+the same path. The compound lane, the bounded scans, and the parallel
+verifiers (which now parallelize disk reads — the owner's parallel-reads
+requirement falls out of the existing fan-out) all funnel through the one
+choke point (`entryMatchesWithContentMatcher`), so every path shares the
+gate and the disk policy with no per-path forks.
+
+**Freshness (verify-direct).** A size/mtime mismatch against the indexed
+fingerprint means stale postings/filter — but the bytes on disk still
+decide: a file edited since the last sync is read directly and matches on
+its current bytes (fsearch's ~1 ms greppable edits; proven by
+`TestContentVerifyDirectServesEditedFile`). The drain still re-extracts
+through the USN/walk pipeline into the delta (which wins over disk while
+present), so the prefilter converges. Terms whose grams the edit introduces
+are a documented re-index window (postings cannot nominate unknown grams);
+the drain closes it within seconds on a live volume. A missing file reads as
+absent (fail-closed — a deleted file is unfindable even before its tombstone
+lands, instead of serving stale bytes). A doc-table path that went stale
+across a rename falls back to the live record-index path for missing files
+only (extraction failures never fall back, so a corrupt file cannot serve
+another path's bytes). A transient Windows sharing violation retries once
+(~20 ms); anything else fails closed.
+
+**Boundedness (the §6m regression must not come back).** Dropping stored
+text recovers the §6m failure mode (cold broad queries of 12–109 s) unless
+three things hold, and all three ship: (1) candidate narrowing before any
+read — postings ∩ per-file filter, so a query touches only files that can
+match (a 4-gram common term prefilters 183k files to ~68k bit tests ≈ 9 ms
+before the first open); (2) early stop at the result limit in scan order —
+selective pages stop after tens of verifies; (3) a per-query disk
+verification budget (`contentDiskVerifyBudget` = 512, a var; delta hits never
+count) with honest `complete:false` — past it the search stops with a
+visible subset and the count is refused with `errContentIncomplete`, never a
+silent truncation or a partial number. The trace carries `DiskVerified` /
+`DiskCapped` alongside the candidate-budget signals.
+
+**Measured (E:\bench\chromium minus third_party, service-allowlist
+selection: 184,321 files → 183,804 docs, 1416.5 MB extracted; GOMAXPROCS=2,
+`go test -p 1`; first = warm-OS-cache first touch incl. Defender, best =
+min-of-5 hot; a true cold page-cache drop needs elevation and is not
+measured — cold numbers are analytic: verifies × first-touch opens):**
+
+| section | MB | share |
+|---|---|---|
+| filter (CXFL) | 64.0 | 0.045x |
+| terms (CXTR) | 42.9 | 0.030x |
+| grams (CXGR) | 97.1 | 0.069x |
+| paths (CXPT) | 3.9 | 0.003x |
+| doctable (52 B × docs) | 9.1 | 0.006x |
+| **file total / extracted** | **217.1 MB** | **0.153x** |
+
+(v9 on its 65k-file sample: 0.332x single-file, 0.381x sharded; the §6m
+no-text postings-only point was 0.147x — v10 adds the filter for +0.006x
+net. Filter alone is 365 B/file mean; whole-file mean is 1238 B/file
+(postings + terms amortized). Classes: 128 B: 59,757 files; 256 B: 60,147;
+512 B: 46,019; 1 KiB: 15,871; 2 KiB: 2,010.)
+
+| query (limit 20) | grams | hits | passes | bloom ε | first | best | complete |
+|---|---|---|---|---|---|---|---|
+| `content:cityhash_v103` (rare) | 11 | 11 | 54 | 43 (FPR 0.0002) | 57 ms | 1.1 ms | true |
+| `content:struct` (common) | 4 | 20 | 67,985 | ~29k | 313 ms | 3.5 ms | true (early stop) |
+| `content:"reassemble"` (phrase) | 8 | 20 | 1,292 | ~842 (FPR 0.0046) | 3.09 s / 448 ms | 462 / 418 ms | true |
+| `content:mutex` (common) | 3 | 20 | 12,982 | ~9k (FPR 0.049) | 3.48 s / 132 ms | 111 / 115 ms | true |
+| `content:paintlayer` | 8 | 20 | 1,730 | ~986 (FPR 0.0054) | 850 / 93 ms | 84 / 86 ms | true |
+| `content:the` (degenerate) | 1 | 20 | 163,885 | — (cf. v9 all-pruned scan) | 74 / 2.2 ms | 1.7 / 1.6 ms | true |
+| `content:"foo bar"` (phrase) | 5 | 20 | 1,780 | ~1,116 (FPR 0.0061) | 584 / 71 ms | 77 / 59 ms | true |
+| `content:ab` (<3 B, no constraint) | 0 | 20 | 183,804 | — (by design) | 25 / 5 ms | 3.7 ms | true |
+
+(First = first touch after the build warmed the OS cache (two sessions:
+cold-ish 3.09 s vs warm 448 ms for the scattered phrase show the Defender +
+cold-read spread); best = min-of-5 hot. "passes" counts bit-test passes;
+ε splits bloom collisions from trigram-inherent positional loss measured by
+recomputing true gram sets on a bounded sample: struct's 68k passes are
+~40k positional + ~29k bloom — the positional share is what the full tier's
+own candidates would verify, not a tier-2 regression. For rare literals
+(11-gram cityhash) positional ≈ 0 and ε = 43 files.)
+
+Counts: cityhash 11/11 complete; struct and mutex refuse past the 512 cap
+(`complete:false` + `errContentIncomplete`) — broad counts over disk stay
+refused rather than burning minutes, exactly the §6m lesson. Regex
+(production prefilter approximated offline):
+`mutex_\w+` 8 hits / 512 verifies / 885 ms incomplete;
+`cityhash_\w+` 2 / 512 / 3.77 s incomplete (cold files);
+`zzz\d+qqq` zero-result 0 / 512 / 1.27 s incomplete (bounded, vs v9's ~15 s
+full scan). Compound `ext:cc content:mutex` (offline approx): 13 hits /
+512 verifies / 117 ms incomplete.
+
+v9 baselines for the same shapes (§6s warm: cityhash-20 2.1 ms, struct-20
+7.9 ms, phrase 68–82 ms, compound-20 53–117 ms, compound-100 82–93 ms,
+regex 609–836 ms, relevance ~146 ms; cold: struct ~13 ms, compound ~175 ms,
+regex ~687 ms): v10 warm is within ~1–3x on postings-narrowed shapes
+(struct-20 3.5 ms actually beats v9's 7.9 ms — early stop needs fewer
+verifies than v9's block decompresses), and 2–5x slower cold on scattered
+shapes (reassemble cold 3.09 s vs ~162 ms — hundreds of cold opens where v9
+paid block decodes; the cap bounds the worst case at 512 files ≈ ≤4 s cold
+instead of §6m's 12–109 s). Regex and unfilled compounds regress most
+(disk per candidate vs decompress); selective literals, phrases that fill
+the page, and common terms are at parity or better.
+
+Recall: `cityhash_v103` answers 11/11 with 0 served false positives, and
+every gap vs `rg -l` is a documented selection rule (non-allowlisted
+extensions `.gn`/extensionless READMEs/`.sky`, top-level `third_party`
+scope) — recall inside indexed files is 100% vs ripgrep, as before. The
+committed differential (`TestContentFilterV10ServiceDifferential`, 17 query
+shapes incl. AND/OR/NOT/regex/case/compounds, search==count) plus the gate
+soundness proof (`TestContentFilterGateSoundness`: gate-reject ⟹
+predicate-false over the shape matrix) carry the exactness argument; lane
+on/off parity holds on real files.
+
+**Budget/reserve.** The v10 output is ~0.15x, so the budget governs a much
+smaller index — but the build PEAK is still the text spool (1.0x) plus
+output: coverage per GB of headroom is ~88k files at the current 1.5x peak
+multiplier (≈104k at the measured-correct 1.25x — left for the spool-peak
+owner, who is reworking `content_space.go`; the estimate CLI stays
+conservative until then). E: real (909k in-scope files, 14.5 GB text):
+steady-state v10 index ≈ 2.2 GB (fits easily), but the spool-bound peak is
+≈18–21 GB against ~8 GB of headroom past the 20 GiB reserve — so even v10
+reserve-truncates without per-shard spooling. That is now the binding
+whole-drive constraint, not the index format; recommended follow-ups are a
+per-shard spool (extract→assemble→save→delete per shard) and/or an explicit
+`budget_bytes` for the volume. `scope_dropped` keeps its meaning (files with
+no coverage at all) and health is unchanged in shape.
+
+**Folds.** A fold re-extracts every base doc the delta does not cover
+(parallel prefetch, ordered merge with the delta; renames resolve live on
+stored-path failure; unreadable docs skip with a bounded log) and
+re-assembles postings + filter from scratch — measured ≈ full re-extract +
+assemble on the sample (~5 min vs v9's ~38 s single-file fold that
+re-encoded resident text). Shard isolation is unchanged (only dirty shards
+re-read). The designed-but-unbuilt optimization is a postings row-merge:
+carry unchanged docs' rows and filter bits verbatim, merge only delta
+postings — it needs exact per-doc gram lists for removals, which v10 does
+not store, so it stays a design note until folds prove too slow in
+production. Fold cadence is the lever in the meantime (raise
+`contentDeltaFoldMaxDocs/Bytes`).
+
+**Freshness.** Verify-direct as above; the drain→delta→fold pipeline is
+unchanged (delta wins over disk while present; reconciles and the §6u
+budget gate are untouched — with no filter tier there is nothing to exempt).
+
+**Tried and rejected (measured, not assumed):** a `store_text` opt-in —
+removed, not shipped. It would double the format/test matrix (CXST
+encode/decode, dual fold paths, dict) to reintroduce the worst case for
+shapes the measurements show are already at parity warm and bounded cold;
+snippets and relevance render from verified bytes and need no store.
+s2/LZ4-class codecs stay rejected on ratio (§6n); k=2 stays rejected
+(saturates small filters); text-length filter classes stay rejected
+(saturate dense files); the `<gsx>.filter` sidecar tier is superseded by
+the CXFL section (one file, atomic publish, shard-local, no extra lock or
+sweep); per-file exact gram lists (row-merge enabler) stay rejected at
+~3 B/gram ≈ text size.
+
+**Open risks.** (1) Fold re-read cost (above) — watch production fold
+times; row-merge is the escape hatch. (2) E: whole-drive coverage is
+spool-bound (above) — needs the spool-peak work, not more format. (3) Cold
+scattered queries pay seconds (Defender first-touch × verifies); the cap
+bounds it, prefetch parallelism does not hide first-touch latency at
+GOMAXPROCS=2. (4) Missing-file fail-closed: a transiently locked file
+retries once on sharing violation, then misses until its next change (v9
+served stale text — a deliberate freshness-over-recall trade). (5) FRN
+reuse across journal generations is guarded as before (journal-ID checks);
+a reused FRN joining the wrong doc would verify wrong — same exposure as
+v9's resolver. (6) Broad counts refuse past the disk cap (by design).
+(7) Relevance windows re-read up to thousands of files (not separately
+measured — inherits the per-verify cost).
+
+**Correctness:** `go vet ./...` clean; `go test -p 1 -timeout 40m
+./cmd/seekfs ./feature` green (the known `TestHeadlessFrameCost`
+wall-clock exclusion aside, which lives in a package that does not import
+the changed code). New tests: CXFL codec round-trip, hash freeze, class
+boundaries, no-false-negatives matrix, gate soundness over the shape
+matrix, verify-direct freshness + missing-file fail-closed + disk-cap
+(search incomplete, count refused), full-path service differential (17
+shapes, search==count, lane on/off parity), budget-drops-uncovered, fold
+re-read convergence, constructor/fixture ports (ASCII fast path, pruned
+parity, stream/shard round-trips, integrity CXFL, reshard-via-disk).
+v9 sidecars are rejected by `TestContentIndexRejectsPreviousVersion` (now
+guarding v9) and the v10 round-trip test.
+## 6z. Inclusion policy + dedupe (done)
+
+Branch `content/inclusion-policy` (WORK_QUEUE item 1, gap G3): content
+search across the whole drive with a small index, after Noah Dunnagan's
+fsearch. Coverage per byte is the metric.
+
+**Policy.** Text files up to ~1 MiB outside git repos (~10 MiB inside;
+raw caps at 2:1 headroom), minus what git ignores, with fsearch's skips:
+lockfiles (`package-lock.json`, `yarn.lock`, `pnpm-lock.yaml`,
+`Cargo.lock`, `go.sum`, `poetry.lock`, `composer.lock`, `Gemfile.lock`
+and kin), JSON >= 100 KiB (`.json`/`.jsonc`/`.json5`; line-delimited
+`.jsonl`/`.ndjson` stay), minified/bundled assets (`*.min.*`,
+bundle/chunk names, `*.map`, plus sampled average line length > 2048
+over files >= 32 KiB), build-output dirs outside repos (`dist`,
+`build`, `out`, `target`, `bin`, `obj`, `_build`, `.next`, `.nuxt`,
+`coverage` — inside a repo git's ignore rules own directories), and
+well-known cache trees anywhere (Go/npm/pnpm/yarn/pip/uv/Cargo
+registry/`.gradle`/NuGet/browser profile caches, any `gocache` or
+`.cache` tree). Linked git worktrees (a `.git` FILE pointing at
+`<main>/.git/worktrees/<name>`) index only the main checkout by
+default (`[content] worktrees = "main" | "all"`); submodule pointers
+(`.../.git/modules/...`) and plain repos still index. The operator adds
+a `content-skip` list (paths, or globs where `*` spans a segment and a
+full `**` segment spans separators) via `plugin config content --skip`
+or `[content] skip`. Explicit `-max-raw`/`-max-text` override the caps
+uniformly. `system_excludes = false` opts out of the directory rules
+only, never the file rules. Git rules come first, then the operator
+list, then the built-ins.
+
+**Enforcement points.** `allowsReason` (scope), the fast scan's
+`admitRecord` (same predicate + record size, with a reason-attributing
+segment memo so estimate and build tally identically), the offline walk
+(DirEntry size, real worktree probe for nested checkouts), the service
+build (`contentBuildDocSafe` per-file caps + extraction-time
+`large_json`/`size_cap`/minified-content skips with canonical reasons),
+and the drain (same extraction gate; declines tombstone base docs
+through the existing path and accumulate per-reason stats the fold
+merges). Selection v6 joins the scope fingerprint, so a worktree
+appearing/vanishing or a skip-list edit reconciles through the §6p/§6u
+path (new keys still held to the reconcile budget) instead of
+rebuilding.
+
+**Dedupe.** Identical files (stored-text length + sha256, already
+computed per doc as `ContentHash`) are extracted and stored ONCE: the
+assembler keeps the first as primary (text + postings) and records the
+rest as aliases — full doc-table rows (own DocID/FRN/path/fingerprint)
+sharing the primary's `TextOff`/`TextLen` with no postings. Pairs ride
+the self-contained CXAL section; readers expand posting-derived
+candidate sets over the alias map BEFORE cap accounting, so the
+expanded set equals the pre-dedupe posting set exactly and every
+lane/cap/budget decision is unchanged (the biased-early-stop lane
+regression caught this placement). Scan shapes enumerate aliases
+directly. Folds and reshards recompute through the same assembler;
+shards dedupe within themselves (cross-shard duplicates store twice —
+the worktree filter removes the corpus-scale case). Format v9 → v10,
+everything else byte-identical (CXAL omitted when empty; per-shard
+peak unchanged plus one hash entry per unique doc). Manifests stay v5
+and carry the build CXIS. If `content/filter-tier` (§6y) also bumps the
+format, renumber at merge: this change is the version line plus
+CXAL/CXIS only.
+
+**Visibility.** Every decision is tallied: the scan accumulates
+per-reason rejections, extraction adds size/content skips and
+truncations, the assembler adds dedupe files/bytes — persisted in CXIS
+and surfaced in `loaded --json` (`inclusion` with files+bytes per skip
+reason, truncations, dedupe savings, skipped worktrees), in
+`content-index` build lines, and in `--estimate` (per-reason
+files+bytes, a legacy baseline for before/after in one run, the
+same-size dedupe pool, skipped worktrees).
+
+**Measured (2026-10-14, GOMAXPROCS=2, shared box).** Estimate path,
+`chromium.gsi` (555,849 records): legacy baseline 468,772 files /
+3,367,822,040 B; policy 468,212 / 3,214,978,499 B (−560 files/−153 MB:
+lockfile 208/5.3 MB, large_json 200/117.2 MB, minified-name 121/8.9 MB,
+cache 31/24 KB, gitignore 334/1.1 MB, binary 40,136/984.5 MB,
+`.git`-exclude 29/1.53 GB). The old binary's estimate prints byte-exact
+the same baseline (468,772 / 3,367,822,040), validating the baseline
+code. Full `--scoped` builds (8 GB explicit budget): old 464,032 docs /
+800.1 MB; new 463,275 docs / 738.4 MB (−61.7 MB, −7.7%), with 26,195
+aliases (5.7%) saving 25.7 MB of extracted text, 198 extra
+minified-content skips at extraction, 2 truncations (1.7 MB cut), and
+estimate↔build agreement on every selection reason. Per doc 1.77 →
+1.63 KB; 0.241× eligible bytes (642k docs, 4.15 GB of source per GB of
+index; old 0.256×). On `E:\bench` (own 589,951-record walk): baseline 479,218 /
+3.54 GB → policy 468,212 / 3.21 GB (−11,006 files/−327 MB), 27 linked
+worktrees skipped (the whole `wt/` farm selects nothing under
+main-only), cache 14,113 files / 15.5 GB the largest new reason.
+Post-budget selection on this box is currently 0: E: free (18.7 GB)
+sits below the 20 GiB reserve, so the default allowance is 0 and only
+an explicit `budget_bytes` selects — headroom math in §6t stands (the
+spool-peak agent is lowering the 1.5×).
+
+**Recall.** 10 terms over the full chromium build vs `rg -l -F -i
+--hidden` intersected with the implementation's own `--paths`
+selection, minus the oracle-replicated content rules (minified-content
+heuristic, 10 MiB prefix restriction, over-raw-cap containers): 8
+terms byte-identical sets; `EINVAL` +2 and `containing` +5 seekfs-side
+extras, all in PDFs/HTML (text-layer extraction reads streams rg's raw
+scan cannot — a recall gain by §2b design, except one untagged PDF
+rg reads raw and we drop for missing `/ToUnicode`, a documented §6h
+limit); 2 extras (one `.md`, one `.html`) stably in our selection but
+absent from rg's full-tree walk while present in its per-file/dir
+runs and `--no-ignore` runs — an unattributed rg-side walk filter
+after honest effort (bisected to root-walk-only, not git per
+check-ignore, not symlinks, not `.ignore` files). Zero indexed-content
+misses on all 10 terms: recall inside the rules is 100%. Method and
+scripts: `E:\bench\scratch\inclusion\recall.py` (deleted with scratch;
+per-term table in the `content/inclusion-policy` measurement commits).
+
+**Tried and rejected (measured).** Avg-line threshold below 2048: the
+2048–4096 band on chromium holds 12 files, all generated
+(`react.min.js`, `opencv.js`, test fixtures) — nothing legit within
+2× of the line, so no finer cut buys recall. Lowering to 1024 would
+take 7 more files, all still generated. `.jsonl`/`.ndjson` in the
+large-JSON skip: line-delimited logs grep cleanly, kept. `*.map` kept
+in minified (sourcemaps are build artifacts: 2 of the largest flagged
+files). Cross-shard global dedupe: needs a pre-pass over all text
+(peak = corpus) or a two-phase assemble; per-shard dedupe plus the
+worktree filter captures the measured duplication. `node_modules`
+style vendored trees inside repos: git's rules already own them; no
+extra list. s2/LZ4-class codecs stay rejected (§6n/§6o/§6s).
+
 ## 7. Carried debt / known gaps
 
-- **Snippet case is preserved; no fixup-aware path remains.** The `.gsx` text
-  store preserves case (`contentRepairText`, PF-6a), and both the service
-  `contentSnippet` and the offline reader render the window directly from that
-  stored text, so snippets keep original case. `contentSnippetWindowSource` and
+- **Snippet case is preserved; no fixup-aware path remains.** Extraction
+  preserves case (`contentRepairText`, PF-6a), and both the service
+  `contentSnippet` and the offline reader render the window directly from the
+  verified bytes, so snippets keep original case. `contentSnippetWindowSource` and
   its `contentSnippetSource`/fixup mapping were dead once raw text was rendered
   directly and have been removed; `contentLossyFixups` remains for the decoder.
+  (v10: there is no text store; "stored text" below means verified bytes.)
 - The `.gsx` is mmapped (`contentLoadFileMapped`); only its doc/path metadata is
   decoded into heap. The **base `.gsi`** is still read into heap unless the
   service runs with `-lowmem`.
@@ -2206,11 +2562,12 @@ re-targeted fits/reserve-truncation numbers. `go vet ./...` clean,
   on a close/USN-quiet window (≤2 s tick), so a file written in place without a
   close can be indexed from a partial state. The next USN change (or the close)
   re-extracts it; there is no in-progress-write guard.
-- **Intra-volume rename keeps its stored path until re-extraction.** An
+- **Intra-volume rename keeps its indexed path until re-extraction.** An
   intra-volume rename preserves the FRN, so the base/delta doc keeps the old
   `Path` (the delta is not re-extracted for a rename). Content search resolves
-  paths through the record index/resolver, so matching is unaffected — this is a
-  stale stored-path/ordering field, not a match gap.
+  entry paths through the record index, and v10 verification falls back to the
+  doc-table path for missing files, so matching survives either side lagging —
+  this is a stale stored-path/ordering field, not a match gap.
 - PDF extraction is a bounded text-layer parser (xref tables + streams, ObjStm,
   Flate/LZW/ASCII85/ASCIIHex/RunLength, ToUnicode/Differences); text-layer only,
   no OCR, encrypted → `Skipped`.
@@ -2412,124 +2769,3 @@ size-capped, never whole-disk by default.
    skipping (the postings are 4096-doc block-paged with first-docID skip
    metadata since §6m), and `.gsx` mmap.
 
-## 6z. Inclusion policy + dedupe (done)
-
-Branch `content/inclusion-policy` (WORK_QUEUE item 1, gap G3): content
-search across the whole drive with a small index, after Noah Dunnagan's
-fsearch. Coverage per byte is the metric.
-
-**Policy.** Text files up to ~1 MiB outside git repos (~10 MiB inside;
-raw caps at 2:1 headroom), minus what git ignores, with fsearch's skips:
-lockfiles (`package-lock.json`, `yarn.lock`, `pnpm-lock.yaml`,
-`Cargo.lock`, `go.sum`, `poetry.lock`, `composer.lock`, `Gemfile.lock`
-and kin), JSON >= 100 KiB (`.json`/`.jsonc`/`.json5`; line-delimited
-`.jsonl`/`.ndjson` stay), minified/bundled assets (`*.min.*`,
-bundle/chunk names, `*.map`, plus sampled average line length > 2048
-over files >= 32 KiB), build-output dirs outside repos (`dist`,
-`build`, `out`, `target`, `bin`, `obj`, `_build`, `.next`, `.nuxt`,
-`coverage` — inside a repo git's ignore rules own directories), and
-well-known cache trees anywhere (Go/npm/pnpm/yarn/pip/uv/Cargo
-registry/`.gradle`/NuGet/browser profile caches, any `gocache` or
-`.cache` tree). Linked git worktrees (a `.git` FILE pointing at
-`<main>/.git/worktrees/<name>`) index only the main checkout by
-default (`[content] worktrees = "main" | "all"`); submodule pointers
-(`.../.git/modules/...`) and plain repos still index. The operator adds
-a `content-skip` list (paths, or globs where `*` spans a segment and a
-full `**` segment spans separators) via `plugin config content --skip`
-or `[content] skip`. Explicit `-max-raw`/`-max-text` override the caps
-uniformly. `system_excludes = false` opts out of the directory rules
-only, never the file rules. Git rules come first, then the operator
-list, then the built-ins.
-
-**Enforcement points.** `allowsReason` (scope), the fast scan's
-`admitRecord` (same predicate + record size, with a reason-attributing
-segment memo so estimate and build tally identically), the offline walk
-(DirEntry size, real worktree probe for nested checkouts), the service
-build (`contentBuildDocSafe` per-file caps + extraction-time
-`large_json`/`size_cap`/minified-content skips with canonical reasons),
-and the drain (same extraction gate; declines tombstone base docs
-through the existing path and accumulate per-reason stats the fold
-merges). Selection v6 joins the scope fingerprint, so a worktree
-appearing/vanishing or a skip-list edit reconciles through the §6p/§6u
-path (new keys still held to the reconcile budget) instead of
-rebuilding.
-
-**Dedupe.** Identical files (stored-text length + sha256, already
-computed per doc as `ContentHash`) are extracted and stored ONCE: the
-assembler keeps the first as primary (text + postings) and records the
-rest as aliases — full doc-table rows (own DocID/FRN/path/fingerprint)
-sharing the primary's `TextOff`/`TextLen` with no postings. Pairs ride
-the self-contained CXAL section; readers expand posting-derived
-candidate sets over the alias map BEFORE cap accounting, so the
-expanded set equals the pre-dedupe posting set exactly and every
-lane/cap/budget decision is unchanged (the biased-early-stop lane
-regression caught this placement). Scan shapes enumerate aliases
-directly. Folds and reshards recompute through the same assembler;
-shards dedupe within themselves (cross-shard duplicates store twice —
-the worktree filter removes the corpus-scale case). Format v9 → v10,
-everything else byte-identical (CXAL omitted when empty; per-shard
-peak unchanged plus one hash entry per unique doc). Manifests stay v5
-and carry the build CXIS. If `content/filter-tier` (§6y) also bumps the
-format, renumber at merge: this change is the version line plus
-CXAL/CXIS only.
-
-**Visibility.** Every decision is tallied: the scan accumulates
-per-reason rejections, extraction adds size/content skips and
-truncations, the assembler adds dedupe files/bytes — persisted in CXIS
-and surfaced in `loaded --json` (`inclusion` with files+bytes per skip
-reason, truncations, dedupe savings, skipped worktrees), in
-`content-index` build lines, and in `--estimate` (per-reason
-files+bytes, a legacy baseline for before/after in one run, the
-same-size dedupe pool, skipped worktrees).
-
-**Measured (2026-10-14, GOMAXPROCS=2, shared box).** Estimate path,
-`chromium.gsi` (555,849 records): legacy baseline 468,772 files /
-3,367,822,040 B; policy 468,212 / 3,214,978,499 B (−560 files/−153 MB:
-lockfile 208/5.3 MB, large_json 200/117.2 MB, minified-name 121/8.9 MB,
-cache 31/24 KB, gitignore 334/1.1 MB, binary 40,136/984.5 MB,
-`.git`-exclude 29/1.53 GB). The old binary's estimate prints byte-exact
-the same baseline (468,772 / 3,367,822,040), validating the baseline
-code. Full `--scoped` builds (8 GB explicit budget): old 464,032 docs /
-800.1 MB; new 463,275 docs / 738.4 MB (−61.7 MB, −7.7%), with 26,195
-aliases (5.7%) saving 25.7 MB of extracted text, 198 extra
-minified-content skips at extraction, 2 truncations (1.7 MB cut), and
-estimate↔build agreement on every selection reason. Per doc 1.77 →
-1.63 KB; 0.241× eligible bytes (642k docs, 4.15 GB of source per GB of
-index; old 0.256×). On `E:\bench` (own 589,951-record walk): baseline 479,218 /
-3.54 GB → policy 468,212 / 3.21 GB (−11,006 files/−327 MB), 27 linked
-worktrees skipped (the whole `wt/` farm selects nothing under
-main-only), cache 14,113 files / 15.5 GB the largest new reason.
-Post-budget selection on this box is currently 0: E: free (18.7 GB)
-sits below the 20 GiB reserve, so the default allowance is 0 and only
-an explicit `budget_bytes` selects — headroom math in §6t stands (the
-spool-peak agent is lowering the 1.5×).
-
-**Recall.** 10 terms over the full chromium build vs `rg -l -F -i
---hidden` intersected with the implementation's own `--paths`
-selection, minus the oracle-replicated content rules (minified-content
-heuristic, 10 MiB prefix restriction, over-raw-cap containers): 8
-terms byte-identical sets; `EINVAL` +2 and `containing` +5 seekfs-side
-extras, all in PDFs/HTML (text-layer extraction reads streams rg's raw
-scan cannot — a recall gain by §2b design, except one untagged PDF
-rg reads raw and we drop for missing `/ToUnicode`, a documented §6h
-limit); 2 extras (one `.md`, one `.html`) stably in our selection but
-absent from rg's full-tree walk while present in its per-file/dir
-runs and `--no-ignore` runs — an unattributed rg-side walk filter
-after honest effort (bisected to root-walk-only, not git per
-check-ignore, not symlinks, not `.ignore` files). Zero indexed-content
-misses on all 10 terms: recall inside the rules is 100%. Method and
-scripts: `E:\bench\scratch\inclusion\recall.py` (deleted with scratch;
-per-term table in the `content/inclusion-policy` measurement commits).
-
-**Tried and rejected (measured).** Avg-line threshold below 2048: the
-2048–4096 band on chromium holds 12 files, all generated
-(`react.min.js`, `opencv.js`, test fixtures) — nothing legit within
-2× of the line, so no finer cut buys recall. Lowering to 1024 would
-take 7 more files, all still generated. `.jsonl`/`.ndjson` in the
-large-JSON skip: line-delimited logs grep cleanly, kept. `*.map` kept
-in minified (sourcemaps are build artifacts: 2 of the largest flagged
-files). Cross-shard global dedupe: needs a pre-pass over all text
-(peak = corpus) or a two-phase assemble; per-shard dedupe plus the
-worktree filter captures the measured duplication. `node_modules`
-style vendored trees inside repos: git's rules already own them; no
-extra list. s2/LZ4-class codecs stay rejected (§6n/§6o/§6s).

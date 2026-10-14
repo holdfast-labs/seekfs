@@ -39,12 +39,12 @@ type contentScopeUnit struct {
 
 // contentEstimate is the pre-flight estimate for a scoped build.
 type contentEstimate struct {
-	Files       int64              `json:"files"`
-	Bytes       int64              `json:"bytes"` // Σ min(size, per-file text cap)
-	ByExt       map[string]int64   `json:"by_ext,omitempty"`
-	ByUnit      []contentScopeUnit `json:"by_unit,omitempty"`
-	Repos       []string           `json:"repos,omitempty"`
-	Excluded    map[string]int64   `json:"excluded,omitempty"` // reason -> files
+	Files    int64              `json:"files"`
+	Bytes    int64              `json:"bytes"` // Σ min(size, per-file text cap)
+	ByExt    map[string]int64   `json:"by_ext,omitempty"`
+	ByUnit   []contentScopeUnit `json:"by_unit,omitempty"`
+	Repos    []string           `json:"repos,omitempty"`
+	Excluded map[string]int64   `json:"excluded,omitempty"` // reason -> files
 	// ExcludedBytes maps the same reasons to source bytes, so every policy
 	// decision is visible as files and bytes (see §6z).
 	ExcludedBytes map[string]int64 `json:"excluded_bytes,omitempty"`
@@ -62,9 +62,9 @@ type contentEstimate struct {
 	// dedupe savings in its CXIS section).
 	SameSizeFiles int64 `json:"same_size_files,omitempty"`
 	SameSizeBytes int64 `json:"same_size_bytes,omitempty"`
-	MaxFilesHit bool    `json:"max_files_hit,omitempty"`
-	BudgetHit   bool    `json:"budget_hit,omitempty"`
-	BudgetBytes int64   `json:"budget_bytes"`
+	MaxFilesHit   bool  `json:"max_files_hit,omitempty"`
+	BudgetHit     bool  `json:"budget_hit,omitempty"`
+	BudgetBytes   int64 `json:"budget_bytes"`
 	// EligibleFiles/EligibleBytes are the pre-budget totals over the whole
 	// candidate set, so a budget_hit names exactly what was cut: eligible
 	// files were considered, files fit. (When MaxFilesHit, both are over the

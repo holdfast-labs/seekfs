@@ -708,6 +708,14 @@ type searchTrace struct {
 	// content count was retried with typo-tolerant corrections, so the count
 	// response can carry the same "Showing results for X" signal as search.
 	FuzzyCorrection string `json:"-"`
+	// DiskVerified counts a query's disk content verifications (open,
+	// extract, match) across every volume and lane. Past
+	// contentDiskVerifyBudget, verification short-circuits to a miss and
+	// DiskCapped marks the trace incomplete: the result is a visible
+	// subset, never a silent truncation; a count refuses outright. Delta
+	// hits never count (memory, not disk). Local-only plumbing.
+	DiskVerified int  `json:"-"`
+	DiskCapped   bool `json:"-"`
 }
 
 type traceTerm struct {

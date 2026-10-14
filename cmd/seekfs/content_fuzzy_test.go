@@ -232,14 +232,14 @@ func TestContentFuzzyOfflineCLI(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if hits := r.search("recieve", 0); len(hits) != 0 {
+	if hits, _ := r.search("recieve", 0); len(hits) != 0 {
 		t.Fatalf("exact typo matched %d", len(hits))
 	}
 	corrected, show, ok := contentFuzzyCorrectOfflineText(r, "recieve")
 	if !ok || show != "receive" {
 		t.Fatalf("ok=%v show=%q; want receive", ok, show)
 	}
-	if hits := r.search(corrected, 0); len(hits) != 1 {
+	if hits, _ := r.search(corrected, 0); len(hits) != 1 {
 		t.Fatalf("corrected search matched %d; want 1", len(hits))
 	}
 }

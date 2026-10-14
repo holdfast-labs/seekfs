@@ -185,4 +185,3 @@ func TestParseQueryOverrideCarriesSearchScalars(t *testing.T) {
 		t.Fatalf("override disturbed leaves: %+v", out.Content)
 	}
 }
-

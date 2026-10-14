@@ -43,6 +43,16 @@ func newContentRecordVolume(t testing.TB, volume string, recs []contentVolRecord
 // is fully in-memory after the build; dir only anchors spill files and the
 // gsi path.
 func newContentRecordVolumeInDir(t testing.TB, volume string, recs []contentVolRecord, tmpDir string) *serviceVolumeIndex {
+	vol, idx, texts := makeRecordVolumeInDir(t, volume, recs, tmpDir)
+	stubContentDiskText(t, recordVolumeDiskTexts(idx, texts))
+	return vol
+}
+
+// makeRecordVolumeInDir builds the volume without installing the disk-text
+// stub, returning the record index and parallel fixture texts so the caller
+// can choose the stub lifetime: test-scoped (per-test volumes) or suite
+// (cross-test shared fixtures, whose reads outlive the building test).
+func makeRecordVolumeInDir(t testing.TB, volume string, recs []contentVolRecord, tmpDir string) (*serviceVolumeIndex, *Index, []string) {
 	t.Helper()
 	t.Setenv("SEEKFS_CONTENT_SEARCH", "1")
 	idx := &Index{Source: "usn", Volume: volume, Compact: true}
@@ -81,7 +91,14 @@ func newContentRecordVolumeInDir(t testing.TB, volume string, recs []contentVolR
 		ids[i] = uint32(contentRecordIndexForFRN(idx, cidx.Docs[i].FRN))
 	}
 	vol.content.setReady(cidx, reader, buildContentResolver(cidx.Docs, frns, ids))
-	return vol
+	// v11 verifies from disk: the caller serves the synthetic corpus through
+	// the disk-text stub (test- or suite-scoped) keyed by reconstructed
+	// index paths (which follow the parent chains).
+	texts := make([]string, len(recs))
+	for i := range recs {
+		texts[i] = recs[i].content
+	}
+	return vol, idx, texts
 }
 
 func entryPathsInOrder(entries []Entry) []string {

@@ -333,6 +333,9 @@ func TestContentExtractorRefreshReextractsOnlyStaleClass(t *testing.T) {
 	t.Cleanup(func() { close(s.stop) })
 	s.attachContentForVolume(vol)
 	releaseVolumeContentOnCleanup(t, vol)
+	// v11 verifies from disk: the record index resolves to synthetic `C:\`
+	// paths while the bytes live in the temp dir.
+	stubContentDiskPathMap(t, map[string]string{`C:\a.bumptest`: htmlPath, `C:\b.txt`: txtPath})
 
 	// The stale class is refreshed in place: ready and usable, degraded signal.
 	if got := vol.content.stateOf(); got != contentStateReady {
@@ -344,9 +347,11 @@ func TestContentExtractorRefreshReextractsOnlyStaleClass(t *testing.T) {
 	if h := vol.content.healthSnapshot(0); !h.ExtractorRefresh || h.StaleExtractorDocs != 1 || h.State != contentStateDegraded {
 		t.Fatalf("refresh health = %+v; want degraded refresh of 1 doc", h)
 	}
-	// The old text is still served during the refresh (not silently dropped).
-	if hits, _ := contentServiceSearch(t, vol, "content:old", false); len(hits) != 1 {
-		t.Fatalf("old text not served during refresh: %v", hits)
+	// v11 verifies the current extraction (already the new one): the old
+	// text exists nowhere verifiable, so it reads 0 instead of serving
+	// stale bytes until the drain re-extracts.
+	if hits, _ := contentServiceSearch(t, vol, "content:old", false); len(hits) != 0 {
+		t.Fatalf("stale text served after its extractor moved on: %v", hits)
 	}
 
 	resolve := func(frn uint64) (string, bool) {
@@ -360,6 +365,11 @@ func TestContentExtractorRefreshReextractsOnlyStaleClass(t *testing.T) {
 	}
 	if n := vol.contentCoord.processQueue(resolve); n != 1 {
 		t.Fatalf("refresh re-extracted %d docs; want only the stale class (1)", n)
+	}
+	// The refreshed text is served from the delta immediately — v11 never
+	// serves the stale extraction in between.
+	if hits, _ := contentServiceSearch(t, vol, "content:bump", false); len(hits) != 1 {
+		t.Fatalf("refreshed text not served from the delta: %v", hits)
 	}
 	// The degraded signal survives the extraction until the fold publishes.
 	if h := vol.content.healthSnapshot(0); !h.ExtractorRefresh {
@@ -475,8 +485,11 @@ func TestContentExtractorRefreshDeletedDocTombstoned(t *testing.T) {
 	if got := vol.content.stateOf(); got != contentStateReady {
 		t.Fatalf("state = %q; want ready refresh", got)
 	}
-	if hits, _ := contentServiceSearch(t, vol, "content:vanished", false); len(hits) != 1 {
-		t.Fatalf("stale text not served before the refresh: %v", hits)
+	// v11 stores no text: the deleted file is unverifiable, so it reads as
+	// absent immediately (fail-closed) instead of serving stale bytes until
+	// the tombstone lands. The tombstone path below still converges.
+	if hits, _ := contentServiceSearch(t, vol, "content:vanished", false); len(hits) != 0 {
+		t.Fatalf("deleted file served without verifiable bytes: %v", hits)
 	}
 
 	// The FRN no longer resolves: the drain tombstones it.

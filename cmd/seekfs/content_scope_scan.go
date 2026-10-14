@@ -387,11 +387,11 @@ func (h *contentScanHeap) Pop() any {
 // whether the cap truncated the corpus.
 func mergeScanMembers(lists [][]contentScopeMember, maxFiles int) (items []contentBuildItem, limited bool) {
 	if maxFiles <= 0 {
-	for _, l := range lists {
-		for _, m := range l {
-			items = append(items, contentBuildItem{frn: m.frn, path: m.path, priority: m.priority, inRepo: m.inRepo})
+		for _, l := range lists {
+			for _, m := range l {
+				items = append(items, contentBuildItem{frn: m.frn, path: m.path, priority: m.priority, inRepo: m.inRepo})
+			}
 		}
-	}
 		return items, false
 	}
 	var h contentScanHeap
@@ -523,10 +523,10 @@ func (w *contentScanWorker) admitRecord(id int, rec CompactRecord) (contentScope
 	if i := strings.LastIndexAny(p, `/\`); i >= 0 {
 		base = p[i+1:]
 	}
-		if reason, skip := contentInclusionSkip(p, base, ext, size, dec.repo != "", w.scope.SystemExcludes, w.scope.Skip); skip {
-			w.reject(reason, size)
-			return out, false
-		}
+	if reason, skip := contentInclusionSkip(p, base, ext, size, dec.repo != "", w.scope.SystemExcludes, w.scope.Skip); skip {
+		w.reject(reason, size)
+		return out, false
+	}
 	// Outside worktrees the name-based system excludes still apply to the
 	// file's own ancestry (in-repo files never consult segments — git
 	// decides there). dec.segHit already covers every non-final component

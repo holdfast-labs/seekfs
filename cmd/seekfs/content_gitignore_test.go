@@ -31,7 +31,8 @@ func contentIndexedPaths(t *testing.T, root string) []string {
 	if err != nil {
 		t.Fatal(err)
 	}
-	paths := contentPathsOf(r.search("zqmarker", 0))
+	hits, _ := r.search("zqmarker", 0)
+	paths := contentPathsOf(hits)
 	sort.Strings(paths)
 	return paths
 }

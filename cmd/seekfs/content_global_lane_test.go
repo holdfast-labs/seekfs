@@ -298,6 +298,7 @@ func TestContentGlobalLaneSkipsUnusableVolume(t *testing.T) {
 // the lane beyond the tiny fixture before it could become the default route.
 func TestContentGlobalLaneLargeCorpusDifferential(t *testing.T) {
 	t.Setenv("SEEKFS_CONTENT_SEARCH", "1")
+	uncappedDiskVerify(t)
 	// Shared read-only pair (same records/constructor as the old per-test
 	// build); this test never mutates the volumes.
 	volC, volF := sharedBoundedFlatVolumes(t)

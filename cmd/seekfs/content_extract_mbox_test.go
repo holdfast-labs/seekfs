@@ -69,7 +69,7 @@ func TestContentMboxTwoMessagesSearchable(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, term := range []string{"onesubjneedle", "onebodyneedle", "twosubjneedle", "twobodyneedle"} {
-		if hits := r.search(term, 0); len(hits) != 1 || hits[0].Path != "mail.mbox" {
+		if hits, _ := r.search(term, 0); len(hits) != 1 || hits[0].Path != "mail.mbox" {
 			t.Fatalf("term %q not findable: %v", term, contentPathsOf(hits))
 		}
 	}

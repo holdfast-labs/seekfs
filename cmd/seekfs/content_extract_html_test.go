@@ -218,7 +218,7 @@ func TestContentHTMLMetaCharsetShiftJIS(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if hits := r.search(term, 0); len(hits) != 1 || hits[0].Path != "jp.html" {
+	if hits, _ := r.search(term, 0); len(hits) != 1 || hits[0].Path != "jp.html" {
 		t.Fatalf("non-ASCII term %q not findable: %v", term, contentPathsOf(hits))
 	}
 }
@@ -316,7 +316,7 @@ func TestContentBuildIndexesHTMLSource(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, term := range []string{"bodyneedle", "titleneedle", "scriptneedle", "styleneedle"} {
-		if hits := r.search(term, 0); len(hits) != 1 || hits[0].Path != "page.html" {
+		if hits, _ := r.search(term, 0); len(hits) != 1 || hits[0].Path != "page.html" {
 			t.Fatalf("term %q not findable: %v", term, contentPathsOf(hits))
 		}
 	}
