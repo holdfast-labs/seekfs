@@ -17,21 +17,30 @@ Merged so far this round: `perf/content-underfill`, `perf/name-fuzzy`,
 | Branch | Worktree | Scope |
 |---|---|---|
 | `test/suite-speed` | suitespeed | `cmd/seekfs` suite under ~5 min; harden `TestHeadlessFrameCost`; gofmt drift |
-| `content/filter-tier` | tier2 | Filter tier with no stored text, verified from disk; evaluate it as the default (G1, §6y) |
+| `content/filter-tier` | tier2 | **Owner decision 2026-10-13: fsearch model is the default.** No stored text; trigram postings plus a per-file filter; matches and snippets verified from disk; edited files read directly. Stored text only as a justified opt-in (G1, G4 partial, §6y) |
 | `content/inclusion-policy` | inclusion | Queued item 1: main-checkout-only worktrees, lower caps, lockfile/JSON/minified/cache skips, user skip list, content-hash dedupe (G3, §6z) |
 | `perf/ranking-signals` | ranking | Queued item 1: open/frecency/recent, query-history boost, `git:` filter + status/commit boosts, `near:`, right-file-first metric (G7, G8, G13) |
 
 ## Queued, in order
 
-1. **Grep features (G10, G9, G11).** Fuzzy grep, multi-pattern OR, context
-   lines, a per-query time budget with cursor pagination, smart case for
-   content, `sym:` definition search and a definition-line bonus, the
-   `'exact`, `^prefix` and `suffix$` operators, `**`/brace globs and accent
-   folding.
-2. **Freshness and footprint (G4, G5, G6).** Read changed/dirty files directly
-   at query time; on-demand indexing (searched folder first); service
-   resident memory (about 500 MB for 1.46M names); startup load time (about
-   40 s for 1.46M entries).
+1. **Grep features (G10, G9, G11).** Plain-literal grep via SIMD memmem and
+   multi-pattern OR via Aho-Corasick (fff); fuzzy grep (Smith-Waterman per
+   line); context lines; a per-query time budget (fff default 150 ms) with
+   cursor pagination; smart case for content; ripgrep line semantics for
+   regex (fsearch); `sym:` definition search and a definition-line bonus;
+   extension and single-file filters for grep.
+2. **Name-search lessons (G11).** A per-name letter bitmap that rules out
+   most names before scoring (fsearch); several words spelling one name
+   (fsearch); accent folding; `'exact`, `^prefix`, `suffix$`, `**` and brace
+   globs, `in:` alias (fsearch); typo budget of one edit, or two for words of
+   8+ letters (compare with ours); current-file deprioritization (fff).
+3. **Freshness and footprint (G4, G5, G6).** Name-side changes visible in
+   milliseconds (fsearch about 15 ms; dirty content reads land with the
+   filter tier); on-demand indexing (searched folder first, fsearch); a
+   restart replays only what changed; service resident memory (about 500 MB
+   for 1.46M names, versus fsearch's 21–35 MB daemon), returned to the OS
+   when idle; startup load time (about 40 s for 1.46M entries); a
+   memory-mapped content cache (fff).
 
 ## Smaller follow-ups
 

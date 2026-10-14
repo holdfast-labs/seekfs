@@ -74,7 +74,8 @@ machine are not required.
 Coverage and size (top priority: small index, content search everywhere):
 
 1. **Stored text** is about 58% of the v9 index. fsearch stores none and
-   verifies from disk. Agent work: `content/filter-tier` (tier 2 with no
+   verifies from disk. **Owner decision (2026-10-13): adopt the no-stored-text,
+   verify-from-disk model as the default.** Agent work: `content/filter-tier` (tier 2 with no
    stored text, measured as a possible default).
 2. **The build's transient spool peak** (1.5× extracted) caps coverage, while
    the final index is about 0.33×. Agent work: `content/spool-peak`.
