@@ -106,7 +106,7 @@ type contentBuildAdaptivePrefetch struct {
 	left    int // undelivered items in the live stream
 	nextFn  func() (contentExtracted, bool)
 	stopFn  func()
-	want int
+	want    int
 }
 
 // newContentBuildAdaptivePrefetch opens the stream at the current desired
