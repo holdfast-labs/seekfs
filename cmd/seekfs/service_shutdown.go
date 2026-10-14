@@ -108,6 +108,10 @@ func (s *goSearchService) shutdownServiceOnce(progress func(stage string)) {
 	if !waitCompanionsStopped(companions, serviceShutdownCompanionWait) {
 		serviceLog("service shutdown: companions did not stop in %s; exiting anyway", serviceShutdownCompanionWait)
 	}
+	// Persist the usage-signal store (frecency + query history); opens also
+	// save synchronously, so this only catches a trailing write.
+	note("flush-signals")
+	flushSignalStore()
 	note("stopped")
 }
 

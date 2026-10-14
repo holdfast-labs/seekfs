@@ -195,18 +195,24 @@ func percentile(sorted []float64, p float64) float64 {
 }
 
 type serviceRequest struct {
-	Command       string              `json:"command"`
-	PluginConfig  string              `json:"plugin_config,omitempty"`
-	Volume        string              `json:"volume,omitempty"`
-	DB            string              `json:"db,omitempty"`
-	Query         string              `json:"query,omitempty"`
-	MatchPath     bool                `json:"match_path,omitempty"`
-	Limit         int                 `json:"limit,omitempty"`
-	CountOnly     bool                `json:"count_only,omitempty"`
-	Under         string              `json:"under,omitempty"`
-	Exists        bool                `json:"exists,omitempty"`
-	CWDBias       string              `json:"cwd_bias,omitempty"`
-	RootBias      string              `json:"root_bias,omitempty"`
+	Command      string `json:"command"`
+	PluginConfig string `json:"plugin_config,omitempty"`
+	Volume       string `json:"volume,omitempty"`
+	DB           string `json:"db,omitempty"`
+	Query        string `json:"query,omitempty"`
+	MatchPath    bool   `json:"match_path,omitempty"`
+	Limit        int    `json:"limit,omitempty"`
+	CountOnly    bool   `json:"count_only,omitempty"`
+	Under        string `json:"under,omitempty"`
+	Exists       bool   `json:"exists,omitempty"`
+	CWDBias      string `json:"cwd_bias,omitempty"`
+	RootBias     string `json:"root_bias,omitempty"`
+	// Near is the proximity anchor for search (CLI --near / near: token).
+	Near string `json:"near,omitempty"`
+	// Path + OpenQuery carry the `open` command (recorded access event for
+	// Path, attributed to normalized query OpenQuery when non-empty).
+	Path          string              `json:"path,omitempty"`
+	OpenQuery     string              `json:"open_query,omitempty"`
 	Recent        string              `json:"recent,omitempty"`
 	ModifiedAfter string              `json:"modified_after,omitempty"`
 	CaseSensitive bool                `json:"case_sensitive,omitempty"`
