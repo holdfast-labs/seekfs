@@ -50,15 +50,20 @@ corruption, exact required sources, auto-fuzzy only on zero exact hits).
 
 | Branch | Worktree | Scope |
 |---|---|---|
-| `perf/adaptive-build-workers` | buildworkers | "Single worker under load": adapt extraction workers during the build instead of fixing the count at start |
-| `content/index-size-budget` | sizebudget | Charge the scope budget by estimated final index bytes, not extracted text (v11 stores no text; Chromium at 600 MB admitted 77.7k docs, dropped 385k already-extracted files, published ~130 MB). Transient disk peak/reserve stays separate |
+| `content/verify-precision` | verifyprec | `content:mutex` on full Chromium verifies 2,157 files for 20 hits (591 ms warm, 8.3 s first) and reports incomplete; make limit-N queries early-stop (~2N verifies, complete). Also regex cost, `count content:struct` exactness |
 | `perf/static-ranking` | staticrank | **Parked** at WIP commit `761db7b` (OR-lane case unresolved, suite not green); resume only with a fresh, narrow brief (G13) |
 
-Merged 2026-10-14: `feat/ui-input-and-user-signals` (UI input heartbeat,
-per-user ranking stores), `integ/filter-tier-merge` (no stored text by default,
-format v11; full suite green). The v11 Chromium query latencies were not
-re-measured (the scale run stopped at the budget); re-measure after
-`content/index-size-budget` lands.
+Merged 2026-10-14: `feat/ui-input-and-user-signals`, `integ/filter-tier-merge`
+(v11, no stored text by default), `perf/adaptive-build-workers`,
+`content/regex-prune`, `content/index-size-budget`.
+
+**Full Chromium on v11 (2026-10-14, 600 MiB explicit budget):** 463,273 docs
+indexed, 0 dropped (was 77,713), 2609 MB extracted, 615 MB index (0.236x;
+grams 341, filter 125, terms 115, doctable 23, paths 11 MB), build 44 min at
+GOMAXPROCS=2, peak disk 0.56x extracted. Limit-20 warm/first: rare literal
+13/274 ms, phrase 62/346 ms, zero-result 1 ms, `mutex` 591 ms/8.3 s
+(incomplete), `ext:cc mutex` 155 ms (incomplete), regex `mutex_\w+`
+1.27/4.2 s. A full fold re-reads every file: 43 min (5.6 ms/doc).
 
 ## Queued, in order
 
@@ -75,6 +80,15 @@ re-measured (the scale run stopped at the budget); re-measure after
 
 ## Smaller follow-ups
 
+- **Whole-drive coverage: stream postings without a full text spool.** The
+  reserve-governed default (no explicit budget, the real E: drive) is limited
+  by the build's transient peak, extracted text x1.5. Peak was 0.56x on
+  Chromium. Build postings without spooling all text first, so the reserve
+  admits far more of the drive.
+- **Build speed:** 44 min for 2.6 GB on Chromium at GOMAXPROCS=2. Profile
+  extraction vs tokenize vs assembly.
+- **Fold cost under no stored text:** a fold re-reads every doc in the shard
+  from disk (5.6 ms/doc). Keep shards small, or fold from postings only.
 - **Typo fallback scope:** content typo fallback fires on scoped zero-result
   queries even when exact matches exist elsewhere (`async` → `sync`). Decide
   whether it should only fire when the whole index has no exact match (from
