@@ -39,35 +39,123 @@ func TestContentPrefetchExtractKeepsOrderAndBoundsWork(t *testing.T) {
 }
 
 func TestContentBuildWorkerCountAdaptive(t *testing.T) {
+	stubGovernorSignals(t)
 	restoreWorkers := contentBuildWorkers
-	restoreActive := contentUserActiveNow
-	restoreBattery := contentOnBatteryNow
+	restoreBatch := contentBuildBatchSize
 	t.Cleanup(func() {
 		contentBuildWorkers = restoreWorkers
-		contentUserActiveNow = restoreActive
-		contentOnBatteryNow = restoreBattery
+		contentBuildBatchSize = restoreBatch
 	})
 	contentBuildWorkers = 4
-	quiet, active := false, true
-	mains, battery := false, true
-	contentUserActiveNow = func() bool { return quiet }
-	contentOnBatteryNow = func() bool { return mains }
 	if got := contentBuildWorkerCount(); got != 4 {
 		t.Fatalf("quiet+mains workers = %d; want the static cap 4", got)
 	}
-	quiet = active
+	// Each user-activity signal alone drops the build to one worker.
+	serviceNoteQueryActivity()
 	if got := contentBuildWorkerCount(); got != 1 {
-		t.Fatalf("active-query workers = %d; want 1", got)
+		t.Fatalf("recent-query workers = %d; want 1", got)
 	}
-	quiet = !active
-	contentOnBatteryNow = func() bool { return battery }
+	serviceLastQueryUnixNano.Store(0)
+	serviceActiveQueryEnter()
+	defer serviceActiveQueryLeave()
+	if got := contentBuildWorkerCount(); got != 1 {
+		t.Fatalf("in-flight-query workers = %d; want 1", got)
+	}
+	serviceActiveQueryLeave()
+	contentInputActiveNow = func() bool { return true }
+	if got := contentBuildWorkerCount(); got != 1 {
+		t.Fatalf("input workers = %d; want 1", got)
+	}
+	contentInputActiveNow = func() bool { return false }
+	contentOnBatteryNow = func() bool { return true }
 	if got := contentBuildWorkerCount(); got != 1 {
 		t.Fatalf("battery workers = %d; want 1", got)
+	}
+	contentOnBatteryNow = func() bool { return false }
+	if got := contentBuildWorkerCount(); got != 4 {
+		t.Fatalf("quiet-again workers = %d; want the static cap 4", got)
+	}
+	// Background CPU/disk pressure slows pauses but must not serialize
+	// extraction: workers stay at the cap.
+	contentSystemBusyNow = func() bool { return true }
+	contentDiskBusyNow = func() bool { return true }
+	if got := contentBuildWorkerCount(); got != 4 {
+		t.Fatalf("cpu+disk workers = %d; want the static cap 4", got)
 	}
 	// A static cap of 1 stays 1 whatever the probes say.
 	contentBuildWorkers = 1
 	if got := contentBuildWorkerCount(); got != 1 {
 		t.Fatalf("single-worker cap = %d; want 1", got)
+	}
+}
+
+// The adaptive prefetch must scale the live extraction stream down while
+// queries or input are active and back up when they go quiet — delivering
+// every document exactly once and in item order throughout. A fake load
+// signal drives the governor probes; the batch size pins the chunking, so
+// no sleeps are involved.
+func TestContentBuildAdaptivePrefetchScalesDownAndUp(t *testing.T) {
+	stubGovernorSignals(t)
+	restoreWorkers := contentBuildWorkers
+	restoreBatch := contentBuildBatchSize
+	t.Cleanup(func() {
+		contentBuildWorkers = restoreWorkers
+		contentBuildBatchSize = restoreBatch
+	})
+	contentBuildWorkers = 4
+	contentBuildBatchSize = 4
+	const n = 24
+	items := make([]contentBuildItem, n)
+	for i := range items {
+		items[i] = contentBuildItem{frn: uint64(i + 1)}
+	}
+	extract := func(_ context.Context, item contentBuildItem) (contentBuildDoc, contentExtractResult, bool) {
+		return contentBuildDoc{frn: item.frn}, contentExtractResult{}, true
+	}
+	a := newContentBuildAdaptivePrefetch(context.Background(), items, extract)
+	defer a.stop()
+	if got := a.workerCount(); got != 4 {
+		t.Fatalf("initial workers = %d; want 4", got)
+	}
+	// Drain the first chunk quiet, then load starts: the next adapt must
+	// drop the stream to 1 worker.
+	for i := 0; i < 4; i++ {
+		got, live := a.next()
+		if !live || got.doc.frn != uint64(i+1) {
+			t.Fatalf("chunk item %d: frn=%d live=%v; want frn=%d", i, got.doc.frn, live, i+1)
+		}
+	}
+	serviceNoteQueryActivity()
+	a.adapt()
+	if got := a.workerCount(); got != 1 {
+		t.Fatalf("loaded workers = %d; want 1", got)
+	}
+	// Drain loaded chunks: order must hold through the 4->1 transition.
+	for i := 4; i < 12; i++ {
+		got, live := a.next()
+		if !live || got.doc.frn != uint64(i+1) {
+			t.Fatalf("loaded item %d: frn=%d live=%v; want frn=%d", i, got.doc.frn, live, i+1)
+		}
+		a.adapt()
+		if got := a.workerCount(); got != 1 {
+			t.Fatalf("loaded workers at item %d = %d; want 1", i, got)
+		}
+	}
+	// Load clears mid-build: the stream scales back to the cap and still
+	// delivers the tail exactly once, in order.
+	serviceLastQueryUnixNano.Store(0)
+	a.adapt()
+	if got := a.workerCount(); got != 4 {
+		t.Fatalf("recovered workers = %d; want 4", got)
+	}
+	for i := 12; i < n; i++ {
+		got, live := a.next()
+		if !live || got.doc.frn != uint64(i+1) {
+			t.Fatalf("tail item %d: frn=%d live=%v; want frn=%d", i, got.doc.frn, live, i+1)
+		}
+	}
+	if _, live := a.next(); live {
+		t.Fatal("next after the last item must report done")
 	}
 }
 

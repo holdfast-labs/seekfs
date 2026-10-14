@@ -891,8 +891,19 @@ func (s *goSearchService) runContentBuild(vol *serviceVolumeIndex, reuseSidecar 
 	}
 	abortReason := ""
 	abortRetry := false
-	nextExtracted, stopPrefetch := contentPrefetchExtract(ctx, items, contentBuildWorkerCount(), contentBuildDocSafe)
-	defer stopPrefetch()
+	// Adaptive extraction: the prefetch stream is chunked at batch
+	// boundaries and the worker count is re-evaluated per chunk, so the
+	// build scales down while queries or user input are active and back up
+	// to the normal count when they go quiet. The stream delivers strictly
+	// in item order (each chunk resumes exactly where the last stopped), so
+	// selection, budget and progress semantics are unchanged; a worker
+	// change never reorders or repeats a document. Chunk size matches the
+	// governor batch (the same point that already re-samples every probe),
+	// so decisions stay in lockstep and no extra timers or goroutines run
+	// during the build. Only the service build adapts: the offline CLI and
+	// the fold create their prefetch once with their (static) count.
+	adaptive := newContentBuildAdaptivePrefetch(ctx, items, contentBuildDocSafe)
+	defer adaptive.stop()
 	for done < total {
 		// The atomic generation covers the common abort (a rebuild/journal
 		// reset bumps replayGen); the full journal-id check runs per batch
@@ -907,7 +918,7 @@ func (s *goSearchService) runContentBuild(vol *serviceVolumeIndex, reuseSidecar 
 		}
 		item := items[done]
 		done++
-		got, live := nextExtracted()
+		got, live := adaptive.next()
 		if !live {
 			abortReason = "service stopping"
 			break
@@ -936,6 +947,9 @@ func (s *goSearchService) runContentBuild(vol *serviceVolumeIndex, reuseSidecar 
 				break
 			}
 			vol.content.setBuildProgress(done, total)
+			// Re-sample the desired worker count at the same boundary: scale
+			// down while queries or input are active, back up when quiet.
+			adaptive.adapt()
 			// Idle-aware IO governor: skip the pause on an idle machine with
 			// no foreground query load; take it when anything is active (see
 			// contentBuildPauseNow). Cancelable through s.stop and the build
