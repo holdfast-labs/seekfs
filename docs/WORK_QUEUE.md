@@ -23,14 +23,12 @@ Merged so far this round: `perf/content-underfill`, `perf/name-fuzzy`,
 
 ## Queued, in order
 
-1. **Agent integration (G12).** An MCP server (find, grep, multi_grep) and a
-   JSON-lines stdio mode.
-2. **Grep features (G10, G9, G11).** Fuzzy grep, multi-pattern OR, context
+1. **Grep features (G10, G9, G11).** Fuzzy grep, multi-pattern OR, context
    lines, a per-query time budget with cursor pagination, smart case for
    content, `sym:` definition search and a definition-line bonus, the
    `'exact`, `^prefix` and `suffix$` operators, `**`/brace globs and accent
    folding.
-3. **Freshness and footprint (G4, G5, G6).** Read changed/dirty files directly
+2. **Freshness and footprint (G4, G5, G6).** Read changed/dirty files directly
    at query time; on-demand indexing (searched folder first); service
    resident memory (about 500 MB for 1.46M names); startup load time (about
    40 s for 1.46M entries).
@@ -62,6 +60,8 @@ Merged so far this round: `perf/content-underfill`, `perf/name-fuzzy`,
 - **Dense-text spool:** the fastest zstd level stores high-entropy text
   uncompressed (1.000x). The default level gets 0.637x, about 28% more
   coverage on dense corpora for roughly +4 s of serial encode (§6x).
+- **JSON-lines stdio mode (G12):** optional and low priority. **No MCP
+  server**: the owner ruled it out on 2026-10-13.
 - **Slow differential test:** `TestContentGlobalLaneScopeDifferential` takes
   300–666 s. `test/suite-speed` tiers it; confirm CI still runs the full tier.
 

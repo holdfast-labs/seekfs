@@ -105,8 +105,9 @@ Accuracy and ranking (fff parity):
 11. **Query language:** no `'exact`, `^prefix` or `suffix$` operators, no
     `**` path globs with brace sets, no `in:` alias. Accent folding for names
     is unverified.
-12. **Integration:** no MCP server (`find`/`grep`/`multi_grep` tools for
-    agents) and no JSON-lines stdio mode.
+12. **Integration:** no JSON-lines stdio mode (optional, low priority).
+    **Out of scope: an MCP server.** The owner ruled it out on 2026-10-13;
+    do not build one, even though fsearch and fff ship MCP tools.
 13. **Reported metrics:** we measure one-typo and two-typo top-1 on Chromium
     (99.5% / 93.0%). Add a "right file first" metric for plain name queries,
     matching fsearch's report.

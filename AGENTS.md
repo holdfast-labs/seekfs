@@ -33,6 +33,7 @@
   current gaps against them. Read it before working on speed, ranking, typo
   tolerance, content coverage or index size, and update its gap list when you
   close one.
+- Do not build an MCP server for seekfs; the owner ruled it out.
 - `docs/WORK_QUEUE.md` is the single list of open work (running agents,
   queued items in order, follow-ups, owner actions). Update it when you
   finish or discover work.
