@@ -754,6 +754,9 @@ func TestContentWalkRegexScanFindsMatch(t *testing.T) {
 func TestContentWalkCappedScanFindsMatch(t *testing.T) {
 	stubContentBuildSync(t)
 	stubContentCatchUpSync(t)
+	// Uncapped: this test proves the capped posting scan still finds every
+	// match (4200 exact); boundedness is proven separately by cap tests.
+	uncappedDiskVerify(t)
 	dir := t.TempDir()
 	root := filepath.Join(dir, "root")
 	if err := os.MkdirAll(root, 0o755); err != nil {

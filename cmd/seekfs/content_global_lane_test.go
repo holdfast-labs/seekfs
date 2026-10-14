@@ -298,6 +298,9 @@ func TestContentGlobalLaneSkipsUnusableVolume(t *testing.T) {
 // the lane beyond the tiny fixture before it could become the default route.
 func TestContentGlobalLaneLargeCorpusDifferential(t *testing.T) {
 	t.Setenv("SEEKFS_CONTENT_SEARCH", "1")
+	// Uncapped: logic equivalence over thousand-verify queries (limit 5000
+	// arms); boundedness is proven separately by cap tests.
+	uncappedDiskVerify(t)
 	volC := newContentRecordVolume(t, "C:", contentBoundedDifferentialRecords("C:", 4_300, 1_000_000))
 	volF := newContentRecordVolume(t, "F:", contentBoundedDifferentialRecords("F:", 4_300, 2_000_000))
 	scopes := []struct {

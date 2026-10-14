@@ -734,16 +734,22 @@ func TestContentAssembleStreamConsumesSourceBuffer(t *testing.T) {
 		scratch = append(scratch[:0], w.term...)
 		return contentBuildDoc{frn: w.frn, path: w.path, text: scratch}, true, nil
 	}
-	idx, err := assembleContentIndexStream(source, t.TempDir())
+	idx, err := assembleContentIndexStream(source, t.TempDir(), contentFilterID{})
 	if err != nil {
 		t.Fatal(err)
 	}
+	// v10 verifies from disk: serve the synthetic docs through the stub.
+	texts := make(map[string]string, len(wants))
+	for _, w := range wants {
+		texts[w.path] = w.term
+	}
+	stubContentDiskText(t, texts)
 	r, err := openContentReader(idx)
 	if err != nil {
 		t.Fatal(err)
 	}
 	for _, w := range wants {
-		hits := r.search(w.term, 0)
+		hits, _ := r.search(w.term, 0)
 		if len(hits) != 1 || hits[0].Path != w.path {
 			t.Fatalf("term %q = %v; want exactly %q", w.term, contentPathsOf(hits), w.path)
 		}
@@ -785,7 +791,7 @@ func TestContentAssembleStreamProcessesAsItPulls(t *testing.T) {
 		pulled++
 		return doc, true, nil
 	}
-	idx, err := assembleContentIndexStream(source, t.TempDir())
+	idx, err := assembleContentIndexStream(source, t.TempDir(), contentFilterID{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -814,7 +820,7 @@ func TestContentAssembleStreamMatchesSlice(t *testing.T) {
 		i++
 		return d, true, nil
 	}
-	b, err := assembleContentIndexStream(source, t.TempDir())
+	b, err := assembleContentIndexStream(source, t.TempDir(), contentFilterID{})
 	if err != nil {
 		t.Fatal(err)
 	}

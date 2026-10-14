@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"fmt"
 	"math/rand"
+	"os"
+	"path/filepath"
 	"testing"
 )
 
@@ -158,12 +160,19 @@ func TestContentSnippetASCIIEquals(t *testing.T) {
 }
 
 // TestVerifyDocContentASCIIEquals proves the offline reader's fast path
-// returns the identical hit (offset and snippet) as the fold path.
+// returns the identical hit (offset and snippet) as the fold path. v10
+// verifies from disk, so the corpus is written to real files first.
 func TestVerifyDocContentASCIIEquals(t *testing.T) {
+	dir := t.TempDir()
+	raws := asciiFoldCorpus()
 	var build []contentBuildDoc
-	for i, raw := range asciiFoldCorpus() {
+	for i, raw := range raws {
+		name := fmt.Sprintf("f%03d.txt", i)
+		if err := os.WriteFile(filepath.Join(dir, name), append([]byte(nil), raw...), 0o644); err != nil {
+			t.Fatal(err)
+		}
 		build = append(build, contentBuildDoc{
-			path: fmt.Sprintf("f%03d.txt", i),
+			path: filepath.Join(dir, name),
 			frn:  uint64(1000 + i),
 			text: append([]byte(nil), raw...),
 		})
@@ -181,10 +190,13 @@ func TestVerifyDocContentASCIIEquals(t *testing.T) {
 		if term == "" {
 			continue
 		}
-		hits := r.searchSerial(term, 0)
+		hits, complete := r.search(term, 0)
+		if !complete {
+			t.Fatalf("needle %q: tiny corpus hit the disk cap", term)
+		}
 		for _, h := range hits {
 			// Reference decision + offset + snippet, spelled out slowly.
-			text := r.docText(h.DocID)
+			text := raws[int(h.DocID)]
 			lower := contentFoldText(text)
 			off := bytes.Index(lower, []byte(term))
 			if off < 0 {
@@ -208,7 +220,7 @@ func TestVerifyDocContentASCIIEquals(t *testing.T) {
 			if hitSet[uint32(id)] {
 				continue
 			}
-			text := r.docText(uint32(id))
+			text := raws[id]
 			if len(text) == 0 {
 				continue
 			}

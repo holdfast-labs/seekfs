@@ -367,10 +367,12 @@ func searchCompactWithCacheHidden(idx *Index, opts queryOptions, countOnly bool,
 		// Counting mode skips path reconstruction when the query has no path
 		// constraint, and tallies the match instead of retaining an Entry.
 		// Walk-origin volumes always keep the path: their content
-		// resolution keys on it (see scanCandidateMatches).
+		// resolution keys on it (see scanCandidateMatches). v10 content
+		// verification always reads the file from disk, so a content query
+		// always keeps the path too.
 		withPath := true
 		if opts.contentCount != nil {
-			withPath = queryNeedsEntryPath(pq) || contentVol.contentWalkOriginAttached()
+			withPath = queryNeedsEntryPath(pq) || queryHasAnyContentLeaf(pq) || contentVol.contentWalkOriginAttached()
 		}
 		entry := compactEntryFromRecordPath(idx, recIndex, rec, pathCache, true, withPath)
 		if entryMatchesWithContentMatcher(contentVol, entry, pq, pq.MatchPath, contentMatcher) {
@@ -541,20 +543,25 @@ func verifyCompactCandidateOrderRange(idx *Index, pq parsedQuery, order []int, p
 
 // contentParallelVerifyMinIDs gates the parallel content verifier: below
 // this many candidates the feeder/channel setup exceeds the win. Content
-// verifies cost ~100x a name verify (block decompress + fold + substring),
-// so the gate is far below the filename parallel threshold.
+// verifies cost ~100x a name verify (disk open + extract + fold +
+// substring), so the gate is far below the filename parallel threshold.
 const contentParallelVerifyMinIDs = 256
 
+// contentParallelMaxWorkers caps the content verify fan-out: disk-bound
+// verification scales with a handful of concurrent reads, and past that the
+// ordered merge contends instead of helping.
+const contentParallelMaxWorkers = 8
+
 // contentParallelWorkers sizes the content verify fan-out: GOMAXPROCS
-// workers up to contentSearchMaxWorkers (past that the shared block cache
-// contends instead of helping); 1 keeps the zero-overhead serial path.
+// workers up to contentParallelMaxWorkers; 1 keeps the zero-overhead serial
+// path.
 func contentParallelWorkers() int {
 	w := runtime.GOMAXPROCS(0)
 	if w < 1 {
 		w = 1
 	}
-	if w > contentSearchMaxWorkers {
-		w = contentSearchMaxWorkers
+	if w > contentParallelMaxWorkers {
+		w = contentParallelMaxWorkers
 	}
 	return w
 }
@@ -732,9 +739,9 @@ func countCompactContentParallel(idx *Index, pq parsedQuery, order []int, hidden
 				}
 				localCache = boundPathCache(localCache)
 				// The same predicate as the serial count loop: prechecks,
-				// then the content-aware match over a path-free entry
-				// unless the query reads paths (see scanCandidateMatches;
-				// walk volumes always keep the path there too).
+				// then the content-aware match (see scanCandidateMatches;
+				// content queries always verify with full entries, since
+				// v10 reads the file from disk).
 				if scanCandidateMatches(contentVol, idx, pq, recIndex, localCache, matcher) {
 					n++
 				}
@@ -788,8 +795,11 @@ func compactCandidateEntryIfMatchIn(vol *serviceVolumeIndex, idx *Index, pq pars
 // here would be wasted work. Any query that reads a path keeps the full entry.
 // Walk-origin volumes always keep the full entry: their content resolution
 // keys on the entry path, so a path-free entry would miss every document.
+// v10 content verification always reads the file from disk, so a content
+// query never takes the path-free form either: without a path there is
+// nothing to open.
 func scanCandidateMatches(vol *serviceVolumeIndex, idx *Index, pq parsedQuery, recIndex int, pathCache map[int]string, matcher *contentLeafMatcher) bool {
-	if matcher != nil && !queryNeedsEntryPath(pq) && !vol.contentWalkOriginAttached() {
+	if matcher != nil && !queryHasAnyContentLeaf(pq) && !queryNeedsEntryPath(pq) && !vol.contentWalkOriginAttached() {
 		rec := idx.compactRecord(recIndex)
 		if rec.Deleted || !compactRecordPrecheck(rec, pq, pq.MatchPath) {
 			return false

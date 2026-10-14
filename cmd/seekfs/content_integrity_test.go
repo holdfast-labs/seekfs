@@ -52,13 +52,13 @@ func contentSectionRange(t *testing.T, raw []byte, tag uint32) (uint64, uint64) 
 }
 
 // contentIntegrityTestFile builds a small USN-keyed index with every section
-// kind present (doc table, terms, grams, text, paths, policy, scope) and saves
+// kind present (doc table, terms, grams, filter, paths, policy, scope) and saves
 // it, returning the path and the loaded index.
 func contentIntegrityTestFile(t *testing.T) (string, *contentIndex) {
 	t.Helper()
-	docs := contentStreamTestDocs(30)
+	docs := contentStreamTestDocs(t, 30)
 	tmp := t.TempDir()
-	built, err := assembleContentIndexStreamed(contentStreamTestSource(docs), tmp)
+	built, err := assembleContentIndexStreamed(contentStreamTestSource(docs), tmp, contentFilterID{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -117,7 +117,7 @@ func TestContentIntegrityDetectsSmallSectionCorruption(t *testing.T) {
 // page them in) but the verify pass reports the mismatch.
 func TestContentIntegrityDetectsLargeSectionCorruption(t *testing.T) {
 	for _, tag := range []uint32{
-		contentSectionText,
+		contentSectionFilter,
 		contentSectionTerms,
 		contentSectionGrams,
 	} {
@@ -151,8 +151,8 @@ func TestContentIntegrityDetectsManifestCorruption(t *testing.T) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	docs := contentStreamTestDocs(10)
-	built, err := assembleContentIndexStreamed(contentStreamTestSource(docs), tmp)
+	docs := contentStreamTestDocs(t, 10)
+	built, err := assembleContentIndexStreamed(contentStreamTestSource(docs), tmp, contentFilterID{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -289,7 +289,7 @@ func TestContentIntegrityFailureMarksStaleAndRebuilds(t *testing.T) {
 	if err := contentSaveFile(gsx, base); err != nil {
 		t.Fatal(err)
 	}
-	contentCorruptSection(t, gsx, contentSectionText)
+	contentCorruptSection(t, gsx, contentSectionFilter)
 
 	rebuilds := stubContentBuildSchedule(t)
 	s := contentTestService(t)
@@ -397,7 +397,7 @@ func TestContentLegacyFileWithoutChecksumsLoads(t *testing.T) {
 	// A corrupt byte in a legacy file is undetected (no checksum to check) —
 	// the upgrade happens on the next save, which stamps checksums.
 	reloaded.Release()
-	contentCorruptSection(t, legacy, contentSectionText)
+	contentCorruptSection(t, legacy, contentSectionFilter)
 	corrupt, err := contentLoadFile(legacy)
 	if err != nil {
 		t.Fatalf("legacy file must keep loading even when corrupt: %v", err)

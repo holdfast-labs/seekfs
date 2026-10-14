@@ -499,6 +499,12 @@ func TestFeatureCommandDispatchAndMixedContent(t *testing.T) {
 	vol.content = newContentVolumeState(vol.volume)
 	vol.content.setReady(idx, reader, buildContentResolver(idx.Docs, vol.index.Derived.FRNs, vol.index.Derived.FRNRecordIDs))
 	s.indexMu.Unlock()
+	// v10 verifies from disk: serve the synthetic docs through the stub
+	// (red.go has no doc and reads as absent, like a text-free file).
+	stubContentDiskText(t, map[string]string{
+		`C:\Blue.go`:  "needle feature:tags:blue",
+		`C:\blue.txt`: "other",
+	})
 	for _, tc := range []struct {
 		query string
 		count int

@@ -1,15 +1,15 @@
 package main
 
 // Read side of the offline content index: dictionary lookup, trigram candidate
-// generation, and substring verification against the stored text.
+// generation, per-file filter narrowing, and substring verification by reading
+// matched files from disk (v10: no stored text).
 
 import (
 	"bytes"
 	"errors"
-	"runtime"
+	"path/filepath"
 	"sort"
 	"strings"
-	"sync"
 	"unicode/utf8"
 )
 
@@ -83,22 +83,24 @@ func contentSnippetWindow(text []byte, off, matchLen int) string {
 	return string(window)
 }
 
-// contentReader is a decoded `.gsx` ready to query. cache is the shared
-// decompressed-block cache: one per reader, shared across a composite's
-// shards, dropped with the reader. See contentBlockCache for lifetime and
-// pin-safety notes.
+// contentReader is a decoded `.gsx` ready to query. In v10 there is no
+// stored text: candidates come from the trigram postings (plus the pruned
+// set), the per-file filter (CXFL) narrows them before any disk read, and
+// verification reads the file from disk with the build's extraction policy
+// (extract, below).
 type contentReader struct {
-	idx   *contentIndex
-	terms *contentTermDict
-	grams *contentPostingIndex
-	store *contentTextStore
-	paths []string
-	cache *contentBlockCache
+	idx     *contentIndex
+	terms   *contentTermDict
+	grams   *contentPostingIndex
+	paths   []string
+	filter  *contentFilterSection
+	extract contentExtractSettings
 	// pruned is the CXGP pruned-gram set: dense grams the builder dropped
 	// from the postings (see contentGramPruneDF). Nil when the index
 	// prunes nothing. candidateStreamIn skips pruned grams as
 	// constraints; a term left with no usable gram falls back to the
-	// full scan like a sub-3-byte term.
+	// full scan like a sub-3-byte term. The filter still constrains pruned
+	// grams (it is never pruned), so dense shapes narrow before any read.
 	pruned map[uint32]struct{}
 }
 
@@ -108,22 +110,23 @@ func openContentReader(idx *contentIndex) (*contentReader, error) {
 		return nil, errors.New("nil content index")
 	}
 	if idx.shards != nil {
-		// One cache for the whole composite: every shard reader shares
-		// it, so a query touching many shards still warms once.
-		r := &contentReader{idx: idx, cache: newContentBlockCache()}
+		// The manifest carries no rows itself; shard readers hold their own
+		// filters. Adopt the first shard's root and extraction identity so
+		// relative document paths resolve and verify with the build policy.
+		r := &contentReader{idx: idx, extract: contentDefaultExtractSettings()}
 		for _, sh := range idx.shards {
-			if sh != nil && sh.reader != nil {
-				sh.reader.cache = r.cache
-				if sh.reader.store != nil {
-					sh.reader.store.cache = r.cache
-				}
+			if sh != nil && sh.reader != nil && sh.reader.filter != nil {
+				r.filter = &contentFilterSection{Root: sh.reader.filter.Root}
+				r.extract = sh.reader.extract
+				break
 			}
 		}
 		return r, nil
 	}
 	r := &contentReader{
-		idx:   idx,
-		paths: make([]string, len(idx.Docs)),
+		idx:     idx,
+		paths:   make([]string, len(idx.Docs)),
+		extract: contentDefaultExtractSettings(),
 	}
 	for i := range idx.Docs {
 		r.paths[i] = ""
@@ -159,60 +162,73 @@ func openContentReader(idx *contentIndex) (*contentReader, error) {
 		}
 		r.pruned = p
 	}
-	if sec := idx.Sections[contentSectionText]; len(sec) > 0 {
-		st, err := openContentTextStore(sec)
+	// The v10 per-file filter: bit rows in DocID order plus the build's
+	// extraction identity (caps, root, encoding) for disk verification. A
+	// corrupt section fails the load; an ABSENT section only disables the
+	// prefilter (postings + disk verification still answer, only slower).
+	if sec := idx.Sections[contentSectionFilter]; len(sec) > 0 {
+		f, err := decodeContentFilterSection(sec, len(idx.Docs))
 		if err != nil {
 			return nil, err
 		}
-		r.store = st
-	}
-	// A v8 shard carries its text dictionary as CXTD; frames decoded
-	// without it fail closed in textFor, so a missing section is never a
-	// wrong slice. Absent CXTD means plain (v7) frames.
-	if sec := idx.Sections[contentSectionDictText]; len(sec) > 0 {
-		if r.store == nil {
-			return nil, errors.New("content text dict without a text store")
+		r.filter = f
+		if f.MaxRaw > 0 {
+			r.extract.maxRaw = f.MaxRaw
 		}
-		id, content, err := decodeContentTextDict(sec)
-		if err != nil {
-			return nil, err
+		if f.MaxText > 0 {
+			r.extract.maxText = f.MaxText
 		}
-		r.store.dictID = id
-		r.store.dict = content
-	}
-	r.cache = newContentBlockCache()
-	if r.store != nil {
-		r.store.cache = r.cache
+		if f.Encoding != "" {
+			if m, err := parseContentEncoding(f.Encoding); err == nil {
+				r.extract.encoding = m
+			}
+		}
+	} else if idx.Policy.MaxRaw > 0 {
+		r.extract.maxRaw = idx.Policy.MaxRaw
+		if idx.Policy.MaxText > 0 {
+			r.extract.maxText = idx.Policy.MaxText
+		}
 	}
 	return r, nil
 }
 
-// docText returns a fresh copy of the stored text of a document: the v7 text
-// store is block-compressed, so the bytes are decompressed (through the
-// block LRU) and copied out. A corrupt offset or undecodable block reads as
-// absent, never as a wrong slice. Callers use the bytes transiently.
-func (r *contentReader) docText(docID uint32) []byte {
+// filterRow returns the filter bits for a document (shard-aware).
+func (r *contentReader) filterRow(docID uint32) (contentFilterRow, bool) {
 	if r.idx.shards != nil {
-		if sh, local, ok := r.shardOf(docID); ok {
-			return sh.reader.docText(local)
+		if sh, local, ok := r.shardOf(docID); ok && sh.reader != nil {
+			return sh.reader.filterRow(local)
 		}
-		return nil
+		return contentFilterRow{}, false
 	}
-	if int(docID) >= len(r.idx.Docs) {
-		return nil
+	if r.filter == nil || int(docID) >= len(r.filter.Rows) {
+		return contentFilterRow{}, false
 	}
-	d := r.idx.Docs[docID]
-	if d.TextLen == 0 {
-		return []byte{}
+	return r.filter.Rows[docID], true
+}
+
+// filterRoot returns the build root for resolving relative document paths.
+func (r *contentReader) filterRoot() string {
+	if r.filter != nil {
+		return r.filter.Root
 	}
-	if r.store == nil {
-		return nil
+	return ""
+}
+
+// verifyPath resolves a document's stored path for disk verification: stored
+// absolute paths verify directly; relative ones resolve against the build
+// root carried by CXFL.
+func (r *contentReader) verifyPath(docID uint32) string {
+	p := r.docPath(docID)
+	if p == "" {
+		return ""
 	}
-	text, ok := r.store.textFor(d.TextOff, d.TextLen)
-	if !ok {
-		return nil
+	if filepath.IsAbs(p) {
+		return p
 	}
-	return text
+	if root := r.filterRoot(); root != "" {
+		return filepath.Join(root, filepath.FromSlash(p))
+	}
+	return p
 }
 
 // docPath returns the path for a docID.
@@ -231,224 +247,105 @@ func (r *contentReader) docPath(docID uint32) string {
 
 // search returns documents whose text contains term (case-insensitive
 // substring), ordered by docID, up to limit (limit <= 0 means unlimited).
-func (r *contentReader) search(term string, limit int) []contentHit {
+// v10 verifies from disk: candidates come from the trigram postings, the
+// per-file filter narrows them before any read, and each surviving candidate
+// is opened, extracted with the build policy, and substring-matched. The
+// second return reports whether the scan ran to completion: false means the
+// disk verification cap stopped it with records unvisited (a visible subset,
+// never silent).
+func (r *contentReader) search(term string, limit int) ([]contentHit, bool) {
 	t := strings.ToLower(term)
 	if t == "" {
-		return nil
+		return nil, true
 	}
-	if contentSearchWorkers() < 2 {
-		return r.searchSerial(t, limit)
+	needle := []byte(t)
+	grams := contentFilterGramsOf(needle)
+	next := r.candidateStream(t)
+	var hits []contentHit
+	verified := 0
+	for {
+		id, ok := next()
+		if !ok {
+			return hits, true
+		}
+		if hit, ok, capped := r.verifyDiskContent(id, needle, grams, &verified); capped {
+			return hits, false
+		} else if ok {
+			hits = append(hits, *hit)
+			if limit > 0 && len(hits) >= limit {
+				return hits, true
+			}
+		}
 	}
-	return r.searchParallel(t, limit, contentSearchWorkers())
 }
 
-// verifyDocContent tests one candidate document and builds its hit (nil when
-// the document does not match). It is the single verification both the
-// serial and parallel searches share, so their results are identical by
-// construction: same needle, same fold, same offset mapping, same window.
-// needle is the pre-folded query bytes, hoisted by the caller so a broad
-// query does not re-allocate it per document; matching runs on bytes, never
-// through a string conversion.
-func (r *contentReader) verifyDocContent(id uint32, needle []byte) *contentHit {
-	text := r.docText(id)
-	if len(text) == 0 {
-		return nil
+// verifyDiskContent tests one candidate document and builds its hit (nil when
+// the document does not match). The filter gate runs first (bit tests only),
+// so most non-matches never touch disk; survivors are read fresh from disk
+// with the build's extraction policy and matched exactly like the service
+// verify path (ASCII fast path, then fold with offset mapping). needle is the
+// pre-folded query bytes and grams its precomputed filter keys, both hoisted
+// by the caller. capped reports the per-query disk verification budget
+// (contentDiskVerifyBudget) stopped the read.
+func (r *contentReader) verifyDiskContent(id uint32, needle []byte, grams []uint32, verified *int) (*contentHit, bool, bool) {
+	if len(grams) > 0 {
+		row, ok := r.filterRow(id)
+		if !ok {
+			// No filter row (a section the builder never wrote): the file
+			// may still match, so verify from disk without narrowing.
+		} else if !contentFilterMayMatch(row, grams) {
+			return nil, false, false
+		}
 	}
-	// Fast path: an ASCII needle in ASCII text matches under ASCII case
-	// folding with no allocation, at identical raw offsets. Anything else
-	// takes the historical fold path below.
+	path := r.verifyPath(id)
+	if path == "" {
+		return nil, false, false
+	}
+	if *verified >= contentDiskVerifyBudget {
+		return nil, false, true
+	}
+	*verified++
+	text, ok := contentDiskReadForVerify(path, r.extract)
+	if !ok {
+		return nil, false, false
+	}
 	if isASCIIBytes(needle) {
 		if off, ascii := asciiCaseIndex(text, needle); ascii {
 			if off < 0 {
-				return nil
+				return nil, false, false
 			}
 			return &contentHit{
 				Path:    r.docPath(id),
 				DocID:   id,
 				Offset:  off,
 				Snippet: contentSnippetWindow(text, off, len(needle)),
-			}
+			}, true, false
 		}
 	}
-	// The stored text preserves case (PF-6a), so fold it for the
-	// case-insensitive match; the window is still taken from the original.
 	lower := contentFoldText(text)
 	off := bytes.Index(lower, needle)
 	if off < 0 {
-		return nil
+		return nil, false, false
 	}
-	// Folding preserves the rune index but not the byte offset: a
-	// byte-length-changing fold rune (İ 2->1, ẞ 3->2, KELVIN 3->1)
-	// shifts every later offset. Map both window boundaries back to
-	// the raw text in one pass, exactly as contentSnippet does, so the
-	// snippet windows the real bytes and Offset points at the raw match
-	// start.
 	rawOff, rawEnd := contentFoldSpanToRaw(text, lower, off, off+len(needle))
 	return &contentHit{
 		Path:    r.docPath(id),
 		DocID:   id,
 		Offset:  rawOff,
 		Snippet: contentSnippetWindow(text, rawOff, rawEnd-rawOff),
-	}
+	}, true, false
 }
 
-// searchSerial is the historical streaming search: candidates verify one at
-// a time in docID order, stopping at the limit.
-func (r *contentReader) searchSerial(t string, limit int) []contentHit {
-	if t == "" {
-		return nil
-	}
-	needle := []byte(t)
-	next := r.candidateStream(t)
-	var hits []contentHit
-	for {
-		id, ok := next()
-		if !ok {
-			break
-		}
-		if hit := r.verifyDocContent(id, needle); hit != nil {
-			hits = append(hits, *hit)
-			if limit > 0 && len(hits) >= limit {
-				break
-			}
-		}
-	}
-	return hits
-}
+// contentDiskVerifyBudget caps one query (service or offline) to this many
+// disk verifications (open, extract, match). Past it the query stops and
+// reports complete:false rather than reading the whole drive. Delta hits
+// never count (memory, not disk). A var so tests pin it.
+var contentDiskVerifyBudget = 512
 
-// contentSearchMaxWorkers caps the parallel search fan-out: decode-bound
-// verification scales with cores, and past a handful of workers the ordered
-// merge and the shared block cache contend instead of helping.
-var contentSearchMaxWorkers = 8
-
-// contentSearchWorkers sizes the parallel search: GOMAXPROCS workers up to
-// the cap (1 keeps the zero-overhead serial path). A var-free func so tests
-// exercise both arms by pinning GOMAXPROCS.
-func contentSearchWorkers() int {
-	n := runtime.GOMAXPROCS(0)
-	if n < 1 {
-		n = 1
-	}
-	if n > contentSearchMaxWorkers {
-		n = contentSearchMaxWorkers
-	}
-	return n
-}
-
-// contentSearchJob is one candidate for the parallel verifier: seq numbers
-// the candidateStream order (ascending docIDs), so the merger restores the
-// exact serial order regardless of which worker finishes first.
-type contentSearchJob struct {
-	seq uint64
-	id  uint32
-}
-
-// contentSearchResult is one verified candidate: hit is nil for a miss, but
-// every job reports (hit or miss) so the merger can advance past it.
-type contentSearchResult struct {
-	seq uint64
-	hit *contentHit
-}
-
-// searchParallel verifies candidates across workers (bounded by
-// contentSearchWorkers) and merges hits in candidate order with the exact
-// serial limit. Verification is CPU-bound (block decompress + fold +
-// substring), so workers scale near-linearly; the feeder, the merger and the
-// limit accounting stay single-threaded. Over-verification past an early
-// limit is bounded by the channel buffer plus one job per worker.
-func (r *contentReader) searchParallel(t string, limit int, workers int) []contentHit {
-	if t == "" {
-		return nil
-	}
-	if workers < 2 {
-		return r.searchSerial(t, limit)
-	}
-	needle := []byte(t)
-	next := r.candidateStream(t)
-	quit := make(chan struct{})
-	var quitOnce sync.Once
-	stop := func() { quitOnce.Do(func() { close(quit) }) }
-	defer stop()
-	work := make(chan contentSearchJob, 64)
-	out := make(chan contentSearchResult, 64)
-	var wg sync.WaitGroup
-	// Feeder: the only goroutine that pulls the candidate stream.
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		defer close(work)
-		var seq uint64
-		for {
-			id, ok := next()
-			if !ok {
-				return
-			}
-			select {
-			case work <- contentSearchJob{seq: seq, id: id}:
-				seq++
-			case <-quit:
-				return
-			}
-		}
-	}()
-	// Workers: verify only; no ordering, no limits here.
-	for w := 0; w < workers; w++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for {
-				select {
-				case job, ok := <-work:
-					if !ok {
-						return
-					}
-					hit := r.verifyDocContent(job.id, needle)
-					select {
-					case out <- contentSearchResult{seq: job.seq, hit: hit}:
-					case <-quit:
-						return
-					}
-				case <-quit:
-					return
-				}
-			}
-		}()
-	}
-	// Closer: once the feeder and every worker are done, no more results.
-	go func() {
-		wg.Wait()
-		close(out)
-	}()
-	// Merger (this goroutine): emit in stream order, stopping at exactly
-	// the limit like the serial path (one emit batch can hold several
-	// ready hits, so the limit is enforced inside emit, not after it).
-	var hits []contentHit
-	pending := make(map[uint64]*contentHit)
-	var expect uint64
-	emit := func() bool {
-		for limit <= 0 || len(hits) < limit {
-			hit, ok := pending[expect]
-			if !ok {
-				return true
-			}
-			delete(pending, expect)
-			expect++
-			if hit != nil {
-				hits = append(hits, *hit)
-			}
-		}
-		return false
-	}
-	for res := range out {
-		pending[res.seq] = res.hit
-		if !emit() {
-			return hits
-		}
-	}
-	emit()
-	return hits
-}
-
+// candidates returns the docIDs that could contain term: trigram intersection
+// when the term has at least three bytes, otherwise every document. The result
+// is always a superset; verification decides. At most budget docIDs are
+// materialized (budget <= 0 means all), so a broad list is not decoded in full.
 // candidates returns the docIDs that could contain term: trigram intersection
 // when the term has at least three bytes, otherwise every document. The result
 // is always a superset; verification decides. At most budget docIDs are

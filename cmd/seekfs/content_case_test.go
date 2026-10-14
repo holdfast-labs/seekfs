@@ -124,10 +124,10 @@ func TestContentServiceSnippetPreservesCase(t *testing.T) {
 	}
 }
 
-// PF-6a: a v3 sidecar (case-folded text store) fails closed, while a v4 one
-// round-trips. The version and magic are both bumped, so neither a stale magic
-// nor a stale version can be read as case-preserving.
-func TestContentIndexV4RoundTripAndV3Rejected(t *testing.T) {
+// v10 carries no stored text: a v9 sidecar fails the version gate (and is
+// rebuilt), while a v10 one round-trips with its filter section. The version
+// is bumped, so a stale sidecar can never be read as current.
+func TestContentIndexV10RoundTripAndV9Rejected(t *testing.T) {
 	build := []contentBuildDoc{{frn: 7, path: "C:\\a.txt", text: []byte("Alpha Needle Beta")}}
 	idx, err := assembleContentIndex(build, t.TempDir())
 	if err != nil {
@@ -140,21 +140,19 @@ func TestContentIndexV4RoundTripAndV3Rejected(t *testing.T) {
 
 	decoded, err := contentIndexDecode(encoded)
 	if err != nil {
-		t.Fatalf("v4 round-trip failed: %v", err)
+		t.Fatalf("v10 round-trip failed: %v", err)
 	}
-	reader, err := openContentReader(decoded)
-	if err != nil {
-		t.Fatal(err)
+	if _, ok := decoded.Sections[contentSectionText]; ok {
+		t.Fatal("v10 sidecar must not carry a text store")
 	}
-	if got := reader.docText(0); string(got) != "Alpha Needle Beta" {
-		t.Fatalf("v4 stored text = %q; want case-preserved %q", got, "Alpha Needle Beta")
+	if _, ok := decoded.Sections[contentSectionFilter]; !ok {
+		t.Fatal("v10 sidecar must carry the filter section")
 	}
 
-	v3 := append([]byte(nil), encoded...)
-	copy(v3[0:8], []byte("GOSCX003"))
-	binary.LittleEndian.PutUint32(v3[8:], contentIndexVersion-1)
-	if _, err := contentIndexDecode(v3); err == nil {
-		t.Fatal("a v3 sidecar must be rejected (fail closed), not read as case-preserving")
+	v9 := append([]byte(nil), encoded...)
+	binary.LittleEndian.PutUint32(v9[8:], contentIndexVersion-1)
+	if _, err := contentIndexDecode(v9); err == nil {
+		t.Fatal("a v9 sidecar must be rejected (fail closed), never attached")
 	}
 }
 

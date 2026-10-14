@@ -824,40 +824,6 @@ func (s *goSearchService) runContentBuild(vol *serviceVolumeIndex, reuseSidecar 
 	} else {
 		allowance = contentScopeAllowance(tmpDir, 0)
 	}
-	// Tier-2 filter (§6y): files the text budget drops are still covered by a
-	// per-file bloom signature verified from disk. The builder is fed from
-	// this same extraction loop (the dropped files are extracted anyway for
-	// exact drop tallies), so covering them costs only the gram pass. Filter
-	// bytes draw from the same pool as text (peak 1.5x per text byte in
-	// reserve mode, 1x in explicit mode, 1x per filter byte): files past both
-	// are scope_dropped with no coverage at all.
-	s.indexMu.RLock()
-	buildIsWalk := vol.index != nil && vol.index.Source == "walk"
-	s.indexMu.RUnlock()
-	filterOrigin := uint32(contentOriginUSN)
-	if buildIsWalk {
-		filterOrigin = contentOriginWalk
-	}
-	var filterScope [32]byte
-	if opts.Scope != nil {
-		filterScope = opts.Scope.fingerprint()
-	}
-	filterBuilder := newContentFilterBuilder(filterOrigin, settings.maxRaw, settings.maxText, filterScope, "")
-	var filterUsed int64
-	var headroom uint64
-	var headroomOK bool
-	if !explicitBudget {
-		headroom, headroomOK = contentScopeHeadroom(tmpDir, 0)
-	}
-	filterFits := func(recSize int64) bool {
-		if explicitBudget {
-			return filterUsed+recSize <= allowance-used
-		}
-		if !headroomOK {
-			return true
-		}
-		return float64(used)*contentScopePeakMultiplier+float64(filterUsed)+float64(recSize) <= float64(headroom)
-	}
 	abortReason := ""
 	abortRetry := false
 	nextExtracted, stopPrefetch := contentPrefetchExtract(ctx, items, contentBuildWorkerCount(), contentBuildDocSafe)
@@ -926,25 +892,12 @@ func (s *goSearchService) runContentBuild(vol *serviceVolumeIndex, reuseSidecar 
 			if sinceAllowanceCheck += n; sinceAllowanceCheck >= contentDiskCheckEvery {
 				sinceAllowanceCheck = 0
 				allowance = contentScopeAllowance(tmpDir, used)
-				headroom, headroomOK = contentScopeHeadroom(tmpDir, used)
 			}
 		}
 		if overBudget || n > allowance-used {
 			overBudget = true
-			// The file is out of tier 1: tally the exact drop (the policy
-			// keeps its meaning — files and bytes the text budget excluded
-			// — so a filter-off build records identical bytes). Tier 2 then
-			// covers it from the same pool at its exact record size,
-			// measured from the extracted text the tally already paid for;
-			// only a file past both is scope_dropped with no coverage.
 			scopeDropped++
 			scopeDroppedBytes += n
-			grams := contentGramsOfU32(contentFoldText(contentStoredText(doc.text)))
-			class := contentFilterClassForGrams(len(grams))
-			if recSize := contentFilterRecordSize(class, item.path); filterFits(recSize) {
-				filterBuilder.AddRecord(item.frn, item.path, doc.fileSize, doc.fileModNano, n, grams)
-				filterUsed += recSize
-			}
 			continue
 		}
 		offset, err := spool.Seek(0, io.SeekCurrent)
@@ -1062,7 +1015,7 @@ func (s *goSearchService) runContentBuild(vol *serviceVolumeIndex, reuseSidecar 
 		if err != nil {
 			return nil, nil, "", err
 		}
-		built, err := assembleContentIndexStreamed(sourceOf(order), shardTmp)
+		built, err := assembleContentIndexStreamed(sourceOf(order), shardTmp, contentFilterID{MaxRaw: settings.maxRaw, MaxText: settings.maxText, Encoding: contentServiceEncodingLabel()})
 		if err != nil {
 			return nil, nil, shardTmp, err
 		}
@@ -1189,21 +1142,6 @@ func (s *goSearchService) runContentBuild(vol *serviceVolumeIndex, reuseSidecar 
 			vol.content.markBuildFailed(err.Error())
 		}
 		return
-	}
-	// Tier-2 sidecar (§6y): publish the dropped files' filter beside the
-	// `.gsx`, guarded by the same reserve. A save failure only disables tier
-	// 2 (the base still attaches; health reports the drops uncovered), never
-	// fails the build. A build that dropped nothing removes a stale filter so
-	// an older selection's coverage cannot outlive its base.
-	filterPath := contentFilterPathForGSX(gsx)
-	if filterBuilder.Len() > 0 {
-		if verr := contentCheckDiskReserve(gsx); verr != nil {
-			serviceLog("content filter skipped volume=%s: %v", vol.volume, verr)
-		} else if verr := contentSaveFilter(filterPath, filterBuilder.Finish()); verr != nil {
-			serviceLog("content filter save failed volume=%s: %v", vol.volume, verr)
-		}
-	} else if filterPath != "" {
-		_ = os.Remove(filterPath)
 	}
 	// Publish through the normal attach path: it loads under indexMu and
 	// re-validates the journal generation, so a base swapped in during the

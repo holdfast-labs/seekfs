@@ -196,11 +196,11 @@ func TestContentBuildIndexesRTF(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, term := range []string{"titleneedle", "bodyneedle"} {
-		if hits := r.search(term, 0); len(hits) != 1 || hits[0].Path != "note.rtf" {
+		if hits, _ := r.search(term, 0); len(hits) != 1 || hits[0].Path != "note.rtf" {
 			t.Fatalf("term %q not findable: %v", term, contentPathsOf(hits))
 		}
 	}
-	if hits := r.search("Arial", 0); len(hits) != 0 {
+	if hits, _ := r.search("Arial", 0); len(hits) != 0 {
 		t.Fatalf("fonttbl content indexed: %v", contentPathsOf(hits))
 	}
 }

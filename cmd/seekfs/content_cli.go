@@ -33,7 +33,6 @@ func cmdContentIndex(args []string) error {
 	encoding := fs.String("encoding", "auto", "text encoding override: auto, none, or a WHATWG label (latin1, windows-1252, utf-16le, sjis, ...)")
 	maxRaw := fs.Int64("max-raw", 0, "max raw source bytes per file (0 = default 32 MiB, clamped to the hard ceiling)")
 	maxText := fs.Int64("max-text", 0, "max extracted text bytes per file (0 = default 16 MiB, clamped to the hard ceiling)")
-	tier2Budget := fs.Int64("tier2-budget", 0, "with -root, partition the corpus at this many extracted-text bytes: the head builds tier 1, the tail is covered by the tier-2 filter sidecar (<out>.filter)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -41,7 +40,6 @@ func cmdContentIndex(args []string) error {
 	opts.Under = *under
 	opts.MaxRaw = *maxRaw
 	opts.MaxText = *maxText
-	opts.Tier2Budget = *tier2Budget
 	if *encoding != "" {
 		if _, err := parseContentEncoding(*encoding); err != nil {
 			return fmt.Errorf("content-index: %w", err)
@@ -149,7 +147,6 @@ func cmdContentIndex(args []string) error {
 
 	var (
 		idx *contentIndex
-		flt *contentFilter
 		err error
 	)
 	if *db != "" {
@@ -171,7 +168,7 @@ func cmdContentIndex(args []string) error {
 		}
 		idx, err = buildContentIndexForIndex(context.Background(), rec, opts)
 	} else {
-		idx, flt, err = buildContentIndexFromDirFiltered(context.Background(), *root, opts)
+		idx, err = buildContentIndexFromDir(context.Background(), *root, opts)
 	}
 	if err != nil {
 		return err
@@ -179,20 +176,10 @@ func cmdContentIndex(args []string) error {
 	if opts.Scope != nil {
 		idx.ScopeHash = opts.Scope.fingerprint()
 	}
-	if flt != nil {
-		flt.ScopeHash = idx.ScopeHash
-		flt.MaxRaw, flt.MaxText = idx.Policy.MaxRaw, idx.Policy.MaxText
-	}
 	if err := contentSaveFile(outPath, idx); err != nil {
 		return err
 	}
 	fmt.Fprintf(os.Stdout, "indexed %d documents into %s\n", len(idx.Docs), outPath)
-	if flt != nil {
-		if err := contentSaveFilter(contentFilterPathForGSX(outPath), flt); err != nil {
-			return err
-		}
-		fmt.Fprintf(os.Stdout, "filter: %d files into %s (%.1f KB)\n", len(flt.Records), contentFilterPathForGSX(outPath), float64(flt.EncodedSize)/1024)
-	}
 	if p := idx.Policy; p != (contentBuildPolicy{}) {
 		limit := fmt.Sprintf("budget=%d", p.BudgetBytes)
 		if p.ReserveBytes > 0 {
@@ -260,24 +247,19 @@ func cmdContent(args []string) error {
 	if err != nil {
 		return err
 	}
-	// Tier-2 filter (§6y): the sibling sidecar covers files the text budget
-	// dropped. Missing or unusable means tier 1 alone, never an error.
-	var flt *contentFilter
-	if f, ferr := contentLoadFilter(contentFilterPathForGSX(*db)); ferr == nil {
-		flt = f
-		defer f.Release()
-	}
-	settings := contentDefaultExtractSettings()
-	hits, complete := r.searchFilter(term, *n, flt, settings)
+	// v10 verifies from disk with the build's extraction policy (caps from
+	// CXPL, encoding from CXFL), so the query decodes exactly as the build
+	// did without extra flags.
+	hits, complete := r.search(term, *n)
 	if !complete {
-		// The filter scan stopped at the verification cap with records
-		// unvisited: the answer is a visible subset, never silent.
-		fmt.Fprintf(os.Stderr, "content: incomplete results (filter verification cap reached; narrow the term or raise -n)\n")
+		// The scan stopped at the verification cap with records unvisited:
+		// the answer is a visible subset, never silent.
+		fmt.Fprintf(os.Stderr, "content: incomplete results (disk verification cap reached; narrow the term)\n")
 	}
 	fuzzy := ""
 	if len(hits) == 0 {
 		if corrected, show, ok := contentFuzzyCorrectOfflineText(r, term); ok {
-			if retry := r.search(corrected, *n); len(retry) > 0 {
+			if retry, _ := r.search(corrected, *n); len(retry) > 0 {
 				hits, fuzzy = retry, show
 			}
 		}

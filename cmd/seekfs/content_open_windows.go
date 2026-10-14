@@ -7,6 +7,7 @@ package main
 // closing the TOCTOU between the attribute check and the read (plan D5).
 
 import (
+	"errors"
 	"os"
 	"unsafe"
 
@@ -56,4 +57,16 @@ func contentOpenNoRecall(path string) (*os.File, error) {
 func contentLowerHandleIOPriority(h windows.Handle) {
 	hint := uint32(contentIOPriorityHintLow)
 	_ = windows.SetFileInformationByHandle(h, windows.FileIoPriorityHintInfo, (*byte)(unsafe.Pointer(&hint)), uint32(unsafe.Sizeof(hint)))
+}
+
+// isContentSharingViolation reports whether err is a Windows file-locking
+// sharing violation (ERROR_SHARING_VIOLATION, 32): another opener (AV
+// indexer, a writer) holds the file without share rights. The verify path
+// retries those once; any other error fails closed.
+func isContentSharingViolation(err error) bool {
+	var errno windows.Errno
+	if errors.As(err, &errno) {
+		return errno == windows.ERROR_SHARING_VIOLATION
+	}
+	return false
 }

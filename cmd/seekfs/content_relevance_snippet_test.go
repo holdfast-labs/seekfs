@@ -65,6 +65,13 @@ func newContentRecordVolume(t testing.TB, volume string, recs []contentVolRecord
 		ids[i] = uint32(contentRecordIndexForFRN(idx, cidx.Docs[i].FRN))
 	}
 	vol.content.setReady(cidx, reader, buildContentResolver(cidx.Docs, frns, ids))
+	// v10 verifies from disk: serve the synthetic corpus through the stub,
+	// keyed by reconstructed index paths (which follow the parent chains).
+	texts := make([]string, len(recs))
+	for i := range recs {
+		texts[i] = recs[i].content
+	}
+	stubContentDiskTextForIndex(t, idx, texts)
 	return vol
 }
 

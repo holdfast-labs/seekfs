@@ -13,6 +13,7 @@ package main
 // lost.
 
 import (
+	"context"
 	"errors"
 	"os"
 	"sort"
@@ -141,49 +142,6 @@ func (s *goSearchService) runContentFold(vol *serviceVolumeIndex) {
 	base := reader.idx
 	contentFoldSnapshotHook(vol)
 
-	// Tier-2 filter maintenance (§6y): delta docs for filter-covered keys
-	// refresh the filter instead of joining tier 1 — they were dropped from
-	// tier 1 by budget, and promoting them would grow tier 1 past its
-	// allowance file by file. Partition the snapshot before assembly:
-	// foldSnap feeds the existing tier-1 paths below, filterSnap recomputes
-	// filter records from delta text once tier 1 publishes (or alone when
-	// tier 1 has nothing to fold). Keys in the base stay tier 1 even if the
-	// filter also names them (tier 1 wins); unknown keys join tier 1 exactly
-	// as before, so a nil filter behaves byte-identically to today.
-	fltOld := vol.content.filterView()
-	var foldSnap, filterSnap []contentDeltaDoc
-	if fltOld != nil && len(fltOld.Records) > 0 {
-		for _, d := range snap {
-			if _, inBase := contentLookupFRN(base.Docs, d.FRN); inBase {
-				foldSnap = append(foldSnap, d)
-				continue
-			}
-			if _, inFilter := fltOld.lookup(d.FRN); inFilter {
-				filterSnap = append(filterSnap, d)
-				continue
-			}
-			foldSnap = append(foldSnap, d)
-		}
-	} else {
-		fltOld = nil
-		foldSnap = snap
-	}
-	if len(foldSnap) == 0 {
-		// Filter-only fold: tier 1 is unchanged, so no base is rewritten;
-		// the refresh persists against the current base. The delta still
-		// drains (commitFold) and the retry backoff clears, so a steady
-		// stream of filter-only changes folds cheaply instead of rewriting
-		// the base every drain tick. The persisted base checkpoint lags
-		// until the next tier-1 fold; a restart replays the committed range
-		// idempotently (fingerprints converge on the refreshed filter).
-		if fltOld != nil && len(filterSnap) > 0 {
-			s.publishFilterRefresh(vol, gen, base, fltOld, filterSnap)
-		}
-		vol.contentCoord.commitFold(snap)
-		vol.contentCoord.foldSucceeded()
-		return
-	}
-
 	tmpDir, err := contentMkdirWork(contentIndexPathForDB(vol.dbPath))
 	if err != nil {
 		vol.contentCoord.foldFailed(contentFoldRetryBackoff)
@@ -226,6 +184,18 @@ func (s *goSearchService) runContentFold(vol *serviceVolumeIndex) {
 	}
 	stopped := func() bool { return s.contentStopped(vol) }
 	contentFoldAssembleHook()
+	// v10 stores no text: the fold re-extracts base docs from disk (the
+	// delta already holds changed files' text). Filter identity carries
+	// forward from the base section; caps carry forward from the header.
+	settings := contentServiceExtractSettings()
+	filterID := contentFilterID{MaxRaw: header.Policy.MaxRaw, MaxText: header.Policy.MaxText, Encoding: contentServiceEncodingLabel()}
+	if reader.filter != nil {
+		filterID = contentFilterID{MaxRaw: header.Policy.MaxRaw, MaxText: header.Policy.MaxText, Root: reader.filter.Root, Encoding: reader.filter.Encoding}
+		if filterID.Encoding == "" {
+			filterID.Encoding = contentServiceEncodingLabel()
+		}
+	}
+	fctx := contentWithExtractSettings(context.Background(), settings)
 	// foldShard assembles one fold source into a spooled shard plus the header
 	// index the streaming save needs. The spooled section files, not a heap
 	// index, are what gets saved; publish reloads the sidecar through the
@@ -237,7 +207,7 @@ func (s *goSearchService) runContentFold(vol *serviceVolumeIndex) {
 			}
 			return source()
 		}
-		built, err := assembleContentIndexStreamed(guarded, tmpDir)
+		built, err := assembleContentIndexStreamed(guarded, tmpDir, filterID)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -250,58 +220,96 @@ func (s *goSearchService) runContentFold(vol *serviceVolumeIndex) {
 		shard.Sections = map[uint32][]byte{contentSectionPaths: encodeContentPaths(built.paths)}
 		return built, shard, nil
 	}
+	// basePaths parallels the base doc table by DocID for disk re-reads.
+	basePaths := make([]string, len(base.Docs))
+	for i := range base.Docs {
+		basePaths[i] = reader.docPath(base.Docs[i].DocID)
+	}
+	// livePath resolves a doc's current record-index path under a brief read
+	// lock (rename fallback for re-reads whose stored path went stale).
+	foldPathCache := make(map[int]string, 1024)
+	livePath := func(frn uint64) string {
+		s.indexMu.RLock()
+		defer s.indexMu.RUnlock()
+		id, ok := vol.recordIDForFRN(frn)
+		if !ok || vol.index == nil {
+			return ""
+		}
+		return vol.index.reconstructCompactPathCached(id, foldPathCache)
+	}
 	var rewritten int
 	var saveErr error
 	if base.shards == nil {
-		source := newContentFoldSource(reader, foldSnap)
-		built, shard, err := foldShard(source.next)
-		if err != nil {
-			serviceLog("content fold assemble failed volume=%s err=%v", vol.volume, err)
-			vol.contentCoord.foldFailed(contentFoldRetryBackoff)
-			return
+		src := newContentFoldDiskSource(vol, base.Docs, basePaths, snap, settings, fctx, livePath)
+		defer src.stop()
+		// Growth is projected up front from metadata (no text reads): base
+		// extracted bytes, minus tombstoned/replaced docs, plus delta docs.
+		// Past twice the shard target the fold shards directly instead of
+		// assembling a single file it would only split again.
+		baseLens := make(map[uint64]int64, len(base.Docs))
+		var projected int64
+		for i := range base.Docs {
+			baseLens[base.Docs[i].FRN] = int64(base.Docs[i].TextLen)
+			projected += int64(base.Docs[i].TextLen)
 		}
-		if !s.contentBuildCurrent(vol, gen, base.JournalID) {
-			// A rebuild/journal reset moved under the fold; keep the delta for
-			// the next fold against the new generation rather than publish
-			// stale.
-			vol.contentCoord.foldFailed(contentFoldRetryBackoff)
-			return
-		}
-		rewritten = len(built.docs)
-		if built.textSize > uint64(2*contentShardTargetBytes) {
-			// Grown well past one shard through folds: publish the single
-			// file, reload it through the mmap loader, and split it into
-			// shards rather than keep rewriting one ever-larger file. The
-			// published single file is complete and correct, so a reshard
-			// failure still publishes it instead of failing the fold.
-			if saveErr = contentFoldSave(gsx, shard, contentBuildFiles(built)); saveErr == nil {
-				var shards int
-				if reloaded, rerr := contentLoadFile(gsx); rerr != nil {
-					saveErr = rerr
-					contentSweepShards(gsx)
-				} else if shards, saveErr = contentReshardAndSave(gsx, reloaded, header, tmpDir); saveErr == nil {
-					serviceLog("content fold resharded volume=%s shards=%d", vol.volume, shards)
-					reloaded.Release()
-				} else {
-					reloaded.Release()
-					contentSweepShards(gsx)
-				}
+		for _, d := range snap {
+			if old, ok := baseLens[d.FRN]; ok {
+				projected -= old
+				delete(baseLens, d.FRN)
 			}
+			if !d.Deleted {
+				projected += int64(len(d.Text))
+			}
+		}
+		if projected > int64(2*contentShardTargetBytes) {
+			serviceLog("content fold resharding volume=%s projected=%d", vol.volume, projected)
+			items := contentFoldMergeItems(base.Docs, basePaths, snap)
+			var shards int
+			shards, saveErr = contentReshardAndSave(gsx, items, foldReadDoc(vol, settings, fctx, livePath), header, filterID, tmpDir)
+			if saveErr == nil {
+				serviceLog("content fold resharded volume=%s shards=%d", vol.volume, shards)
+			} else {
+				contentSweepShards(gsx)
+			}
+			rewritten = len(items)
 		} else {
+			built, shard, err := foldShard(src.next)
+			if err != nil {
+				serviceLog("content fold assemble failed volume=%s err=%v", vol.volume, err)
+				vol.contentCoord.foldFailed(contentFoldRetryBackoff)
+				return
+			}
+			if !s.contentBuildCurrent(vol, gen, base.JournalID) {
+				// A rebuild/journal reset moved under the fold; keep the delta for
+				// the next fold against the new generation rather than publish
+				// stale.
+				vol.contentCoord.foldFailed(contentFoldRetryBackoff)
+				return
+			}
+			rewritten = len(built.docs)
 			saveErr = contentFoldSave(gsx, shard, contentBuildFiles(built))
 		}
 	} else {
 		// Sharded: rewrite only the shards the delta touches; the others are
-		// named unchanged by the new manifest.
-		plan := planContentShardedFold(reader, resolver, foldSnap)
+		// named unchanged by the new manifest. Each dirty shard re-reads its
+		// surviving base docs from disk (v10: no stored text) merged with its
+		// incoming delta docs.
+		plan := planContentShardedFold(reader, resolver, snap)
 		infos := make([]contentShardInfo, len(base.shards))
+		var stops []func()
+		defer func() {
+			for _, stop := range stops {
+				stop()
+			}
+		}()
 		for i, sh := range base.shards {
 			infos[i] = sh.info
 			if !plan.dirty[i] || saveErr != nil {
 				continue
 			}
-			source := contentShardFoldSource(sh, plan.incoming[i], plan.drop)
-			built, shard, err := foldShard(source)
+			src := contentShardFoldDiskSource(vol, sh, plan.incoming[i], plan.drop, settings, fctx, livePath)
+			stops = append(stops, src.stop)
+			built, shard, err := foldShard(src.next)
 			if err != nil {
 				serviceLog("content fold assemble failed volume=%s shard=%s err=%v", vol.volume, sh.info.File, err)
 				vol.contentCoord.foldFailed(contentFoldRetryBackoff)
@@ -356,132 +364,7 @@ func (s *goSearchService) runContentFold(vol *serviceVolumeIndex) {
 	// health to ready).
 	vol.content.clearReconcileActive()
 	contentSweepShards(gsx)
-	// Tier-2 refresh (§6y): tombstoned filter keys drop their records and
-	// changed keys recompute bits + fingerprints from the delta text the fold
-	// just consumed. The new base's scope restamps the filter identity.
-	if fltOld != nil && len(filterSnap) > 0 {
-		if fp, ok := vol.content.scopeReconciledFP(); ok {
-			header.ScopeHash = fp
-		}
-		s.publishFilterRefresh(vol, gen, header, fltOld, filterSnap)
-	}
 	serviceLog("content fold volume=%s rewritten_docs=%d checkpoint=%d", vol.volume, rewritten, checkpoint)
-}
-
-// publishFilterRefresh persists a filter generation and installs it under
-// indexMu for writing, so no query reads the replaced mapping mid-swap. The
-// file save is guarded by the same reserve; a save failure keeps the old
-// filter (its stale records skip by fingerprint) and only logs — the delta
-// still drained, so a lost refresh is re-covered by the file's next change.
-// A generation that moved under the fold drops the refresh instead of
-// installing it past a newer base.
-func (s *goSearchService) publishFilterRefresh(vol *serviceVolumeIndex, gen uint64, header *contentIndex, old *contentFilter, refresh []contentDeltaDoc) {
-	if vol == nil || old == nil && len(refresh) == 0 {
-		return
-	}
-	var scope [32]byte
-	var origin uint32
-	var maxRaw, maxText int64
-	if header != nil {
-		scope, origin, maxRaw, maxText = header.ScopeHash, header.Origin, header.Policy.MaxRaw, header.Policy.MaxText
-	} else if old != nil {
-		scope, origin, maxRaw, maxText = old.ScopeHash, old.Origin, old.MaxRaw, old.MaxText
-	}
-	next := contentFilterApplyRefresh(old, refresh, origin, scope, maxRaw, maxText)
-	if next == nil {
-		return
-	}
-	gsx := contentIndexPathForDB(vol.dbPath)
-	if gsx == "" {
-		next.Release()
-		return
-	}
-	if err := contentCheckDiskReserve(gsx); err != nil {
-		serviceLog("content filter refresh skipped volume=%s: %v", vol.volume, err)
-		next.Release()
-		return
-	}
-	if err := contentSaveFilter(contentFilterPathForGSX(gsx), next); err != nil {
-		serviceLog("content filter refresh save failed volume=%s: %v", vol.volume, err)
-		next.Release()
-		return
-	}
-	s.indexMu.Lock()
-	defer s.indexMu.Unlock()
-	// Re-validate the generation and journal under the write lock, inline:
-	// contentBuildCurrent takes indexMu.RLock itself and must not be called
-	// nested here (Go RWMutex is not reentrant — that self-deadlocks).
-	// replayGen is atomic; journalID is safe under the write lock, exactly
-	// as publishFoldedContent reads it.
-	if s.contentStopped(vol) || vol.replayGen.Load() != gen || vol.journalID != header.JournalID {
-		next.Release()
-		return
-	}
-	vol.content.setFilter(next)
-}
-
-// contentFilterApplyRefresh folds delta docs into a filter generation: live
-// docs for covered keys recompute bits + fingerprints from the delta text,
-// tombstoned covered keys drop their records, and every other record carries
-// over verbatim. The result restamps the given identity (the fold's header).
-// It returns nil when there is nothing to carry (no old filter and no live
-// refresh), so no empty sidecar is written.
-func contentFilterApplyRefresh(old *contentFilter, refresh []contentDeltaDoc, origin uint32, scope [32]byte, maxRaw, maxText int64) *contentFilter {
-	drop := make(map[uint64]bool, len(refresh))
-	var live []contentDeltaDoc
-	for _, d := range refresh {
-		drop[d.FRN] = true
-		if !d.Deleted {
-			live = append(live, d)
-		}
-	}
-	var kept []contentFilterRecord
-	if old != nil {
-		kept = make([]contentFilterRecord, 0, len(old.Records))
-		for _, r := range old.Records {
-			if !drop[r.Key] {
-				kept = append(kept, r)
-			}
-		}
-	}
-	if len(kept) == 0 && len(live) == 0 {
-		return nil
-	}
-	made := make([]contentFilterRecord, 0, len(live))
-	for _, d := range live {
-		stored := contentStoredText(d.Text)
-		folded := contentFoldText(stored)
-		grams := contentGramsOfU32(folded)
-		class := contentFilterClassForGrams(len(grams))
-		bits := make([]byte, contentFilterClassBits[class]/8)
-		contentFilterBitsOfU32(bits, grams)
-		made = append(made, contentFilterRecord{Key: d.FRN, FileSize: d.FileSize, FileModNano: d.FileModNano, TextLen: int64(len(d.Text)), Class: class, Path: d.Path, Bits: bits})
-	}
-	sort.Slice(made, func(i, j int) bool { return made[i].Key < made[j].Key })
-	// Both halves are key-sorted: merge, with the refreshed records winning
-	// ties (a key cannot be in both — the partition drops refreshed keys
-	// from kept — but the merge stays total regardless).
-	out := make([]contentFilterRecord, 0, len(kept)+len(made))
-	i, j := 0, 0
-	for i < len(kept) && j < len(made) {
-		if kept[i].Key < made[j].Key {
-			out = append(out, kept[i])
-			i++
-		} else {
-			out = append(out, made[j])
-			j++
-		}
-	}
-	out = append(out, kept[i:]...)
-	out = append(out, made[j:]...)
-	if len(out) == 0 {
-		return nil
-	}
-	root := ""
-	if old != nil {
-		root = old.Root
-	}
-	return &contentFilter{Version: contentFilterVersion, Origin: origin, MaxRaw: maxRaw, MaxText: maxText, ScopeHash: scope, Root: root, BuiltAt: time.Now(), Records: out}
 }
 
 // publishFoldedContent attaches the freshly saved `.gsx` under indexMu. Unlike
@@ -572,18 +455,19 @@ func (s *goSearchService) publishFoldedContent(vol *serviceVolumeIndex, gen uint
 	return true
 }
 
-// contentFoldSource merges the base doc table with the delta snapshot in
-// ascending (frn, path) order, one document at a time. Both inputs are already
-// resident; the merge adds no corpus-sized buffer.
-type contentFoldSource struct {
-	reader *contentReader
-	base   []contentDoc
-	delta  []contentDeltaDoc
-	i      int
-	j      int
+// contentFoldItem is one merged corpus member for grouping/resharding:
+// its key, path, and extracted-text size — all known without reading text.
+type contentFoldItem struct {
+	frn  uint64
+	path string
+	size int64
 }
 
-func newContentFoldSource(reader *contentReader, snap []contentDeltaDoc) *contentFoldSource {
+// contentFoldMergeItems merges the base doc table (FRN-sorted, with parallel
+// DocID-ordered paths) and the delta snapshot into the ordered merged corpus
+// without reading any text: delta docs win ties, tombstones vanish. Sizes
+// come from the doc table (base) and the delta text lengths.
+func contentFoldMergeItems(base []contentDoc, paths []string, snap []contentDeltaDoc) []contentFoldItem {
 	delta := append([]contentDeltaDoc(nil), snap...)
 	sort.Slice(delta, func(i, j int) bool {
 		if delta[i].FRN != delta[j].FRN {
@@ -591,47 +475,212 @@ func newContentFoldSource(reader *contentReader, snap []contentDeltaDoc) *conten
 		}
 		return delta[i].Path < delta[j].Path
 	})
-	return &contentFoldSource{reader: reader, base: reader.idx.Docs, delta: delta}
-}
-
-func (m *contentFoldSource) next() (contentBuildDoc, bool, error) {
-	for {
-		haveBase := m.i < len(m.base)
-		haveDelta := m.j < len(m.delta)
+	var out []contentFoldItem
+	i, j := 0, 0
+	for i < len(base) || j < len(delta) {
 		var baseFRN, deltaFRN uint64
+		haveBase, haveDelta := i < len(base), j < len(delta)
 		if haveBase {
-			baseFRN = m.base[m.i].FRN
+			baseFRN = base[i].FRN
 		}
 		if haveDelta {
-			deltaFRN = m.delta[m.j].FRN
+			deltaFRN = delta[j].FRN
 		}
 		switch {
 		case haveDelta && (!haveBase || deltaFRN < baseFRN):
-			d := m.delta[m.j]
-			m.j++
-			if d.Deleted {
-				continue
+			if !delta[j].Deleted {
+				out = append(out, contentFoldItem{frn: delta[j].FRN, path: delta[j].Path, size: int64(len(delta[j].Text))})
 			}
-			return contentBuildDoc{frn: d.FRN, path: d.Path, text: d.Text, class: d.ContentType, version: d.ExtractorVersion, fileSize: d.FileSize, fileModNano: d.FileModNano}, true, nil
+			j++
 		case haveBase && (!haveDelta || baseFRN < deltaFRN):
-			doc := m.base[m.i]
-			m.i++
-			text := m.reader.docText(doc.DocID)
-			if len(text) == 0 {
+			p := ""
+			if i < len(paths) {
+				p = paths[i]
+			}
+			out = append(out, contentFoldItem{frn: base[i].FRN, path: p, size: int64(base[i].TextLen)})
+			i++
+		case haveBase && haveDelta:
+			d := delta[j]
+			j++
+			i++
+			if d.Deleted {
 				continue
 			}
-			return contentBuildDoc{frn: doc.FRN, path: m.reader.docPath(doc.DocID), text: text, modUnix: doc.ModUnix, class: doc.ContentType, version: doc.ExtractorVersion, fileSize: doc.FileSize, fileModNano: doc.FileModNano}, true, nil
-		case haveBase && haveDelta:
-			// Same FRN: the delta replaces the base doc; a tombstone drops it.
+			out = append(out, contentFoldItem{frn: d.FRN, path: d.Path, size: int64(len(d.Text))})
+		}
+	}
+	return out
+}
+
+// foldReadDoc returns a serial disk reader for merged items (the reshard
+// growth path, which is too rare to parallelize): each item re-extracts
+// through the same safe path as the build, stamping fresh extractor
+// identity and fingerprints. Unreadable items report false and are skipped;
+// stale stored paths fall back to the live record-index path like the
+// parallel source.
+func foldReadDoc(vol *serviceVolumeIndex, settings contentExtractSettings, ctx context.Context, livePath func(frn uint64) string) func(contentFoldItem) (contentBuildDoc, bool) {
+	cctx := contentWithExtractSettings(ctx, settings)
+	return func(it contentFoldItem) (contentBuildDoc, bool) {
+		if it.path == "" {
+			return contentBuildDoc{}, false
+		}
+		if doc, _, ok := contentBuildDocSafe(cctx, contentBuildItem{frn: it.frn, path: it.path}); ok {
+			return doc, true
+		}
+		if livePath != nil {
+			if lp := livePath(it.frn); lp != "" && lp != it.path {
+				doc, _, ok := contentBuildDocSafe(cctx, contentBuildItem{frn: it.frn, path: lp})
+				return doc, ok
+			}
+		}
+		return contentBuildDoc{}, false
+	}
+}
+
+// contentFoldDiskSource merges base docs (re-read from disk in parallel,
+// in order) with delta docs (from memory) in ascending (frn, path) order.
+// v10 stores no text, so a fold re-extracts every base doc the delta does
+// not cover; the delta wins for covered keys and tombstones drop docs.
+// Unreadable base docs are skipped (logged): a file deleted mid-fold is
+// correctly dropped, and its drain tombstone converges the rest. A transient
+// read failure loses the doc until its next change (documented residual);
+// folds never publish partial text. The merge adds no corpus-sized buffer
+// (one metadata item per base doc); text flows one document at a time.
+type contentFoldDiskSource struct {
+	items    []contentFoldItem
+	delta    []contentDeltaDoc
+	pull     func() (contentExtracted, bool)
+	halt     func()
+	settings contentExtractSettings
+	livePath func(frn uint64) string
+	i        int
+	j        int
+	skips    int
+	vol      string
+}
+
+// newContentFoldDiskSource builds the source over base docs (parallel docs
+// and paths) merged with snap. settings is the extraction policy the
+// re-reads use (the service policy, matching the drain). vol names the
+// volume for skip logging. Call stop when assembly ends or aborts.
+func newContentFoldDiskSource(vol *serviceVolumeIndex, base []contentDoc, paths []string, snap []contentDeltaDoc, settings contentExtractSettings, ctx context.Context, livePath func(frn uint64) string) *contentFoldDiskSource {
+	delta := append([]contentDeltaDoc(nil), snap...)
+	sort.Slice(delta, func(i, j int) bool {
+		if delta[i].FRN != delta[j].FRN {
+			return delta[i].FRN < delta[j].FRN
+		}
+		return delta[i].Path < delta[j].Path
+	})
+	items := make([]contentFoldItem, 0, len(base))
+	for i := range base {
+		p := ""
+		if i < len(paths) {
+			p = paths[i]
+		}
+		if p == "" {
+			// No path, no re-read: the prefetch yields exactly one result
+			// per submitted item, so unsubmittable docs must not occupy
+			// merge positions (that would misalign every later result).
+			// Stored paths are never empty in practice; a hole drops the
+			// doc until its next change re-adds it through the delta.
+			continue
+		}
+		items = append(items, contentFoldItem{frn: base[i].FRN, path: p, size: int64(base[i].TextLen)})
+	}
+	bitems := make([]contentBuildItem, 0, len(items))
+	for _, it := range items {
+		bitems = append(bitems, contentBuildItem{frn: it.frn, path: it.path})
+	}
+	cctx := contentWithExtractSettings(ctx, settings)
+	next, stop := contentPrefetchExtract(cctx, bitems, contentBuildWorkerCount(), contentBuildDocSafe)
+	name := ""
+	if vol != nil {
+		name = vol.volume
+	}
+	return &contentFoldDiskSource{items: items, delta: delta, pull: next, halt: stop, settings: settings, livePath: livePath, vol: name}
+}
+
+// stop frees the prefetch workers and open handles.
+func (m *contentFoldDiskSource) stop() {
+	if m == nil || m.halt == nil {
+		return
+	}
+	m.halt()
+}
+
+// next serves the merged stream in (frn, path) order. Base docs covered by
+// the delta come from the delta; tombstoned docs vanish; unreadable base
+// docs are skipped with a bounded log.
+func (m *contentFoldDiskSource) next() (contentBuildDoc, bool, error) {
+	for {
+		// Advance the base cursor past delta-covered keys without consuming
+		// prefetch results out of order: the prefetch yields in item order,
+		// so results are consumed strictly front-to-back.
+		for m.i < len(m.items) && m.j < len(m.delta) && m.delta[m.j].FRN < m.items[m.i].frn {
 			d := m.delta[m.j]
 			m.j++
-			m.i++
 			if d.Deleted {
 				continue
 			}
 			return contentBuildDoc{frn: d.FRN, path: d.Path, text: d.Text, class: d.ContentType, version: d.ExtractorVersion, fileSize: d.FileSize, fileModNano: d.FileModNano}, true, nil
-		default:
+		}
+		if m.j < len(m.delta) && (m.i >= len(m.items) || m.delta[m.j].FRN == m.items[m.i].frn) {
+			// Same FRN: the delta replaces the base doc; consume both sides.
+			d := m.delta[m.j]
+			m.j++
+			if m.i < len(m.items) {
+				m.i++
+				if _, live := m.pull(); !live {
+					return contentBuildDoc{}, false, errors.New("content fold re-read stopped")
+				}
+			}
+			if d.Deleted {
+				continue
+			}
+			return contentBuildDoc{frn: d.FRN, path: d.Path, text: d.Text, class: d.ContentType, version: d.ExtractorVersion, fileSize: d.FileSize, fileModNano: d.FileModNano}, true, nil
+		}
+		if m.i >= len(m.items) {
+			// Drain any remaining delta-only tail.
+			for m.j < len(m.delta) {
+				d := m.delta[m.j]
+				m.j++
+				if d.Deleted {
+					continue
+				}
+				return contentBuildDoc{frn: d.FRN, path: d.Path, text: d.Text, class: d.ContentType, version: d.ExtractorVersion, fileSize: d.FileSize, fileModNano: d.FileModNano}, true, nil
+			}
 			return contentBuildDoc{}, false, nil
 		}
+		got, live := m.pull()
+		if !live {
+			return contentBuildDoc{}, false, errors.New("content fold re-read stopped")
+		}
+		m.i++
+		doc, res, ok := got.doc, got.res, got.ok
+		if !ok && m.livePath != nil {
+			// The stored path is stale (most often an intra-volume rename,
+			// which keeps the FRN but moves the file): resolve the live
+			// record-index path and retry once. A rename without content
+			// change is not re-extracted by the drain, so without this the
+			// doc would be dropped until its next change.
+			if lp := m.livePath(m.items[m.i-1].frn); lp != "" && lp != m.items[m.i-1].path {
+				doc, res, ok = contentBuildDocSafe(contentWithExtractSettings(context.Background(), m.settings), contentBuildItem{frn: m.items[m.i-1].frn, path: lp})
+			}
+		}
+		if !ok {
+			// Skip unreadable/unextractable base docs (a mid-fold delete is
+			// correctly dropped); bound the log, not the skip.
+			m.skips++
+			if m.skips <= 10 {
+				reason := res.Reason
+				if reason == "" {
+					reason = "unreadable"
+				}
+				serviceLog("content fold volume=%s skip %s: %s", m.vol, m.items[m.i-1].path, reason)
+			}
+			continue
+		}
+		_ = res
+		return doc, true, nil
 	}
 }

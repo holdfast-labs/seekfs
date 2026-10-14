@@ -91,6 +91,7 @@ func assertBoundedDifferentialEqual(t *testing.T, label string, oldTrace, newTra
 
 func TestContentBoundedCandidatesDifferential(t *testing.T) {
 	t.Setenv("SEEKFS_CONTENT_SEARCH", "1")
+	uncappedDiskVerify(t)
 	volC := newContentRecordVolume(t, "C:", contentBoundedDifferentialRecords("C:", 4_300, 1_000_000))
 	volF := newContentRecordVolume(t, "F:", contentBoundedDifferentialRecords("F:", 4_300, 2_000_000))
 
@@ -148,6 +149,7 @@ func TestContentBoundedCandidatesDifferential(t *testing.T) {
 // they tally in place over the full match set.
 func TestContentBoundedCountMatchesSearchDifferential(t *testing.T) {
 	t.Setenv("SEEKFS_CONTENT_SEARCH", "1")
+	uncappedDiskVerify(t)
 	volC := newContentRecordVolume(t, "C:", contentBoundedDifferentialRecords("C:", 4_300, 1_000_000))
 	volF := newContentRecordVolume(t, "F:", contentBoundedDifferentialRecords("F:", 4_300, 2_000_000))
 	scopes := []struct {
@@ -196,6 +198,7 @@ func TestContentBoundedCountMatchesSearchDifferential(t *testing.T) {
 // search. This is the case that makes a per-volume page-limit reduction unsafe.
 func TestContentBoundedMultiVolumeDuplicateNameDifferential(t *testing.T) {
 	t.Setenv("SEEKFS_CONTENT_SEARCH", "1")
+	uncappedDiskVerify(t)
 	mk := func(volume string, baseFRN uint64, dirs []string) []contentVolRecord {
 		recs := make([]contentVolRecord, 0, len(dirs))
 		for i, dir := range dirs {
@@ -240,6 +243,7 @@ func TestContentBoundedMultiVolumeDuplicateNameDifferential(t *testing.T) {
 // window-full query reports complete while the pre-PB8 arm reports incomplete.
 func TestContentBoundedHiddenOverlayCompletenessDifferential(t *testing.T) {
 	t.Setenv("SEEKFS_CONTENT_SEARCH", "1")
+	uncappedDiskVerify(t)
 	vol := newContentRecordVolume(t, "C:", contentBoundedDifferentialRecords("C:", 4_300, 1_000_000))
 	// Tombstone the first base record (FRN 1_000_002) so the volume carries
 	// hidden IDs. The broad term still matches every remaining document.
@@ -275,6 +279,7 @@ func TestContentBoundedHiddenOverlayCompletenessDifferential(t *testing.T) {
 // while the pre-PB8 arm reports incomplete.
 func TestContentBoundedOverlayAdditionCompletenessDifferential(t *testing.T) {
 	t.Setenv("SEEKFS_CONTENT_SEARCH", "1")
+	uncappedDiskVerify(t)
 	vol := newContentRecordVolume(t, "C:", contentBoundedDifferentialRecords("C:", 4_300, 1_000_000))
 	const addedFRN = 9_000_001
 	vol.applyUSNChanges([]usnChange{{
@@ -311,6 +316,7 @@ func TestContentBoundedOverlayAdditionCompletenessDifferential(t *testing.T) {
 // including completeness.
 func TestContentBoundedPathShapeCompletenessDifferential(t *testing.T) {
 	t.Setenv("SEEKFS_CONTENT_SEARCH", "1")
+	uncappedDiskVerify(t)
 	vol := newContentRecordVolume(t, "C:", contentBoundedDifferentialRecords("C:", 4_300, 1_000_000))
 	vols := []*serviceVolumeIndex{vol}
 	shapes := []struct {
@@ -350,6 +356,7 @@ func TestContentBoundedPathShapeCompletenessDifferential(t *testing.T) {
 // order is exactly the non-early-stop result's prefix.
 func TestContentBoundedBiasedDifferential(t *testing.T) {
 	t.Setenv("SEEKFS_CONTENT_SEARCH", "1")
+	uncappedDiskVerify(t)
 	vol := newContentRecordVolume(t, "C:", contentBoundedDifferentialRecords("C:", 4_300, 1_000_000))
 	vols := []*serviceVolumeIndex{vol}
 	queries := []string{
@@ -446,6 +453,7 @@ func contentBiasedNestedRecords(volume string, baseFRN uint64, filesPerDir int) 
 // volume.
 func TestContentBoundedBiasedHiddenDifferential(t *testing.T) {
 	t.Setenv("SEEKFS_CONTENT_SEARCH", "1")
+	uncappedDiskVerify(t)
 	volC := newContentRecordVolume(t, "C:", contentBiasedNestedRecords("C:", 1_000_000, 1_100))
 	volF := newContentRecordVolume(t, "F:", contentBiasedNestedRecords("F:", 2_000_000, 1_100))
 	// Hide every alpha file (i%4==0, frn = base + 1000 + i), far more than a
@@ -513,6 +521,7 @@ func TestContentBoundedBiasedHiddenDifferential(t *testing.T) {
 // fixture so a hit under the bias root actually reorders the result.
 func TestContentBoundedBiasedFilenameMultiVolumeDifferential(t *testing.T) {
 	t.Setenv("SEEKFS_CONTENT_SEARCH", "1")
+	uncappedDiskVerify(t)
 	volC := newContentRecordVolume(t, "C:", contentBiasedNestedRecords("C:", 1_000_000, 1_100))
 	volF := newContentRecordVolume(t, "F:", contentBiasedNestedRecords("F:", 2_000_000, 1_100))
 	scopes := []struct {
@@ -568,6 +577,7 @@ func TestContentBoundedBiasedFilenameMultiVolumeDifferential(t *testing.T) {
 // scan this fixes.
 func TestContentBoundedNonBiasedHiddenDifferential(t *testing.T) {
 	t.Setenv("SEEKFS_CONTENT_SEARCH", "1")
+	uncappedDiskVerify(t)
 	const total = 200
 	const hiddenTotal = 60
 	const limit = 20
@@ -777,6 +787,7 @@ func TestContentOrUnionStreamMatchesMaterializedUnion(t *testing.T) {
 // does not disable it.
 func TestContentBoundedBiasedEarlyStopStopsNearLimit(t *testing.T) {
 	t.Setenv("SEEKFS_CONTENT_SEARCH", "1")
+	uncappedDiskVerify(t)
 	vol := newContentRecordVolume(t, "C:", contentBiasedNestedRecords("C:", 1_000_000, 1_100))
 	const limit = 20
 	trace := &searchTrace{}

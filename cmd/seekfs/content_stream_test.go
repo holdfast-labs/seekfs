@@ -18,7 +18,11 @@ import (
 // contentStreamTestDocs builds a deterministic synthetic corpus: mixed
 // scripts, case, multibyte text and long words so terms, grams, text, paths,
 // policy and scope sections are all non-trivial.
-func contentStreamTestDocs(n int) []contentBuildDoc {
+func contentStreamTestDocs(t *testing.T, n int) []contentBuildDoc {
+	t.Helper()
+	// v10 verifies from disk: materialize the synthetic corpus as real
+	// files and index their absolute paths.
+	dir := t.TempDir()
 	docs := make([]contentBuildDoc, 0, n)
 	for i := 0; i < n; i++ {
 		body := fmt.Sprintf("Needle Doc %d caf\u00e9 \u4e2d\u6587 %s tail-%d", i, "lorem ipsum dolor sit amet ", i%7)
@@ -28,9 +32,16 @@ func contentStreamTestDocs(n int) []contentBuildDoc {
 		if i%13 == 0 {
 			body += " UNIQUEMARKER" + fmt.Sprintf("%d", i)
 		}
-		path := fmt.Sprintf("sub/dir%02d/file%04d.txt", i%17, i)
+		rel := fmt.Sprintf("sub/dir%02d/file%04d.txt", i%17, i)
+		full := filepath.Join(dir, filepath.FromSlash(rel))
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(full, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
 		docs = append(docs, contentBuildDoc{
-			path:    path,
+			path:    full,
 			frn:     uint64(1000 + i*3),
 			text:    []byte(body),
 			modUnix: 1_700_000_000 + int64(i),
@@ -113,7 +124,7 @@ func TestContentExternalBuilderFinishFileParity(t *testing.T) {
 // byte-identical to contentIndexEncode for the same input (including policy
 // and scope sections), and that the streamed file decodes and searches.
 func TestContentStreamedSaveMatchesInMemoryEncode(t *testing.T) {
-	docs := contentStreamTestDocs(500)
+	docs := contentStreamTestDocs(t, 500)
 	tmp := t.TempDir()
 
 	mem, err := assembleContentIndex(docs, tmp)
@@ -125,7 +136,7 @@ func TestContentStreamedSaveMatchesInMemoryEncode(t *testing.T) {
 	mem.BuiltAt = time.Unix(0, 5)
 	want := contentIndexEncode(mem)
 
-	built, err := assembleContentIndexStreamed(contentStreamTestSource(docs), tmp)
+	built, err := assembleContentIndexStreamed(contentStreamTestSource(docs), tmp, contentFilterID{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -156,11 +167,11 @@ func TestContentStreamedSaveMatchesInMemoryEncode(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if hits := r.search("needle", 0); len(hits) != len(docs) {
+	if hits, _ := r.search("needle", 0); len(hits) != len(docs) {
 		t.Fatalf("search hits = %d; want %d", len(hits), len(docs))
 	}
 	// UNIQUEMARKER39 also matches doc 390 (substring), so expect both.
-	if hits := r.search("UNIQUEMARKER39", 0); len(hits) != 2 {
+	if hits, _ := r.search("UNIQUEMARKER39", 0); len(hits) != 2 {
 		t.Fatalf("selective search hits = %d; want 2", len(hits))
 	}
 }
@@ -168,9 +179,9 @@ func TestContentStreamedSaveMatchesInMemoryEncode(t *testing.T) {
 // TestContentStreamedSaveRespectsSizeCap proves an over-cap streamed save is
 // refused with contentGSXSizeError and writes nothing.
 func TestContentStreamedSaveRespectsSizeCap(t *testing.T) {
-	docs := contentStreamTestDocs(50)
+	docs := contentStreamTestDocs(t, 50)
 	tmp := t.TempDir()
-	built, err := assembleContentIndexStreamed(contentStreamTestSource(docs), tmp)
+	built, err := assembleContentIndexStreamed(contentStreamTestSource(docs), tmp, contentFilterID{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -202,7 +213,7 @@ func TestContentStreamedSaveRespectsSizeCap(t *testing.T) {
 // streaming path loads as a composite member: save two shards plus a manifest
 // and query across them.
 func TestContentStreamedShardSaveRoundTrip(t *testing.T) {
-	docs := contentStreamTestDocs(200)
+	docs := contentStreamTestDocs(t, 200)
 	tmp := t.TempDir()
 	gsx := filepath.Join(tmp, "sharded.gsx")
 	dir := contentShardDir(gsx)
@@ -211,7 +222,7 @@ func TestContentStreamedShardSaveRoundTrip(t *testing.T) {
 	}
 	var infos []contentShardInfo
 	for shard, chunk := range [][]contentBuildDoc{docs[:100], docs[100:]} {
-		built, err := assembleContentIndexStreamed(contentStreamTestSource(chunk), tmp)
+		built, err := assembleContentIndexStreamed(contentStreamTestSource(chunk), tmp, contentFilterID{})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -239,7 +250,7 @@ func TestContentStreamedShardSaveRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if hits := r.search("needle", 0); len(hits) != len(docs) {
+	if hits, _ := r.search("needle", 0); len(hits) != len(docs) {
 		t.Fatalf("composite search hits = %d; want %d", len(hits), len(docs))
 	}
 }

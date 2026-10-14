@@ -8,11 +8,10 @@ import (
 	"testing"
 )
 
-// contentFilterServiceFixture builds a USN service volume over real files:
-// tier1Names are indexed in the full tier, the rest are covered by an
-// attached tier-2 filter with real fingerprints, so disk verification reads
-// the same files the brute-force oracle does.
-func contentFilterServiceFixture(t *testing.T, bodies map[string]string, tier1Names []string) *serviceVolumeIndex {
+// contentFilterV10Fixture builds a USN service volume over real files with a
+// v10 index (postings + filter, no stored text): every file is verified from
+// disk, so the fixture doubles as the freshness oracle — no stubs.
+func contentFilterV10Fixture(t *testing.T, bodies map[string]string) *serviceVolumeIndex {
 	t.Helper()
 	t.Setenv("SEEKFS_CONTENT_SEARCH", "1")
 	dir := t.TempDir()
@@ -22,38 +21,28 @@ func contentFilterServiceFixture(t *testing.T, bodies map[string]string, tier1Na
 	}
 	sort.Strings(names)
 	for _, name := range names {
-		if err := os.WriteFile(filepath.Join(dir, name), []byte(bodies[name]), 0o644); err != nil {
+		full := filepath.Join(dir, filepath.FromSlash(name))
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
 			t.Fatal(err)
 		}
-	}
-	inTier1 := map[string]bool{}
-	for _, name := range tier1Names {
-		inTier1[name] = true
+		if err := os.WriteFile(full, []byte(bodies[name]), 0o644); err != nil {
+			t.Fatal(err)
+		}
 	}
 	idx := &Index{Source: "usn", Volume: dir, Compact: true}
 	var frn uint64 = 10
-	frns := map[string]uint64{}
+	var build []contentBuildDoc
 	for _, name := range names {
-		st, err := os.Stat(filepath.Join(dir, name))
+		full := filepath.Join(dir, filepath.FromSlash(name))
+		st, err := os.Stat(full)
 		if err != nil {
 			t.Fatal(err)
 		}
-		idx.Records = append(idx.Records, CompactRecord{FRN: frn, ParentFRN: 1, Parent: -1, Name: name, Size: st.Size()})
-		frns[name] = frn
+		idx.Records = append(idx.Records, CompactRecord{FRN: frn, ParentFRN: 1, Parent: -1, Name: filepath.Base(name), Size: st.Size()})
+		build = append(build, contentBuildDoc{path: full, frn: frn, text: []byte(bodies[name])})
 		frn++
 	}
 	contentIndexFRNs(idx)
-	var build []contentBuildDoc
-	fb := newContentFilterBuilder(contentOriginUSN, contentExtractMaxRawBytes, contentExtractMaxTextBytes, [32]byte{}, "")
-	for _, name := range names {
-		path := filepath.Join(dir, name)
-		st, _ := os.Stat(path)
-		if inTier1[name] {
-			build = append(build, contentBuildDoc{path: path, frn: frns[name], text: []byte(bodies[name])})
-			continue
-		}
-		fb.Add(frns[name], path, st.Size(), st.ModTime().UnixNano(), []byte(bodies[name]))
-	}
 	cidx, err := assembleContentIndex(build, t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -63,27 +52,26 @@ func contentFilterServiceFixture(t *testing.T, bodies map[string]string, tier1Na
 	if err != nil {
 		t.Fatal(err)
 	}
-	vol := newServiceVolumeIndex(filepath.Join(t.TempDir(), "seekfs_f.gsi"), idx)
+	vol := newServiceVolumeIndex(filepath.Join(t.TempDir(), "seekfs_v10.gsi"), idx)
 	if vol.content == nil {
 		t.Fatal("content state not initialized")
 	}
-	frnList := make([]uint64, len(cidx.Docs))
+	frns := make([]uint64, len(cidx.Docs))
 	ids := make([]uint32, len(cidx.Docs))
 	for i := range cidx.Docs {
-		frnList[i] = cidx.Docs[i].FRN
+		frns[i] = cidx.Docs[i].FRN
 		ids[i] = uint32(contentRecordIndexForFRN(idx, cidx.Docs[i].FRN))
 	}
-	vol.content.setReady(cidx, reader, buildContentResolver(cidx.Docs, frnList, ids))
-	if flt := fb.Finish(); flt != nil {
-		vol.content.setFilter(flt)
-	}
+	vol.content.setReady(cidx, reader, buildContentResolver(cidx.Docs, frns, ids))
+	vol.rebuildNameTrigramsLocked()
 	releaseVolumeContentOnCleanup(t, vol)
 	return vol
 }
 
-// contentFilterBruteForce evaluates the full content predicate for one query
-// over real files, the oracle the tier-2 pipeline must equal.
-func contentFilterBruteForce(t *testing.T, dir string, bodies map[string]string, query string) []string {
+// contentFilterV10BruteForce evaluates the full content predicate for one
+// query over real files: the oracle the v10 pipeline must equal. Entry paths
+// are the reconstructed record paths, exactly as the service builds them.
+func contentFilterV10BruteForce(t *testing.T, vol *serviceVolumeIndex, bodies map[string]string, query string) []string {
 	t.Helper()
 	opts := queryOptions{Query: query}
 	pq, err := parseQuery(opts)
@@ -94,13 +82,16 @@ func contentFilterBruteForce(t *testing.T, dir string, bodies map[string]string,
 	settings := contentServiceExtractSettings()
 	ctx := contentWithExtractSettings(t.Context(), settings)
 	var out []string
-	names := make([]string, 0, len(bodies))
-	for name := range bodies {
-		names = append(names, name)
-	}
-	sort.Strings(names)
-	for _, name := range names {
-		path := filepath.Join(dir, name)
+	cache := map[int]string{}
+	for id := 0; id < vol.index.compactRecordCount(); id++ {
+		rec := vol.index.compactRecord(id)
+		if rec.Deleted || rec.Mode&uint32(os.ModeDir) != 0 {
+			continue
+		}
+		path := vol.index.reconstructCompactPathCached(id, cache)
+		if path == "" {
+			continue
+		}
 		s, serr := contentSlurpNoRecall(path, settings.maxRaw)
 		if serr != nil {
 			continue
@@ -116,20 +107,27 @@ func contentFilterBruteForce(t *testing.T, dir string, bodies map[string]string,
 			continue
 		}
 		text := contentStoredText(res.Text)
-		entry := Entry{Path: path, Name: name, LowerName: strings.ToLower(name), LowerPath: strings.ToLower(path)}
-		if entryMatchesContentAt(entry, pq, pq.MatchPath, contentFilterMatchText(text, m)) {
+		entry := Entry{Path: path, Name: rec.Name, LowerName: strings.ToLower(rec.Name), LowerPath: strings.ToLower(path)}
+		matched := make([]bool, m.size)
+		var folded []byte
+		foldedReady := false
+		for _, leaf := range m.leaves {
+			matched[leaf.LeafID] = m.matchRawFirst(text, &folded, &foldedReady, leaf)
+		}
+		if entryMatchesContentAt(entry, pq, pq.MatchPath, matched) {
 			out = append(out, path)
 		}
 	}
+	sort.Strings(out)
 	return out
 }
 
-// TestContentFilterServiceDifferential proves tier-2 answers equal brute force
-// through the full service path (tier-1 postings + filter + disk verify +
-// merge + limit) for many query shapes: rare/common literals, AND, phrase,
-// OR, NOT, regex with required literals, case-sensitive, and a filename
-// compound.
-func TestContentFilterServiceDifferential(t *testing.T) {
+// TestContentFilterV10ServiceDifferential proves v10 answers equal brute
+// force through the full service path (postings + filter gate + disk verify
+// + merge + limit) for every query shape: rare/common literals, AND,
+// phrase, OR, NOT, regex with required literals, case-sensitive, filename
+// compounds, and the empty answer. Count agrees with search throughout.
+func TestContentFilterV10ServiceDifferential(t *testing.T) {
 	bodies := map[string]string{
 		"a.txt": "alpha needle one",
 		"b.txt": "bravo nothing here",
@@ -147,9 +145,10 @@ func TestContentFilterServiceDifferential(t *testing.T) {
 		"n.txt": "november foo bar",
 		"o.txt": "oscar",
 		"p.txt": "papa STRUCT",
+		"q.txt": "quebec mutex needle",
 	}
-	vol := contentFilterServiceFixture(t, bodies, []string{"a.txt", "b.txt", "i.txt"})
-	dir := vol.volume
+	vol := contentFilterV10Fixture(t, bodies)
+	vols := []*serviceVolumeIndex{vol}
 	queries := []string{
 		"content:needle",
 		"content:NEEDLE",
@@ -160,11 +159,13 @@ func TestContentFilterServiceDifferential(t *testing.T) {
 		"content:needle !content:juliet",
 		`content:/ne+dle/`,
 		`content:/mutex_\w+/`,
+		`content:/zzz\d+/`,
 		"case:true content:Needle",
 		"case:true content:STRUCT",
 		"ext:txt content:needle",
 		"content:zzz-no-match",
 		"content:the",
+		"content:ab",
 	}
 	for _, q := range queries {
 		matches, err := contentServiceSearch(t, vol, q, false)
@@ -179,7 +180,7 @@ func TestContentFilterServiceDifferential(t *testing.T) {
 			}
 		}
 		want := map[string]bool{}
-		for _, p := range contentFilterBruteForce(t, dir, bodies, q) {
+		for _, p := range contentFilterV10BruteForce(t, vol, bodies, q) {
 			want[p] = true
 		}
 		if len(got) != len(want) {
@@ -190,225 +191,15 @@ func TestContentFilterServiceDifferential(t *testing.T) {
 				t.Fatalf("%s: missing %q in %v", q, p, got)
 			}
 		}
-		// Count agrees with search on every shape.
-		if n := contentServiceCount(t, []*serviceVolumeIndex{vol}, q); n != len(want) {
+		if n := contentServiceCount(t, vols, q); n != len(want) {
 			t.Fatalf("%s: count=%d search=%d", q, n, len(want))
 		}
 	}
 }
 
-// TestContentFilterServiceTier1OrderUnchanged proves tier-1 results keep
-// their exact order and content with a filter attached: the tier-1-only
-// answer is a prefix of the combined answer.
-func TestContentFilterServiceTier1OrderUnchanged(t *testing.T) {
-	bodies := map[string]string{
-		"a.txt": "alpha needle one",
-		"b.txt": "bravo needle two",
-		"c.txt": "charlie needle three",
-		"d.txt": "delta needle four",
-	}
-	vol := contentFilterServiceFixture(t, bodies, []string{"a.txt", "b.txt"})
-	// Detach the filter: tier-1-only baseline through the same path.
-	flt := vol.content.filterView()
-	vol.content.setFilter(nil)
-	baseline, err := contentServiceSearch(t, vol, "content:needle", false)
-	if err != nil {
-		t.Fatal(err)
-	}
-	vol.content.setFilter(flt)
-	combined, err := contentServiceSearch(t, vol, "content:needle", false)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(combined) != len(bodies) {
-		t.Fatalf("combined = %d hits; want %d", len(combined), len(bodies))
-	}
-	for i := range baseline {
-		if combined[i].Path != baseline[i].Path {
-			t.Fatalf("tier-1 order moved at %d: %q vs %q", i, combined[i].Path, baseline[i].Path)
-		}
-	}
-}
-
-// TestContentFilterServiceCapMarksIncomplete proves the per-query disk
-// verification bound: a tiny cap stops the filter scan, the search reports
-// incomplete, and the count is refused (never partial).
-func TestContentFilterServiceCapMarksIncomplete(t *testing.T) {
-	bodies := map[string]string{}
-	for i := 0; i < 30; i++ {
-		bodies[string(rune('a'+i/10))+string(rune('0'+i%10))+".txt"] = "common filler needle"
-	}
-	vol := contentFilterServiceFixture(t, bodies, nil)
-	oldCap := contentFilterMaxVerify
-	contentFilterMaxVerify = 3
-	defer func() { contentFilterMaxVerify = oldCap }()
-	matches, trace, err := contentServiceSearchLimit(t, []*serviceVolumeIndex{vol}, "content:needle", 100)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if trace == nil || !trace.ContentIncomplete {
-		t.Fatalf("capped filter scan did not mark incomplete (hits=%d)", len(matches))
-	}
-	if len(matches) > 3 {
-		t.Fatalf("capped scan returned %d hits past a 3-verify cap", len(matches))
-	}
-	if _, _, err := countServiceVolumes([]*serviceVolumeIndex{vol}, queryOptions{Query: "content:needle", Trace: &searchTrace{}}); err == nil {
-		t.Fatal("capped filter count was answered instead of refused")
-	}
-}
-
-// TestContentFilterServiceBuildCoversDrops proves the service build covers
-// dropped files with tier 2 from the same extraction pass: the policy still
-// records the exact tier-1 drop, the filter sidecar holds the file, and
-// health reports no uncovered files (ready, not degraded).
-func TestContentFilterServiceBuildCoversDrops(t *testing.T) {
-	t.Setenv("SEEKFS_CONTENT_SEARCH", "1")
-	stubContentCatchUpSync(t)
-	stubContentBuildSync(t)
-	dir := t.TempDir()
-	// The dropped file is large: its ~360 B filter record fits the remaining
-	// budget while its 5 KB text does not. (A file tinier than its own
-	// filter record can never be filter-covered from the same pool — it is
-	// only dropped when the remainder fits neither — so small files always
-	// resolve to tier 1 or to uncovered.)
-	bigBody := "charlie? " + strings.Repeat("padding text for the dropped file. ", 150)
-	bodies := map[string]string{
-		"a.txt": "alpha",
-		"b.txt": "bravo!",
-		"c.txt": bigBody,
-	}
-	for name, body := range bodies {
-		if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o644); err != nil {
-			t.Fatal(err)
-		}
-	}
-	const journal = uint64(95)
-	const cp = int64(103)
-	stubContentCatchUpJournal(t, usnJournalDataV0{UsnJournalID: journal, FirstUsn: 1, LowestValidUsn: 1, NextUsn: cp})
-	vol, gsx := contentBuildTestVolume(t, dir, journal, uint64(cp), []CompactRecord{
-		{FRN: 1, Parent: -1, Name: "a.txt", Size: 5},
-		{FRN: 2, Parent: -1, Name: "b.txt", Size: 6},
-		{FRN: 3, Parent: -1, Name: "c.txt", Size: int64(len(bigBody))},
-	})
-	s := contentTestService(t)
-	// Budget fits a.txt + b.txt as tier 1; c.txt's text exceeds the
-	// remainder but its filter record fits inside the same budget.
-	s.contentCfg.Content.BudgetBytes = 500
-	s.ensureContentBuild(vol)
-	built, err := contentLoadFile(gsx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	releaseContentIndexOnCleanup(t, built)
-	if len(built.Docs) != 2 || built.Policy.ScopeDropped != 1 {
-		t.Fatalf("budgeted index docs=%d dropped=%d; want 2 docs, 1 dropped", len(built.Docs), built.Policy.ScopeDropped)
-	}
-	flt, err := contentLoadFilter(contentFilterPathForGSX(gsx))
-	if err != nil {
-		t.Fatalf("filter sidecar missing: %v", err)
-	}
-	defer flt.Release()
-	if len(flt.Records) != 1 || flt.Records[0].Key != 3 {
-		t.Fatalf("filter records = %+v; want the dropped FRN 3", flt.Records)
-	}
-	h := vol.content.healthSnapshot(0)
-	if h.FilterFiles != 1 || h.FilterBytes != flt.EncodedSize {
-		t.Fatalf("filter health = %+v; want 1 file", h)
-	}
-	if h.ScopeDropped != 0 || h.ScopeDroppedBytes != 0 {
-		t.Fatalf("covered drops still reported uncovered: %+v", h)
-	}
-	if h.Incomplete || h.State != contentStateReady {
-		t.Fatalf("fully-covered build not ready: %+v", h)
-	}
-	// The dropped file answers through the service with tier-2 verification.
-	matches, err := contentServiceSearch(t, vol, "content:padding", false)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(matches) != 1 || !strings.HasSuffix(matches[0].Path, "c.txt") {
-		t.Fatalf("tier-2 query = %v; want c.txt", matches)
-	}
-}
-
-// TestContentFilterFoldRefresh proves a changed filter-covered file refreshes
-// its record through drain → delta → fold: the new text matches, the old
-// text stops, and tier-1 docs are untouched.
-func TestContentFilterFoldRefresh(t *testing.T) {
-	t.Setenv("SEEKFS_CONTENT_SEARCH", "1")
-	stubContentCatchUpSync(t)
-	stubContentBuildSync(t)
-	dir := t.TempDir()
-	oldWord := "charlie filter oldword " + strings.Repeat("padding text for the covered file. ", 60)
-	files := map[string]string{
-		"a.txt": "alpha tier one",
-		"b.txt": "bravo tier one",
-		"c.txt": oldWord,
-	}
-	for name, body := range files {
-		if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o644); err != nil {
-			t.Fatal(err)
-		}
-	}
-	const journal = uint64(96)
-	const cp = int64(104)
-	stubContentCatchUpJournal(t, usnJournalDataV0{UsnJournalID: journal, FirstUsn: 1, LowestValidUsn: 1, NextUsn: cp})
-	vol, gsx := contentBuildTestVolume(t, dir, journal, uint64(cp), []CompactRecord{
-		{FRN: 1, Parent: -1, Name: "a.txt", Size: 14},
-		{FRN: 2, Parent: -1, Name: "b.txt", Size: 14},
-		{FRN: 3, Parent: -1, Name: "c.txt", Size: int64(len(oldWord))},
-	})
-	s := contentTestService(t)
-	s.contentCfg.Content.BudgetBytes = 500
-	s.ensureContentBuild(vol)
-	old := vol.content.filterView()
-	if old == nil || len(old.Records) != 1 {
-		t.Fatalf("precondition: filter = %v", old)
-	}
-	// Change the filter-covered file on disk and refresh the record through
-	// the fold path with a delta doc as the drain would produce it.
-	newWord := "charlie filter newword " + strings.Repeat("padding text for the covered file. ", 60)
-	if err := os.WriteFile(filepath.Join(dir, "c.txt"), []byte(newWord), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	nst, err := os.Stat(filepath.Join(dir, "c.txt"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	reader, _ := vol.content.readerResolverView()
-	base := reader.idx
-	refresh := []contentDeltaDoc{{
-		FRN: 3, Path: filepath.Join(dir, "c.txt"), Text: []byte(newWord),
-		FileSize: nst.Size(), FileModNano: nst.ModTime().UnixNano(),
-	}}
-	s.publishFilterRefresh(vol, vol.replayGen.Load(), base, old, refresh)
-	next := vol.content.filterView()
-	if next == nil || len(next.Records) != 1 {
-		t.Fatalf("refreshed filter = %v", next)
-	}
-	rec := next.Records[0]
-	if rec.FileSize != nst.Size() || rec.FileModNano != nst.ModTime().UnixNano() {
-		t.Fatalf("fingerprint not restamped: %+v", rec)
-	}
-	if !rec.mayMatch(contentFilterGramsOf(contentFoldText([]byte("newword")))) {
-		t.Fatal("refreshed record misses its new text")
-	}
-	// The dropped file answers with the new text through the service.
-	matches, err := contentServiceSearch(t, vol, "content:newword", false)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(matches) != 1 {
-		t.Fatalf("post-refresh query = %v; want c.txt", matches)
-	}
-	_ = gsx
-}
-
-// TestContentFilterLaneParityWithPerVolumePath proves the compound lane's
-// tier-2 fallback answers identically with the lane off: same sets, same
-// order, same snippets — on a filtered volume, where the lane's inline
-// verify cannot see tier-2 files without the fallback.
-func TestContentFilterLaneParityWithPerVolumePath(t *testing.T) {
+// TestContentFilterV10LaneParity proves the compound lane answers identically
+// with the lane off on real files: same sets, order, snippets and counts.
+func TestContentFilterV10LaneParity(t *testing.T) {
 	bodies := map[string]string{
 		"a.txt": "alpha needle one",
 		"b.txt": "bravo needle two",
@@ -416,14 +207,12 @@ func TestContentFilterLaneParityWithPerVolumePath(t *testing.T) {
 		"d.txt": "delta nothing",
 		"e.md":  "echo needle markdown",
 	}
-	vol := contentFilterServiceFixture(t, bodies, []string{"a.txt"})
+	vol := contentFilterV10Fixture(t, bodies)
 	vols := []*serviceVolumeIndex{vol}
 	queries := []string{
 		"ext:txt content:needle",
 		"ext:txt content:alpha content:needle",
 		`ext:txt content:/ne+dle/`,
-		// Pure content queries have no filename side, so the lane declines
-		// them; they are covered by TestContentFilterServiceDifferential.
 	}
 	for _, q := range queries {
 		on, onTrace := contentGlobalLaneSearch(vols, q, 100, true)
@@ -443,7 +232,6 @@ func TestContentFilterLaneParityWithPerVolumePath(t *testing.T) {
 				t.Fatalf("%s: hit %d differs:\nlane=%+v\nslow =%+v", q, i, on[i], off[i])
 			}
 		}
-		// Count agrees across lanes too.
 		if nOn, _ := contentGlobalLaneCount(vols, q, true); nOn != len(off) {
 			t.Fatalf("%s: lane count=%d search=%d", q, nOn, len(off))
 		}
@@ -452,12 +240,168 @@ func TestContentFilterLaneParityWithPerVolumePath(t *testing.T) {
 		}
 	}
 }
-// TestContentFilterHealthMerge proves the aggregate sums tier-2 coverage.
+
+// TestContentDiskVerifyBudgetBoundsQuery proves the per-query disk bound on a
+// live volume: a tiny budget stops the search (incomplete, bounded hits)
+// and refuses the count (never partial).
+func TestContentDiskVerifyBudgetBoundsQuery(t *testing.T) {
+	bodies := map[string]string{}
+	for i := 0; i < 30; i++ {
+		bodies["f"+string(rune('a'+i/10))+string(rune('0'+i%10))+".txt"] = "common filler needle"
+	}
+	vol := contentFilterV10Fixture(t, bodies)
+	prev := contentDiskVerifyBudget
+	contentDiskVerifyBudget = 3
+	t.Cleanup(func() { contentDiskVerifyBudget = prev })
+	matches, trace, err := contentServiceSearchLimit(t, []*serviceVolumeIndex{vol}, "content:needle", 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if trace == nil || !trace.ContentIncomplete {
+		t.Fatalf("capped query did not mark incomplete (hits=%d)", len(matches))
+	}
+	if len(matches) > 3 {
+		t.Fatalf("capped query returned %d hits past a 3-verify budget", len(matches))
+	}
+	if _, _, err := countServiceVolumes([]*serviceVolumeIndex{vol}, queryOptions{Query: "content:needle", Trace: &searchTrace{}}); err == nil {
+		t.Fatal("capped count was answered instead of refused")
+	}
+}
+
+// TestContentFilterV10BuildBudgetDropsUncovered proves budget-dropped files
+// have no coverage in v10 (no sidecar): the policy records the exact drop,
+// health reports it uncovered, and queries miss it (fail-closed, honest).
+func TestContentFilterV10BuildBudgetDropsUncovered(t *testing.T) {
+	t.Setenv("SEEKFS_CONTENT_SEARCH", "1")
+	stubContentCatchUpSync(t)
+	stubContentBuildSync(t)
+	dir := t.TempDir()
+	var bigBody strings.Builder
+	bigBody.WriteString("charlie padding ")
+	for i := 0; i < 150; i++ {
+		bigBody.WriteString("padding text for the dropped file. ")
+	}
+	big := bigBody.String()
+	for name, body := range map[string]string{"a.txt": "alpha", "b.txt": "bravo!", "c.txt": big} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	const journal = uint64(95)
+	const cp = int64(103)
+	stubContentCatchUpJournal(t, usnJournalDataV0{UsnJournalID: journal, FirstUsn: 1, LowestValidUsn: 1, NextUsn: cp})
+	vol, gsx := contentBuildTestVolume(t, dir, journal, uint64(cp), []CompactRecord{
+		{FRN: 1, Parent: -1, Name: "a.txt", Size: 5},
+		{FRN: 2, Parent: -1, Name: "b.txt", Size: 6},
+		{FRN: 3, Parent: -1, Name: "c.txt", Size: int64(len(big))},
+	})
+	s := contentTestService(t)
+	s.contentCfg.Content.BudgetBytes = 500
+	s.ensureContentBuild(vol)
+	built, err := contentLoadFile(gsx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	releaseContentIndexOnCleanup(t, built)
+	if len(built.Docs) != 2 || built.Policy.ScopeDropped != 1 {
+		t.Fatalf("budgeted index docs=%d dropped=%d; want 2 docs, 1 dropped", len(built.Docs), built.Policy.ScopeDropped)
+	}
+	h := vol.content.healthSnapshot(0)
+	if h.ScopeDropped != 1 || h.ScopeDroppedBytes != int64(len(big)) {
+		t.Fatalf("health drops = %+v; want the exact uncovered file", h)
+	}
+	if !h.Incomplete {
+		t.Fatal("budget-truncated sidecar must report incomplete")
+	}
+	// The dropped file is unfindable (no coverage, no stale hit)...
+	if matches, _ := contentServiceSearch(t, vol, "content:padding", false); len(matches) != 0 {
+		t.Fatalf("dropped file served without coverage: %v", matches)
+	}
+	// ...while indexed files answer.
+	if matches, _ := contentServiceSearch(t, vol, "content:alpha", false); len(matches) != 1 {
+		t.Fatalf("indexed file missed: %v", matches)
+	}
+}
+
+// TestContentFilterV10FoldReReadsBase proves folds re-extract base docs from
+// disk: a file modified behind the index (no USN, no drain) still converges
+// at the next fold, and the folded base carries the new text.
+func TestContentFilterV10FoldReReadsBase(t *testing.T) {
+	t.Setenv("SEEKFS_CONTENT_SEARCH", "1")
+	stubContentCatchUpSync(t)
+	stubContentBuildSync(t)
+	dir := t.TempDir()
+	files := map[string]string{
+		"a.txt": "alpha tier one",
+		"b.txt": "bravo tier one",
+		"c.txt": "charlie tier one",
+	}
+	for name, body := range files {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	const journal = uint64(96)
+	const cp = int64(104)
+	stubContentCatchUpJournal(t, usnJournalDataV0{UsnJournalID: journal, FirstUsn: 1, LowestValidUsn: 1, NextUsn: cp})
+	vol, gsx := contentBuildTestVolume(t, dir, journal, uint64(cp), []CompactRecord{
+		{FRN: 1, Parent: -1, Name: "a.txt", Size: 14},
+		{FRN: 2, Parent: -1, Name: "b.txt", Size: 14},
+		{FRN: 3, Parent: -1, Name: "c.txt", Size: 15},
+	})
+	s := contentTestService(t)
+	s.ensureContentBuild(vol)
+	if got := vol.content.stateOf(); got != contentStateReady {
+		t.Fatalf("build state = %q; want ready", got)
+	}
+	// Churn c.txt through the drain (delta) and silently rewrite a.txt on
+	// disk (no USN): the fold must carry both — the delta text and the
+	// re-read bytes.
+	if err := os.WriteFile(filepath.Join(dir, "c.txt"), []byte("charlie delta newword"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	vol.contentCoord.observeChanges([]usnChange{{FRN: 3, USN: 200, Reason: usnReasonDataOverwrite | usnReasonClose}})
+	vol.contentCoord.processQueue(func(frn uint64) (string, bool) {
+		if frn == 3 {
+			return filepath.Join(dir, "c.txt"), true
+		}
+		return "", false
+	})
+	if err := os.WriteFile(filepath.Join(dir, "a.txt"), []byte("alpha DISKEDIT tier one"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s.runContentFold(vol)
+	// The delta text published...
+	if matches, _ := contentServiceSearch(t, vol, "content:newword", false); len(matches) != 1 {
+		t.Fatalf("delta text lost across the fold: %v", matches)
+	}
+	// ...and the silently rewritten base file converged by re-read.
+	if matches, _ := contentServiceSearch(t, vol, "content:DISKEDIT", false); len(matches) != 1 {
+		t.Fatalf("silently rewritten base file not converged by the fold: %v", matches)
+	}
+	if matches, _ := contentServiceSearch(t, vol, `content:"charlie tier one"`, false); len(matches) != 0 {
+		t.Fatalf("stale base text still served: %v", matches)
+	}
+	// The folded base carries no text store.
+	reloaded, err := contentLoadFile(gsx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	releaseContentIndexOnCleanup(t, reloaded)
+	if _, ok := reloaded.Sections[contentSectionText]; ok {
+		t.Fatal("folded base must not carry a text store")
+	}
+	if _, ok := reloaded.Sections[contentSectionFilter]; !ok {
+		t.Fatal("folded base must carry the filter section")
+	}
+}
+
+// TestContentFilterHealthMerge proves the aggregate still sums drops.
 func TestContentFilterHealthMerge(t *testing.T) {
-	a := contentHealth{State: contentStateReady, Docs: 10, FilterFiles: 5, FilterBytes: 100, ScopeDropped: 1, ScopeDroppedBytes: 50}
-	b := contentHealth{State: contentStateReady, Docs: 7, FilterFiles: 3, FilterBytes: 60, ScopeDropped: 0}
+	a := contentHealth{State: contentStateReady, Docs: 10, ScopeDropped: 1, ScopeDroppedBytes: 50}
+	b := contentHealth{State: contentStateReady, Docs: 7, ScopeDropped: 0}
 	mergeContentHealth(&a, b)
-	if a.FilterFiles != 8 || a.FilterBytes != 160 || a.ScopeDropped != 1 || a.ScopeDroppedBytes != 50 {
+	if a.Docs != 17 || a.ScopeDropped != 1 || a.ScopeDroppedBytes != 50 {
 		t.Fatalf("merged = %+v", a)
 	}
 }

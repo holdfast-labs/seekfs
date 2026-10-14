@@ -65,6 +65,14 @@ func newContentFoldFixture(t *testing.T, files []contentFixtureFile) *contentFol
 	if got := vol.content.stateOf(); got != contentStateReady {
 		t.Fatalf("state after attach = %q; want ready", got)
 	}
+	// v10 verifies (and fold re-reads) from disk: the record index resolves
+	// to synthetic `C:\` paths while the bytes live in the temp dir, so
+	// remap one to the other. Reads stay real, so churned content is fresh.
+	remap := make(map[string]string, len(files))
+	for _, f := range files {
+		remap[`C:\`+f.name] = paths[f.frn]
+	}
+	stubContentDiskPathMap(t, remap)
 	return &contentFoldFixture{s: s, vol: vol, idx: idx, dbPath: dbPath, paths: paths}
 }
 
@@ -217,8 +225,11 @@ func TestContentFoldCappedBackoffBoundsDelta(t *testing.T) {
 	}
 
 	// Base and already-admitted delta content stay searchable; nothing is lost.
-	if hits, _ := contentServiceSearch(t, f.vol, "content:baseonly", false); len(hits) == 0 {
-		t.Fatal("base content not searchable while capped")
+	// v10 verifies current bytes (fail-closed freshness): every file was
+	// churned, so no file contains "baseonly" anymore and it correctly
+	// reads 0 — while the acknowledged delta text stays findable.
+	if hits, _ := contentServiceSearch(t, f.vol, "content:baseonly", false); len(hits) != 0 {
+		t.Fatalf("stale base text served after every file churned: %v", hits)
 	}
 	if hits, _ := contentServiceSearch(t, f.vol, "content:needlealpha", false); len(hits) != 1 {
 		t.Fatalf("acknowledged delta content lost while capped: %v", hits)

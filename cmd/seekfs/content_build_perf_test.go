@@ -173,7 +173,7 @@ func TestContentParallelAssembleIsByteIdentical(t *testing.T) {
 			d := build[i]
 			i++
 			return d, true, nil
-		}, t.TempDir())
+		}, t.TempDir(), contentFilterID{})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -191,13 +191,9 @@ func TestContentParallelAssembleIsByteIdentical(t *testing.T) {
 	}
 }
 
-// The text pipe must stay byte-identical with the dictionary engaged
-// (sendSetDict mid-stream) and fail (not hang) when the source errors.
-func TestContentTextPipeWithDictMatchesDirect(t *testing.T) {
-	oldSample, oldMin := contentDictSampleBytes, contentDictMinLogical
-	contentDictSampleBytes = 16 << 10
-	contentDictMinLogical = 0
-	defer func() { contentDictSampleBytes, contentDictMinLogical = oldSample, oldMin }()
+// The filter section must stay byte-identical across worker counts (rows
+// derive from the same gram sets in docID order, like postings).
+func TestContentFilterSectionByteIdenticalAcrossWorkers(t *testing.T) {
 	build := func() []contentBuildDoc {
 		var docs []contentBuildDoc
 		for i := 0; i < 200; i++ {
@@ -224,35 +220,30 @@ func TestContentTextPipeWithDictMatchesDirect(t *testing.T) {
 			d := docs[i]
 			i++
 			return d, true, nil
-		}, t.TempDir())
+		}, t.TempDir(), contentFilterID{})
 		if err != nil {
 			t.Fatal(err)
 		}
 		return built
 	}
 	one, multi := assemble(1), assemble(4)
-	if one.dictPath == "" || multi.dictPath == "" {
-		t.Fatal("expected a trained dictionary section")
+	if one.filterPath == "" || multi.filterPath == "" {
+		t.Fatal("expected a filter section file")
 	}
-	a, err := os.ReadFile(one.textPath)
+	a, err := os.ReadFile(one.filterPath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	b, err := os.ReadFile(multi.textPath)
+	b, err := os.ReadFile(multi.filterPath)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if string(a) != string(b) {
-		t.Fatal("text section differs across worker counts with dict engaged")
-	}
-	da, _ := os.ReadFile(one.dictPath)
-	db, _ := os.ReadFile(multi.dictPath)
-	if string(da) != string(db) {
-		t.Fatal("dict section differs across worker counts")
+		t.Fatal("filter section differs across worker counts")
 	}
 }
 
-func TestContentTextPipeAbortOnSourceError(t *testing.T) {
+func TestContentAssembleAbortOnSourceError(t *testing.T) {
 	i := 0
 	_, err := assembleContentIndexStreamed(func() (contentBuildDoc, bool, error) {
 		i++
@@ -260,7 +251,7 @@ func TestContentTextPipeAbortOnSourceError(t *testing.T) {
 			return contentBuildDoc{}, false, errors.New("boom")
 		}
 		return contentBuildDoc{frn: uint64(i), path: "a.txt", text: []byte("hello")}, true, nil
-	}, t.TempDir())
+	}, t.TempDir(), contentFilterID{})
 	if err == nil {
 		t.Fatal("expected the source error")
 	}
