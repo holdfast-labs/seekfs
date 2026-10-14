@@ -31,8 +31,8 @@ func cmdContentIndex(args []string) error {
 	jsonOut := fs.Bool("json", false, "with -estimate, emit JSON")
 	configPath := fs.String("config", "", "optional seekfs.toml config path")
 	encoding := fs.String("encoding", "auto", "text encoding override: auto, none, or a WHATWG label (latin1, windows-1252, utf-16le, sjis, ...)")
-	maxRaw := fs.Int64("max-raw", 0, "max raw source bytes per file (0 = default 32 MiB, clamped to the hard ceiling)")
-	maxText := fs.Int64("max-text", 0, "max extracted text bytes per file (0 = default 16 MiB, clamped to the hard ceiling)")
+	maxRaw := fs.Int64("max-raw", 0, "max raw source bytes per file (0 = policy default: ~2 MiB outside repos, ~20 MiB inside)")
+	maxText := fs.Int64("max-text", 0, "max extracted text bytes per file (0 = policy default: ~1 MiB outside repos, ~10 MiB inside)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -109,11 +109,15 @@ func cmdContentIndex(args []string) error {
 			budget = "unlimited (reserve-governed)"
 		}
 		fmt.Fprintf(os.Stdout, "  files=%d bytes=%d projected_gsx=%d max_files_hit=%v budget_hit=%v budget=%s eligible_files=%d eligible_bytes=%d\n", est.Files, est.Bytes, est.ProjectedGSXBytes, est.MaxFilesHit, est.BudgetHit, budget, est.EligibleFiles, est.EligibleBytes)
+		fmt.Fprintf(os.Stdout, "  baseline_files=%d baseline_bytes=%d same_size_files=%d same_size_bytes=%d\n", est.BaselineFiles, est.BaselineBytes, est.SameSizeFiles, est.SameSizeBytes)
 		fmt.Fprintf(os.Stdout, "  text_candidates=%d binary_candidates=%d", est.TextCandidates, est.BinaryCandidates)
 		for reason, n := range est.Excluded {
-			fmt.Fprintf(os.Stdout, " excluded_%s=%d", reason, n)
+			fmt.Fprintf(os.Stdout, " excluded_%s=%d/%dB", reason, n, est.ExcludedBytes[reason])
 		}
 		fmt.Fprintln(os.Stdout)
+		for _, r := range est.SkippedWorktrees {
+			fmt.Fprintf(os.Stdout, "  skipped_worktree: %s\n", r)
+		}
 		if *sniffSample > 0 {
 			fmt.Fprintf(os.Stdout, "  sniff_sample: opened=%d binary=%d projected_text_files=%d\n", est.SampledFiles, est.SampledBinary, est.ProjectedTextFiles)
 		}

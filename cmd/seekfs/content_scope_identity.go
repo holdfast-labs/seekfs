@@ -15,7 +15,13 @@ import (
 // Version 5: sniff-based default selection (SniffText) joins the identity: an
 // explicit allowlist identical to the registry still selects differently from
 // sniffing, so the mode bit must invalidate.
-const contentScopeSelectionVersion = 5
+// Version 6: the inclusion policy (§6z) joins the identity: the linked-
+// worktree filter (Repos now holds only indexed checkouts plus the mode),
+// the content-skip list, and the lockfile/large-JSON/minified/build-output/
+// cache skips. A worktree appearing or vanishing, or a skip-list edit,
+// reconciles the selection difference instead of rebuilding (see §6p),
+// except past the rebuild fraction.
+const contentScopeSelectionVersion = 6
 
 // fingerprint identifies the effective scope and budget selection policy used
 // to build a sidecar. Old sidecars have a zero hash and must be rebuilt. The
@@ -43,9 +49,12 @@ func (r contentScopeResolved) fingerprint() [32]byte {
 		BudgetBytes      int64
 		SystemExcludes   bool
 		IgnoreDigest     [32]byte
+		WorktreesAll     bool
+		Skip             []string
 	}{contentScopeSelectionVersion, r.Mode, sortedContentScopePaths(r.Roots), sortedContentScopePaths(r.Repos),
 		sortedContentScopePaths(r.ExplicitRoots), sortedContentScopePaths(r.Excludes),
-		exts, r.SniffText, budget, r.SystemExcludes, r.IgnoreDigest}
+		exts, r.SniffText, budget, r.SystemExcludes, r.IgnoreDigest, r.WorktreesAll,
+		sortedContentScopePaths(r.Skip)}
 	b, _ := json.Marshal(canonical) // fixed fields of supported JSON scalar types
 	return sha256.Sum256(b)
 }

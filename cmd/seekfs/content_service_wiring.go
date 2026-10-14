@@ -727,6 +727,8 @@ func (s *goSearchService) contentDrainLoop(vol *serviceVolumeIndex) {
 			// which the search path trims under searchMu (a different lock).
 			pathCache := make(map[int]string, 64)
 			ignoreChanged := false
+			// Hand the tick's scope to extraction for the repo-aware caps.
+			vol.contentCoord.scopeHint = scope
 			vol.contentCoord.processQueue(func(frn uint64) (string, bool) {
 				var path string
 				var ok bool

@@ -56,6 +56,11 @@ type contentExtractSettings struct {
 	encoding contentEncodingMode
 	maxRaw   int64
 	maxText  int64
+	// capsExplicit is true when maxRaw/maxText came from an operator
+	// override (CLI flags). False means policy defaults, so extraction
+	// applies the repo-aware inclusion caps per file (1 MiB text outside
+	// git repos, 10 MiB inside) instead of the uniform values.
+	capsExplicit bool
 }
 
 type contentExtractSettingsKey struct{}
@@ -124,6 +129,9 @@ type contentExtractResult struct {
 	// also means binary; callers map that to Binary.
 	Binary bool
 	Reason string
+	// Size carries the source file bytes for per-reason stats. Set by the
+	// Safe extraction wrappers (build/delta), not by extractors.
+	Size int64
 }
 
 // contentExtractor turns file bytes into text. Implementations live in their own

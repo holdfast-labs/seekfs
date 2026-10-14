@@ -97,7 +97,18 @@ func legacyScanSelection(idx *Index, opts contentBuildOptions, isWalk bool) map[
 			continue
 		}
 		path := idx.reconstructCompactPathCached(id, cache)
-		if path == "" || !opts.allows(path) {
+		size := rec.Size
+		if size < 0 {
+			size = 0
+		}
+		allows := opts.allows(path)
+		if opts.Scope != nil {
+			// The fast scan applies the size-gated inclusion rules with
+			// the record size; the reference must too, or the two bind
+			// different sets by construction.
+			_, _, allows = opts.Scope.allowsSize(path, size)
+		}
+		if path == "" || !allows {
 			continue
 		}
 		frn := rec.FRN

@@ -68,11 +68,74 @@ type contentParentDecision struct {
 	repo     string // deepest worktree containing the dir, "" if none
 	excluded bool   // under an exclude prefix (whole subtree out)
 	segHit   bool   // an excluded segment on the dir path (non-final for children)
+	// segKind names the segment class that set segHit ("build_output",
+	// "cache" or "system", by inclusion-policy priority), so a pruned
+	// subtree tallies the same reason allowsReason reports per file.
+	segKind  string
 	ignored  bool   // git-ignored (whole subtree dead)
 	unit     string // matched include root, "" if none
 	kind     string // "repo" or "root"
 	priority int    // scope priority for admitted files below
 	computed bool
+}
+
+// contentScanTally accumulates per-reason selection rejections for one
+// scan (files + source bytes). Builds merge it into the sidecar's CXIS
+// inclusion stats so every policy decision stays visible in loaded.
+type contentScanTally struct {
+	Rejected      map[string]int64
+	RejectedBytes map[string]int64
+}
+
+func (t *contentScanTally) add(reason string, bytes int64) {
+	if t == nil || reason == "" {
+		return
+	}
+	if t.Rejected == nil {
+		t.Rejected = make(map[string]int64)
+	}
+	if t.RejectedBytes == nil {
+		t.RejectedBytes = make(map[string]int64)
+	}
+	t.Rejected[reason]++
+	t.RejectedBytes[reason] += bytes
+}
+
+// absorb folds one worker's tally into the combined tally.
+func (t *contentScanTally) absorb(o *contentScanTally) {
+	if t == nil || o == nil {
+		return
+	}
+	if t.Rejected == nil {
+		t.Rejected = make(map[string]int64)
+	}
+	if t.RejectedBytes == nil {
+		t.RejectedBytes = make(map[string]int64)
+	}
+	for r, n := range o.Rejected {
+		t.Rejected[r] += n
+	}
+	for r, b := range o.RejectedBytes {
+		t.RejectedBytes[r] += b
+	}
+}
+
+func (t *contentScanTally) mergeInto(stats *contentInclusionStats) {
+	if t == nil || stats == nil {
+		return
+	}
+	if stats.Skipped == nil {
+		stats.Skipped = make(map[string]int64)
+	}
+	if stats.SkippedBytes == nil {
+		stats.SkippedBytes = make(map[string]int64)
+	}
+	for r, n := range t.Rejected {
+		stats.Skipped[r] += n
+	}
+	for r, b := range t.RejectedBytes {
+		stats.SkippedBytes[r] += b
+	}
 }
 
 // contentScopeMember is one admitted file: everything the build snapshot and
@@ -84,6 +147,7 @@ type contentScopeMember struct {
 	size     int64
 	mod      int64
 	priority int
+	inRepo   bool // inside a git worktree (for the repo-aware size caps)
 }
 
 // contentScopeScanConfig bundles one selection scan.
@@ -107,6 +171,9 @@ type contentScopeScanConfig struct {
 	// workers share (each distinct file read and parsed once per scan).
 	// Nil makes the scan allocate a private one.
 	shared *contentIgnoreSharedCache
+	// tally, when non-nil, receives per-reason rejection counts
+	// (files + source bytes) merged from every worker.
+	tally *contentScanTally
 }
 
 // contentScanWorker carries one range's private scan state: no mutex sits in
@@ -120,6 +187,10 @@ type contentScanWorker struct {
 	memo   map[int32]contentParentDecision
 	cache  map[int]string
 	count  int
+	// rejects tallies per-reason rejections for the scan's CXIS stats;
+	// nil disables tallying (reconcile scans).
+	rejects     map[string]int64
+	rejectBytes map[string]int64
 	// parentOrig memoizes one directory's reconstructed original-case path so
 	// each file's path is one parent-plus-name concatenation instead of a
 	// full chain walk (byte-identical to reconstruction: the same chain,
@@ -146,6 +217,7 @@ func scanScopeMembers(s *goSearchService, vol *serviceVolumeIndex, cfg contentSc
 		top     contentScanHeap
 		limited bool
 		moved   bool
+		tally   *contentScanTally
 	}
 	out := make([]workerOut, workers)
 	shared := cfg.shared
@@ -178,14 +250,27 @@ func scanScopeMembers(s *goSearchService, vol *serviceVolumeIndex, cfg contentSc
 				parentOrig: make(map[int32]string, 4096),
 				repoDepth:  make(map[string]int),
 			}
+			var tally *contentScanTally
+			if cfg.tally != nil {
+				tally = &contentScanTally{}
+				worker.rejects = make(map[string]int64)
+				worker.rejectBytes = make(map[string]int64)
+			}
 			members, top, limited, moved := worker.scanRange(s, vol, cfg, start, end, &scanned)
-			out[w] = workerOut{members: members, top: top, limited: limited, moved: moved}
+			if tally != nil {
+				tally.Rejected = worker.rejects
+				tally.RejectedBytes = worker.rejectBytes
+			}
+			out[w] = workerOut{members: members, top: top, limited: limited, moved: moved, tally: tally}
 		}(w, start, end)
 	}
 	wg.Wait()
 	for w := range out {
 		if out[w].moved {
 			return nil, false
+		}
+		if cfg.tally != nil && out[w].tally != nil {
+			cfg.tally.absorb(out[w].tally)
 		}
 	}
 	lists := make([][]contentScopeMember, workers)
@@ -302,11 +387,11 @@ func (h *contentScanHeap) Pop() any {
 // whether the cap truncated the corpus.
 func mergeScanMembers(lists [][]contentScopeMember, maxFiles int) (items []contentBuildItem, limited bool) {
 	if maxFiles <= 0 {
-		for _, l := range lists {
-			for _, m := range l {
-				items = append(items, contentBuildItem{frn: m.frn, path: m.path, priority: m.priority})
-			}
+	for _, l := range lists {
+		for _, m := range l {
+			items = append(items, contentBuildItem{frn: m.frn, path: m.path, priority: m.priority, inRepo: m.inRepo})
 		}
+	}
 		return items, false
 	}
 	var h contentScanHeap
@@ -336,6 +421,16 @@ func mergeScanMembers(lists [][]contentScopeMember, maxFiles int) (items []conte
 // scope admits it. Directory inheritance carries every hierarchical input,
 // so the per-file work is a memo lookup, an extension check, and (for
 // in-repo files) the basename pattern match.
+// reject tallies one selection rejection for the scan's CXIS stats.
+// size is the source bytes (already clamped by the caller).
+func (w *contentScanWorker) reject(reason string, size int64) {
+	if w.rejects == nil {
+		return
+	}
+	w.rejects[reason]++
+	w.rejectBytes[reason] += size
+}
+
 func (w *contentScanWorker) admitRecord(id int, rec CompactRecord) (contentScopeMember, bool) {
 	var out contentScopeMember
 	parent := rec.Parent
@@ -343,31 +438,39 @@ func (w *contentScanWorker) admitRecord(id int, rec CompactRecord) (contentScope
 	if !ok {
 		dec = w.dirDecision(parent)
 	}
-	if dec.excluded || dec.ignored {
+	size := rec.Size
+	if size < 0 {
+		size = 0
+	}
+	if dec.excluded {
+		w.reject("exclude", size)
+		return out, false
+	}
+	if dec.ignored {
+		w.reject("gitignore", size)
 		return out, false
 	}
 	// Extension gate first: it needs only the name, no path.
 	ext := contentPathExtension(rec.Name)
 	if w.scope.SniffText {
 		if contentBinaryRejected(ext) {
+			w.reject("binary", size)
 			return out, false
 		}
 	} else if _, ok := w.scope.ExtSet[ext]; !ok {
+		w.reject("ext", size)
 		return out, false
 	}
 	raw := w.fileOrigPath(id, rec)
 	if raw == "" {
+		w.reject("path", size)
 		return out, false
 	}
-	// Outside worktrees the name-based system excludes still apply to the
-	// file's own ancestry (in-repo files never consult segments — git
-	// decides there). dec.segHit already covers every non-final component
-	// (the basename is spared by contentPathHasExcludedSegment, so the old
-	// per-file full-path recheck was a recomputation of this memo bit).
-	if dec.repo == "" && w.scope.SystemExcludes && dec.segHit {
-		return out, false
-	}
+	// Resolve the priority without rejecting: rejections below run in
+	// allowsReason order (gitignore, inclusion, system, root) so the
+	// tallied reason matches the estimate's even when several rules fire.
 	var priority int
+	rootMiss := false
 	if dec.repo != "" {
 		priority = 0
 	} else if dec.unit != "" {
@@ -377,12 +480,9 @@ func (w *contentScanWorker) admitRecord(id int, rec CompactRecord) (contentScope
 		// root naming it exactly (a root strictly inside the parent
 		// cannot prefix the file without naming it — the boundary would
 		// have to fall inside the file name).
-		p := contentNormPath(raw)
-		unit, hit := w.scope.rootExact[p]
-		if !hit {
-			return out, false
-		}
-		if _, isExplicit := w.scope.explicitSet[unit]; isExplicit {
+		if unit, hit := w.scope.rootExact[contentNormPath(raw)]; !hit {
+			rootMiss = true
+		} else if _, isExplicit := w.scope.explicitSet[unit]; isExplicit {
 			priority = 1
 		} else {
 			priority = 2
@@ -397,18 +497,53 @@ func (w *contentScanWorker) admitRecord(id int, rec CompactRecord) (contentScope
 		relOrig, ok := w.fileRelComps(raw, dec.repo)
 		if !ok {
 			if w.ignore.ignoredInRepo(raw, false, dec.repo) {
+				w.reject("gitignore", size)
 				return out, false
 			}
 		} else {
 			for _, c := range relOrig {
 				if strings.EqualFold(c, ".git") {
+					w.reject("gitignore", size)
 					return out, false
 				}
 			}
 			if w.ignore.ignoredInRepoComps(dec.repo, relOrig, false) {
+				w.reject("gitignore", size)
 				return out, false
 			}
 		}
+	}
+	// Inclusion-policy file rules (user skip list, lockfiles, large JSON,
+	// minified names, build-output/cache segments): the same predicate
+	// allowsReason applies, with the record size for the size-gated rules.
+	// Derive the lookup key exactly like allowsReason: the folded
+	// normalized path, basename off it.
+	p := contentNormPath(raw)
+	base := p
+	if i := strings.LastIndexAny(p, `/\`); i >= 0 {
+		base = p[i+1:]
+	}
+		if reason, skip := contentInclusionSkip(p, base, ext, size, dec.repo != "", w.scope.SystemExcludes, w.scope.Skip); skip {
+			w.reject(reason, size)
+			return out, false
+		}
+	// Outside worktrees the name-based system excludes still apply to the
+	// file's own ancestry (in-repo files never consult segments — git
+	// decides there). dec.segHit already covers every non-final component
+	// (the basename is spared by contentPathHasExcludedSegment, so the old
+	// per-file full-path recheck was a recomputation of this memo bit).
+	// The kind names the inclusion-policy class allowsReason reports.
+	if dec.repo == "" && w.scope.SystemExcludes && dec.segHit {
+		kind := dec.segKind
+		if kind == "" {
+			kind = "system"
+		}
+		w.reject(kind, size)
+		return out, false
+	}
+	if rootMiss {
+		w.reject("root", size)
+		return out, false
 	}
 	frn := rec.FRN
 	if w.isWalk {
@@ -417,7 +552,7 @@ func (w *contentScanWorker) admitRecord(id int, rec CompactRecord) (contentScope
 			return out, false
 		}
 	}
-	out = contentScopeMember{id: id, frn: frn, path: raw, size: rec.Size, mod: rec.ModUnix, priority: priority}
+	out = contentScopeMember{id: id, frn: frn, path: raw, size: rec.Size, mod: rec.ModUnix, priority: priority, inRepo: dec.repo != ""}
 	return out, true
 }
 
@@ -549,6 +684,7 @@ func (w *contentScanWorker) deriveChildDecision(parent contentParentDecision, na
 	// Segments: the parent's hit plus this dir's own name (non-final for
 	// everything below, exactly what contentPathHasExcludedSegment tests).
 	out.segHit = parent.segHit || contentSegmentExcluded(name)
+	out.segKind = combineSegmentKind(parent.segKind, contentSegmentKind(name))
 	// Repo: the parent's repo still contains this dir unless a deeper repo
 	// root was crossed; nested repos are rare, so confirm cheaply.
 	out.repo = parent.repo
@@ -640,6 +776,7 @@ func (w *contentScanWorker) dirDecisionStandalone(id int32) contentParentDecisio
 	p := contentNormPath(raw)
 	out.excluded = w.scope.matchExcluded(p)
 	out.segHit = contentPathHasAllExcludedSegments(p)
+	out.segKind = contentPathSegKind(p)
 	if repo, ok := w.scope.matchRepo(p); ok {
 		out.repo = repo
 	}
@@ -672,6 +809,7 @@ func (w *contentScanWorker) volumeRootDecision() contentParentDecision {
 	p := contentNormPath(vol + string(filepath.Separator))
 	out.excluded = w.scope.matchExcluded(p)
 	out.segHit = contentPathHasAllExcludedSegments(p)
+	out.segKind = contentPathSegKind(p)
 	if repo, ok := w.scope.matchRepo(p); ok {
 		out.repo = repo
 	}
@@ -703,15 +841,56 @@ func (w *contentScanWorker) priorityFor(d contentParentDecision) int {
 // contentSegmentExcluded reports whether a single directory name is an
 // excluded segment. The name folds like the normalized path components
 // contentPathHasExcludedSegment tests, so `Build` excludes exactly like
-// `build` does through allows().
+// `build` does through allows(). The set is the union of the legacy
+// system segments and the inclusion-policy build-output/cache segments:
+// pruning covers every class allowsReason rejects outside repos, and the
+// kind (below) keeps the tallied reason exact.
 func contentSegmentExcluded(name string) bool {
+	return contentSegmentKind(name) != ""
+}
+
+// contentSegmentKind names one lowercase directory segment's exclusion
+// class ("build_output", "cache" or "system", by allowsReason priority),
+// or "" when the segment excludes nothing.
+func contentSegmentKind(name string) string {
+	// Fold like the normalized path components allowsReason tests, so
+	// `Build` prunes exactly like `build` does through allows().
 	name = strings.ToLower(name)
+	if contentBuildOutputSegment(name) {
+		return contentSkipBuildOutput
+	}
+	if contentCacheSegment(name) {
+		return contentSkipCache
+	}
 	for _, s := range contentSystemExcludeSegments {
 		if name == s {
-			return true
+			return "system"
 		}
 	}
-	return false
+	return ""
+}
+
+// combineSegmentKind folds one more segment's class into an accumulated
+// kind by allowsReason priority: build_output beats cache beats system,
+// independent of depth (contentInclusionSkip scans every non-final
+// segment in the same class order).
+func combineSegmentKind(acc, kind string) string {
+	rank := map[string]int{contentSkipBuildOutput: 3, contentSkipCache: 2, "system": 1}
+	if rank[kind] > rank[acc] {
+		return kind
+	}
+	return acc
+}
+
+// contentPathSegKind folds the exclusion class over every component of a
+// normalized directory path (a directory's own name is non-final for
+// everything below it).
+func contentPathSegKind(p string) string {
+	kind := ""
+	for _, part := range strings.FieldsFunc(p, func(r rune) bool { return r == '\\' || r == '/' }) {
+		kind = combineSegmentKind(kind, contentSegmentKind(part))
+	}
+	return kind
 }
 
 // contentPathHasAllExcludedSegments reports whether ANY component of the

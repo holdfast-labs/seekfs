@@ -18,6 +18,7 @@ type contentEstimateCandidate struct {
 	item            contentBuildItem
 	unit, kind, ext string
 	bytes           int64
+	size            int64 // uncapped source bytes (for same-size grouping)
 }
 
 type contentEstimateHeap []contentEstimateCandidate
@@ -39,14 +40,31 @@ type contentScopeUnit struct {
 // contentEstimate is the pre-flight estimate for a scoped build.
 type contentEstimate struct {
 	Files       int64              `json:"files"`
-	Bytes       int64              `json:"bytes"` // Σ min(size, contentExtractMaxTextBytes)
+	Bytes       int64              `json:"bytes"` // Σ min(size, per-file text cap)
 	ByExt       map[string]int64   `json:"by_ext,omitempty"`
 	ByUnit      []contentScopeUnit `json:"by_unit,omitempty"`
 	Repos       []string           `json:"repos,omitempty"`
 	Excluded    map[string]int64   `json:"excluded,omitempty"` // reason -> files
-	MaxFilesHit bool               `json:"max_files_hit,omitempty"`
-	BudgetHit   bool               `json:"budget_hit,omitempty"`
-	BudgetBytes int64              `json:"budget_bytes"`
+	// ExcludedBytes maps the same reasons to source bytes, so every policy
+	// decision is visible as files and bytes (see §6z).
+	ExcludedBytes map[string]int64 `json:"excluded_bytes,omitempty"`
+	// BaselineFiles/BaselineBytes are the legacy selection (every linked
+	// worktree, no inclusion skips, the historical 16 MiB text cap) over
+	// the same roots: before vs after in one run.
+	BaselineFiles int64 `json:"baseline_files,omitempty"`
+	BaselineBytes int64 `json:"baseline_bytes,omitempty"`
+	// SkippedWorktrees are the linked worktrees the main-only policy left
+	// out (empty with worktrees=all).
+	SkippedWorktrees []string `json:"skipped_worktrees,omitempty"`
+	// SameSizeFiles/SameSizeBytes count selected files sharing their size
+	// with another selected file: the dedupe candidate pool (an upper
+	// bound measured without reading bytes; the build reports exact
+	// dedupe savings in its CXIS section).
+	SameSizeFiles int64 `json:"same_size_files,omitempty"`
+	SameSizeBytes int64 `json:"same_size_bytes,omitempty"`
+	MaxFilesHit bool    `json:"max_files_hit,omitempty"`
+	BudgetHit   bool    `json:"budget_hit,omitempty"`
+	BudgetBytes int64   `json:"budget_bytes"`
 	// EligibleFiles/EligibleBytes are the pre-budget totals over the whole
 	// candidate set, so a budget_hit names exactly what was cut: eligible
 	// files were considered, files fit. (When MaxFilesHit, both are over the
@@ -141,6 +159,16 @@ func (s contentScope) resolveForIndex(volume string, idx *Index) (contentScopeRe
 	return r, repos
 }
 
+// resolveForIndexWithIgnoreFiles is resolveForIndex plus the detected
+// ignore-file layout, so a second scope over the same index (the estimate's
+// legacy baseline) attaches identical git rules.
+func (s contentScope) resolveForIndexWithIgnoreFiles(volume string, idx *Index) (contentScopeResolved, []string, map[string][]string) {
+	repos, ignoreFiles := contentDetectGitLayout(idx)
+	r := s.resolve(volume, repos)
+	r.attachGitIgnore(ignoreFiles)
+	return r, repos, ignoreFiles
+}
+
 // attachGitIgnore enables git ignore rules for the resolved worktrees. It
 // stats the ignore files, so callers holding index locks should detect the
 // layout under the lock and attach after releasing it. The global excludes
@@ -160,14 +188,35 @@ func (r *contentScopeResolved) attachGitIgnore(ignoreFiles map[string][]string) 
 // listPaths records every selected (post-budget) path in est.Paths.
 func scanContentScope(idx *Index, scope contentScope, volume string, maxFiles int, sniffSample int, listPaths bool) contentEstimate {
 	est := contentEstimate{
-		ByExt:    make(map[string]int64),
-		Excluded: make(map[string]int64),
+		ByExt:         make(map[string]int64),
+		Excluded:      make(map[string]int64),
+		ExcludedBytes: make(map[string]int64),
 	}
 	if idx == nil {
 		return est
 	}
-	resolved, repos := scope.resolveForIndex(volume, idx)
+	resolved, repos, ignoreFiles := scope.resolveForIndexWithIgnoreFiles(volume, idx)
 	est.Repos = repos
+	est.SkippedWorktrees = resolved.DroppedWorktrees
+	// The legacy baseline resolves the same scope with the inclusion
+	// policy off (every worktree kept, no skip rules, the historical
+	// 16 MiB cap), so one run reports before vs after. It attaches the
+	// same ignore layout, or in-repo membership (and the per-file caps
+	// the estimate projects) would diverge by construction.
+	legacyScope := scope
+	legacyScope.WorktreesAll = true
+	legacyScope.Skip = nil
+	legacyResolved := legacyScope.resolve(volume, repos)
+	legacyResolved.Skip = nil
+	legacyResolved.InclusionOff = true
+	legacyResolved.attachGitIgnore(ignoreFiles)
+	exclude := func(reason string, bytes int64) {
+		if reason == "" {
+			reason = "exclude"
+		}
+		est.Excluded[reason]++
+		est.ExcludedBytes[reason] += bytes
+	}
 
 	count := idx.compactRecordCount()
 	cache := make(map[int]string, 1024)
@@ -180,37 +229,49 @@ func scanContentScope(idx *Index, scope contentScope, volume string, maxFiles in
 		if contentGitMarkerName(rec.Name) {
 			continue // already counted as a repo marker
 		}
+		size := rec.Size
+		if size < 0 {
+			size = 0
+		}
 		ext := strings.ToLower(contentPathExtension(rec.Name))
 		if resolved.SniffText {
 			// Cheap binary rejections are tallied apart from scope
 			// exclusions; the build never opens them.
 			if contentBinaryRejected(ext) {
-				est.Excluded["binary"]++
+				exclude("binary", size)
 				est.BinaryCandidates++
 				continue
 			}
 		} else if _, ok := resolved.ExtSet[ext]; !ok {
-			est.Excluded["ext"]++
+			exclude("ext", size)
 			continue
 		}
 		path := idx.reconstructCompactPathCached(id, cache)
 		if path == "" {
-			est.Excluded["path"]++
+			exclude("path", size)
 			continue
 		}
-		unit, kind, ok := resolved.allows(path)
+		// Legacy baseline tally (no inclusion skips, every worktree).
+		if _, _, ok := legacyResolved.allows(path); ok {
+			n := size
+			if n > contentExtractMaxTextBytes {
+				n = contentExtractMaxTextBytes
+			}
+			est.BaselineFiles++
+			est.BaselineBytes += n
+		}
+		unit, kind, reason, ok := resolved.allowsReason(path, size)
 		if !ok {
-			est.Excluded["exclude"]++
+			exclude(reason, size)
 			continue
 		}
-		n := rec.Size
-		if n < 0 {
-			n = 0
+		// Per-file text cap: ~1 MiB outside repos, ~10 MiB inside.
+		_, inRepo := resolved.Ignore.repoFor(contentNormPath(path))
+		n := size
+		if cap := contentInclusionTextCap(inRepo); n > cap {
+			n = cap
 		}
-		if n > contentExtractMaxTextBytes {
-			n = contentExtractMaxTextBytes
-		}
-		c := contentEstimateCandidate{item: contentBuildItem{frn: rec.FRN, path: path, priority: resolved.priority(path)}, unit: unit, kind: kind, ext: ext, bytes: n}
+		c := contentEstimateCandidate{item: contentBuildItem{frn: rec.FRN, path: path, priority: resolved.priority(path)}, unit: unit, kind: kind, ext: ext, bytes: n, size: size}
 		if maxFiles <= 0 || len(candidates) < maxFiles {
 			candidates = append(candidates, c)
 			continue
@@ -242,6 +303,7 @@ func scanContentScope(idx *Index, scope contentScope, volume string, maxFiles in
 	// reserve; the anchor is the volume root, the same volume the sidecar
 	// is written to.
 	anchor := contentScopeBudgetAnchor(volume)
+	var selectedSizes []int64
 	for _, c := range candidates {
 		if resolved.BudgetExplicit {
 			if est.Bytes+c.bytes > resolved.BudgetBytes {
@@ -254,6 +316,7 @@ func scanContentScope(idx *Index, scope contentScope, volume string, maxFiles in
 		}
 		est.Files++
 		est.Bytes += c.bytes
+		selectedSizes = append(selectedSizes, c.size)
 		if listPaths {
 			est.Paths = append(est.Paths, c.item.path)
 		}
@@ -264,6 +327,20 @@ func scanContentScope(idx *Index, scope contentScope, volume string, maxFiles in
 		} else {
 			unitIndex[c.unit] = len(est.ByUnit)
 			est.ByUnit = append(est.ByUnit, contentScopeUnit{Root: c.unit, Kind: c.kind, Files: 1, Bytes: c.bytes})
+		}
+	}
+	// Same-size grouping over the selected files: the dedupe candidate
+	// pool (an upper bound measured without reading bytes).
+	{
+		bySize := make(map[int64]int64)
+		for _, s := range selectedSizes {
+			bySize[s]++
+		}
+		for s, n := range bySize {
+			if n > 1 {
+				est.SameSizeFiles += n
+				est.SameSizeBytes += s * n
+			}
 		}
 	}
 	est.ProjectedGSXBytes = int64(float64(est.Bytes) * contentScopeEncodedMultiplier)

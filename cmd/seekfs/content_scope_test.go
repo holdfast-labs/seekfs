@@ -265,8 +265,11 @@ func TestContentScopeEstimateAndDetect(t *testing.T) {
 	if len(est.ByUnit) != 1 || est.ByUnit[0].Kind != "repo" || est.ByUnit[0].Files != 4 {
 		t.Fatalf("by-unit = %+v", est.ByUnit)
 	}
-	if est.Excluded["exclude"] == 0 || est.Excluded["ext"] != 0 {
-		t.Fatalf("excluded = %+v; want exclude>0, ext=0", est.Excluded)
+	if est.Excluded["root"] != 1 || est.Excluded["ext"] != 0 {
+		t.Fatalf("excluded = %+v; want root=1 (readme.md), ext=0", est.Excluded)
+	}
+	if est.ExcludedBytes["root"] != 10 {
+		t.Fatalf("excluded bytes = %+v; want root=10B (readme.md)", est.ExcludedBytes)
 	}
 	// The projection scales extracted bytes by the compact-encoding
 	// multiplier (< 1), so it sits below the raw byte count.

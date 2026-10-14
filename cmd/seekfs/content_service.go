@@ -1565,6 +1565,14 @@ type contentCoordinator struct {
 	// with the coordinator and closed at most once.
 	done     chan struct{}
 	doneOnce sync.Once
+	// scopeHint is the drain tick's resolved scope, set before each
+	// processQueue: extraction stamps per-file worktree membership from
+	// it for the repo-aware size caps. Read-only while a tick runs.
+	scopeHint *contentScopeResolved
+	// inclusion accumulates drain-time inclusion-policy declines
+	// (per-reason files/bytes) since the last fold, which merges them
+	// into the published sidecar's CXIS section and resets this.
+	inclusion contentInclusionStats
 }
 
 func newContentCoordinator(state *contentVolumeState) *contentCoordinator {
@@ -1911,8 +1919,19 @@ func contentExtractDeltaDoc(frn uint64, path string, prior [contentHashLen]byte,
 }
 
 func contentExtractDeltaDocContext(baseCtx context.Context, frn uint64, path string, prior [contentHashLen]byte, havePrior bool) (doc contentDeltaDoc, changed bool, err error) {
+	doc, changed, _, _, err = contentExtractDeltaDocReason(baseCtx, frn, path, prior, havePrior)
+	return doc, changed, err
+}
+
+// contentExtractDeltaDocReason is the reason-carrying form of the delta
+// extractor: on a deterministic policy decline (large JSON, over-cap
+// container, minified text, binary) it reports the canonical skip reason
+// and the source size so the coordinator tallies per-reason stats. An
+// empty reason means the file was indexed (changed), untouched
+// (hash-equal), unreadable, or declined by the extractor itself.
+func contentExtractDeltaDocReason(baseCtx context.Context, frn uint64, path string, prior [contentHashLen]byte, havePrior bool) (doc contentDeltaDoc, changed bool, reason string, size int64, err error) {
 	if baseCtx != nil && baseCtx.Err() != nil {
-		return contentDeltaDoc{}, false, baseCtx.Err()
+		return contentDeltaDoc{}, false, "", 0, baseCtx.Err()
 	}
 	// The settings context carries the service's encoding/cap policy. The
 	// call goes through contentExtractSafely so the drain shares the build's
@@ -1922,29 +1941,39 @@ func contentExtractDeltaDocContext(baseCtx context.Context, frn uint64, path str
 		baseCtx = context.Background()
 	}
 	ctx := contentWithExtractSettings(baseCtx, contentServiceExtractSettings())
-	settings := contentExtractSettingsFromContext(ctx)
+	// Per-file inclusion caps: the drain stamps the file's worktree
+	// membership on the context (see processQueue); without one the
+	// decision fails open to the in-repo caps.
+	inRepo, _ := contentInRepoFromContext(ctx)
+	fctx, fileRaw, _ := contentFileExtractContext(ctx, inRepo)
 	// Single-read open without recalling cloud placeholders; the extractor
 	// reuses the slurped bytes in place.
-	s, err := contentSlurpNoRecall(path, settings.maxRaw)
+	s, err := contentSlurpNoRecall(path, fileRaw)
 	if err != nil {
-		return contentDeltaDoc{}, false, err
+		return contentDeltaDoc{}, false, "", 0, err
 	}
 	defer s.close()
-	size := s.size
+	size = s.size
+	if reason, skip := contentExtractionSkip(path, size, fileRaw); skip {
+		return contentDeltaDoc{}, false, reason, size, nil
+	}
 	e := contentExtractorForPath(path, s.headBytes())
 	if e == nil {
-		return contentDeltaDoc{}, false, nil
+		return contentDeltaDoc{}, false, "binary", size, nil
 	}
-	res, err := contentExtractSafely(ctx, e, s.reader(), size)
+	res, err := contentExtractSafely(fctx, e, s.reader(), size)
 	if err != nil || res.Skipped || len(res.Text) == 0 {
-		return contentDeltaDoc{}, false, err
+		return contentDeltaDoc{}, false, "", size, err
+	}
+	if res.Class == contentClassText && contentLooksMinified(res.Text) {
+		return contentDeltaDoc{}, false, contentSkipMinified, size, nil
 	}
 	stored := contentStoredText(res.Text)
 	h := sha256Of(stored)
 	if havePrior && h == prior {
-		return contentDeltaDoc{}, false, nil
+		return contentDeltaDoc{}, false, "", size, nil
 	}
-	return contentDeltaDoc{FRN: frn, Path: path, Text: stored, Hash: h, ContentType: res.Class, ExtractorVersion: e.Version(), FileSize: size, FileModNano: s.modNano}, true, nil
+	return contentDeltaDoc{FRN: frn, Path: path, Text: stored, Hash: h, ContentType: res.Class, ExtractorVersion: e.Version(), FileSize: size, FileModNano: s.modNano}, true, "", size, nil
 }
 
 // sha256Of is the shared content hash: sha256 truncated to contentHashLen bytes
@@ -1997,10 +2026,19 @@ func (c *contentCoordinator) processQueue(resolvePath func(frn uint64) (string, 
 			continue
 		}
 		prior, havePrior := delta.priorHash(frn)
-		doc, didChange, err := contentExtractDeltaDocContext(c.extractCtx, frn, path, prior, havePrior)
+		// Stamp the file's worktree membership for the repo-aware caps.
+		fctx := c.extractCtx
+		if c.scopeHint != nil && fctx != nil {
+			_, inRepo := c.scopeHint.Ignore.repoFor(contentNormPath(path))
+			fctx = contentWithInRepo(fctx, inRepo)
+		}
+		doc, didChange, reason, size, err := contentExtractDeltaDocReason(fctx, frn, path, prior, havePrior)
 		if err != nil {
 			c.state.noteExtractionError()
 			continue
+		}
+		if reason != "" {
+			c.inclusion.add(reason, size)
 		}
 		if !didChange {
 			// A base doc that re-extracts to nothing — the file is now binary or

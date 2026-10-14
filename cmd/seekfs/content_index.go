@@ -270,6 +270,10 @@ type contentIndex struct {
 	Sections      map[uint32][]byte
 	// Policy is the build's extraction policy + skip/truncation counts (CXPL).
 	Policy contentBuildPolicy
+	// Inclusion is the per-reason inclusion-policy tally (selection
+	// rejections, truncations, dedupe savings; §6z), persisted in the
+	// CXIS section. Decoded copies like Policy.
+	Inclusion contentInclusionStats
 	// ScopeHash identifies the resolved scope. Zero means this sidecar predates
 	// scope identity and is not safe for service attachment.
 	ScopeHash [32]byte
