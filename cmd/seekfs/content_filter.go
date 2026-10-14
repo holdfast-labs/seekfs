@@ -329,17 +329,16 @@ func contentFilterRegexGramsMatch(row contentFilterRow, disjuncts [][][]uint32) 
 }
 
 // contentFilterGateOk is the tier-2 candidate gate over one document's filter
-// row: every top-level positive term leaf must may-match, pure-regex leaves
+// row: every top-level positive term leaf must may-match, every regex leaf
 // must hold a disjunct, and content-driven OR groups need a passing
 // alternative. NOT leaves are exclusion and constrain nothing. Anything it
 // cannot prove is verified, so it is sound (no false negatives) by
 // construction: every check is a mayMatch superset test. Leaf grams come
 // precomputed from the matcher, so the per-record cost is bit tests only.
 func contentFilterGateOk(row contentFilterRow, pq parsedQuery, m *contentLeafMatcher) bool {
-	pureRegex := contentLeavesAllRegex(pq)
 	for _, leaf := range pq.Content {
 		if leaf.Kind == contentLeafRegex {
-			if pureRegex && !contentFilterRegexGramsMatch(row, m.filterRegexGramsFor(leaf.LeafID)) {
+			if !contentFilterRegexGramsMatch(row, m.filterRegexGramsFor(leaf.LeafID)) {
 				return false
 			}
 			continue
@@ -359,7 +358,7 @@ func contentFilterGateOk(row contentFilterRow, pq parsedQuery, m *contentLeafMat
 		if !driven {
 			continue
 		}
-		if !contentFilterGroupOk(row, group, m, pureRegex) {
+		if !contentFilterGroupOk(row, group, m) {
 			return false
 		}
 	}
@@ -369,9 +368,9 @@ func contentFilterGateOk(row contentFilterRow, pq parsedQuery, m *contentLeafMat
 // contentFilterGroupOk reports whether an OR group's constraints can hold: an
 // alternative without content constraints always can, so the group passes
 // when any alternative passes — mirroring the tier-1 union streams.
-func contentFilterGroupOk(row contentFilterRow, group []parsedQuery, m *contentLeafMatcher, pureRegex bool) bool {
+func contentFilterGroupOk(row contentFilterRow, group []parsedQuery, m *contentLeafMatcher) bool {
 	for i := range group {
-		if contentFilterAltOk(row, group[i], m, pureRegex) {
+		if contentFilterAltOk(row, group[i], m) {
 			return true
 		}
 	}
@@ -380,10 +379,10 @@ func contentFilterGroupOk(row contentFilterRow, group []parsedQuery, m *contentL
 
 // contentFilterAltOk reports whether one OR alternative's positive content
 // constraints can hold in the row.
-func contentFilterAltOk(row contentFilterRow, alt parsedQuery, m *contentLeafMatcher, pureRegex bool) bool {
+func contentFilterAltOk(row contentFilterRow, alt parsedQuery, m *contentLeafMatcher) bool {
 	for _, leaf := range alt.Content {
 		if leaf.Kind == contentLeafRegex {
-			if pureRegex && !contentFilterRegexGramsMatch(row, m.filterRegexGramsFor(leaf.LeafID)) {
+			if !contentFilterRegexGramsMatch(row, m.filterRegexGramsFor(leaf.LeafID)) {
 				return false
 			}
 			continue
@@ -393,7 +392,7 @@ func contentFilterAltOk(row contentFilterRow, alt parsedQuery, m *contentLeafMat
 		}
 	}
 	for _, group := range alt.OrGroups {
-		if !contentFilterGroupOk(row, group, m, pureRegex) {
+		if !contentFilterGroupOk(row, group, m) {
 			return false
 		}
 	}

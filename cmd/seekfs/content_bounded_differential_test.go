@@ -672,7 +672,7 @@ func TestContentOrUnionStreamStopsEarly(t *testing.T) {
 	contentPostingDecodeHook = func() { decoded++ }
 	defer func() { contentPostingDecodeHook = nil }()
 
-	stream, driven, ok := contentOrGroupCandidateStream(r, group, nil, false)
+	stream, driven, ok := contentOrGroupCandidateStream(r, group, nil)
 	if !ok || !driven || stream == nil {
 		t.Fatalf("group stream driven=%v ok=%v nil=%v; want a driven stream", driven, ok, stream == nil)
 	}
@@ -746,7 +746,7 @@ func TestContentOrUnionStreamMatchesMaterializedUnion(t *testing.T) {
 		t.Run(g.name, func(t *testing.T) {
 			var want []uint32
 			for i, alt := range g.group {
-				altStream, driven, ok := contentAltCandidateStream(r, alt, nil, false)
+				altStream, driven, ok := contentAltCandidateStream(r, alt, nil)
 				if !ok || !driven {
 					t.Fatalf("alt %d driven=%v ok=%v; want a content-driven alternative", i, driven, ok)
 				}
@@ -760,7 +760,7 @@ func TestContentOrUnionStreamMatchesMaterializedUnion(t *testing.T) {
 					want = unionSortedDocIDs(want, altDocs)
 				}
 			}
-			underStream, driven, ok := contentOrGroupCandidateStream(r, g.group, nil, false)
+			underStream, driven, ok := contentOrGroupCandidateStream(r, g.group, nil)
 			if !ok || !driven || underStream == nil {
 				t.Fatalf("group stream driven=%v ok=%v nil=%v", driven, ok, underStream == nil)
 			}
@@ -768,7 +768,7 @@ func TestContentOrUnionStreamMatchesMaterializedUnion(t *testing.T) {
 				t.Fatalf("full streamed union = %v; want %v", got, want)
 			}
 			for _, budget := range []int{0, 1, 2, 5} {
-				stream, _, _ := contentOrGroupCandidateStream(r, g.group, nil, false)
+				stream, _, _ := contentOrGroupCandidateStream(r, g.group, nil)
 				got := collectDocIDStream(stream, budget+1)
 				exp := want
 				if budget+1 < len(exp) {
