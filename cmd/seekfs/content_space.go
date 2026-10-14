@@ -173,14 +173,14 @@ func contentScopeHeadroom(anchorPath string, spooled int64) (headroom uint64, ok
 // An explicit scope budget (budget_bytes) caps the final index, not the
 // extracted text: the format stores no text (§6y), so a doc costs its
 // postings, terms, per-file filter and doc-table row. contentIndexCostEstimate
-// projects that from the doc's extracted length. Measured on Chromium (v10,
-// 183,804 docs, 1416.5 MB extracted, 217.1 MB index) the mean is 1238 B/doc
-// at a 7.7 KB mean text; the estimate gives ~1411 B there (~14% margin), and
-// it overestimates large files, whose distinct trigrams saturate.
+// projects that from the doc's extracted length. The cost is mostly per doc:
+// full Chromium (463,273 docs, 2609 MB extracted) measured 1327 B/doc at a
+// 5.6 KB mean text (the estimate gives ~1444 B, +9%); the v10 sample without
+// third_party measured 1238 B/doc at 7.7 KB (estimate ~1692 B).
 const (
-	contentIndexCostPerDoc     = 256
+	contentIndexCostPerDoc     = 768
 	contentIndexCostPerTextNum = 3
-	contentIndexCostPerTextDen = 20
+	contentIndexCostPerTextDen = 25
 )
 
 // contentIndexCostEstimate returns the projected final-index bytes of one

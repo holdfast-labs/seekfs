@@ -176,8 +176,8 @@ guard, so selection and writes agree. Set `[content]`
 `budget_bytes` (or `[content."E:"]` per volume, or
 `SEEKFS_CONTENT_BUDGET_BYTES`) to pin an explicit budget on the final
 index size. Each admitted doc is charged its projected index bytes
-(`contentIndexCostEstimate`: 256 B + 0.15 × extracted text, ~14% above the
-measured v10 mean of 1238 B/doc on Chromium), because the index stores no
+(`contentIndexCostEstimate`: 768 B + 0.12 × extracted text; full Chromium
+measured 1327 B/doc, estimated ~1444 B), because the index stores no
 text (§6y); charging extracted text admitted only 77.7k of 468k Chromium
 files under a 600 MB budget and published ~130 MB. The reserve-derived
 transient allowance (extracted-text units, the spool peak) applies under an
