@@ -1005,4 +1005,3 @@ func (u *UI) layoutRenameCard(gtx layout.Context, s Scheme) layout.Dimensions {
 	call.Add(gtx.Ops)
 	return dims
 }
-

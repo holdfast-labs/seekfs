@@ -91,8 +91,9 @@ func assertBoundedDifferentialEqual(t *testing.T, label string, oldTrace, newTra
 
 func TestContentBoundedCandidatesDifferential(t *testing.T) {
 	t.Setenv("SEEKFS_CONTENT_SEARCH", "1")
-	volC := newContentRecordVolume(t, "C:", contentBoundedDifferentialRecords("C:", 4_300, 1_000_000))
-	volF := newContentRecordVolume(t, "F:", contentBoundedDifferentialRecords("F:", 4_300, 2_000_000))
+	// Shared read-only pair (same records/constructor as the old per-test
+	// build); this test never mutates the volumes.
+	volC, volF := sharedBoundedFlatVolumes(t)
 
 	scopes := []struct {
 		name string
@@ -148,8 +149,8 @@ func TestContentBoundedCandidatesDifferential(t *testing.T) {
 // they tally in place over the full match set.
 func TestContentBoundedCountMatchesSearchDifferential(t *testing.T) {
 	t.Setenv("SEEKFS_CONTENT_SEARCH", "1")
-	volC := newContentRecordVolume(t, "C:", contentBoundedDifferentialRecords("C:", 4_300, 1_000_000))
-	volF := newContentRecordVolume(t, "F:", contentBoundedDifferentialRecords("F:", 4_300, 2_000_000))
+	// Shared read-only pair; this test never mutates the volumes.
+	volC, volF := sharedBoundedFlatVolumes(t)
 	scopes := []struct {
 		name string
 		vols []*serviceVolumeIndex
@@ -311,7 +312,8 @@ func TestContentBoundedOverlayAdditionCompletenessDifferential(t *testing.T) {
 // including completeness.
 func TestContentBoundedPathShapeCompletenessDifferential(t *testing.T) {
 	t.Setenv("SEEKFS_CONTENT_SEARCH", "1")
-	vol := newContentRecordVolume(t, "C:", contentBoundedDifferentialRecords("C:", 4_300, 1_000_000))
+	// Shared read-only volume; this test never mutates it.
+	vol, _ := sharedBoundedFlatVolumes(t)
 	vols := []*serviceVolumeIndex{vol}
 	shapes := []struct {
 		name   string
@@ -350,7 +352,8 @@ func TestContentBoundedPathShapeCompletenessDifferential(t *testing.T) {
 // order is exactly the non-early-stop result's prefix.
 func TestContentBoundedBiasedDifferential(t *testing.T) {
 	t.Setenv("SEEKFS_CONTENT_SEARCH", "1")
-	vol := newContentRecordVolume(t, "C:", contentBoundedDifferentialRecords("C:", 4_300, 1_000_000))
+	// Shared read-only volume; this test never mutates it.
+	vol, _ := sharedBoundedFlatVolumes(t)
 	vols := []*serviceVolumeIndex{vol}
 	queries := []string{
 		"content:download",
@@ -513,8 +516,8 @@ func TestContentBoundedBiasedHiddenDifferential(t *testing.T) {
 // fixture so a hit under the bias root actually reorders the result.
 func TestContentBoundedBiasedFilenameMultiVolumeDifferential(t *testing.T) {
 	t.Setenv("SEEKFS_CONTENT_SEARCH", "1")
-	volC := newContentRecordVolume(t, "C:", contentBiasedNestedRecords("C:", 1_000_000, 1_100))
-	volF := newContentRecordVolume(t, "F:", contentBiasedNestedRecords("F:", 2_000_000, 1_100))
+	// Shared read-only pair; this test never mutates the volumes.
+	volC, volF := sharedBoundedNestedVolumes(t)
 	scopes := []struct {
 		name string
 		vols []*serviceVolumeIndex
@@ -777,7 +780,8 @@ func TestContentOrUnionStreamMatchesMaterializedUnion(t *testing.T) {
 // does not disable it.
 func TestContentBoundedBiasedEarlyStopStopsNearLimit(t *testing.T) {
 	t.Setenv("SEEKFS_CONTENT_SEARCH", "1")
-	vol := newContentRecordVolume(t, "C:", contentBiasedNestedRecords("C:", 1_000_000, 1_100))
+	// Shared read-only volume; this test never mutates it.
+	vol, _ := sharedBoundedNestedVolumes(t)
 	const limit = 20
 	trace := &searchTrace{}
 	matches, err := searchServiceVolumes([]*serviceVolumeIndex{vol}, queryOptions{Query: "content:download", Limit: limit, RootBias: `C:\alpha`, Trace: trace}, false)

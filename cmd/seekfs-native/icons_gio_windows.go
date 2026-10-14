@@ -32,11 +32,11 @@ const (
 )
 
 type gShFileInfo struct {
-	HIcon         uintptr
-	IIcon         int32
-	Attributes    uint32
-	DisplayName   [260]uint16
-	TypeName      [80]uint16
+	HIcon       uintptr
+	IIcon       int32
+	Attributes  uint32
+	DisplayName [260]uint16
+	TypeName    [80]uint16
 }
 
 type gBitmapInfoHeader struct {
@@ -172,11 +172,11 @@ func renderShellIcon(path string, isDir bool, size int) *image.RGBA {
 	defer syscall.SyscallN(pDeleteDC.Addr(), mem)
 
 	bmi := gBitmapInfo{Header: gBitmapInfoHeader{
-		BiSize:      uint32(unsafe.Sizeof(gBitmapInfoHeader{})),
-		BiWidth:     int32(size),
-		BiHeight:    -int32(size),
-		BiPlanes:    1,
-		BiBitCount:  32,
+		BiSize:        uint32(unsafe.Sizeof(gBitmapInfoHeader{})),
+		BiWidth:       int32(size),
+		BiHeight:      -int32(size),
+		BiPlanes:      1,
+		BiBitCount:    32,
 		BiCompression: gBiRGB,
 	}}
 	var bits unsafe.Pointer

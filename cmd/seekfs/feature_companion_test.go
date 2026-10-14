@@ -169,7 +169,13 @@ func featureTestService(t *testing.T, mode string) (*goSearchService, *serviceVo
 	}}
 	contentIndexFRNs(idx)
 	vol := newServiceVolumeIndex(filepath.Join(t.TempDir(), "seekfs_c.gsi"), idx)
-	s := &goSearchService{stop: make(chan struct{}), contentCfg: appConfig{SeekFSDir: t.TempDir(), Features: map[string]featureConfig{"tags": {Enabled: true, Command: exe, Args: []string{"-test.run=^TestFeatureCompanionProcess$", "--", mode}, Timeout: time.Second}}}}
+	// Test-only companion timeout: the helper spawns the test binary as a
+	// subprocess per test, and 1s left no headroom for process start on a
+	// loaded box ("feature tags request timed out" flakes). 15s keeps the
+	// kill-switch semantics (no test asserts the 1s bound; the stall mode
+	// is driven by its own 100ms ctx) while surviving load. This touches
+	// only test scaffolding, never product defaults.
+	s := &goSearchService{stop: make(chan struct{}), contentCfg: appConfig{SeekFSDir: t.TempDir(), Features: map[string]featureConfig{"tags": {Enabled: true, Command: exe, Args: []string{"-test.run=^TestFeatureCompanionProcess$", "--", mode}, Timeout: 15 * time.Second}}}}
 	s.prepareFeatureVolume(vol)
 	s.indexMu.Lock()
 	s.indexes, s.volumes = []*Index{idx}, []*serviceVolumeIndex{vol}

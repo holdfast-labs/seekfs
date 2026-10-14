@@ -67,9 +67,9 @@ const (
 )
 
 var globalDropSourceVtbl = &dropSourceVtbl{
-	queryInterface: syscall.NewCallback(dropSourceQueryInterface),
-	addRef:         syscall.NewCallback(dropSourceAddRef),
-	release:        syscall.NewCallback(dropSourceRelease),
+	queryInterface:    syscall.NewCallback(dropSourceQueryInterface),
+	addRef:            syscall.NewCallback(dropSourceAddRef),
+	release:           syscall.NewCallback(dropSourceRelease),
 	queryContinueDrag: syscall.NewCallback(dropSourceQueryContinueDrag),
 	giveFeedback:      syscall.NewCallback(dropSourceGiveFeedback),
 }

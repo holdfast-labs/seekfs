@@ -30,7 +30,9 @@ func validFeatureName(name string) bool {
 }
 
 func featureContentEnabled(cfg appConfig) bool {
-	if d,ok:=cfg.Plugins["content"]; ok { return d.Installed && d.Feature.Enabled }
+	if d, ok := cfg.Plugins["content"]; ok {
+		return d.Installed && d.Feature.Enabled
+	}
 	if value, ok := os.LookupEnv("SEEKFS_CONTENT_SEARCH"); ok {
 		return value == "1"
 	}

@@ -98,6 +98,8 @@ func TestMain(m *testing.M) {
 
 	// Best-effort cleanup of the temp root (defers never run on Exit).
 	_ = os.RemoveAll(testRoot)
+	// Suite-lived shared fixtures (see shared_content_volume_test.go).
+	removeSharedContentTmpDirs()
 	if failed {
 		os.Stderr.WriteString("TEST HERMETICITY GUARD: failing the suite\n")
 		os.Exit(1)

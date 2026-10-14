@@ -21,11 +21,11 @@ import (
 // DXGI_STATUS_OCCLUDED on machines with headless/capture displays).
 
 var (
-	gdi32mod              = syscall.NewLazyDLL("gdi32.dll")
-	pStretchDIBits        = gdi32mod.NewProc("StretchDIBits")
-	user32presentmod      = syscall.NewLazyDLL("user32.dll")
-	pGetDCForPresent      = user32presentmod.NewProc("GetDC")
-	pReleaseDCForPresent  = user32presentmod.NewProc("ReleaseDC")
+	gdi32mod             = syscall.NewLazyDLL("gdi32.dll")
+	pStretchDIBits       = gdi32mod.NewProc("StretchDIBits")
+	user32presentmod     = syscall.NewLazyDLL("user32.dll")
+	pGetDCForPresent     = user32presentmod.NewProc("GetDC")
+	pReleaseDCForPresent = user32presentmod.NewProc("ReleaseDC")
 )
 
 // bitmapInfoV3 is a 40-byte BITMAPINFOHEADER for 32bpp BI_RGB DIBs.

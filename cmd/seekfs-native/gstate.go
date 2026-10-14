@@ -20,7 +20,7 @@ import (
 const saveDebounce = 800 * time.Millisecond
 
 type UI struct {
-	win      *app.Window
+	win        *app.Window
 	invalidate func()
 
 	client   *Client
@@ -29,50 +29,50 @@ type UI struct {
 	shell    shellBridge
 	settings Settings
 
-	mu       sync.Mutex
-	rows     []ResultRow // sorted display order
-	seq      int64
-	query    string
-	under    string
-	contents bool
-	view     ViewMode
-	sortKey  SortKey
-	sortAsc  bool
-	sel      map[int]bool // selected row indices
-	focus    int          // focused row (-1 none)
-	fuzzyMsg string
+	mu        sync.Mutex
+	rows      []ResultRow // sorted display order
+	seq       int64
+	query     string
+	under     string
+	contents  bool
+	view      ViewMode
+	sortKey   SortKey
+	sortAsc   bool
+	sel       map[int]bool // selected row indices
+	focus     int          // focused row (-1 none)
+	fuzzyMsg  string
 	elapsedMS int64
-	searchMS float64
-	source   string
-	content  *contentState
-	unavail  string
-	flashMsg string
-	volumes  []DBVolume
-	health   string
+	searchMS  float64
+	source    string
+	content   *contentState
+	unavail   string
+	flashMsg  string
+	volumes   []DBVolume
+	health    string
 	healthMsg string
-	entries  int
+	entries   int
 
 	// Theme.
-	th       *material.Theme
-	scheme   Scheme
-	dark     bool
-	accent   color.NRGBA
+	th     *material.Theme
+	scheme Scheme
+	dark   bool
+	accent color.NRGBA
 
 	// Widgets.
-	searchEd   widget.Editor
-	scopeEd    widget.Editor
-	backBtn    widget.Clickable
-	fwdBtn     widget.Clickable
-	clearBtn   widget.Clickable
-	contentsCk widget.Clickable
-	viewBtns   [3]widget.Clickable
-	list       widget.List
-	iconList   widget.List
-	sideList   widget.List
+	searchEd    widget.Editor
+	scopeEd     widget.Editor
+	backBtn     widget.Clickable
+	fwdBtn      widget.Clickable
+	clearBtn    widget.Clickable
+	contentsCk  widget.Clickable
+	viewBtns    [3]widget.Clickable
+	list        widget.List
+	iconList    widget.List
+	sideList    widget.List
 	previewList widget.List
-	saveBtn    widget.Clickable
-	cancelBtn  widget.Clickable
-	renameEd   widget.Editor
+	saveBtn     widget.Clickable
+	cancelBtn   widget.Clickable
+	renameEd    widget.Editor
 
 	// Sidebar rows (rebuilt on volumes/saved change).
 	sideRows   []sideRow

@@ -389,13 +389,13 @@ func (b *contentExternalSectionBuilder) removeRuns() error {
 // The key lives in a fixed array (never appended to, never reallocated);
 // key views it for the merge heap.
 type contentRunReader struct {
-	f       *os.File
-	br      *bufio.Reader
-	keyBuf  [3]byte
-	key     []byte
-	recBuf  [contentExternalRecordSize]byte
-	docID   uint32
-	done    bool
+	f      *os.File
+	br     *bufio.Reader
+	keyBuf [3]byte
+	key    []byte
+	recBuf [contentExternalRecordSize]byte
+	docID  uint32
+	done   bool
 }
 
 func newContentRunReader(path string) (*contentRunReader, error) {

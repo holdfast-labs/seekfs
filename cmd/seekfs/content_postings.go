@@ -83,7 +83,7 @@ type contentDocFreq struct {
 //     1 = singleton).
 type contentPostingEntry struct {
 	key        [3]byte
-	single    bool
+	single     bool
 	count      uint32
 	firstBlock uint32
 	blockCount uint32
@@ -93,8 +93,8 @@ type contentPostingEntry struct {
 // contentPostingEntryMulti and contentPostingEntrySingle are the flags-byte
 // values distinguishing the two v9 entry kinds.
 const (
-	contentPostingEntryMulti   = 0
-	contentPostingEntrySingle  = 1
+	contentPostingEntryMulti  = 0
+	contentPostingEntrySingle = 1
 )
 
 // contentBlockMeta locates one encoded block and records its bounds.
