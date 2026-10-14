@@ -158,6 +158,11 @@ type contentHealth struct {
 	// Binary counts files that sniffed as binary at build time (NUL in the
 	// head window, like ripgrep): expected rejections, not drops.
 	Binary int `json:"binary,omitempty"`
+	// Inclusion carries the §6z per-reason inclusion tallies from the
+	// attached base's CXIS section (selection rejections with files and
+	// bytes per skip reason, truncations, dedupe savings, skipped
+	// worktrees), so every policy decision is visible in loaded.
+	Inclusion contentInclusionStats `json:"inclusion,omitempty"`
 	// SidecarBytes/SidecarCap report the attached `.gsx` encoded size and the
 	// size cap (WP10/M7), so unbounded sidecar growth is observable in
 	// `loaded --json` instead of only failing silently.
@@ -852,6 +857,9 @@ func (s *contentVolumeState) setReady(idx *contentIndex, reader *contentReader, 
 		s.health.ReserveBytes = idx.Policy.ReserveBytes
 		s.health.Binary = int(idx.Policy.Binary)
 	}
+	// The CXIS inclusion stats ride their own section, independent of
+	// the CXPL policy block.
+	s.health.Inclusion = idx.Inclusion
 	// A targeted extractor-version refresh (WP11) keeps the volume usable: its
 	// text is a valid, if older, extraction. The refresh signal is only raised
 	// by markExtractorRefresh (attach), and recomputed here as folds publish

@@ -413,7 +413,9 @@ func buildContentIndexFromDir(ctx context.Context, root string, opts contentBuil
 		polRaw, polText = settings.maxRaw, settings.maxText
 	}
 	idx.Policy = contentBuildPolicy{MaxRaw: polRaw, MaxText: polText, Skipped: skipped, Truncated: truncated, Binary: binary}
-	idx.Inclusion = inclusion
+	// The assembler already stamped the dedupe totals; merge the
+	// selection/extraction tallies around them.
+	idx.Inclusion.merge(inclusion)
 	idx.Scanned = int64(scanned)
 	idx.Declined = declined
 	return idx, nil
@@ -469,6 +471,9 @@ func assembleContentIndexStream(source contentBuildSource, tmpDir string) (*cont
 	idx := newContentIndex()
 	idx.Origin = contentOriginWalk
 	idx.Docs = built.docs
+	idx.Aliases = built.aliasPairs
+	idx.Inclusion.DedupeFiles = built.dedupeFiles
+	idx.Inclusion.DedupeBytes = built.dedupeBytes
 	if built.termPath != "" {
 		terms, err := os.ReadFile(built.termPath)
 		if err != nil {
@@ -530,6 +535,12 @@ type contentStreamedBuild struct {
 	// dictPath holds the exact CXTD section bytes (the shard's trained
 	// text dictionary), or "" when the shard encodes plain.
 	dictPath string
+	// aliasPairs holds the §6z dedupe map (alias DocID -> primary
+	// DocID); dedupeFiles/Bytes tally the shared documents and the
+	// extracted-text bytes storing them once saved.
+	aliasPairs  []contentAliasPair
+	dedupeFiles int64
+	dedupeBytes int64
 }
 
 // contentAssembleBatchDocs and contentAssembleBatchBytes bound the streaming
@@ -621,6 +632,13 @@ func assembleContentIndexStreamed(source contentBuildSource, tmpDir string) (*co
 	built := &contentStreamedBuild{}
 	var docs []contentDoc
 	var paths []string
+	// Content-hash dedupe (§6z): stored-text length + sha256 (already
+	// computed per doc as the doc table's ContentHash) maps to the
+	// primary's text location. Later identical documents become aliases:
+	// full doc-table rows sharing the primary's bytes with no postings.
+	dedupeSeen := make(map[contentDedupeKey]contentDedupeSeen)
+	var aliasPairs []contentAliasPair
+	var dedupeFiles, dedupeBytes int64
 	// Dictionary sampling (v8): the first contentDictSampleBytes of stored
 	// text train the shard's dictionary, then later blocks encode against
 	// it. Sampling rides the normal emit path — every document is still
@@ -732,6 +750,35 @@ func assembleContentIndexStreamed(source contentBuildSource, tmpDir string) (*co
 				t := &toks[i]
 				docID := uint32(len(docs))
 				paths = append(paths, d.path)
+				// Identical content is stored once: the alias keeps its
+				// own identity (DocID, FRN, path, fingerprint, hash) and
+				// addresses the primary's bytes, contributing no text or
+				// postings of its own. Empty stored text never aliases.
+				if len(t.stored) > 0 {
+					key := contentDedupeKey{length: len(t.stored), hash: t.hash}
+					if prim, dup := dedupeSeen[key]; dup {
+						docs = append(docs, contentDoc{
+							DocID:            docID,
+							FRN:              d.frn,
+							ContentType:      d.class,
+							ExtractorVersion: d.version,
+							DocLen:           t.docLen,
+							RawSize:          int64(len(t.stored)),
+							ModUnix:          d.modUnix,
+							ContentHash:      t.hash,
+							TextOff:          prim.textOff,
+							TextLen:          prim.textLen,
+							FileSize:         d.fileSize,
+							FileModNano:      d.fileModNano,
+						})
+						aliasPairs = append(aliasPairs, contentAliasPair{Alias: docID, Primary: prim.docID})
+						dedupeFiles++
+						dedupeBytes += int64(len(t.stored))
+						contentAssembleStreamHook(int(docID))
+						continue
+					}
+					dedupeSeen[key] = contentDedupeSeen{docID: docID, textOff: textLogical, textLen: uint32(len(t.stored))}
+				}
 				// Dictionary sampling rides along: accumulate stored text
 				// until the sample cap or the exhausted source, then train
 				// once and keep emitting. Emission itself never pauses, so
@@ -875,6 +922,9 @@ func assembleContentIndexStreamed(source contentBuildSource, tmpDir string) (*co
 	}
 	built.docs = docs
 	built.paths = paths
+	built.aliasPairs = aliasPairs
+	built.dedupeFiles = dedupeFiles
+	built.dedupeBytes = dedupeBytes
 	built.textPath = textPath
 	// textSize stays the logical (decompressed) stream length: shard
 	// planning and the reshard threshold budget memory and work by corpus
@@ -1060,7 +1110,7 @@ func buildContentIndexForIndex(ctx context.Context, idx *Index, opts contentBuil
 		polRaw, polText = settings.maxRaw, settings.maxText
 	}
 	cidx.Policy = contentBuildPolicy{MaxRaw: polRaw, MaxText: polText, Skipped: skipped, Truncated: truncated, Binary: binary}
-	cidx.Inclusion = inclusion
+	cidx.Inclusion.merge(inclusion)
 	// Stamp the content USN checkpoint from the record index metadata: the
 	// base is complete as of the .gsi checkpoint, so restart catch-up resumes
 	// from here rather than re-reading the whole journal (WP0/PB3).

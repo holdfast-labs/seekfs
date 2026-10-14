@@ -71,7 +71,7 @@ func parsePluginDefinitions(text string) (map[string]pluginDefinition, error) {
 		switch key {
 		case "installed":
 			d.Installed, err = strconv.ParseBool(value)
-		case "scope", "roots", "exclude", "exts", "git", "system_excludes", "budget_bytes":
+		case "scope", "roots", "exclude", "exts", "git", "system_excludes", "budget_bytes", "skip", "worktrees":
 			if name != "content" {
 				err = fmt.Errorf("content-only setting %s", key)
 				break
@@ -84,7 +84,14 @@ func parsePluginDefinitions(text string) (map[string]pluginDefinition, error) {
 						err = fmt.Errorf("invalid scope")
 					}
 				}
-			case "roots", "exclude", "exts":
+			case "worktrees":
+				d.Content.Worktrees, err = parseFeatureString(value)
+				if err == nil {
+					if w := strings.TrimSpace(d.Content.Worktrees); w != "" && !strings.EqualFold(w, contentWorktreesAll) && !strings.EqualFold(w, "main") {
+						err = fmt.Errorf("invalid worktrees (want main or all)")
+					}
+				}
+			case "roots", "exclude", "exts", "skip":
 				var values []string
 				values, err = parseFeatureArgs(value)
 				if err == nil && values == nil {
@@ -98,6 +105,9 @@ func parsePluginDefinitions(text string) (map[string]pluginDefinition, error) {
 				}
 				if key == "exts" {
 					d.Content.Exts = values
+				}
+				if key == "skip" {
+					d.Content.Skip = values
 				}
 			case "git", "system_excludes":
 				var b bool
@@ -174,10 +184,13 @@ func formatPluginDefinition(name string, d pluginDefinition) string {
 	for _, item := range []struct {
 		key    string
 		values []string
-	}{{"roots", sc.Roots}, {"exclude", sc.Exclude}, {"exts", sc.Exts}} {
+	}{{"roots", sc.Roots}, {"exclude", sc.Exclude}, {"exts", sc.Exts}, {"skip", sc.Skip}} {
 		if item.values != nil {
 			fmt.Fprintf(&b, "%s = %s\n", item.key, formatStringArray(item.values))
 		}
+	}
+	if sc.Worktrees != "" {
+		fmt.Fprintf(&b, "worktrees = %s\n", strconvQuote(sc.Worktrees))
 	}
 	if sc.Git != nil {
 		fmt.Fprintf(&b, "git = %t\n", *sc.Git)

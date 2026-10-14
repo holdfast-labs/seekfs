@@ -1092,6 +1092,11 @@ func (s *goSearchService) runContentBuild(vol *serviceVolumeIndex, reuseSidecar 
 		shard.Sections = map[uint32][]byte{contentSectionPaths: encodeContentPaths(built.paths)}
 		return built, shard, shardTmp, nil
 	}
+	// Sharded saves accumulate the per-shard dedupe totals for the
+	// manifest's CXIS section (single-file saves stamp them on the
+	// shard directly below).
+	var dedupeMu sync.Mutex
+	var totalDedupeFiles, totalDedupeBytes int64
 	saveShard := func(dir string, order []int, prefixes []string) (contentShardInfo, error) {
 		built, shard, shardTmp, err := assemble(order)
 		if shardTmp != "" {
@@ -1103,6 +1108,10 @@ func (s *goSearchService) runContentBuild(vol *serviceVolumeIndex, reuseSidecar 
 		if err := contentCheckDiskReserve(dir); err != nil {
 			return contentShardInfo{}, err
 		}
+		dedupeMu.Lock()
+		totalDedupeFiles += built.dedupeFiles
+		totalDedupeBytes += built.dedupeBytes
+		dedupeMu.Unlock()
 		return contentSaveShard(dir, shard, contentBuildFiles(built), prefixes)
 	}
 	// save assembles and writes the sidecar: one file for a corpus within a
@@ -1125,6 +1134,8 @@ func (s *goSearchService) runContentBuild(vol *serviceVolumeIndex, reuseSidecar 
 			if err := contentCheckDiskReserve(gsx); err != nil {
 				return err
 			}
+			shard.Inclusion.DedupeFiles = built.dedupeFiles
+			shard.Inclusion.DedupeBytes = built.dedupeBytes
 			return contentSaveAssembled(gsx, shard, contentBuildFiles(built))
 		}
 		paths := make([]string, len(selected))
@@ -1183,6 +1194,8 @@ func (s *goSearchService) runContentBuild(vol *serviceVolumeIndex, reuseSidecar 
 		if !s.contentBuildCurrent(vol, gen, journalID) {
 			return errContentBuildStale
 		}
+		header.Inclusion.DedupeFiles = totalDedupeFiles
+		header.Inclusion.DedupeBytes = totalDedupeBytes
 		serviceLog("content build volume=%s shards=%d", vol.volume, len(infos))
 		return contentSaveManifest(gsx, header, infos)
 	}

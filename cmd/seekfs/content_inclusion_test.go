@@ -4,7 +4,9 @@ package main
 // filtering, per-file caps, and every skip class.
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -190,6 +192,53 @@ func TestContentInclusionCaps(t *testing.T) {
 	// Unstamped contexts fail open to the in-repo caps.
 	if inRepo, ok := contentInRepoFromContext(context.Background()); !inRepo || ok {
 		t.Fatalf("unstamped inRepo = %v,%v; want true,false", inRepo, ok)
+	}
+}
+
+func TestContentPluginSkipWorktreesConfig(t *testing.T) {
+	root := t.TempDir()
+	config := filepath.Join(root, "seekfs.toml")
+	if err := os.WriteFile(config, []byte("default_limit = 25\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	oldCall := pluginServiceCall
+	pluginServiceCall = func(string, serviceRequest) (serviceResponse, error) {
+		return serviceResponse{}, errors.New("offline")
+	}
+	t.Cleanup(func() { pluginServiceCall = oldCall })
+	var out bytes.Buffer
+	// --skip takes plain paths and globs; --worktrees takes main|all.
+	if err := runPluginCommand([]string{"add", "content", "--config", config, "--plugin-config", filepath.Join(root, "plugin.toml"),
+		"--root", root, "--skip", filepath.Join(root, "secret"), "--skip", `C:\w\gen\**\*.pb.go`, "--worktrees", "all"}, &out); err != nil {
+		t.Fatal(err)
+	}
+	defs, err := loadPluginDefinitions(filepath.Join(root, "plugin.toml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := defs["content"].Content
+	if len(d.Skip) != 2 || d.Worktrees != "all" {
+		t.Fatalf("content skip/worktrees = %+v", d)
+	}
+	// The saved file round-trips and resolves into the scope.
+	defs2, err := parsePluginDefinitions(formatPluginDefinition("content", defs["content"]))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(defs2["content"].Content.Skip) != 2 || defs2["content"].Content.Worktrees != "all" {
+		t.Fatalf("round-trip = %+v", defs2["content"].Content)
+	}
+	scope := contentScopeForVolume(appConfig{}, "C:")
+	if len(scope.Skip) != 0 {
+		t.Fatalf("empty config scope skip = %v", scope.Skip)
+	}
+	// Invalid worktrees values are rejected at the CLI and the file.
+	out.Reset()
+	if err := runPluginCommand([]string{"config", "content", "--config", config, "--plugin-config", filepath.Join(root, "plugin.toml"), "--worktrees", "sometimes"}, &out); err == nil {
+		t.Fatal("invalid worktrees accepted")
+	}
+	if _, err := parsePluginDefinitions("[plugins.content]\nworktrees = \"sometimes\"\n"); err == nil {
+		t.Fatal("invalid worktrees in file accepted")
 	}
 }
 

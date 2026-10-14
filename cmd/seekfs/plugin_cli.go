@@ -35,7 +35,7 @@ func runPluginCommand(args []string, out io.Writer) error {
 seekfs plugin add content [--scope auto|explicit] [--root PATH] [--wait]
 seekfs plugin add NAME --command C:\Tools\companion.exe [--arg VALUE]
 seekfs plugin remove|enable|disable NAME
-seekfs plugin config NAME [--scope MODE] [--root PATH] [--budget-bytes N]
+seekfs plugin config NAME [--scope MODE] [--root PATH] [--budget-bytes N] [--skip PATH] [--worktrees main|all]
 seekfs plugin doctor [NAME] [--wait] [--timeout 10m] [--json]
 seekfs plugin reload
 seekfs plugin path
@@ -62,10 +62,12 @@ activation in a running service; --wait waits for readiness.`)
 	budget := fs.Int64("budget-bytes", 0, "content text budget")
 	git := fs.Bool("git", true, "include detected git worktrees")
 	system := fs.Bool("system-excludes", true, "exclude generated/system directories")
-	var roots, excludes, exts, commandArgs stringList
+	worktrees := fs.String("worktrees", "", "linked git worktrees: main (default) or all")
+	var roots, excludes, exts, skips, commandArgs stringList
 	fs.Var(&roots, "root", "content root; repeatable")
 	fs.Var(&excludes, "exclude", "excluded content path; repeatable")
 	fs.Var(&exts, "ext", "content extension; repeatable")
+	fs.Var(&skips, "skip", "content-skip path or glob; repeatable")
 	fs.Var(&commandArgs, "arg", "companion argument; repeatable (use --arg=--flag)")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -118,7 +120,7 @@ activation in a running service; --wait waits for readiness.`)
 		return err
 	}
 	settingsChanged := false
-	for _, key := range []string{"command", "arg", "timeout-seconds", "scope", "root", "exclude", "ext", "git", "system-excludes", "budget-bytes"} {
+	for _, key := range []string{"command", "arg", "timeout-seconds", "scope", "root", "exclude", "ext", "git", "system-excludes", "budget-bytes", "skip", "worktrees"} {
 		settingsChanged = settingsChanged || changed[key]
 	}
 	mutating := op == "add" || op == "remove" || op == "enable" || op == "disable" || op == "config" && settingsChanged
@@ -135,7 +137,7 @@ activation in a running service; --wait waits for readiness.`)
 		if serviceErr == nil && info.PluginConfig != "" && !samePath(info.PluginConfig, *pluginPath) {
 			return fmt.Errorf("running service uses %s; select that plugin file", info.PluginConfig)
 		}
-		if name != "content" && (changed["scope"] || changed["root"] || changed["exclude"] || changed["ext"] || changed["git"] || changed["system-excludes"] || changed["budget-bytes"]) {
+		if name != "content" && (changed["scope"] || changed["root"] || changed["exclude"] || changed["ext"] || changed["git"] || changed["system-excludes"] || changed["budget-bytes"] || changed["skip"] || changed["worktrees"]) {
 			return fmt.Errorf("content settings require plugin content")
 		}
 		if name == "content" && (changed["command"] || changed["arg"] || changed["timeout-seconds"]) {
@@ -149,6 +151,18 @@ activation in a running service; --wait waits for readiness.`)
 		}
 		for i, path := range excludes {
 			excludes[i], err = filepath.Abs(path)
+			if err != nil {
+				return err
+			}
+		}
+		// Skip entries may be globs (never absolutized: patterns match
+		// normalized paths, and Abs would corrupt the magic); plain
+		// paths are cleaned at resolve time.
+		for i, path := range skips {
+			if contentSkipHasMagic(path) {
+				continue
+			}
+			skips[i], err = filepath.Abs(path)
 			if err != nil {
 				return err
 			}
@@ -214,6 +228,15 @@ activation in a running service; --wait waits for readiness.`)
 			}
 			if changed["exclude"] {
 				d.Content.Exclude = append([]string{}, excludes...)
+			}
+			if changed["skip"] {
+				d.Content.Skip = append([]string{}, skips...)
+			}
+			if changed["worktrees"] {
+				if w := *worktrees; w != "" && w != contentWorktreesAll && w != "main" {
+					return d, fmt.Errorf("invalid worktrees (want main or all)")
+				}
+				d.Content.Worktrees = *worktrees
 			}
 			if changed["ext"] {
 				d.Content.Exts = append([]string{}, exts...)

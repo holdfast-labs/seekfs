@@ -97,9 +97,42 @@ type contentReader struct {
 	// pruned is the CXGP pruned-gram set: dense grams the builder dropped
 	// from the postings (see contentGramPruneDF). Nil when the index
 	// prunes nothing. candidateStreamIn skips pruned grams as
-	// constraints; a term left with no usable gram falls back to the
-	// full scan like a sub-3-byte term.
+	// constraints; a term left with no usable gram scans like a sub-3-byte term.
 	pruned map[uint32]struct{}
+	// aliasExpand maps a primary docID to its alias docIDs (§6z dedupe):
+	// aliases share the primary's bytes but own no postings, so every
+	// posting-derived candidate set expands over this map before
+	// verification. Nil when the index dedupes nothing. On a composite
+	// the IDs are global (rebased); shard readers carry local maps.
+	aliasExpand map[uint32][]uint32
+}
+
+// expandAliasDocIDs unions docIDs with every alias of an included primary
+// and sorts ascending. Idempotent: inputs already containing aliases (the
+// all-documents stream, scan shapes) come back unchanged apart from order.
+func (r *contentReader) expandAliasDocIDs(ids []uint32) []uint32 {
+	if len(r.aliasExpand) == 0 {
+		// Posting streams and the all-documents stream are ascending by
+		// construction; with no aliases there is nothing to add.
+		return ids
+	}
+	seen := make(map[uint32]struct{}, len(ids))
+	out := make([]uint32, 0, len(ids))
+	add := func(id uint32) {
+		if _, ok := seen[id]; ok {
+			return
+		}
+		seen[id] = struct{}{}
+		out = append(out, id)
+	}
+	for _, id := range ids {
+		add(id)
+		for _, a := range r.aliasExpand[id] {
+			add(a)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	return out
 }
 
 // openContentReader decodes the queryable sections of idx.
@@ -117,6 +150,25 @@ func openContentReader(idx *contentIndex) (*contentReader, error) {
 				if sh.reader.store != nil {
 					sh.reader.store.cache = r.cache
 				}
+			}
+		}
+		// Global alias map: rebase each shard's local pairs (shard
+		// readers decoded their own CXAL at open; a shard without one
+		// contributes nothing). The manifest itself holds no docs.
+		for _, sh := range idx.shards {
+			if sh == nil || sh.reader == nil || len(sh.reader.aliasExpand) == 0 {
+				continue
+			}
+			if r.aliasExpand == nil {
+				r.aliasExpand = make(map[uint32][]uint32)
+			}
+			for prim, aliases := range sh.reader.aliasExpand {
+				gp := sh.base + prim
+				ga := make([]uint32, 0, len(aliases))
+				for _, a := range aliases {
+					ga = append(ga, sh.base+a)
+				}
+				r.aliasExpand[gp] = ga
 			}
 		}
 		return r, nil
@@ -165,6 +217,18 @@ func openContentReader(idx *contentIndex) (*contentReader, error) {
 			return nil, err
 		}
 		r.store = st
+	}
+	// Alias expansion prefers the decoded field (in-memory builds that
+	// never round-tripped through a file); the CXAL section is the same
+	// data for loads.
+	if len(idx.Aliases) > 0 {
+		r.aliasExpand = contentAliasExpandMap(idx.Aliases)
+	} else if sec := idx.Sections[contentSectionAlias]; len(sec) > 0 {
+		if pairs, err := decodeContentAliases(sec, len(idx.Docs)); err != nil {
+			return nil, err
+		} else {
+			r.aliasExpand = contentAliasExpandMap(pairs)
+		}
 	}
 	// A v8 shard carries its text dictionary as CXTD; frames decoded
 	// without it fail closed in textFor, so a missing section is never a
@@ -293,19 +357,17 @@ func (r *contentReader) verifyDocContent(id uint32, needle []byte) *contentHit {
 }
 
 // searchSerial is the historical streaming search: candidates verify one at
-// a time in docID order, stopping at the limit.
+// a time in docID order, stopping at the limit. The candidate set
+// materializes first so §6z aliases expand into docID order before the
+// limit applies: every duplicate path is listed, not just the primary.
 func (r *contentReader) searchSerial(t string, limit int) []contentHit {
 	if t == "" {
 		return nil
 	}
 	needle := []byte(t)
-	next := r.candidateStream(t)
+	ids := r.expandAliasDocIDs(collectDocIDStream(r.candidateStream(t), 0))
 	var hits []contentHit
-	for {
-		id, ok := next()
-		if !ok {
-			break
-		}
+	for _, id := range ids {
 		if hit := r.verifyDocContent(id, needle); hit != nil {
 			hits = append(hits, *hit)
 			if limit > 0 && len(hits) >= limit {
@@ -364,7 +426,18 @@ func (r *contentReader) searchParallel(t string, limit int, workers int) []conte
 		return r.searchSerial(t, limit)
 	}
 	needle := []byte(t)
-	next := r.candidateStream(t)
+	// Materialized like the serial path (aliases expanded into docID
+	// order), so the ordered merger restores the exact serial result.
+	ids := r.expandAliasDocIDs(collectDocIDStream(r.candidateStream(t), 0))
+	nextIdx := 0
+	next := func() (uint32, bool) {
+		if nextIdx >= len(ids) {
+			return 0, false
+		}
+		id := ids[nextIdx]
+		nextIdx++
+		return id, true
+	}
 	quit := make(chan struct{})
 	var quitOnce sync.Once
 	stop := func() { quitOnce.Do(func() { close(quit) }) }
@@ -453,8 +526,14 @@ func (r *contentReader) searchParallel(t string, limit int, workers int) []conte
 // when the term has at least three bytes, otherwise every document. The result
 // is always a superset; verification decides. At most budget docIDs are
 // materialized (budget <= 0 means all), so a broad list is not decoded in full.
+// §6z aliases expand into the set before the budget trims it.
 func (r *contentReader) candidates(term string, budget int) []uint32 {
-	return collectDocIDStream(r.candidateStream(term), budget)
+	ids := collectDocIDStream(r.candidateStream(term), budget)
+	ids = r.expandAliasDocIDs(ids)
+	if budget > 0 && len(ids) > budget {
+		ids = ids[:budget]
+	}
+	return ids
 }
 
 // candidateStream returns a lazy, ascending stream of the docIDs that could

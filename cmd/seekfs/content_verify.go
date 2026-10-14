@@ -772,6 +772,16 @@ func (vol *serviceVolumeIndex) contentCandidatesBounded(pq parsedQuery, cap int)
 		limit = materialize
 	}
 	candidates := collectDocIDStream(intersectDocIDStreams(streams), limit)
+	// §6z dedupe: aliases own no postings, so expand primaries to their
+	// duplicates BEFORE the cap accounts the set. The expanded set then
+	// equals the pre-dedupe posting set exactly (an alias shares its
+	// primary's text, hence its trigrams, both directions), so every
+	// lane/cap/budget decision behaves as if nothing were deduplicated —
+	// only the stored bytes shrink. A capped set still falls back to the
+	// covering scan, which enumerates aliases directly. The resolver maps
+	// every alias DocID through its own FRN, and the final sort restores
+	// order.
+	candidates = reader.expandAliasDocIDs(candidates)
 	// capped reports that the returned superset was truncated by the
 	// materialization cap and must not be used as a complete ordered set. It is
 	// deliberately separate from incompleteness: the page/window cap is an
