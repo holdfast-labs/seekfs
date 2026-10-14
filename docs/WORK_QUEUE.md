@@ -32,7 +32,7 @@ growing context, full-suite output pasted into context, polling, coordinator
 - The coordinator does small finishing work (commit, merge, suite run)
   directly instead of spawning an agent for it.
 
-## Running (2026-10-13)
+## Running (2026-10-14)
 
 Merged so far this round: `perf/content-underfill`, `perf/name-fuzzy`,
 `fix/cli-silent-empty`, `content/idle-governor`, `content/spool-peak`, `perf/ranking-signals` (G7, G8, G13), `content/inclusion-policy` (G3, §6z,
@@ -47,14 +47,20 @@ corruption, exact required sources, auto-fuzzy only on zero exact hits).
 
 | Branch | Worktree | Scope |
 |---|---|---|
-| `perf/static-ranking` | staticrank | **Parked** at WIP commit `761db7b` (OR-lane case unresolved, suite not green); resume only with a fresh, narrow brief. Queued item 0b: static ranker (no usage) right-file-first above 39% top-1, on two labeled sets; sets and counts unchanged (G13) |
-| `integ/filter-tier-merge` | tiermerge | Merging `content/filter-tier` (no stored text by default) with inclusion v10 + spool-peak; one format v11; dedupe under no-stored-text; re-measure; list regressions |
-| `feat/ui-input-and-user-signals` | uiinput | seekfs-ui reports user-session input time to the service (governor input signal); per-user ranking store keyed by caller SID |
+| `perf/adaptive-build-workers` | buildworkers | "Single worker under load": adapt extraction workers during the build instead of fixing the count at start |
+| `content/index-size-budget` | sizebudget | Charge the scope budget by estimated final index bytes, not extracted text (v11 stores no text; Chromium at 600 MB admitted 77.7k docs, dropped 385k already-extracted files, published ~130 MB). Transient disk peak/reserve stays separate |
+| `perf/static-ranking` | staticrank | **Parked** at WIP commit `761db7b` (OR-lane case unresolved, suite not green); resume only with a fresh, narrow brief (G13) |
+
+Merged 2026-10-14: `feat/ui-input-and-user-signals` (UI input heartbeat,
+per-user ranking stores), `integ/filter-tier-merge` (no stored text by default,
+format v11; full suite green). The v11 Chromium query latencies were not
+re-measured (the scale run stopped at the budget); re-measure after
+`content/index-size-budget` lands.
 
 ## Queued, in order
 
-1. **Grep features (G10, G9, G11). Start after `content/filter-tier`
-   merges** (both touch the content verify and snippet path). Plain-literal grep via SIMD memmem and
+1. **Grep features (G10, G9, G11). Unblocked: `content/filter-tier` merged
+   2026-10-14** (both touch the content verify and snippet path). Plain-literal grep via SIMD memmem and
    multi-pattern OR via Aho-Corasick (fff); fuzzy grep (Smith-Waterman per
    line); context lines; a per-query time budget (fff default 150 ms) with
    cursor pagination; smart case for content; ripgrep line semantics for
