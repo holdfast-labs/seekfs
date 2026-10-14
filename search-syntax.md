@@ -113,8 +113,18 @@
 ## Ranking signals
 
 `seekfs open <path>` (or opening a result in the UI) records a usage event
-in a small local store (`ranking_signals.json` next to the service state;
-top 5000 files / 2000 queries, 30-day score half-life, local only). Signals
+in a small local per-user store (one `ranking_signals-<SID>.json` per local
+user next to the service state; top 5000 files / 2000 queries, 30-day score
+half-life, local only). The LocalSystem service keys the store by the
+caller's pipe SID, so one service keeps each local user's frecency,
+recent list, and query history separate; files are ACL-restricted to
+SYSTEM + Administrators + the owning user (protected DACL, no inheritance),
+never readable by other users. The pre-per-user `ranking_signals.json`, when
+present, is claimed by the first user that opens (renamed to their per-user
+file with a service-log line; later users start empty) — single-user
+machines keep their history, multi-user machines stop sharing. A standalone
+or user-session service (single user) works unchanged; callers with no
+identity get an ephemeral empty store (no persistence, no leak). Signals
 blend into name ranking as bounded within-band tie-breakers:
 
 - Bands, best first: for single-term filename queries, exact name, name

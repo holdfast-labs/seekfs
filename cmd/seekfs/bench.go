@@ -223,6 +223,11 @@ type serviceRequest struct {
 	RequestSeq    int64               `json:"request_seq,omitempty"`
 	SinceVolumes  []watchVolumeCursor `json:"since_volumes,omitempty"`
 	Baseline      bool                `json:"baseline,omitempty"`
+	// InputUnixNano carries the `input-heartbeat` op: the UI's session
+	// GetLastInputInfo-derived last-input time as unix nanos (UTC). The
+	// service treats the freshest report as its input signal; zero/negative
+	// values are rejected.
+	InputUnixNano int64 `json:"input_unix_nano,omitempty"`
 	// CancelOverride is a transport-injected cancellation predicate used by the
 	// remote transport for connection-scoped cancellation.  It never crosses
 	// the wire and is never set from client-supplied input.

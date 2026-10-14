@@ -496,6 +496,11 @@ type queryOptions struct {
 	RequestSeq    int64        `json:"request_seq,omitempty"`
 	Cancel        func() bool  `json:"-"`
 	Trace         *searchTrace `json:"-"`
+	// SignalStore is the per-user frecency/query-history store for this
+	// request. The service sets it from the caller's SID; direct (local
+	// index) searches leave it nil and fall back to the current process
+	// user's store. Local-only; never crosses the wire.
+	SignalStore *signalStore `json:"-"`
 	// Per-query content budgets. Zero means "use the default"; they are never
 	// globals, so concurrent queries cannot race on each other's limits.
 	ContentCandidateBudget int `json:"content_candidate_budget,omitempty"`
