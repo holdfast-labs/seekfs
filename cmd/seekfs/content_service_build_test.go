@@ -1553,12 +1553,15 @@ func TestContentServiceBuildAdaptsToIncompressibleSpool(t *testing.T) {
 	for i := 0; i < ndocs; i++ {
 		marker := fmt.Sprintf("needle-marker-%d", i)
 		dense = append(dense, append([]byte(marker+"\n"), body...))
-		// Compressible arm: same byte length, trivially compressible.
+		// Compressible arm: same byte length, trivially compressible. Short
+		// lines, like the dense arm's 76-char ones: one ~33 KB line would
+		// read as minified content and be skipped by the inclusion policy
+		// (contentLooksMinified, §6z).
 		var cb strings.Builder
 		cb.WriteString(marker)
 		cb.WriteByte('\n')
 		for cb.Len() < len(dense[i]) {
-			cb.WriteString("needle haystack bundle chunk pack ")
+			cb.WriteString("needle haystack bundle chunk pack\n")
 		}
 		c := []byte(cb.String())
 		comp = append(comp, c[:len(dense[i])])
