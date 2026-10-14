@@ -20,6 +20,7 @@ format v10).
 | `test/suite-speed` | suitespeed | `cmd/seekfs` suite under ~5 min; harden `TestHeadlessFrameCost`; gofmt drift |
 | `content/filter-tier` | tier2 | **Owner decision 2026-10-13: fsearch model is the default.** No stored text; trigram postings plus a per-file filter; matches and snippets verified from disk; edited files read directly. Stored text only as a justified opt-in (G1, G4 partial, §6y) |
 | `fix/short-term-postings` | shortterm | Queued item 0: lossy short-term postings (underfill) and rank-neighbor false positives; exactness sweep plus differential test |
+| `perf/static-ranking` | staticrank | Queued item 0b: static ranker (no usage) right-file-first above 39% top-1, on two labeled sets; sets and counts unchanged (G13) |
 
 ## Queued, in order
 
@@ -31,13 +32,6 @@ format v10).
    `perf/ranking-signals`. Fix these before more features, with tests that
    fail first. The `git:` filter on short or broad terms inherits the first
    bug.
-0b. **Static ranking accuracy (G13).** With no usage history, plain-name
-   right-file-first top-1 is only 39% (partial-name 2%) on 100 labeled
-   Chromium targets (`E:/bench/scratch/ranking/rightfile.py`). fsearch
-   reports 93–97% for names (different metric). Improve the static ranker:
-   exact basename first, shallower or shorter paths, source over generated
-   files, test/vendor demotion, and so on. Typo top-1 (99.5% / 93.0%) must
-   not regress.
 1. **Grep features (G10, G9, G11).** Plain-literal grep via SIMD memmem and
    multi-pattern OR via Aho-Corasick (fff); fuzzy grep (Smith-Waterman per
    line); context lines; a per-query time budget (fff default 150 ms) with
