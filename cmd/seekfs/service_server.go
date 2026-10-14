@@ -291,6 +291,19 @@ func (s *goSearchService) serviceCommandSearch(w io.Writer, caps serviceCapabili
 		loading := s.loading
 		loadErr := s.loadErr
 		s.indexMu.RUnlock()
+		if !loading && loadErr == "" && !req.CountOnly {
+			// Folder-first on-demand answer (fsearch-style): no index
+			// covers the scope, so walk the requested folder itself and
+			// answer from it. Bounded (100k entries / 2s), read-only, and
+			// only when --under names a real directory — every other shape
+			// keeps the error contract below. A full background index for
+			// the folder is deliberately not started here: it would race
+			// the budgeted builder and stall the query behind a build.
+			if resp, ok := serviceOnDemandFolderResponse(s, req); ok {
+				_ = json.NewEncoder(w).Encode(resp)
+				return
+			}
+		}
 		message := "service has no search indexes loaded"
 		if loading {
 			message = "loading indexes"
