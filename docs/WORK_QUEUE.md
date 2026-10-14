@@ -85,7 +85,12 @@ re-measured (the scale run stopped at the budget); re-measure after
   extracting every in-scope file just to tally exact drop counts (468k files
   extracted for a 71k-doc budget, `content/idle-governor` report). Either
   estimate the drops from file sizes, or feed those extractions into the
-  filter tier (`content/filter-tier`) so the work buys coverage.
+  filter tier (`content/filter-tier`) so the work buys coverage. Mostly
+  moot after `content/index-size-budget`: an explicit budget now charges
+  projected index bytes (~0.15x text), so it admits ~6x more files. The
+  reserve-governed default is still limited by the transient spool peak
+  (extracted text x1.5); streaming postings without a full text spool is the
+  next lever for whole-drive coverage.
 - **Single worker under load:** DONE (`perf/adaptive-build-workers`).
   Extraction re-samples the desired worker count at every governor batch
   boundary (recent/in-flight query, input incl. UI heartbeat, or battery ->

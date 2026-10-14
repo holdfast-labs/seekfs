@@ -986,11 +986,13 @@ func buildContentIndexForIndex(ctx context.Context, idx *Index, opts contentBuil
 			// build) has no sidecar volume to project a reserve against at
 			// selection time — the save fails loudly if the disk fills.
 			if opts.Scope != nil && opts.Scope.BudgetExplicit {
-				n := int64(len(doc.text))
-				if n > opts.Scope.BudgetBytes-scopeBytes {
-					return nil, fmt.Errorf("content-index: scoped build exceeds %d-byte extracted-text budget; narrow the scope or raise budget_bytes", opts.Scope.BudgetBytes)
+				// Charged in projected index bytes (contentIndexCostEstimate):
+				// the index stores no text.
+				cost := contentIndexCostEstimate(int64(len(doc.text)))
+				if cost > opts.Scope.BudgetBytes-scopeBytes {
+					return nil, fmt.Errorf("content-index: scoped build exceeds %d-byte index budget; narrow the scope or raise budget_bytes", opts.Scope.BudgetBytes)
 				}
-				scopeBytes += n
+				scopeBytes += cost
 			}
 			offset, compLen, serr := spoolWriter.Append(doc.text)
 			if serr != nil {

@@ -296,7 +296,8 @@ func TestContentFilterV11BuildBudgetDropsUncovered(t *testing.T) {
 		{FRN: 3, Parent: -1, Name: "c.txt", Size: int64(len(big))},
 	})
 	s := contentTestService(t)
-	s.contentCfg.Content.BudgetBytes = 500
+	// The budget is in projected index bytes: a.txt + b.txt fit, c.txt does not.
+	s.contentCfg.Content.BudgetBytes = contentIndexCostEstimate(5) + contentIndexCostEstimate(6)
 	s.ensureContentBuild(vol)
 	built, err := contentLoadFile(gsx)
 	if err != nil {

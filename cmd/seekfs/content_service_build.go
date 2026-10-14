@@ -869,9 +869,12 @@ func (s *goSearchService) runContentBuild(vol *serviceVolumeIndex, reuseSidecar 
 	var sinceDiskCheck int64
 	// overBudget latches once the scope budget bites; see the tally below.
 	overBudget := false
-	// allowance is the extracted-text budget enforced below: the explicit
-	// budget_bytes when configured, else the reserve-derived allowance for
-	// the sidecar's volume, refreshed as the spool grows (free space moves
+	// Two limits gate selection. indexBudget is the explicit budget_bytes,
+	// charged in projected final-index bytes (contentIndexCostEstimate; the
+	// index stores no text, so charging extracted text admitted ~1/6 of the
+	// coverage the budget pays for). allowance is the build's transient disk
+	// limit in extracted-text bytes: the reserve-derived allowance for the
+	// sidecar's volume, refreshed as the spool grows (free space moves
 	// under it; the staged compressed bytes are credited back, since the
 	// allowance budgets the build's whole peak). MaxInt64 means unlimited
 	// (unknown free space; the write-time guard stays the backstop).
@@ -884,11 +887,12 @@ func (s *goSearchService) runContentBuild(vol *serviceVolumeIndex, reuseSidecar 
 	peakMult := contentScopePeakMultiplier
 	var sinceAllowanceCheck int64
 	explicitBudget := opts.Scope != nil && opts.Scope.BudgetExplicit
+	indexBudget := int64(^uint64(0) >> 1)
 	if explicitBudget {
-		allowance = opts.Scope.BudgetBytes
-	} else {
-		allowance = contentScopeAllowance(tmpDir, 0)
+		indexBudget = opts.Scope.BudgetBytes
 	}
+	var indexUsed int64
+	allowance = contentScopeAllowance(tmpDir, 0)
 	abortReason := ""
 	abortRetry := false
 	// Adaptive extraction: the prefetch stream is chunked at batch
@@ -978,15 +982,14 @@ func (s *goSearchService) runContentBuild(vol *serviceVolumeIndex, reuseSidecar 
 		// still extracted, its text tallied and released instead of spooled.
 		// Selection order is unchanged; this only costs extraction work on a
 		// build that was already going to publish incomplete.
-		if !explicitBudget {
-			if sinceAllowanceCheck += n; sinceAllowanceCheck >= contentAllowanceCheckEvery {
-				sinceAllowanceCheck = 0
-				staged := spoolWriter.StagedBytes()
-				peakMult = contentEffectivePeakMultiplier(peakMult, used, staged)
-				allowance = contentScopeAllowanceWithMultiplier(tmpDir, staged, peakMult)
-			}
+		if sinceAllowanceCheck += n; sinceAllowanceCheck >= contentAllowanceCheckEvery {
+			sinceAllowanceCheck = 0
+			staged := spoolWriter.StagedBytes()
+			peakMult = contentEffectivePeakMultiplier(peakMult, used, staged)
+			allowance = contentScopeAllowanceWithMultiplier(tmpDir, staged, peakMult)
 		}
-		if overBudget || n > allowance-used {
+		cost := contentIndexCostEstimate(n)
+		if overBudget || n > allowance-used || cost > indexBudget-indexUsed {
 			overBudget = true
 			scopeDropped++
 			scopeDroppedBytes += n
@@ -999,6 +1002,7 @@ func (s *goSearchService) runContentBuild(vol *serviceVolumeIndex, reuseSidecar 
 		}
 		selected = append(selected, selectedDoc{item: item, offset: offset, length: len(doc.text), spoolLen: compLen, modUnix: doc.modUnix, class: doc.class, version: doc.version, fileSize: doc.fileSize, fileModNano: doc.fileModNano})
 		used += n
+		indexUsed += cost
 		if sinceDiskCheck += n; sinceDiskCheck >= contentDiskCheckEvery {
 			sinceDiskCheck = 0
 			if err := contentCheckDiskReserve(tmpDir); err != nil {

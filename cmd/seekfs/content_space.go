@@ -170,6 +170,28 @@ func contentScopeHeadroom(anchorPath string, spooled int64) (headroom uint64, ok
 	return free - need, true
 }
 
+// An explicit scope budget (budget_bytes) caps the final index, not the
+// extracted text: the format stores no text (§6y), so a doc costs its
+// postings, terms, per-file filter and doc-table row. contentIndexCostEstimate
+// projects that from the doc's extracted length. The cost is mostly per doc:
+// full Chromium (463,273 docs, 2609 MB extracted) measured 1327 B/doc at a
+// 5.6 KB mean text (the estimate gives ~1444 B, +9%); the v10 sample without
+// third_party measured 1238 B/doc at 7.7 KB (estimate ~1692 B).
+const (
+	contentIndexCostPerDoc     = 768
+	contentIndexCostPerTextNum = 3
+	contentIndexCostPerTextDen = 25
+)
+
+// contentIndexCostEstimate returns the projected final-index bytes of one
+// admitted doc with textBytes of extracted text.
+func contentIndexCostEstimate(textBytes int64) int64 {
+	if textBytes < 0 {
+		textBytes = 0
+	}
+	return contentIndexCostPerDoc + textBytes*contentIndexCostPerTextNum/contentIndexCostPerTextDen
+}
+
 // contentScopeAllowance returns the extracted-text bytes selectable before
 // the build's peak (spool plus output, contentScopePeakMultiplier) would
 // breach the reserve on anchorPath's volume, given the bytes this build has

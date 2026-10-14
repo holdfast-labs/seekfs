@@ -152,3 +152,28 @@ func TestContentReconcileScansHoldBackgroundPersists(t *testing.T) {
 		}
 	})
 }
+
+// An explicit budget is charged in projected index bytes, matching the build:
+// with no stored text, a budget admits files whose extracted text far exceeds
+// it, and the transient text allowance still applies on its own.
+func TestContentReconcileTrimNewIndexLimit(t *testing.T) {
+	rank := map[uint64]contentScopeMember{
+		1: {frn: 1, path: `E:\r\a.txt`, priority: 0, size: 100_000},
+		2: {frn: 2, path: `E:\r\b.txt`, priority: 0, size: 100_000},
+		3: {frn: 3, path: `E:\r\c.txt`, priority: 0, size: 100_000},
+	}
+	keys := []uint64{1, 2, 3}
+	two := 2 * contentIndexCostEstimate(100_000)
+	if two >= 200_000 {
+		t.Fatalf("index cost of 200 KB text = %d; want far below the text", two)
+	}
+	got, out, outBytes := contentReconcileTrimNewLimits(keys, rank, contentReconcileLimits{text: contentReconcileUnlimited, index: two})
+	if want := []uint64{1, 2}; !reflect.DeepEqual(got, want) || out != 1 || outBytes != 100_000 {
+		t.Fatalf("index-limited trim = %v (%d out, %d bytes); want [1 2] with c out", got, out, outBytes)
+	}
+	// The transient disk allowance (text bytes) still bites independently.
+	got, out, _ = contentReconcileTrimNewLimits(keys, rank, contentReconcileLimits{text: 150_000, index: contentReconcileUnlimited})
+	if want := []uint64{1}; !reflect.DeepEqual(got, want) || out != 2 {
+		t.Fatalf("text-limited trim = %v (%d out); want [1] with 2 out", got, out)
+	}
+}
