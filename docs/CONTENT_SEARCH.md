@@ -2005,6 +2005,25 @@ times the source engages with no code change (covered by
 `TestContentInputSourceSelection`, including the session-0 skip). The WTS
 sample is cached 5 s; zero times are skipped, never treated as recent.
 
+**UI heartbeat input source (done, `feat/ui-input-and-user-signals`).**
+Because WTS times are zero on this build, the service still could not see
+typing from session 0. `seekfs-ui` (which runs in the interactive session)
+now reports its session's `GetLastInputInfo` time to the service over the
+existing pipe protocol (`input-heartbeat` op, local-only like `open`/`recent`
+— remote rejected by the capability gate): one fire-and-forget send every
+5 s on a background goroutine with a 2 s timeout, skipped when the probe is
+unavailable, so it never blocks search, render, or Open. The service keeps
+the freshest valid report across sessions (`noteUIHeartbeat`) and lets it
+expire after 30 s with no refresh (`uiHeartbeatExpiry`), so a dead UI cannot
+pin the signal. The heartbeat joins the existing freshest-wins sampling
+(`contentSampleInputTime`) in every session including session 0, drives the
+same `input` pause reason (`contentBuildBusyReason`), and surfaces as
+`governor.input.detail = "ui-heartbeat"` in `loaded --json` (sources:
+`ui-heartbeat` / `wts` / `lastinput` / `unavailable`). Future timestamps are
+clamped to now; reports older than the quiet window + expiry are rejected.
+Covered by `content_input_heartbeat_test.go` (op auth, expiry, session-0
+decisions, health/`loaded` reporting).
+
 ## 6x. Build peak ≈ final size (done)
 
 Branch `content/spool-peak`. Coverage was capped by the build's transient

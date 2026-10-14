@@ -125,7 +125,11 @@ func contentResetInputSample() {
 // In session 0 (the service) only WTS is consulted — GetLastInputInfo would
 // read the inputless service session. Elsewhere both sources count and the
 // most recent wins (a neighbor RDP session's typing counts as presence).
-// ok is false when no source yields a time.
+// The UI heartbeat (seekfs-ui reporting its session's GetLastInputInfo over
+// the pipe) counts in every session, including session 0 — it is the only
+// input source that works from the service on builds where WTS times are
+// zero. The freshest valid time across all sources wins; ok is false when no
+// source yields a time.
 func contentSampleInputTime() (t time.Time, ok bool, source string) {
 	var best time.Time
 	var bOK bool
@@ -137,6 +141,9 @@ func contentSampleInputTime() (t time.Time, ok bool, source string) {
 	}
 	if wt, wok := contentWTSLastInput(); wok && (!bOK || wt.After(best)) {
 		best, bOK, src = wt, true, "wts"
+	}
+	if ht, hok := uiHeartbeatSample(); hok && (!bOK || ht.After(best)) {
+		best, bOK, src = ht, true, "ui-heartbeat"
 	}
 	return best, bOK, src
 }

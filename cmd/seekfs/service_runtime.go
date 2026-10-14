@@ -37,9 +37,8 @@ func (s *goSearchService) runStandalone() error {
 
 func (s *goSearchService) loadConfiguredIndexes() error {
 	s.initializeFeatures()
-	// Load the usage-signal store (frecency + query history) next to the
-	// service state; it survives restarts and is local-only.
-	_ = sharedSignalStore()
+	// Per-user usage-signal stores (frecency + query history) load lazily per
+	// caller SID; nothing to preload for the LocalSystem service itself.
 	s.indexMu.Lock()
 	s.loading = true
 	s.loadErr = ""

@@ -64,28 +64,51 @@ type signalPageCtx struct {
 	useKinds bool
 	hasBias  bool
 	active   bool // any evidence distinguishes the page (or near/git-filter)
+	store    *signalStore
+}
+
+// signalStoreFromOpts resolves the frecency store for a request: the
+// per-user store the service attached, else the current process user's.
+func signalStoreFromOpts(opts queryOptions) *signalStore {
+	if opts.SignalStore != nil {
+		return opts.SignalStore
+	}
+	return sharedSignalStore()
 }
 
 // signalReorderActive is the cheap gate: false means return the page
 // untouched (byte-identical order, ~zero overhead).
 func signalReorderActive(pq parsedQuery) bool {
+	return signalReorderActiveWithStore(pq, sharedSignalStore())
+}
+
+// signalReorderActiveWithStore is the per-user gate used by the service path.
+func signalReorderActiveWithStore(pq parsedQuery, store *signalStore) bool {
 	if pq.SortColumn != "" || queryHasAnyContentLeaf(pq) {
 		return false
 	}
 	if len(pq.GitFilters) > 0 || pq.Near != "" || pq.Current != "" {
 		return true
 	}
-	return !sharedSignalStore().empty()
+	return !store.empty()
 }
 
 // buildSignalPageCtx snapshots one evidence row per hit.
 func buildSignalPageCtx(entries []Entry, pq parsedQuery) *signalPageCtx {
-	ctx := &signalPageCtx{pq: pq}
+	return buildSignalPageCtxWithStore(entries, pq, sharedSignalStore())
+}
+
+// buildSignalPageCtxWithStore snapshots evidence against one user's store.
+func buildSignalPageCtxWithStore(entries []Entry, pq parsedQuery, store *signalStore) *signalPageCtx {
+	ctx := &signalPageCtx{pq: pq, store: store}
+	if store == nil {
+		store = sharedSignalStore()
+		ctx.store = store
+	}
 	if len(entries) == 0 {
 		return ctx
 	}
 	now := time.Now()
-	store := sharedSignalStore()
 	ctx.keys = make([]signalHitKeys, len(entries))
 	ctx.useKinds = signalKindBandsUsable(pq)
 	var kindTerm string
@@ -183,10 +206,19 @@ func buildSignalPageCtx(entries []Entry, pq parsedQuery) *signalPageCtx {
 // bands (see the package rule). It returns the input slice, possibly
 // re-sorted; with no distinguishing signals it returns it untouched.
 func applySignalReorder(entries []Entry, pq parsedQuery) []Entry {
-	if len(entries) < 2 || !signalReorderActive(pq) {
+	return applySignalReorderWithStore(entries, pq, sharedSignalStore())
+}
+
+// applySignalReorderWithStore reorders against one user's store (service
+// path). A nil store falls back to the shared (current-user) store.
+func applySignalReorderWithStore(entries []Entry, pq parsedQuery, store *signalStore) []Entry {
+	if store == nil {
+		store = sharedSignalStore()
+	}
+	if len(entries) < 2 || !signalReorderActiveWithStore(pq, store) {
 		return entries
 	}
-	ctx := buildSignalPageCtx(entries, pq)
+	ctx := buildSignalPageCtxWithStore(entries, pq, store)
 	if !ctx.active {
 		return entries
 	}
@@ -215,7 +247,8 @@ func reorderFuzzyGroup(group []Entry, ctx *signalPageCtx) {
 	// The group is a slice of a larger page the ctx was built for; compare
 	// by path-keyed evidence through fresh index rows is overkill here.
 	// Groups are tiny (usually singletons), so build a minimal ctx.
-	gctx := buildSignalPageCtx(group, ctx.pq)
+	// Reuse the parent ctx's store so per-user ranking stays per-user.
+	gctx := buildSignalPageCtxWithStore(group, ctx.pq, ctx.store)
 	if !gctx.active {
 		return
 	}

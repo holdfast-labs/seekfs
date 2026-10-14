@@ -62,6 +62,7 @@ type queryPick struct {
 type signalStore struct {
 	mu      sync.Mutex
 	path    string
+	sid     string // owning user SID; "" for the legacy shared file or ephemeral
 	files   map[string]*fileSignal
 	queries map[string]map[string]*queryPick
 	nowFunc func() time.Time
@@ -76,12 +77,58 @@ type signalStoreFile struct {
 
 var (
 	globalSignalStoreMu sync.Mutex
-	globalSignalStore   *signalStore
+	globalSignalStores  map[string]*signalStore
+	// signalStoreDisableACLForTest skips per-user ACL restriction so tests
+	// using fake SIDs stay able to read and clean up their TempDir files.
+	// The ACL test itself uses the real process SID with this false.
+	signalStoreDisableACLForTest bool
 )
 
-// signalStorePath returns the store path for the current SEEKFS_DIR.
+// signalStorePath returns the legacy shared store path for the current
+// SEEKFS_DIR. It is kept for migration only: per-user stores live alongside
+// it (see signalStorePathForSID).
 func signalStorePath() string {
 	return filepath.Join(defaultSeekFSDir(), signalStoreFileName)
+}
+
+// sidFilenameComponent sanitizes a user SID for use in a file name. SIDs are
+// already S-1-5-... (digits and dashes), but sanitize defensively so a
+// malformed identity can never escape the state dir.
+func sidFilenameComponent(sid string) string {
+	var b strings.Builder
+	for _, r := range sid {
+		switch {
+		case r >= 'A' && r <= 'Z', r >= 'a' && r <= 'z', r >= '0' && r <= '9', r == '-', r == '_':
+			b.WriteRune(r)
+		default:
+			b.WriteRune('_')
+		}
+	}
+	s := b.String()
+	if len(s) > 128 {
+		s = s[:128]
+	}
+	return s
+}
+
+// signalStorePathForSID returns the store file for one user identity. Empty
+// SID means the legacy shared file (pre-per-user installs, and CLI fallback
+// when the process SID cannot be resolved). Non-empty SIDs get a sibling
+// file in the same service state dir so SEEKFS_DIR redirection, backup, and
+// cleanup keep working with one dir:
+//
+//	<state>/ranking_signals.json            legacy (migration source only)
+//	<state>/ranking_signals-S-1-5-....json  one per user, ACL-restricted
+func signalStorePathForSID(sid string) string {
+	if sid == "" {
+		return signalStorePath()
+	}
+	return filepath.Join(defaultSeekFSDir(), signalStoreFileNameBase(sid))
+}
+
+// signalStoreFileNameBase is the per-user file name (split for tests).
+func signalStoreFileNameBase(sid string) string {
+	return "ranking_signals-" + sidFilenameComponent(sid) + ".json"
 }
 
 // loadSignalStore opens (or creates) the store at path.
@@ -130,26 +177,97 @@ func loadSignalStore(path string) *signalStore {
 	return s
 }
 
-// sharedSignalStore returns the process-wide store for the current
-// SEEKFS_DIR. The service loads it at startup; the CLI loads it on demand
-// for `open`/`recent` fallback.
+// sharedSignalStore returns the process-wide store for the current process
+// user and SEEKFS_DIR. The CLI (open/recent fallback, direct-index ranking)
+// loads it on demand. The service never uses this for request handling — it
+// uses serviceSignalStoreForSID(principal.SID) so each caller gets their own
+// store.
 func sharedSignalStore() *signalStore {
-	globalSignalStoreMu.Lock()
-	defer globalSignalStoreMu.Unlock()
-	path := signalStorePath()
-	if globalSignalStore != nil && globalSignalStore.path == path {
-		return globalSignalStore
-	}
-	globalSignalStore = loadSignalStore(path)
-	return globalSignalStore
+	return signalStoreForSID(currentProcessUserSID())
 }
 
-// resetSharedSignalStoreForTest drops the process-wide store so tests with
-// different SEEKFS_DIR values do not share state.
+// signalStoreForSID returns the cached per-user store for sid, loading it
+// from its per-user file (migrating the legacy shared file on first use).
+// Empty sid returns the legacy shared file store (CLI/tests without an
+// identity).
+func signalStoreForSID(sid string) *signalStore {
+	path := signalStorePathForSID(sid)
+	key := sid + "\x00" + path
+	globalSignalStoreMu.Lock()
+	defer globalSignalStoreMu.Unlock()
+	if globalSignalStores == nil {
+		globalSignalStores = make(map[string]*signalStore)
+	}
+	if s, ok := globalSignalStores[key]; ok {
+		return s
+	}
+	if sid != "" {
+		migrateLegacySignalStoreLocked(path)
+	}
+	s := loadSignalStore(path)
+	s.sid = sid
+	globalSignalStores[key] = s
+	return s
+}
+
+// serviceSignalStoreForSID returns the store for one pipe caller. Empty SID
+// (impersonation failure, remote loopback with no identity) gets a shared
+// ephemeral in-memory store that never persists: it fails closed (no leak
+// across users, no read of anyone's history) while keeping the op total
+// (open then recent in one process still works in tests).
+func serviceSignalStoreForSID(sid string) *signalStore {
+	if sid == "" {
+		globalSignalStoreMu.Lock()
+		defer globalSignalStoreMu.Unlock()
+		if globalSignalStores == nil {
+			globalSignalStores = make(map[string]*signalStore)
+		}
+		const key = "\x00ephemeral"
+		if s, ok := globalSignalStores[key]; ok {
+			return s
+		}
+		s := loadSignalStore("")
+		globalSignalStores[key] = s
+		return s
+	}
+	return signalStoreForSID(sid)
+}
+
+// migrateLegacySignalStoreLocked claims the pre-per-user shared file for the
+// first user that needs a per-user store: when the per-user file does not
+// exist yet but the legacy ranking_signals.json does, the legacy file is
+// renamed to the per-user path (first opener wins; later users start empty)
+// and a log line records the claim. Rename is atomic, so concurrent first
+// uses cannot double-claim. Caller holds globalSignalStoreMu.
+//
+// Rationale: single-user machines (the common case) keep their history with
+// zero loss; multi-user machines previously shared one file readable by all
+// local users, so assigning it to whoever opens first discloses nothing new
+// and stops all future sharing. Discarding would lose the single-user
+// history for no privacy gain.
+func migrateLegacySignalStoreLocked(perUserPath string) {
+	legacy := signalStorePath()
+	if perUserPath == legacy || perUserPath == "" || legacy == "" {
+		return
+	}
+	if _, err := os.Stat(perUserPath); err == nil {
+		return
+	}
+	if _, err := os.Stat(legacy); err != nil {
+		return
+	}
+	if err := os.Rename(legacy, perUserPath); err != nil {
+		return
+	}
+	serviceLog("ranking signals: claimed legacy %s for %s", legacy, perUserPath)
+}
+
+// resetSharedSignalStoreForTest drops the process-wide stores so tests with
+// different SEEKFS_DIR values or SIDs do not share state.
 func resetSharedSignalStoreForTest() {
 	globalSignalStoreMu.Lock()
 	defer globalSignalStoreMu.Unlock()
-	globalSignalStore = nil
+	globalSignalStores = nil
 }
 
 func (s *signalStore) now() time.Time {
@@ -229,8 +347,9 @@ func (s *signalStore) recordOpen(path, query string) {
 	s.compact()
 	disk := s.snapshotLocked()
 	storePath := s.path
+	storeSID := s.sid
 	s.mu.Unlock()
-	saveSignalStore(storePath, disk)
+	saveSignalStoreForSID(storePath, storeSID, disk)
 }
 
 // comboCount returns how often normalized query q picked path (0 when the
@@ -471,6 +590,15 @@ func (s *signalStore) snapshotLocked() signalStoreFile {
 
 // saveSignalStore writes a snapshot to path atomically (tmp + rename).
 func saveSignalStore(path string, disk signalStoreFile) {
+	saveSignalStoreForSID(path, "", disk)
+}
+
+// saveSignalStoreForSID writes a snapshot atomically and then restricts the
+// file ACL to the owning user (plus SYSTEM/Administrators). The legacy shared
+// path (sid == "") keeps its inherited ACL for backward compat; per-user
+// files are always restricted, best-effort (a failure is logged, never fatal
+// — the data is still correct, just less private until the next save).
+func saveSignalStoreForSID(path, sid string, disk signalStoreFile) {
 	if path == "" {
 		return
 	}
@@ -495,19 +623,30 @@ func saveSignalStore(path string, disk signalStoreFile) {
 		return
 	}
 	_ = os.Rename(tmpName, path)
+	if sid != "" {
+		restrictSignalStoreFile(path, sid)
+	}
 }
 
-// flushSignalStore persists the shared store (service shutdown path).
+// flushSignalStore persists every cached per-user store (service shutdown
+// path). Opens also save synchronously, so this only catches a trailing
+// write; with no cached stores it is a no-op.
 func flushSignalStore() {
 	globalSignalStoreMu.Lock()
-	s := globalSignalStore
-	globalSignalStoreMu.Unlock()
-	if s == nil {
-		return
+	stores := make([]*signalStore, 0, len(globalSignalStores))
+	for _, s := range globalSignalStores {
+		stores = append(stores, s)
 	}
-	s.mu.Lock()
-	disk := s.snapshotLocked()
-	storePath := s.path
-	s.mu.Unlock()
-	saveSignalStore(storePath, disk)
+	globalSignalStoreMu.Unlock()
+	for _, s := range stores {
+		if s == nil {
+			continue
+		}
+		s.mu.Lock()
+		disk := s.snapshotLocked()
+		storePath := s.path
+		storeSID := s.sid
+		s.mu.Unlock()
+		saveSignalStoreForSID(storePath, storeSID, disk)
+	}
 }
