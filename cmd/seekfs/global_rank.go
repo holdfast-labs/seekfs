@@ -17,7 +17,7 @@ func globalExtOnlySupported(pq parsedQuery) bool {
 		len(pq.Regexps) != 0 || len(pq.RegexTerms) != 0 ||
 		len(pq.Parents) != 0 || pq.Under != "" || pq.lateVerified() || pq.HasModAfter || len(pq.SizeFilters) != 0 ||
 		len(pq.DateFilters) != 0 || len(pq.AttrFilters) != 0 || len(pq.OrGroups) != 0 || len(pq.NotGroups) != 0 ||
-		queryHasAnyContentLeaf(pq) ||
+		queryHasAnyContentLeaf(pq) || needsPathVerification(pq) ||
 		pq.CaseSensitive {
 		return false
 	}
@@ -685,7 +685,7 @@ func collectGlobalPathDeferredTopN(it globalIDIterator, volumes []*serviceVolume
 		if !compactRecordPrecheck(rec, volumePQ, volumePQ.MatchPath) {
 			continue
 		}
-		if termsOK && !vol.index.compactPathContainsAll(id.local, volumePQ.Terms) {
+		if termsOK && !vol.index.compactPathContainsAllFolded(id.local, volumePQ.Terms, volumePQ) {
 			continue
 		}
 		matched := true
@@ -694,7 +694,7 @@ func collectGlobalPathDeferredTopN(it globalIDIterator, volumes []*serviceVolume
 				// Undecidable cheaply; the final gate decides.
 				continue
 			}
-			if !vol.index.compactPathContainsTerm(id.local, dir) {
+			if !vol.index.compactPathContainsTermFolded(id.local, dir, volumePQ.CaseSensitive || foldOffKillSwitch) {
 				matched = false
 				break
 			}

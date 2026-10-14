@@ -11,7 +11,7 @@ import (
 )
 
 func (vol *serviceVolumeIndex) underCandidates(pq parsedQuery) ([]int, bool) {
-	if vol == nil || vol.index == nil || pq.Under == "" {
+	if vol == nil || vol.index == nil || pq.Under == "" || needsPathVerification(pq) {
 		return nil, false
 	}
 	under := filepath.Clean(pq.Under)
@@ -199,7 +199,10 @@ func (vol *serviceVolumeIndex) cacheUnderRoots(key string, roots []int) {
 }
 
 func (vol *serviceVolumeIndex) underLimitedTermCandidates(roots []int, pq parsedQuery) ([]int, bool) {
-	if vol == nil || vol.index == nil || pq.CountOnly || pq.Limit <= 0 || len(roots) == 0 || len(pq.Terms) != 1 || len(pq.Exts) > 0 || len(pq.Dirs) > 0 || len(pq.Globs) > 0 || len(pq.Regexps) > 0 || pq.Type != "" || pq.HasModAfter || pq.lateVerified() || pq.CaseSensitive || pq.hiddenBlocksTruncation() {
+	if vol == nil || vol.index == nil || pq.CountOnly || pq.Limit <= 0 || len(roots) == 0 || len(pq.Terms) != 1 || len(pq.Exts) > 0 || len(pq.Dirs) > 0 || len(pq.Globs) > 0 || len(pq.Regexps) > 0 || pq.Type != "" || pq.HasModAfter || pq.lateVerified() || pq.CaseSensitive || pq.hiddenBlocksTruncation() || vol.accentUnionActive(pq) {
+		// The subtree scan below matches unfolded bytes and truncates at
+		// the limit before verification; with foldable names it would miss
+		// accent matches. Decline so the prefilter path answers instead.
 		return nil, false
 	}
 	term := pq.Terms[0]

@@ -301,7 +301,7 @@ func (vol *serviceVolumeIndex) fastPostingCountHidden(pq parsedQuery, hidden hid
 		return count, true
 	}
 	globExts, globsOK := simpleGlobExts(pq.Globs)
-	if vol == nil || vol.index == nil || vol.queryIndex == nil || pq.CaseSensitive || pq.Under != "" || pq.lateVerified() || pq.HasModAfter || len(pq.AttrFilters) > 0 || len(pq.Regexps) > 0 || !globsOK || len(pq.Dirs) > 0 || len(pq.Parents) > 0 {
+	if vol == nil || vol.index == nil || vol.queryIndex == nil || pq.CaseSensitive || pq.Under != "" || pq.lateVerified() || pq.HasModAfter || len(pq.AttrFilters) > 0 || len(pq.Regexps) > 0 || !globsOK || len(pq.Dirs) > 0 || len(pq.Parents) > 0 || needsPathVerification(pq) {
 		return 0, false
 	}
 	lists := make([]postingCountCandidate, 0, len(pq.Exts)+len(globExts)+len(pq.Terms)+1)

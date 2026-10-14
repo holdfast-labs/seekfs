@@ -40,7 +40,14 @@ func capBroadCandidates(ids []int, pq parsedQuery) []int {
 	}
 	if pq.Type != "" || len(pq.Exts) > 0 || len(pq.Globs) > 0 ||
 		len(pq.SizeFilters) > 0 || len(pq.DateFilters) > 0 || len(pq.AttrFilters) > 0 ||
-		len(pq.NotGroups) > 0 || pq.HasModAfter || pq.lateVerified() {
+		len(pq.NotGroups) > 0 || pq.HasModAfter || pq.lateVerified() ||
+		// Name anchors, path globs, negated roots, quoted terms and
+		// case-sensitive matching all reject past the posting the scan
+		// verified (the accent union is a superset for the latter two),
+		// so truncating here would underfill the page.
+		len(pq.ExactTerms) > 0 || len(pq.Prefixes) > 0 || len(pq.Suffixes) > 0 ||
+		len(pq.PathGlobs) > 0 || len(pq.NotUnders) > 0 || len(pq.QuotedTerms) > 0 ||
+		pq.CaseSensitive {
 		return ids
 	}
 	if len(ids) <= pq.Limit {
