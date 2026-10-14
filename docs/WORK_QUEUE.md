@@ -28,6 +28,9 @@ growing context, full-suite output pasted into context, polling, coordinator
 - Send test, build and benchmark output to a file and read only the tail or
   failures. Wait on the process instead of polling.
 - Coordinators send no FYI messages to agents; only prompts that contain work.
+- On command-code Muse, any agent message without a tool call ends its turn
+  (agents stopped mid-task after a progress line). Every brief must say: "No
+  progress narration; reply without a tool call only for the final report."
 - Prefer a fresh session with a short handoff note over resuming a very long one.
 - The coordinator does small finishing work (commit, merge, suite run)
   directly instead of spawning an agent for it.
