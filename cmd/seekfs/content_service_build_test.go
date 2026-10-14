@@ -1040,10 +1040,10 @@ func TestContentServiceBuildReserveDropsExactFilesAndBytes(t *testing.T) {
 	oldFree, oldTotal := contentFreeBytesFn, contentTotalBytesFn
 	defer func() { contentFreeBytesFn, contentTotalBytesFn = oldFree, oldTotal }()
 	// 20 GiB reserve (5% of 500 GiB, capped) plus the in-flight shard
-	// scratch, and 17 bytes of headroom: the build peak (spool + output,
-	// ×1.5) allows 11 extracted bytes.
+	// scratch, and 9 bytes of headroom: the build peak (compressed spool +
+	// output, ×0.8) allows 11 extracted bytes.
 	contentTotalBytesFn = func(_ string) (uint64, error) { return 500 << 30, nil }
-	contentFreeBytesFn = func(_ string) (uint64, error) { return (20 << 30) + contentScopeScratchSlack() + 17, nil }
+	contentFreeBytesFn = func(_ string) (uint64, error) { return (20 << 30) + contentScopeScratchSlack() + 9, nil }
 	dir := t.TempDir()
 	bodies := map[string]string{
 		"a.txt": "alpha",
@@ -1143,6 +1143,123 @@ func TestContentServiceBuildRemovesShardScratchAsItGoes(t *testing.T) {
 	}
 	if maxScratch > 1 {
 		t.Fatalf("%d shard scratch directories alive at a save; want at most the in-flight one", maxScratch)
+	}
+}
+
+// A sharded build reframes its spool into one file per shard group and
+// deletes each file as soon as its shard is saved, so the assembly peak is
+// one group's spool plus the shards saved so far. The per-group spool files
+// alive at each shard save must strictly decrease: with N groups the saves
+// observe N, N-1, ..., 1 files.
+func TestContentServiceBuildDeletesGroupSpoolsAsItGoes(t *testing.T) {
+	t.Setenv("SEEKFS_CONTENT_SEARCH", "1")
+	stubContentCatchUpSync(t)
+	stubContentBuildSync(t)
+	restoreTarget, restoreConc := contentShardTargetBytes, contentShardBuildConcurrency
+	contentShardTargetBytes, contentShardBuildConcurrency = 1, 1 // one shard per file, sequential
+	t.Cleanup(func() { contentShardTargetBytes, contentShardBuildConcurrency = restoreTarget, restoreConc })
+	dir := t.TempDir()
+	names := []string{"a.txt", "b.txt", "c.txt", "d.txt"}
+	var recs []CompactRecord
+	for i, name := range names {
+		// Repetitive bodies stage far below the spool-cap share, so the
+		// build takes the split path.
+		body := strings.Repeat("needle haystack "+name+" ", 30)
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		recs = append(recs, CompactRecord{FRN: uint64(i + 1), Parent: -1, Name: name, Size: int64(len(body))})
+	}
+	const journal = uint64(96)
+	const cp = int64(104)
+	stubContentCatchUpJournal(t, usnJournalDataV0{UsnJournalID: journal, FirstUsn: 1, LowestValidUsn: 1, NextUsn: cp})
+	vol, gsx := contentBuildTestVolume(t, dir, journal, uint64(cp), recs)
+	// At each write-guard check before a shard save, count the per-group
+	// spool files alive in the build work dir.
+	oldFree := contentFreeBytesFn
+	t.Cleanup(func() { contentFreeBytesFn = oldFree })
+	var alive []int
+	contentFreeBytesFn = func(path string) (uint64, error) {
+		if path == contentShardDir(gsx) {
+			files, _ := filepath.Glob(filepath.Join(filepath.Dir(gsx), contentWorkPrefix+"*", "spool-*"))
+			alive = append(alive, len(files))
+		}
+		return 1 << 40, nil
+	}
+	s := contentTestService(t)
+	s.ensureContentBuild(vol)
+	built, err := contentLoadFile(gsx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	releaseContentIndexOnCleanup(t, built)
+	if len(built.Docs) != len(names) {
+		t.Fatalf("sharded build docs=%d; want %d", len(built.Docs), len(names))
+	}
+	// Every save must observe one fewer group spool than the previous one,
+	// ending with the last group's own file: nothing lingers past its shard.
+	if len(alive) < 2 {
+		t.Fatalf("saw %d shard saves (%v); want at least 2 (sharded path not taken)", len(alive), alive)
+	}
+	for i := 1; i < len(alive); i++ {
+		if alive[i] != alive[i-1]-1 {
+			t.Fatalf("group spools alive at saves = %v; want strictly decreasing (split path not taken?)", alive)
+		}
+	}
+	if alive[len(alive)-1] != 1 {
+		t.Fatalf("group spools alive at saves = %v; want the last group freed by its own save", alive)
+	}
+}
+
+// A sharded build whose spool stages past its cap share skips the reframe:
+// copying it would double an already-large spool. Assembly reads the shared
+// spool as before and still publishes every doc.
+func TestContentServiceBuildSkipsSplitPastSpoolCap(t *testing.T) {
+	t.Setenv("SEEKFS_CONTENT_SEARCH", "1")
+	stubContentCatchUpSync(t)
+	stubContentBuildSync(t)
+	restoreTarget, restoreConc := contentShardTargetBytes, contentShardBuildConcurrency
+	contentShardTargetBytes, contentShardBuildConcurrency = 1, 1 // one shard per file, sequential
+	t.Cleanup(func() { contentShardTargetBytes, contentShardBuildConcurrency = restoreTarget, restoreConc })
+	dir := t.TempDir()
+	names := []string{"a.txt", "b.txt"}
+	var recs []CompactRecord
+	for i, name := range names {
+		// Tiny docs stage more than the 0.35 cap share: each frame carries
+		// fixed overhead larger than the text.
+		body := "needle " + name
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		recs = append(recs, CompactRecord{FRN: uint64(i + 1), Parent: -1, Name: name, Size: int64(len(body))})
+	}
+	const journal = uint64(97)
+	const cp = int64(105)
+	stubContentCatchUpJournal(t, usnJournalDataV0{UsnJournalID: journal, FirstUsn: 1, LowestValidUsn: 1, NextUsn: cp})
+	vol, gsx := contentBuildTestVolume(t, dir, journal, uint64(cp), recs)
+	oldFree := contentFreeBytesFn
+	t.Cleanup(func() { contentFreeBytesFn = oldFree })
+	splitSeen := false
+	contentFreeBytesFn = func(path string) (uint64, error) {
+		if path == contentShardDir(gsx) {
+			if files, _ := filepath.Glob(filepath.Join(filepath.Dir(gsx), contentWorkPrefix+"*", "spool-*")); len(files) > 0 {
+				splitSeen = true
+			}
+		}
+		return 1 << 40, nil
+	}
+	s := contentTestService(t)
+	s.ensureContentBuild(vol)
+	built, err := contentLoadFile(gsx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	releaseContentIndexOnCleanup(t, built)
+	if len(built.Docs) != len(names) {
+		t.Fatalf("sharded build docs=%d; want %d", len(built.Docs), len(names))
+	}
+	if splitSeen {
+		t.Fatal("per-group spool files staged past the spool cap; want the shared spool")
 	}
 }
 

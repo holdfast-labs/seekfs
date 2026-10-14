@@ -55,7 +55,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -784,19 +783,28 @@ func (s *goSearchService) runContentBuild(vol *serviceVolumeIndex, reuseSidecar 
 		vol.content.markBuildFailed(err.Error())
 		return
 	}
-	spool, err := os.Create(filepath.Join(tmpDir, "text.spool"))
+	spoolPath := filepath.Join(tmpDir, "text.spool")
+	spool, err := os.Create(spoolPath)
 	if err != nil {
 		vol.content.markBuildFailed(err.Error())
 		return
 	}
 	defer spool.Close()
+	spoolWriter, err := newContentSpoolWriter(spool)
+	if err != nil {
+		vol.content.markBuildFailed(err.Error())
+		return
+	}
+	defer spoolWriter.Close()
 
-	// Selection extracts in scope priority order. A single spool keeps memory
-	// bounded while the assembler later consumes selected docs in FRN order.
+	// Selection extracts in scope priority order. A single compressed spool
+	// keeps memory bounded while the assembler later consumes selected docs
+	// in FRN order.
 	type selectedDoc struct {
 		item        contentBuildItem
 		offset      int64
 		length      int
+		spoolLen    int
 		modUnix     int64
 		class       uint16
 		version     uint16
@@ -813,9 +821,9 @@ func (s *goSearchService) runContentBuild(vol *serviceVolumeIndex, reuseSidecar 
 	// allowance is the extracted-text budget enforced below: the explicit
 	// budget_bytes when configured, else the reserve-derived allowance for
 	// the sidecar's volume, refreshed as the spool grows (free space moves
-	// under it; the spooled bytes are credited back, since the allowance
-	// budgets the build's whole peak). MaxInt64 means unlimited (unknown
-	// free space; the write-time guard stays the backstop).
+	// under it; the staged compressed bytes are credited back, since the
+	// allowance budgets the build's whole peak). MaxInt64 means unlimited
+	// (unknown free space; the write-time guard stays the backstop).
 	allowance := int64(^uint64(0) >> 1)
 	var sinceAllowanceCheck int64
 	explicitBudget := opts.Scope != nil && opts.Scope.BudgetExplicit
@@ -891,7 +899,7 @@ func (s *goSearchService) runContentBuild(vol *serviceVolumeIndex, reuseSidecar 
 		if !explicitBudget {
 			if sinceAllowanceCheck += n; sinceAllowanceCheck >= contentDiskCheckEvery {
 				sinceAllowanceCheck = 0
-				allowance = contentScopeAllowance(tmpDir, used)
+				allowance = contentScopeAllowance(tmpDir, spoolWriter.StagedBytes())
 			}
 		}
 		if overBudget || n > allowance-used {
@@ -900,16 +908,12 @@ func (s *goSearchService) runContentBuild(vol *serviceVolumeIndex, reuseSidecar 
 			scopeDroppedBytes += n
 			continue
 		}
-		offset, err := spool.Seek(0, io.SeekCurrent)
+		offset, compLen, err := spoolWriter.Append(doc.text)
 		if err != nil {
 			vol.content.markBuildFailed(err.Error())
 			return
 		}
-		if _, err := spool.Write(doc.text); err != nil {
-			vol.content.markBuildFailed(err.Error())
-			return
-		}
-		selected = append(selected, selectedDoc{item: item, offset: offset, length: len(doc.text), modUnix: doc.modUnix, class: doc.class, version: doc.version, fileSize: doc.fileSize, fileModNano: doc.fileModNano})
+		selected = append(selected, selectedDoc{item: item, offset: offset, length: len(doc.text), spoolLen: compLen, modUnix: doc.modUnix, class: doc.class, version: doc.version, fileSize: doc.fileSize, fileModNano: doc.fileModNano})
 		used += n
 		if sinceDiskCheck += n; sinceDiskCheck >= contentDiskCheckEvery {
 			sinceDiskCheck = 0
@@ -931,10 +935,12 @@ func (s *goSearchService) runContentBuild(vol *serviceVolumeIndex, reuseSidecar 
 		return selected[i].item.path < selected[j].item.path
 	})
 	// sourceOf streams the selected docs at the given positions (ascending
-	// FRN) back out of the spool. Each sourceOf call owns its cursor, but
-	// concurrent shard assembles share the abort latch, so it is mutex-held.
+	// FRN) back out of a spool file rf: the shared spool for a single-file
+	// build, one per-group spool file for a sharded build. Each sourceOf
+	// call owns its cursor and its decoder, but concurrent shard assembles
+	// share the abort latch, so it is mutex-held.
 	var abortMu sync.Mutex
-	sourceOf := func(order []int) contentBuildSource {
+	sourceOf := func(rf *os.File, order []int) (contentBuildSource, *contentSpoolReader) {
 		next := 0
 		setAbort := func(reason string, retry bool) {
 			abortMu.Lock()
@@ -942,6 +948,14 @@ func (s *goSearchService) runContentBuild(vol *serviceVolumeIndex, reuseSidecar 
 			if abortReason == "" {
 				abortReason, abortRetry = reason, retry
 			}
+		}
+		fail := func(err error) (contentBuildDoc, bool, error) {
+			setAbort(err.Error(), false)
+			return contentBuildDoc{}, false, err
+		}
+		r, err := newContentSpoolReader(rf)
+		if err != nil {
+			return func() (contentBuildDoc, bool, error) { return fail(err) }, nil
 		}
 		return func() (contentBuildDoc, bool, error) {
 			if vol.replayGen.Load() != gen || next%contentBuildBatchSize == 0 && !s.contentBuildCurrent(vol, gen, journalID) {
@@ -957,12 +971,12 @@ func (s *goSearchService) runContentBuild(vol *serviceVolumeIndex, reuseSidecar 
 			}
 			s := selected[order[next]]
 			next++
-			text := make([]byte, s.length)
-			if _, err := spool.ReadAt(text, s.offset); err != nil {
+			text, err := r.Read(s.offset, s.spoolLen, s.length)
+			if err != nil {
 				return contentBuildDoc{}, false, err
 			}
 			return contentBuildDoc{path: s.item.path, frn: s.item.frn, text: text, modUnix: s.modUnix, class: s.class, version: s.version, fileSize: s.fileSize, fileModNano: s.fileModNano}, true, nil
-		}
+		}, r
 	}
 	s.indexMu.RLock()
 	isWalkBuild := vol.index != nil && vol.index.Source == "walk"
@@ -1010,12 +1024,16 @@ func (s *goSearchService) runContentBuild(vol *serviceVolumeIndex, reuseSidecar 
 	// once: the save copies the section files into the shard, so keeping the
 	// scratch until tmpDir goes would hold a second copy of every saved
 	// shard on the volume alongside the spool.
-	assemble := func(order []int) (*contentStreamedBuild, *contentIndex, string, error) {
+	assemble := func(rf *os.File, order []int) (*contentStreamedBuild, *contentIndex, string, error) {
 		shardTmp, err := os.MkdirTemp(tmpDir, "shard-*")
 		if err != nil {
 			return nil, nil, "", err
 		}
-		built, err := assembleContentIndexStreamed(sourceOf(order), shardTmp)
+		src, rdr := sourceOf(rf, order)
+		built, err := assembleContentIndexStreamed(src, shardTmp)
+		if rdr != nil {
+			rdr.Close()
+		}
 		if err != nil {
 			return nil, nil, shardTmp, err
 		}
@@ -1023,8 +1041,8 @@ func (s *goSearchService) runContentBuild(vol *serviceVolumeIndex, reuseSidecar 
 		shard.Sections = map[uint32][]byte{contentSectionPaths: encodeContentPaths(built.paths)}
 		return built, shard, shardTmp, nil
 	}
-	saveShard := func(dir string, order []int, prefixes []string) (contentShardInfo, error) {
-		built, shard, shardTmp, err := assemble(order)
+	saveShard := func(dir string, rf *os.File, order []int, prefixes []string) (contentShardInfo, error) {
+		built, shard, shardTmp, err := assemble(rf, order)
 		if shardTmp != "" {
 			defer os.RemoveAll(shardTmp)
 		}
@@ -1046,7 +1064,7 @@ func (s *goSearchService) runContentBuild(vol *serviceVolumeIndex, reuseSidecar 
 			for i := range all {
 				all[i] = i
 			}
-			built, shard, _, err := assemble(all)
+			built, shard, shardTmp, err := assemble(spool, all)
 			if err != nil {
 				return err
 			}
@@ -1056,7 +1074,14 @@ func (s *goSearchService) runContentBuild(vol *serviceVolumeIndex, reuseSidecar 
 			if err := contentCheckDiskReserve(gsx); err != nil {
 				return err
 			}
-			return contentSaveAssembled(gsx, shard, contentBuildFiles(built))
+			saveErr := contentSaveAssembled(gsx, shard, contentBuildFiles(built))
+			// The save copies the section files into the shard; drop the
+			// scratch at once instead of holding a second copy of the output
+			// next to the spool until the build ends.
+			if shardTmp != "" {
+				_ = os.RemoveAll(shardTmp)
+			}
+			return saveErr
 		}
 		paths := make([]string, len(selected))
 		sizes := make([]int64, len(selected))
@@ -1068,13 +1093,74 @@ func (s *goSearchService) runContentBuild(vol *serviceVolumeIndex, reuseSidecar 
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			return err
 		}
+		// Reframe the spool into one file per shard group and drop the
+		// original: each group's frames are copied in group (FRN) order, and
+		// a group's file is closed and removed as soon as its shard is
+		// saved, so the assembly peak is one group's spool plus the shards
+		// saved so far instead of the whole spool plus the whole output.
+		// Grouping is unchanged (planned from the same paths and actual
+		// lengths), so the published shards are byte-identical. The reframe
+		// is skipped when the staged spool already exceeds its cap share (a
+		// corpus that compresses pathologically): copying it would double an
+		// already-large spool, so assembly reads the shared spool as before
+		// and the write-time guard stays the backstop.
+		var split []*contentSpoolGroup
+		if staged := spoolWriter.StagedBytes(); staged <= int64(contentScopeSpoolMultiplier*float64(used)) {
+			offsets := make([]int64, len(selected))
+			compLens := make([]int, len(selected))
+			for i, d := range selected {
+				offsets[i], compLens[i] = d.offset, d.spoolLen
+			}
+			groupIdx := make([][]int, len(groups))
+			for i, g := range groups {
+				groupIdx[i] = g.docs
+			}
+			split, err = contentSpoolSplitGroups(spool, offsets, compLens, groupIdx, tmpDir)
+			if err != nil {
+				return err
+			}
+			for gi, g := range groups {
+				for k, di := range g.docs {
+					selected[di].offset = split[gi].Offsets[k]
+					selected[di].spoolLen = split[gi].Lens[k]
+				}
+			}
+			// The spool's bytes now live in the group files (Windows cannot
+			// delete the open file, so close it first).
+			_ = spool.Close()
+			_ = os.Remove(spoolPath)
+		}
+		groupFile := func(gi int) *os.File {
+			if split != nil {
+				return split[gi].File
+			}
+			return spool
+		}
+		closeGroup := func(gi int) {
+			if split == nil || gi < 0 || gi >= len(split) || split[gi].File == nil {
+				return
+			}
+			_ = split[gi].File.Close()
+			split[gi].File = nil
+			_ = os.Remove(split[gi].Path)
+		}
+		closeAllGroups := func() {
+			if split == nil {
+				return
+			}
+			for gi := range split {
+				closeGroup(gi)
+			}
+		}
 		infos := make([]contentShardInfo, 0, len(groups))
 		if len(groups) == 1 || contentShardBuildConcurrency < 2 {
-			for _, g := range groups {
-				info, err := saveShard(dir, g.docs, g.prefixes)
+			for gi, g := range groups {
+				info, err := saveShard(dir, groupFile(gi), g.docs, g.prefixes)
 				if err != nil {
+					closeAllGroups()
 					return err
 				}
+				closeGroup(gi)
 				infos = append(infos, info)
 			}
 		} else {
@@ -1092,9 +1178,10 @@ func (s *goSearchService) runContentBuild(vol *serviceVolumeIndex, reuseSidecar 
 					defer wg.Done()
 					sem <- struct{}{}
 					defer func() { <-sem }()
-					info, err := saveShard(dir, groups[gi].docs, groups[gi].prefixes)
+					info, err := saveShard(dir, groupFile(gi), groups[gi].docs, groups[gi].prefixes)
 					if err == nil {
 						par[gi] = info
+						closeGroup(gi)
 					}
 					if err != nil {
 						mu.Lock()
@@ -1107,6 +1194,7 @@ func (s *goSearchService) runContentBuild(vol *serviceVolumeIndex, reuseSidecar 
 			}
 			wg.Wait()
 			if firstErr != nil {
+				closeAllGroups()
 				return firstErr
 			}
 			infos = append(infos, par...)
