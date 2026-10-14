@@ -21,21 +21,18 @@ corruption, exact required sources, auto-fuzzy only on zero exact hits).
 | `test/suite-speed` | suitespeed | `cmd/seekfs` suite under ~5 min; harden `TestHeadlessFrameCost`; gofmt drift |
 | `content/filter-tier` | tier2 | **Owner decision 2026-10-13: fsearch model is the default.** No stored text; trigram postings plus a per-file filter; matches and snippets verified from disk; edited files read directly. Stored text only as a justified opt-in (G1, G4 partial, §6y) |
 | `perf/static-ranking` | staticrank | Queued item 0b: static ranker (no usage) right-file-first above 39% top-1, on two labeled sets; sets and counts unchanged (G13) |
+| `perf/name-lessons` | namelessons | Name-search lessons: letter-bitmap prefilter, multi-word spelling, accent folding, `'exact ^prefix suffix$ ** {a,b} in:`, typo budget by word length, current-file demotion (G11) |
 
 ## Queued, in order
 
-1. **Grep features (G10, G9, G11).** Plain-literal grep via SIMD memmem and
+1. **Grep features (G10, G9, G11). Start after `content/filter-tier`
+   merges** (both touch the content verify and snippet path). Plain-literal grep via SIMD memmem and
    multi-pattern OR via Aho-Corasick (fff); fuzzy grep (Smith-Waterman per
    line); context lines; a per-query time budget (fff default 150 ms) with
    cursor pagination; smart case for content; ripgrep line semantics for
    regex (fsearch); `sym:` definition search and a definition-line bonus;
    extension and single-file filters for grep.
-2. **Name-search lessons (G11).** A per-name letter bitmap that rules out
-   most names before scoring (fsearch); several words spelling one name
-   (fsearch); accent folding; `'exact`, `^prefix`, `suffix$`, `**` and brace
-   globs, `in:` alias (fsearch); typo budget of one edit, or two for words of
-   8+ letters (compare with ours); current-file deprioritization (fff).
-3. **Freshness and footprint (G4, G5, G6).** Name-side changes visible in
+2. **Freshness and footprint (G4, G5, G6).** Name-side changes visible in
    milliseconds (fsearch about 15 ms; dirty content reads land with the
    filter tier); on-demand indexing (searched folder first, fsearch); a
    restart replays only what changed; service resident memory (about 500 MB
