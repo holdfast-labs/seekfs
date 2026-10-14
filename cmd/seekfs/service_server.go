@@ -272,6 +272,8 @@ func (s *goSearchService) serviceCommandInfo(w io.Writer, req *serviceRequest) {
 
 func (s *goSearchService) serviceCommandSearch(w io.Writer, caps serviceCapabilities, req *serviceRequest) {
 	serviceNoteQueryActivity()
+	serviceActiveQueryEnter()
+	defer serviceActiveQueryLeave()
 	if queryHasFeatureToken(req.Query) {
 		s.serviceCommandFeatureSearch(w, caps, req)
 		return
@@ -392,6 +394,8 @@ func (s *goSearchService) serviceCommandSearch(w io.Writer, caps serviceCapabili
 
 func (s *goSearchService) serviceCommandWatchDelta(w io.Writer, req *serviceRequest) {
 	serviceNoteQueryActivity()
+	serviceActiveQueryEnter()
+	defer serviceActiveQueryLeave()
 	if queryHasFeatureToken(req.Query) {
 		_ = json.NewEncoder(w).Encode(serviceResponse{OK: false, Message: "watch does not support generic feature predicates"})
 		return

@@ -1431,6 +1431,16 @@ func serviceNoteQueryActivity() {
 	serviceLastQueryUnixNano.Store(time.Now().UnixNano())
 }
 
+// serviceActiveQueries counts in-flight foreground search commands, so the
+// content build governor can pause while a query is actually running — not
+// just within the recent-activity window afterwards. Incremented and
+// decremented around the search commands that note query activity.
+var serviceActiveQueries atomic.Int64
+
+func serviceActiveQueryEnter() { serviceActiveQueries.Add(1) }
+
+func serviceActiveQueryLeave() { serviceActiveQueries.Add(-1) }
+
 func applyServiceRuntimeMemoryTuning() {
 	serviceRuntimeTuningOnce.Do(func() {
 		if raw := strings.TrimSpace(os.Getenv("SEEKFS_GO_MEM_LIMIT_MB")); raw != "" {
