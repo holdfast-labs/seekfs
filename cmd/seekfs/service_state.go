@@ -1318,6 +1318,35 @@ func (vol *serviceVolumeIndex) clearSearchCachesLocked() {
 	vol.underRootCache = nil
 }
 
+// releaseIdleCaches drops the per-volume query-result caches (term, path
+// term, ext, under) plus the decoded posting-block cache. Everything here
+// is rebuilt on demand from the mmapped base, so the next query pays a
+// re-decode, not a wrong answer. Called only from the idle release path.
+func (vol *serviceVolumeIndex) releaseIdleCaches() {
+	if vol == nil {
+		return
+	}
+	vol.termMu.Lock()
+	vol.clearSearchCachesLocked()
+	vol.termMu.Unlock()
+}
+
+// serviceReleaseIdleCaches drops all idle-releasable name-query caches
+// across every volume. It precedes debug.FreeOSMemory in the idle loop so
+// the freed spans actually reach the OS.
+func serviceReleaseIdleCaches(s *goSearchService) {
+	servicePostingBlockCache.clear()
+	if s == nil {
+		return
+	}
+	s.indexMu.RLock()
+	volumes := append([]*serviceVolumeIndex(nil), s.volumes...)
+	s.indexMu.RUnlock()
+	for _, vol := range volumes {
+		vol.releaseIdleCaches()
+	}
+}
+
 func (vol *serviceVolumeIndex) trimSearchCachesLocked() {
 	if len(vol.pathCache) > servicePathCacheLimit {
 		vol.pathCache = make(map[int]string)
@@ -1379,6 +1408,9 @@ func (vol *serviceVolumeIndex) residentMemoryInfo() *residentMemoryInfo {
 		info.NameTrigramBytes = trigrams.postingBytes
 		info.NameTrigramKeys = trigrams.keyCount()
 	}
+	vol.termMu.Lock()
+	info.CacheBytes = vol.postingListCacheBytesLocked()
+	vol.termMu.Unlock()
 	info.ChildBytes = (len(vol.childOffsets) + len(vol.childIDs) + len(vol.rootIDs) + len(vol.subtreeOrder) + len(vol.subtreeStart) + len(vol.subtreeEnd)) * 4
 	info.FRNIndexBytes = len(vol.frns)*8 + len(vol.frnRecordIDs)*4
 	info.FRNOverlayEntries = len(vol.frnToID)
@@ -1402,7 +1434,8 @@ func (vol *serviceVolumeIndex) residentMemoryInfo() *residentMemoryInfo {
 		int64(info.NameTrigramBytes) +
 		int64(info.TypePostBytes) +
 		int64(info.ChildBytes) +
-		int64(info.FRNIndexBytes) + info.NameIdentityBytes + info.NameMemoBytes
+		int64(info.FRNIndexBytes) + info.NameIdentityBytes + info.NameMemoBytes +
+		info.CacheBytes
 	return info
 }
 
@@ -1421,6 +1454,7 @@ func runtimeMemorySnapshot() *runtimeMemoryInfo {
 		NumGC:             m.NumGC,
 		GCCPUFraction:     m.GCCPUFraction,
 		GoMemLimitBytes:   limit,
+		BlockCacheBytes:   servicePostingBlockCache.liveBytes(),
 	}
 }
 
@@ -1441,7 +1475,7 @@ func serviceActiveQueryEnter() { serviceActiveQueries.Add(1) }
 
 func serviceActiveQueryLeave() { serviceActiveQueries.Add(-1) }
 
-func applyServiceRuntimeMemoryTuning() {
+func applyServiceRuntimeMemoryTuning(s *goSearchService) {
 	serviceRuntimeTuningOnce.Do(func() {
 		if raw := strings.TrimSpace(os.Getenv("SEEKFS_GO_MEM_LIMIT_MB")); raw != "" {
 			if mb, err := strconv.ParseInt(raw, 10, 64); err == nil && mb > 0 {
@@ -1456,12 +1490,12 @@ func applyServiceRuntimeMemoryTuning() {
 			}
 		}
 		if idle > 0 {
-			go serviceIdleMemoryReleaseLoop(idle)
+			go serviceIdleMemoryReleaseLoop(s, idle)
 		}
 	})
 }
 
-func serviceIdleMemoryReleaseLoop(idle time.Duration) {
+func serviceIdleMemoryReleaseLoop(s *goSearchService, idle time.Duration) {
 	var lastRelease time.Time
 	ticker := time.NewTicker(time.Minute)
 	defer ticker.Stop()
@@ -1473,6 +1507,7 @@ func serviceIdleMemoryReleaseLoop(idle time.Duration) {
 		if !lastRelease.IsZero() && time.Since(lastRelease) < idle {
 			continue
 		}
+		serviceReleaseIdleCaches(s)
 		debug.FreeOSMemory()
 		lastRelease = time.Now()
 		serviceLog("idle memory release ran (threshold %s)", idle)

@@ -396,7 +396,11 @@ type residentMemoryInfo struct {
 	FRNOverlayEntries int   `json:"frn_overlay_entries,omitempty"`
 	NameIdentityBytes int64 `json:"name_identity_bytes,omitempty"`
 	NameMemoBytes     int64 `json:"name_memo_bytes,omitempty"`
-	KnownBytes        int64 `json:"known_bytes,omitempty"`
+	// CacheBytes tallies the idle-releasable per-volume query caches
+	// (term/path-term/ext/under posting lists). The global decoded
+	// posting-block cache is reported on the runtime snapshot instead.
+	CacheBytes int64 `json:"cache_bytes,omitempty"`
+	KnownBytes int64 `json:"known_bytes,omitempty"`
 }
 
 type runtimeMemoryInfo struct {
@@ -410,6 +414,9 @@ type runtimeMemoryInfo struct {
 	NumGC             uint32  `json:"num_gc"`
 	GCCPUFraction     float64 `json:"gc_cpu_fraction,omitempty"`
 	GoMemLimitBytes   int64   `json:"go_mem_limit_bytes,omitempty"`
+	// BlockCacheBytes is the heap held by the global decoded posting-block
+	// cache (default cap 128 MiB); cleared by the idle release path.
+	BlockCacheBytes int64 `json:"block_cache_bytes,omitempty"`
 }
 
 type goSearchService struct {

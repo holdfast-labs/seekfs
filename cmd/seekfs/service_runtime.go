@@ -19,7 +19,7 @@ func (s *goSearchService) runStandalone() error {
 	if s.processMode == "" {
 		s.processMode = "standalone"
 	}
-	applyServiceRuntimeMemoryTuning()
+	applyServiceRuntimeMemoryTuning(s)
 	fmt.Fprintf(os.Stderr, "seekfs privileged service listening on %s\n", s.pipeName)
 	go func() {
 		defer func() {
