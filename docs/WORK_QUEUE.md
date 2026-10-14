@@ -50,6 +50,14 @@ refer to `docs/REFERENCE_TOOLS.md`.
   the recall run, `E:\bench\scratch\recall\REPORT.md`).
 - **Single-line JSON:** an 11.4 MB single-line `tokenizer.json` makes every
   broad query 4–5× slower. Covered by item 1's caps; verify after.
+- **Extraction past the budget:** after the budget bites, builds keep
+  extracting every in-scope file just to tally exact drop counts (468k files
+  extracted for a 71k-doc budget, `content/idle-governor` report). Either
+  estimate the drops from file sizes, or feed those extractions into the
+  filter tier (`content/filter-tier`) so the work buys coverage.
+- **Single worker under load:** builds drop to 1 worker when queries are
+  active at build start, which serializes a loaded build to 60+ min. Adapt
+  workers during the build instead of fixing the count at the start.
 - **Slow differential test:** `TestContentGlobalLaneScopeDifferential` takes
   300–666 s. `test/suite-speed` tiers it; confirm CI still runs the full tier.
 
