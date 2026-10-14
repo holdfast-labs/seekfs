@@ -12,10 +12,18 @@ import (
 )
 
 // directWriteLOWRSectionFromSpool writes the existing LOWR wire format
-// directly from the canonical record spool.  It reads the spool once, writing
-// the folded-name blob to a bounded temp file and the per-record offset/length
-// table to a second temp file; the section header is emitted from the final
-// blob size and both temps are streamed to the output.
+// directly from the canonical record spool: header (token count, blob
+// length), then the whole offset table, then the whole length table, then
+// the blob — the split layout decodeLowerSection reads. It reads the spool
+// once, streaming offsets, lengths, and folded names to three bounded temp
+// files; the section header is emitted from the final blob size and all
+// three temps are streamed to the output in order.
+//
+// Offsets and lengths are per name token. Direct builds use one token per
+// record in spool order, so per-record iteration already yields token order.
+// An interleaved (offset,length) per-record table would decode as garbage
+// under the split layout and silently underfill every token-addressed lower
+// name read (see TestDirectLOWRSectionIsCanonical).
 //
 // The caller owns alignment and section-table insertion. The returned entry
 // starts at the writer's current offset.
@@ -31,20 +39,34 @@ func directWriteLOWRSectionFromSpool(ctx context.Context, cw *countingWriter, fi
 	}
 
 	blobPath := filepath.Join(filepath.Dir(finalPath), "direct-lowr-blob.tmp")
-	tablePath := filepath.Join(filepath.Dir(finalPath), "direct-lowr-table.tmp")
+	offsPath := filepath.Join(filepath.Dir(finalPath), "direct-lowr-offs.tmp")
+	lensPath := filepath.Join(filepath.Dir(finalPath), "direct-lowr-lens.tmp")
 	defer os.Remove(blobPath)
-	defer os.Remove(tablePath)
+	defer os.Remove(offsPath)
+	defer os.Remove(lensPath)
 	blob, err := os.Create(blobPath)
 	if err != nil {
 		return indexSectionTableEntry{}, err
 	}
 	blobWriter := bufio.NewWriterSize(blob, 256*1024)
-	table, err := os.Create(tablePath)
+	offs, err := os.Create(offsPath)
 	if err != nil {
 		_ = blob.Close()
 		return indexSectionTableEntry{}, err
 	}
-	tableWriter := bufio.NewWriterSize(table, 256*1024)
+	offsWriter := bufio.NewWriterSize(offs, 256*1024)
+	lens, err := os.Create(lensPath)
+	if err != nil {
+		_ = blob.Close()
+		_ = offs.Close()
+		return indexSectionTableEntry{}, err
+	}
+	lensWriter := bufio.NewWriterSize(lens, 256*1024)
+	closeAll := func() {
+		_ = blob.Close()
+		_ = offs.Close()
+		_ = lens.Close()
+	}
 
 	var blobBytes uint64
 	count, err := directForEachSpoolName(ctx, finalPath, recordCount, func(_ int, name string) error {
@@ -65,43 +87,37 @@ func directWriteLOWRSectionFromSpool(ctx context.Context, cw *countingWriter, fi
 		}
 		var b [4]byte
 		binary.LittleEndian.PutUint32(b[:], off)
-		if _, err := tableWriter.Write(b[:]); err != nil {
+		if _, err := offsWriter.Write(b[:]); err != nil {
 			return err
 		}
 		var lens [2]byte
 		binary.LittleEndian.PutUint16(lens[:], uint16(len(lower)))
-		if _, err := tableWriter.Write(lens[:]); err != nil {
+		if _, err := lensWriter.Write(lens[:]); err != nil {
 			return err
 		}
 		return nil
 	})
 	if err != nil {
-		_ = blob.Close()
-		_ = table.Close()
+		closeAll()
 		return indexSectionTableEntry{}, err
 	}
 	if count != recordCount {
-		_ = blob.Close()
-		_ = table.Close()
+		closeAll()
 		return indexSectionTableEntry{}, errors.New("direct LOWR record count mismatch")
 	}
 	if err := blobWriter.Flush(); err != nil {
-		_ = blob.Close()
-		_ = table.Close()
+		closeAll()
 		return indexSectionTableEntry{}, err
 	}
-	if err := tableWriter.Flush(); err != nil {
-		_ = blob.Close()
-		_ = table.Close()
+	if err := offsWriter.Flush(); err != nil {
+		closeAll()
 		return indexSectionTableEntry{}, err
 	}
-	if err := blob.Close(); err != nil {
-		_ = table.Close()
+	if err := lensWriter.Flush(); err != nil {
+		closeAll()
 		return indexSectionTableEntry{}, err
 	}
-	if err := table.Close(); err != nil {
-		return indexSectionTableEntry{}, err
-	}
+	closeAll()
 	blobInfo, err := os.Stat(blobPath)
 	if err != nil {
 		return indexSectionTableEntry{}, err
@@ -117,7 +133,10 @@ func directWriteLOWRSectionFromSpool(ctx context.Context, cw *countingWriter, fi
 	if err := directWriteBytes(cw, header[:]); err != nil {
 		return indexSectionTableEntry{}, err
 	}
-	if err := copyFileToWriter(cw, tablePath); err != nil {
+	if err := copyFileToWriter(cw, offsPath); err != nil {
+		return indexSectionTableEntry{}, err
+	}
+	if err := copyFileToWriter(cw, lensPath); err != nil {
 		return indexSectionTableEntry{}, err
 	}
 	if err := copyFileToWriter(cw, blobPath); err != nil {

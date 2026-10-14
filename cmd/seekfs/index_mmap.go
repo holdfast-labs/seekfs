@@ -417,7 +417,21 @@ func decodeLowerSection(data []byte) ([]byte, []uint32, []uint16) {
 	if off+blobLen < off || off+blobLen > len(data) {
 		return nil, nil, nil
 	}
-	return data[off : off+blobLen], offs, lens
+	blob := data[off : off+blobLen]
+	// Every writer emits offsets that are either SameAsName or a live blob
+	// range (see encodeLowerSection and the direct LOWR writer). Anything
+	// else is a corrupt section (older direct builds interleaved the table);
+	// discard it so token-addressed reads fall back to exact decoding
+	// instead of serving garbage postings.
+	for i, tokenOff := range offs {
+		if tokenOff == packedLowerSameAsName {
+			continue
+		}
+		if end := uint64(tokenOff) + uint64(lens[i]); end > uint64(len(blob)) {
+			return nil, nil, nil
+		}
+	}
+	return blob, offs, lens
 }
 
 func mappedUint16Slice(data []byte) []uint16 {
