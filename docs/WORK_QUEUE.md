@@ -28,6 +28,9 @@ growing context, full-suite output pasted into context, polling, coordinator
 - Send test, build and benchmark output to a file and read only the tail or
   failures. Wait on the process instead of polling.
 - Coordinators send no FYI messages to agents; only prompts that contain work.
+- On command-code Muse, any agent message without a tool call ends its turn
+  (agents stopped mid-task after a progress line). Every brief must say: "No
+  progress narration; reply without a tool call only for the final report."
 - Prefer a fresh session with a short handoff note over resuming a very long one.
 - The coordinator does small finishing work (commit, merge, suite run)
   directly instead of spawning an agent for it.
@@ -83,9 +86,11 @@ re-measured (the scale run stopped at the budget); re-measure after
   extracted for a 71k-doc budget, `content/idle-governor` report). Either
   estimate the drops from file sizes, or feed those extractions into the
   filter tier (`content/filter-tier`) so the work buys coverage.
-- **Single worker under load:** builds drop to 1 worker when queries are
-  active at build start, which serializes a loaded build to 60+ min. Adapt
-  workers during the build instead of fixing the count at the start.
+- **Single worker under load:** DONE (`perf/adaptive-build-workers`).
+  Extraction re-samples the desired worker count at every governor batch
+  boundary (recent/in-flight query, input incl. UI heartbeat, or battery ->
+  1 worker; quiet -> back to the GOMAXPROCS-aware cap), so load only slows
+  the build while it is actually present instead of serializing it to 60+ min.
 - **User input seen from the service:** DONE (`feat/ui-input-and-user-signals`).
   `seekfs-ui` reports its session's `GetLastInputInfo` time over the pipe
   (`input-heartbeat`, local-only, 5 s background heartbeat, 30 s expiry);
