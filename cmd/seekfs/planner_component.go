@@ -169,6 +169,11 @@ func (vol *serviceVolumeIndex) componentDirectTopCandidates(pq parsedQuery) ([]i
 	if len(term) < 3 || strings.ContainsAny(term, `\/*?[]:`) {
 		return nil, false
 	}
+	if vol.pathTermSatisfiedByVolume(term) {
+		// The component posting only covers directory roots; volume-only
+		// matches have no root here, so the walk below would underfill.
+		return nil, false
+	}
 	candidates := vol.componentPosting32(term)
 	if len(candidates) == 0 {
 		if len(vol.extPosting32(term)) > 0 {
@@ -253,6 +258,27 @@ func (vol *serviceVolumeIndex) componentDirectTopCandidates(pq parsedQuery) ([]i
 			}
 		}
 	}
+	if len(out) < pq.Limit {
+		// Path-substring truth also includes file self-hits outside every
+		// component-rooted subtree (e.g. cargo.json for -path cargo). The
+		// component posting only covers directory roots, so union the exact
+		// name hits to fill the shortfall; the verify loop re-checks the
+		// path predicate. Existing prefix order is untouched.
+		for _, id := range vol.nameTermPosting(term) {
+			if len(out) >= pq.Limit {
+				break
+			}
+			if _, ok := seen[id]; ok || id < 0 || id >= recordCount {
+				continue
+			}
+			rec := vol.index.compactRecord(id)
+			if rec.Deleted || !containsFoldASCII(vol.index.compactNameAt(id), term) {
+				continue
+			}
+			seen[id] = struct{}{}
+			out = append(out, id)
+		}
+	}
 	return out, len(out) > 0
 }
 
@@ -270,7 +296,7 @@ func (vol *serviceVolumeIndex) componentMultiTermTopCandidates(pq parsedQuery) (
 	bestEstimate := int(^uint(0) >> 1)
 	for _, term := range pq.Terms {
 		if len(term) < 3 || isVolumeQueryTerm(term) || strings.ContainsAny(term, `\/*?[]:.`) ||
-			vol.pathTermIsUsableExtensionCandidate(term) {
+			vol.pathTermIsUsableExtensionCandidate(term) || vol.pathTermSatisfiedByVolume(term) {
 			continue
 		}
 		nameMatches, roots, complete := vol.pathDirectoryTermSource(term)
@@ -311,7 +337,7 @@ func (vol *serviceVolumeIndex) componentMultiTermTopCandidates(pq parsedQuery) (
 		var bestTerm string
 		for _, term := range pq.Terms {
 			if len(term) < 3 || isVolumeQueryTerm(term) || strings.ContainsAny(term, `\/*?[]:.`) ||
-				vol.pathTermIsUsableExtensionCandidate(term) {
+				vol.pathTermIsUsableExtensionCandidate(term) || vol.pathTermSatisfiedByVolume(term) {
 				continue
 			}
 			_, roots, _ := vol.pathDirectoryTermSource(term)
@@ -454,6 +480,9 @@ func (vol *serviceVolumeIndex) selectiveNamePathTermCandidates(pq parsedQuery) (
 	bestIDs := []int(nil)
 	for _, term := range pq.Terms {
 		if len(term) < 4 || isVolumeQueryTerm(term) || strings.ContainsAny(term, `\/*?[]:`) || !filenameLikePathTerm(term) {
+			continue
+		}
+		if vol.pathTermSatisfiedByVolume(term) {
 			continue
 		}
 		ids, ok := vol.nameTrigramNameTermPostingLimited(term, servicePathNameTrigramCandidateMaxIDs)

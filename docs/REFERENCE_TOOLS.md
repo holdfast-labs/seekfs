@@ -124,8 +124,10 @@ Accuracy and ranking (fff parity):
     commits, skipping commits touching > 50 files, small tree diffs only).
     Approximations: dirs never report modified/staged/conflict; unreadable
     repos resolve unknown (positive predicates fail closed); short/broad
-    terms on tiny indexes inherit the planned term posting's known underfill
-    (pre-existing, base-identical — same as `--exists` there).
+    terms on tiny direct indexes were lossy via the planned term posting
+    (fixed in `fix/short-term-postings`: the direct LOWR writer now emits the
+    canonical split per-token layout, and corrupt sections fall back to exact
+    decoding).
 9. **No `sym:`** (definition search) and no definition-line bonus in content
    ranking.
 10. **Grep features:** no fuzzy (Smith-Waterman) grep, no multi-pattern OR

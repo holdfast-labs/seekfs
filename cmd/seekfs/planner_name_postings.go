@@ -99,6 +99,10 @@ func (vol *serviceVolumeIndex) filterCandidates(pq parsedQuery) ([]int, bool) {
 		lists = append(lists, list)
 	}
 	for _, term := range pq.Terms {
+		if pq.MatchPath && vol.pathTermSatisfiedByVolume(term) {
+			// Vacuous for sourcing; verification re-checks it.
+			continue
+		}
 		list := vol.nameTermPosting(term)
 		if pq.MatchPath {
 			list = vol.pathTermPosting(term)
@@ -235,11 +239,20 @@ func (vol *serviceVolumeIndex) pathTermSubtreeCandidates(pq parsedQuery) ([]int,
 	}
 	lists := make([][]int, 0, len(pq.Terms))
 	for _, term := range pq.Terms {
+		if vol.pathTermSatisfiedByVolume(term) {
+			// Vacuous for sourcing (matches every path via the volume);
+			// verification re-checks it. Sourcing it would intersect an
+			// incomplete name-derived subset.
+			continue
+		}
 		list := vol.pathPlanTermPosting(term)
 		if len(list) == 0 {
 			return []int{}, true
 		}
 		lists = append(lists, list)
+	}
+	if len(lists) == 0 {
+		return nil, false
 	}
 	sortIntListsByLen(lists)
 	candidates := append([]int(nil), lists[0]...)

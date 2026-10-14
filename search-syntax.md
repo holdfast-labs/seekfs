@@ -35,10 +35,10 @@
 - Recency filters with `--recent 24h` or `--modified-after 2026-05-22`.
 - Ranking bias with `--cwd-bias` or `--root-bias <path>`.
 - Proximity anchor with `--near <path>` (see `near:` above).
-- Fuzzy matching: when a single-term query returns fewer than 10 results,
-  close matches (Damerau-Levenshtein distance, accent/fullwidth-folded) are
-  appended below the exact results and ranked by edit distance, then prefix
-  alignment, then normal rank. For multi-term queries that return no results
+- Fuzzy matching: when a single-term query returns no results at all, close
+  matches (Damerau-Levenshtein distance, accent/fullwidth-folded) are
+  returned, ranked by edit distance, then prefix alignment, then normal rank.
+  For multi-term queries that return no results
   at all, terms that match nothing (or almost nothing) on their own are
   replaced by their best close-match variants and the query is re-run once
   (`reprot pdf` finds `report.pdf`, `discovery llog` finds `discovery log`);

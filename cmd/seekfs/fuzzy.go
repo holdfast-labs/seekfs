@@ -21,11 +21,6 @@ const (
 	fuzzyMaxDistance   = 2
 	fuzzyCandidateCap  = serviceNameTrigramCandidateMaxIDs
 	fuzzyCollectFactor = 16
-	// Auto-fuzzy fires when exact search returns fewer than this many
-	// results: zero hits are the strongest typo signal, but a handful of
-	// incidental substring hits (e.g. "reprot" inside "coreproto") can also
-	// mask the intended match, so a small threshold catches those too.
-	fuzzyAutoResultThreshold = 10
 	// Terms this long split into pigeonhole pieces of 5+ runes, selective
 	// enough to replace depth-2 deletion variants.
 	fuzzyLongTermRunes = 15
@@ -779,8 +774,12 @@ func appendFuzzyServiceMatches(volumes []*serviceVolumeIndex, opts queryOptions,
 	// Auto-fuzzy: a query that matched nothing is the strongest typo signal,
 	// so the fallback tier fires without needing the explicit ~ marker or
 	// --fuzzy flag. Explicit markers additionally allow topping up partially
-	// filled result sets.
-	autoFuzzy := len(matches) < fuzzyAutoResultThreshold
+	// filled result sets. A partial exact set never auto-tops: appended rows
+	// would not satisfy the query, so they read as false positives next to
+	// exact hits. Typo queries whose misspelling still hits incidentally need
+	// an explicit marker to reach the tier; the recall harness pins the
+	// typo top-1 rates that must not regress.
+	autoFuzzy := len(matches) == 0
 	if !autoFuzzy && !pq.Fuzzy {
 		return matches, false
 	}

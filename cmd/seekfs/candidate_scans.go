@@ -14,6 +14,12 @@ func (vol *serviceVolumeIndex) boundedPathTermPlanSource(term string) ([]int, bo
 		strings.ContainsAny(term, `\/*?[]:`) || len(term) < 3 {
 		return nil, false
 	}
+	if vol.pathTermSatisfiedByVolume(term) {
+		// Volume-satisfied terms (UNC volume substrings) match every path;
+		// the gram-emptiness proof and bounded sources below only see names
+		// and would falsely empty or underfill the plan.
+		return nil, false
+	}
 	// A term whose required filename grams are proven absent by the complete
 	// name-gram metadata (PNGR counts complete, or the PNGC companion) cannot
 	// match anything: return a proven empty source so the plan marks itself
@@ -1072,6 +1078,19 @@ func (vol *serviceVolumeIndex) plainTermMayOccurInPathPrefix(term string) bool {
 		return true
 	}
 	return len(vol.index.Roots) > 0 && containsFoldASCII(vol.index.Roots[0], term)
+}
+
+// pathTermSatisfiedByVolume reports whether term holds on every reconstructed
+// path through the volume prefix alone, mirroring compactPathContainsTerm's
+// volume check (the record-name chain check there is the constraining part).
+// Such a term is vacuous as a candidate source: any name/posting-derived
+// subset misses the volume-only matches, so sourcing lanes must skip it when
+// choosing multi-term drivers, or decline single-term drivers and let the
+// verified scan decide. Verification still re-checks the term (vacuously
+// true), so skipping only widens candidates, never results.
+func (vol *serviceVolumeIndex) pathTermSatisfiedByVolume(term string) bool {
+	return vol != nil && vol.index != nil && vol.index.Volume != "" && term != "" &&
+		containsFoldASCII(vol.index.Volume, term)
 }
 
 // plainTermPostingWorthBuilding reports whether intersecting a term's name

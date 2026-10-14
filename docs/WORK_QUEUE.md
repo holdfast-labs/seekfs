@@ -13,13 +13,13 @@ refer to `docs/REFERENCE_TOOLS.md`.
 
 Merged so far this round: `perf/content-underfill`, `perf/name-fuzzy`,
 `fix/cli-silent-empty`, `content/idle-governor`, `content/spool-peak`, `perf/ranking-signals` (G7, G8, G13), `content/inclusion-policy` (G3, §6z,
-format v10).
+format v10), `fix/short-term-postings` (direct-index LOWR writer
+corruption, exact required sources, auto-fuzzy only on zero exact hits).
 
 | Branch | Worktree | Scope |
 |---|---|---|
 | `test/suite-speed` | suitespeed | `cmd/seekfs` suite under ~5 min; harden `TestHeadlessFrameCost`; gofmt drift |
 | `content/filter-tier` | tier2 | **Owner decision 2026-10-13: fsearch model is the default.** No stored text; trigram postings plus a per-file filter; matches and snippets verified from disk; edited files read directly. Stored text only as a justified opt-in (G1, G4 partial, §6y) |
-| `fix/short-term-postings` | shortterm | Queued item 0: lossy short-term postings (underfill) and rank-neighbor false positives; exactness sweep plus differential test |
 | `perf/static-ranking` | staticrank | Queued item 0b: static ranker (no usage) right-file-first above 39% top-1, on two labeled sets; sets and counts unchanged (G13) |
 
 ## Queued, in order
@@ -83,9 +83,15 @@ format v10).
 
 ## Owner actions (not agent work)
 
-- **Patch release decision:** the CLI silent-empty bug (service errors exit 0
-  with no output) is in released v1.11.0. The fix is merged into integ (two
-  lines in `cmdSearch`) and could be cherry-picked to `main` for v1.11.1.
+- **Patch release decision:** two bugs in released v1.11.0 are fixed on
+  integ and could be cherry-picked to `main` for v1.11.1:
+  - CLI silent-empty: service errors exit 0 with no output (two lines in
+    `cmdSearch`, `fix/cli-silent-empty`).
+  - `seekfs direct` writes a corrupt LOWR (folded-name) section, so
+    direct-built indexes return too few results for short or broad terms
+    (`go` 6 of 21). The fix also discards corrupt sections on load
+    (`fix/short-term-postings` commit 8205201). USN-built and walk-built
+    indexes are not affected.
 - **Paseo sidebar:** 14 stale worktree projects are marked archived in
   `~\.paseo\projects\projects.json` (backup at
   `E:\bench\scratch\paseo-projects.backup.json`). This takes effect on the
