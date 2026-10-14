@@ -512,7 +512,7 @@ func TestFeatureCommandDispatchAndMixedContent(t *testing.T) {
 		{"feature:tags:blue content:needle", 1}, {"feature:tags:all !content:needle", 2}, {"feature:tags:blue|content:needle", 2}, {`content:"feature:tags:blue"`, 1},
 	} {
 		var out bytes.Buffer
-		s.serviceCommandSearch(&out, serviceCapabilities{}, &serviceRequest{Query: tc.query, Limit: 100})
+		s.serviceCommandSearch(&out, serviceCapabilities{}, servicePrincipal{}, &serviceRequest{Query: tc.query, Limit: 100})
 		var resp serviceResponse
 		if err := json.Unmarshal(out.Bytes(), &resp); err != nil {
 			t.Fatal(err)
@@ -522,7 +522,7 @@ func TestFeatureCommandDispatchAndMixedContent(t *testing.T) {
 		}
 	}
 	var out bytes.Buffer
-	s.serviceCommandSearch(&out, serviceCapabilities{Remote: true}, &serviceRequest{Query: "feature:tags:blue"})
+	s.serviceCommandSearch(&out, serviceCapabilities{Remote: true}, servicePrincipal{}, &serviceRequest{Query: "feature:tags:blue"})
 	var resp serviceResponse
 	if err := json.Unmarshal(out.Bytes(), &resp); err != nil {
 		t.Fatal(err)

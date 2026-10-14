@@ -196,6 +196,7 @@ func cmdDefault(args []string) error {
 
 func (a *UIApp) startup(ctx context.Context) {
 	a.ctx = ctx
+	a.startInputHeartbeatLoop()
 	warmUpShellContextMenus()
 }
 

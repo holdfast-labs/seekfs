@@ -52,11 +52,12 @@ corruption, exact required sources, auto-fuzzy only on zero exact hits).
 - **Single worker under load:** builds drop to 1 worker when queries are
   active at build start, which serializes a loaded build to 60+ min. Adapt
   workers during the build instead of fixing the count at the start.
-- **User input seen from the service:** the governor's input signal is
-  unavailable from session 0 on this Windows build (WTS `LastInputTime` is 0,
-  `GetLastInputInfo` sees only session 0; §6w, `loaded --json` governor
-  section). Fix it by having `seekfs-ui` (runs in the user session) report
-  its session's last-input time to the service over the pipe.
+- **User input seen from the service:** DONE (`feat/ui-input-and-user-signals`).
+  `seekfs-ui` reports its session's `GetLastInputInfo` time over the pipe
+  (`input-heartbeat`, local-only, 5 s background heartbeat, 30 s expiry);
+  the service treats the freshest report as the governor input signal and
+  `loaded --json` names the source (`ui-heartbeat`/`wts`/`lastinput`/
+  `unavailable`). See §6w.
 - **Save-time peak:** the write guard checks free space before each shard save,
   but a save briefly holds both the section files and the output (§6x
   residual). Account for it, or stream the save.
@@ -68,9 +69,11 @@ corruption, exact required sources, auto-fuzzy only on zero exact hits).
 - **Content accent folding:** names fold accents (`resume` → `résumé`), but
   content matching is still case-folded only. Folding content needs an
   index-format change; fold it into the next format bump.
-- **Ranking store scope:** `ranking_signals.json` lives next to the service
-  state (the LocalSystem service holds one store for all local users). Decide
-  whether it should be per-user before shipping on multi-user machines.
+- **Ranking store scope:** DONE (`feat/ui-input-and-user-signals`). Per-user
+  `ranking_signals-<SID>.json` files next to the service state, keyed by the
+  pipe client's SID, ACL-restricted to SYSTEM + Administrators + owner;
+  `open`/`recent`/ranking use the caller's store; legacy shared file migrates
+  to the first opener. See `search-syntax.md` "Ranking signals".
 - **Single-line JSON follow-up:** the 1 MiB / 10 MiB caps and JSON skip from
   `content/inclusion-policy` should cover the 11.4 MB single-line
   `tokenizer.json`. Verify on the next real-index recall run.

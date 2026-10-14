@@ -124,12 +124,13 @@ func classifyServiceCommand(command string) serviceCommandClass {
 	switch command {
 	case "search", "info", "status":
 		return serviceCommandReadOnly
-	case "watch-delta", "plugin-list", "open", "recent":
+	case "watch-delta", "plugin-list", "open", "recent", "input-heartbeat":
 		// watch-delta is a read-only local operation but is deferred remotely
 		// until Phase 7: it exposes cursor semantics that need scoped identity.
 		// open/recent are local-only usage signals (frecency store); they
 		// mutate only the local signals file, need no elevation, and never
-		// leave the machine.
+		// leave the machine. input-heartbeat is the same class: the UI's
+		// session input time, local only, never leaves the machine.
 		return serviceCommandLocalOnly
 	case "index-usn", "plugin-reload":
 		return serviceCommandMutate
@@ -192,11 +193,13 @@ func (s *goSearchService) handleServiceCommand(w io.Writer, principal servicePri
 	case "info":
 		s.serviceCommandInfo(w, req)
 	case "search":
-		s.serviceCommandSearch(w, caps, req)
+		s.serviceCommandSearch(w, caps, principal, req)
 	case "open":
-		s.serviceCommandOpen(w, req)
+		s.serviceCommandOpen(w, principal, req)
 	case "recent":
-		s.serviceCommandRecent(w, req)
+		s.serviceCommandRecent(w, principal, req)
+	case "input-heartbeat":
+		s.serviceCommandInputHeartbeat(w, req)
 	case "watch-delta":
 		s.serviceCommandWatchDelta(w, req)
 	case "index-usn":
@@ -278,7 +281,7 @@ func (s *goSearchService) serviceCommandInfo(w io.Writer, req *serviceRequest) {
 	_ = json.NewEncoder(w).Encode(serviceInfoResponseFor(serviceResponse{OK: loadErr == "", Message: message, Entries: total, Loading: loading, DBs: infos, Runtime: runtimeMemorySnapshot(), Health: health, HealthMessage: healthMessage, Content: s.contentHealthSnapshot(), Governor: contentGovernorHealthSnapshot(), Features: s.featureHealthSnapshot(), PluginAPI: 1, PluginConfig: s.pluginFilePath()}, s.pipeName, s.processMode))
 }
 
-func (s *goSearchService) serviceCommandSearch(w io.Writer, caps serviceCapabilities, req *serviceRequest) {
+func (s *goSearchService) serviceCommandSearch(w io.Writer, caps serviceCapabilities, principal servicePrincipal, req *serviceRequest) {
 	serviceNoteQueryActivity()
 	serviceActiveQueryEnter()
 	defer serviceActiveQueryLeave()
@@ -301,6 +304,11 @@ func (s *goSearchService) serviceCommandSearch(w io.Writer, caps serviceCapabili
 		return
 	}
 	opts := requestToOptionsFromService(*req)
+	// Per-user ranking: the frecency/query-history store is keyed by the
+	// caller's SID so one LocalSystem service keeps each local user's
+	// history separate. Empty SID gets an ephemeral empty store — no leak,
+	// and with no history the order is byte-identical to the base ranker.
+	opts.SignalStore = serviceSignalStoreForSID(principal.SID)
 	if opts.DeadlineUnix == 0 {
 		opts.DeadlineUnix = time.Now().Add(serviceQueryTimeout - 250*time.Millisecond).UnixNano()
 	}
@@ -405,22 +413,22 @@ func (s *goSearchService) serviceCommandSearch(w io.Writer, caps serviceCapabili
 
 // serviceCommandOpen records one usage-signal access event: the user opened
 // path (optionally attributed to the normalized query that led there). It
-// feeds the frecency store and the query-history combo boost (rank_blend.go).
-// Best-effort and synchronous: opens are user-paced and the store file is
-// small, so the write lands before the response.
-func (s *goSearchService) serviceCommandOpen(w io.Writer, req *serviceRequest) {
+// feeds the caller's per-user frecency store and the query-history combo
+// boost (rank_blend.go). Best-effort and synchronous: opens are user-paced
+// and the store file is small, so the write lands before the response.
+func (s *goSearchService) serviceCommandOpen(w io.Writer, principal servicePrincipal, req *serviceRequest) {
 	path := normalizeSignalPath(req.Path)
 	if path == "" {
 		_ = json.NewEncoder(w).Encode(serviceResponse{OK: false, Message: "open requires a path"})
 		return
 	}
-	sharedSignalStore().recordOpen(path, req.OpenQuery)
+	serviceSignalStoreForSID(principal.SID).recordOpen(path, req.OpenQuery)
 	_ = json.NewEncoder(w).Encode(serviceResponse{OK: true, Message: "recorded open for " + path})
 }
 
 // serviceCommandRecent lists recently opened files, newest first, from the
-// frecency store (local only, never leaves the machine).
-func (s *goSearchService) serviceCommandRecent(w io.Writer, req *serviceRequest) {
+// caller's per-user frecency store (local only, never leaves the machine).
+func (s *goSearchService) serviceCommandRecent(w io.Writer, principal servicePrincipal, req *serviceRequest) {
 	limit := req.Limit
 	if limit <= 0 {
 		limit = 20
@@ -428,7 +436,7 @@ func (s *goSearchService) serviceCommandRecent(w io.Writer, req *serviceRequest)
 	if limit > 200 {
 		limit = 200
 	}
-	recent := sharedSignalStore().recent(limit)
+	recent := serviceSignalStoreForSID(principal.SID).recent(limit)
 	rows := make([]recentFileJSON, 0, len(recent))
 	for _, r := range recent {
 		row := recentFileJSON{
@@ -444,6 +452,35 @@ func (s *goSearchService) serviceCommandRecent(w io.Writer, req *serviceRequest)
 		rows = append(rows, row)
 	}
 	_ = json.NewEncoder(w).Encode(serviceResponse{OK: true, Count: len(rows), Recent: rows})
+}
+
+// serviceCommandInputHeartbeat records the UI session's last-input time for
+// the build governor. The UI runs in the interactive session and reports its
+// GetLastInputInfo time every few seconds; the service keeps the freshest
+// report across sessions and lets it expire after uiHeartbeatExpiry with no
+// refresh. Local-only (remote rejected by the capability gate, like
+// open/recent); any local caller may report — the timestamp is advisory
+// presence, not a privilege. A zero/missing timestamp is rejected; future
+// timestamps (clock skew) are clamped to now so they cannot pin the governor
+// active forever.
+func (s *goSearchService) serviceCommandInputHeartbeat(w io.Writer, req *serviceRequest) {
+	if req == nil || req.InputUnixNano <= 0 {
+		_ = json.NewEncoder(w).Encode(serviceResponse{OK: false, Message: "input-heartbeat requires input_unix_nano"})
+		return
+	}
+	at := time.Unix(0, req.InputUnixNano).UTC()
+	if now := time.Now().UTC(); at.After(now) {
+		at = now
+	}
+	// Reject absurdly old reports (a client bug, not presence): anything
+	// older than the input quiet window plus the heartbeat expiry cannot be
+	// active anyway and would only pollute the freshest-wins slot.
+	if time.Since(at) > contentBuildInputQuietWindow+uiHeartbeatExpiry {
+		_ = json.NewEncoder(w).Encode(serviceResponse{OK: false, Message: "input-heartbeat timestamp too old"})
+		return
+	}
+	noteUIHeartbeat(at)
+	_ = json.NewEncoder(w).Encode(serviceResponse{OK: true})
 }
 
 func (s *goSearchService) serviceCommandWatchDelta(w io.Writer, req *serviceRequest) {

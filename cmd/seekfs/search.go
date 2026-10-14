@@ -255,7 +255,7 @@ func applySignalReorderDirect(results []Entry, opts queryOptions, countOnly bool
 	if err != nil {
 		return results
 	}
-	return applySignalReorder(results, pq)
+	return applySignalReorderWithStore(results, pq, signalStoreFromOpts(opts))
 }
 
 func entriesSpanMultipleVolumes(entries []Entry) bool {
@@ -391,11 +391,13 @@ func searchServiceVolumes(volumes []*serviceVolumeIndex, opts queryOptions, coun
 	// Usage/git/proximity signals reorder the exact-tier page within
 	// match-quality bands only (rank_blend.go); with no signals the page
 	// returns untouched, so base order and every existing test are intact.
+	// The store is the caller's per-user store (service) or the current
+	// user's (direct), so one user's history never reorders another's.
 	pq, perr := parseQuery(opts)
 	if perr != nil {
 		return matches, err
 	}
-	return applySignalReorder(matches, pq), err
+	return applySignalReorderWithStore(matches, pq, signalStoreFromOpts(opts)), err
 }
 
 func searchServiceVolumesInner(volumes []*serviceVolumeIndex, opts queryOptions, countOnly bool) ([]Entry, error) {

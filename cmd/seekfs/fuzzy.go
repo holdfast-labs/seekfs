@@ -912,9 +912,10 @@ func appendFuzzyServiceMatches(volumes []*serviceVolumeIndex, opts queryOptions,
 		sort.Slice(group, func(a, b int) bool { return group[a].Path < group[b].Path })
 		// Usage/git/proximity signals reorder within this equal-distance
 		// group only (rank_blend.go band rule); distance order never inverts,
-		// and with no signals the path order above stands.
-		if signalReorderActive(pq) {
-			reorderFuzzyGroup(group, buildSignalPageCtx(group, pq))
+		// and with no signals the path order above stands. Per-user: the
+		// caller's store, not the process-shared one.
+		if store := signalStoreFromOpts(opts); signalReorderActiveWithStore(pq, store) {
+			reorderFuzzyGroup(group, buildSignalPageCtxWithStore(group, pq, store))
 		}
 		for _, entry := range group {
 			if len(appended) >= need {
