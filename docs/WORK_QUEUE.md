@@ -19,21 +19,18 @@ Merged so far this round: `perf/content-underfill`, `perf/name-fuzzy`,
 | `test/suite-speed` | suitespeed | `cmd/seekfs` suite under ~5 min; harden `TestHeadlessFrameCost`; gofmt drift |
 | `content/filter-tier` | tier2 | Filter tier with no stored text, verified from disk; evaluate it as the default (G1, §6y) |
 | `content/inclusion-policy` | inclusion | Queued item 1: main-checkout-only worktrees, lower caps, lockfile/JSON/minified/cache skips, user skip list, content-hash dedupe (G3, §6z) |
+| `perf/ranking-signals` | ranking | Queued item 1: open/frecency/recent, query-history boost, `git:` filter + status/commit boosts, `near:`, right-file-first metric (G7, G8, G13) |
 
 ## Queued, in order
 
-1. **fff ranking signals (G7, G8).** Open/frecency tracking with an `open`
-   API and boost; `near` proximity; a recently-used list; a query-history
-   boost; a `git:` filter (modified/staged/untracked/…); git-status and
-   recent-commit boosts; a "right file first" metric for name queries (G13).
-2. **Agent integration (G12).** An MCP server (find, grep, multi_grep) and a
+1. **Agent integration (G12).** An MCP server (find, grep, multi_grep) and a
    JSON-lines stdio mode.
-3. **Grep features (G10, G9, G11).** Fuzzy grep, multi-pattern OR, context
+2. **Grep features (G10, G9, G11).** Fuzzy grep, multi-pattern OR, context
    lines, a per-query time budget with cursor pagination, smart case for
    content, `sym:` definition search and a definition-line bonus, the
    `'exact`, `^prefix` and `suffix$` operators, `**`/brace globs and accent
    folding.
-4. **Freshness and footprint (G4, G5, G6).** Read changed/dirty files directly
+3. **Freshness and footprint (G4, G5, G6).** Read changed/dirty files directly
    at query time; on-demand indexing (searched folder first); service
    resident memory (about 500 MB for 1.46M names); startup load time (about
    40 s for 1.46M entries).
