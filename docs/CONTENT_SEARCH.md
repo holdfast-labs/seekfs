@@ -1935,20 +1935,40 @@ pause and the query paths are untouched):**
   ~100 MB against the 128 MB slack; single-file builds absorb their fixed
   excess there too). Selection credits staged *compressed* bytes (exact),
   not extracted bytes — crediting extracted bytes would double count the
-  bytes the spool never occupied and admit past the peak. The write-time
+  bytes the spool never occupied and admit past the peak. The fixed 0.8 is
+  the floor the adaptive rule below never goes under: normal text stays at
+  0.8 (the 1.875x gain), denser text only ever tightens. The write-time
   guard and monotonic reserve semantics are unchanged, and both reconciles
   inherit the rule through the same allowance helpers (no reconcile change
-  needed).
+  needed; the estimate path budgets the floor since it works from source
+  sizes without extracting and cannot know the ratio — the build refines it
+  at runtime).
+- **Adaptive multiplier** (`contentEffectivePeakMultiplier`, follow-up for
+  the E: guard trip). The fixed 0.8 is only valid while the spool stays
+  within its cap and the split runs. Past the cap the peak is spool +
+  output (~0.95x at r = 0.6), so selection overspent and the write-time
+  guard failed the whole build mid-assembly — leaving no index at all. The
+  build now derives the effective multiplier from the observed ratio r =
+  staged/used at each allowance refresh (every `contentAllowanceCheckEvery`,
+  256 MB in production): 0.8 until `contentSpoolTrustBytes` (64 MB) is
+  staged, then max(0.8, 2r + 0.15) while the split runs and r +
+  `contentScopeEncodedMultiplier` + 0.15 once it will be skipped (same
+  `contentSpoolWillSplit` test as the save path, so projection and decision
+  agree). The result is pinned to only tighten within a build and never
+  drops below the floor, so the allowance never grows because the ratio
+  estimate moved. Incompressible input now stops selection earlier and
+  publishes a degraded-but-usable partial index instead of tripping the
+  guard.
 
 **Measured** (600 MB Chromium sample: 79,542 files selected, 79,327 docs /
 599 MB extracted, 12 shards at the 64 MB target, GOMAXPROCS=2; peak sampled
 every 100 ms over the work + output + shard trees; harness
-`zz_content_scale_local_test.go`, local-only, never committed):
+`zz_spoolpeak_local_test.go`, local-only, never committed):
 
 | | before | compressed spool | + reframe (shipped) |
 |---|---|---|---|
 | spool | 599 MB (1.000x) | 158 MB (0.265x) | 158 MB, deleted progressively |
-| peak disk | 911 MB (1.521x) | 463 MB (0.773x) | **353 MB (0.590x)** |
+| peak disk | 911 MB (1.521x) | 463 MB (0.773x) | **353–362 MB (0.590–0.605x)** |
 | output | 210 MB (0.351x) | 210 MB, identical | 210 MB, identical |
 | wall | 2m50s | 3m30s\* | **1m22s–2m16s\*** |
 
@@ -1963,16 +1983,39 @@ serial compression costs +8–11 s, the reframe +0.7–0.9 s and spool decode
 reads — the shipped build is net faster than the baseline in every run.
 
 **Coverage.** Extracted bytes admitted per GB of headroom go from 1/1.5 =
-0.67 GB to 1/0.8 = 1.25 GB (1.875x). On the real E: drive (~9 GB above the
+0.67 GB to 1/0.8 = 1.25 GB (1.875x), confirmed on the final code (0.605x
+peak, identical output — the adaptive rule is a no-op at r = 0.265, so the
+gain holds for normal text). On the real E: drive (~9 GB above the
 20 GiB reserve) that is ~11 GB of text where the old rule admitted ~6 GB
 (and the pre-§6t double-charge indexed ~2 GB).
+
+**Adaptive check** (same harness shape, synthetic dense corpus): 240
+deterministic 32 KiB hex-line docs (r = 1.000 — see the codec note below)
+under a headroom admitting everything at the floor: the dense arm stops at
+129/240 docs (multiplier risen to ~1.65), peaks at 10.05 MB inside the
+10.75 MB budget, and publishes degraded-but-queryable (directed queries
+find an admitted doc and miss a dropped one); the same-size compressible
+arm admits 240/240 with a 0.06 MB peak and stays ready. Forcing the floor
+reproduces the old behavior (no early stop). The committed
+`TestContentServiceBuildAdaptsToIncompressibleSpool` pins all of this with
+a depleting free-space stub (a constant stub would double count the spool
+credit and inflate the allowance without bound — the stub falls as the
+build stages bytes, exactly like a real disk).
 
 **Tried and rejected (measured, not assumed):**
 
 - s2 frames for the spool: 0.347x at 346 MB/s encode vs zstd-fastest
   0.264x at 85 MB/s — 50 MB more peak on the sample to save ~9 s serial;
   ratio wins at this size. zstd-better (0.232x) rejected: 14 MB/s serial
-  adds ~43 s.
+  adds ~43 s. Follow-up lever, measured but not taken: zstd-default
+  compresses code to 0.251x (vs 0.264x) at 59 MB/s with faster decode
+  (292 vs 201 MB/s), and — unlike fastest — entropy-codes high-entropy
+  text (0.637x on random hex vs fastest storing it at 1.000x, s2 also
+  1.000x; only default and above entropy-code). Fastest-level encoders are
+  pure LZ match finders: on text with no matches they emit stored blocks.
+  The spool keeps fastest for serial-write speed; the adaptive allowance is
+  what bounds high-entropy corpora, and switching levels is a pure win/loss
+  re-measure away.
 - Larger spool blocks spanning docs (better ratio via cross-doc
   redundancy): assembly reads in FRN order, which is scattered against
   spool order, so every doc touch would decode a whole block — per-doc
@@ -1994,13 +2037,26 @@ reads — the shipped build is net faster than the baseline in every run.
 the reframe and briefly hold spool + section files + output together; the
 fixed excess fits inside the scratch slack by construction (≤64 MB corpus).
 A corpus past the spool cap skips the reframe and peaks at spool + output;
-the write-time guard fails it loudly rather than breaching the reserve.
+the adaptive allowance now budgets that peak, and the write-time guard fails
+it loudly rather than breaching the reserve. Guard-check spacing is
+pre-save: the sections+output doubling mid-save (~2x one shard's output)
+is never checked after the save starts; for target-sized shards it sits
+inside the slack and margins, but it is a hole a future change should close
+(a post-save check, or streaming the save without retaining the sections).
+Oversize shards (one folder unit past the target — indivisible docs) widen
+the same hole past the slack; sharding by size within a folder would fix it
+but changes grouping and therefore output bytes.
 
 Tests: `TestContentSpoolRoundTrip`, `TestContentSpoolCorruptFailsClosed`,
 `TestContentSpoolSplitGroups(+CleansUp)`,
 `TestContentSpoolAssembleIdentical`,
 `TestContentServiceBuildDeletesGroupSpoolsAsItGoes` (group files strictly
 decrease across saves), `TestContentServiceBuildSkipsSplitPastSpoolCap`,
+`TestContentEffectivePeakMultiplier` (floor/pin/branch math),
+`TestContentSpoolWillSplit` (projection matches the save decision),
+`TestContentServiceBuildAdaptsToIncompressibleSpool` (dense stops earlier,
+peak in budget, publishes; compressible control admits all; fails with the
+adaptation forced to the floor),
 the compressed-credit subtest in `TestContentScopeReserve`, and the
 re-targeted fits/reserve-truncation numbers. `go vet ./...` clean,
 `go test -p 1 -timeout 40m ./cmd/seekfs ./feature` passing.

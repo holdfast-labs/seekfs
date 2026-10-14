@@ -68,12 +68,62 @@ const contentScopeEncodedMultiplier = 0.5
 // their shards save, so assembly holds remaining spool plus saved output — a
 // mix bounded by the larger share, not the sum — and the sum-like instant is
 // the split itself (original plus reframed copy: twice the spool cap, 0.7).
-// 0.8 covers that with margin; the in-flight shard scratch rides the
-// separate contentScopeScratchSlack, single-file builds (at most one shard of
-// extracted text) absorb their fixed excess there too, and a corpus past the
-// spool cap skips the split and relies on the write-time guard. Measured peak
-// on the 599 MB Chromium sample: 0.596 of extracted (was 1.521).
+// 0.8 covers that with margin for normal text; the in-flight shard scratch
+// rides the separate contentScopeScratchSlack, single-file builds (at most
+// one shard of extracted text) absorb their fixed excess there too, and a
+// corpus past the spool cap takes the adaptive rule below instead of relying
+// on the write-time guard. Measured peak on the 599 MB Chromium sample:
+// 0.590 of extracted (was 1.521). This is the floor the adaptive rule never
+// goes below.
 const contentScopePeakMultiplier = 0.8
+
+// contentSpoolTrustBytes is the extracted text staged before the observed
+// spool ratio feeds the peak multiplier. Below it the per-frame overhead
+// dominates small corpora and the ratio is noise, so the floor governs. A
+// var so tests can exercise adaptation at small scale.
+var contentSpoolTrustBytes int64 = 64 << 20
+
+// contentAdaptiveMargin is the safety margin on the observed-ratio peak
+// projection: it covers the output side (which also densifies on hard text,
+// up to ~0.65 of extracted in the minified-JS regime) plus the fixed
+// per-shard transients the per-byte model does not itemize.
+const contentAdaptiveMargin = 0.15
+
+// contentSpoolWillSplit reports whether a spool staging staged compressed
+// bytes for used extracted bytes is reframed per group at save time: only
+// when the copy stays within the spool cap. The save path and the allowance
+// share this test so the projection always matches the decision.
+func contentSpoolWillSplit(used, staged int64) bool {
+	return staged <= int64(contentScopeSpoolMultiplier*float64(used))
+}
+
+// contentEffectivePeakMultiplier derives the peak multiplier from the
+// observed spool ratio r = staged/used: while the split runs the sum-like
+// instant is twice the staged ratio, and once the split will be skipped the
+// peak is the staged ratio plus the encoded output. prev pins the result so
+// the rule only ever tightens within a build: the allowance never grows
+// because the ratio estimate moved (the §6t monotonic reserve rule), and it
+// never drops below the measured-normal floor. Before contentSpoolTrustBytes
+// the floor governs alone.
+func contentEffectivePeakMultiplier(prev float64, used, staged int64) float64 {
+	m := contentScopePeakMultiplier
+	if used >= contentSpoolTrustBytes && used > 0 {
+		r := float64(staged) / float64(used)
+		var proj float64
+		if contentSpoolWillSplit(used, staged) {
+			proj = 2*r + contentAdaptiveMargin
+		} else {
+			proj = r + contentScopeEncodedMultiplier + contentAdaptiveMargin
+		}
+		if proj > m {
+			m = proj
+		}
+	}
+	if m < prev {
+		m = prev
+	}
+	return m
+}
 
 // contentScopeScratchSlack is the headroom kept for the shards being
 // assembled at once: their section files exist alongside the spool until
@@ -129,11 +179,26 @@ func contentScopeHeadroom(anchorPath string, spooled int64) (headroom uint64, ok
 // proceeds and keep extracting past it to tally exact dropped counts, which
 // health reports.
 func contentScopeAllowance(anchorPath string, spooled int64) int64 {
+	return contentScopeAllowanceWithMultiplier(anchorPath, spooled, contentScopePeakMultiplier)
+}
+
+// contentScopeAllowanceWithMultiplier is contentScopeAllowance under an
+// adapted peak multiplier. The service build threads its effective multiplier
+// (contentEffectivePeakMultiplier, floored at contentScopePeakMultiplier and
+// pinned to only tighten) through its refreshes; every other caller uses the
+// floor. The estimate path in particular cannot know the ratio — it works
+// from source file sizes without extracting — so it budgets the
+// measured-normal value and the build refines it at runtime, stopping earlier
+// on incompressible input instead of tripping the write-time guard.
+func contentScopeAllowanceWithMultiplier(anchorPath string, spooled int64, mult float64) int64 {
 	headroom, ok := contentScopeHeadroom(anchorPath, spooled)
 	if !ok {
 		return int64(^uint64(0) >> 1)
 	}
-	allowance := float64(headroom) / contentScopePeakMultiplier
+	if mult <= 0 {
+		mult = contentScopePeakMultiplier
+	}
+	allowance := float64(headroom) / mult
 	if allowance >= float64(int64(^uint64(0)>>1)) {
 		return int64(^uint64(0) >> 1)
 	}
@@ -160,6 +225,12 @@ func contentScopeFitsReserve(anchorPath string, extracted int64) bool {
 // contentDiskCheckEvery is how many bytes a build writes between free-space
 // checks.
 const contentDiskCheckEvery = 256 << 20
+
+// contentAllowanceCheckEvery bounds how much extracted text selection admits
+// between allowance refreshes. It matches contentDiskCheckEvery in production
+// (one cadence for both checks); a var so tests can exercise the adaptive
+// multiplier at small scale without staging hundreds of megabytes.
+var contentAllowanceCheckEvery int64 = contentDiskCheckEvery
 
 // contentDiskSpaceError reports a build stopped to keep the reserve free.
 type contentDiskSpaceError struct {

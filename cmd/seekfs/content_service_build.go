@@ -824,7 +824,13 @@ func (s *goSearchService) runContentBuild(vol *serviceVolumeIndex, reuseSidecar 
 	// under it; the staged compressed bytes are credited back, since the
 	// allowance budgets the build's whole peak). MaxInt64 means unlimited
 	// (unknown free space; the write-time guard stays the backstop).
+	// peakMult is the effective peak multiplier behind the allowance: the
+	// measured-normal floor until the staged spool is big enough to trust,
+	// then the observed-ratio projection, pinned to only tighten within a
+	// build (contentEffectivePeakMultiplier), so incompressible input stops
+	// selection earlier instead of tripping the write-time guard.
 	allowance := int64(^uint64(0) >> 1)
+	peakMult := contentScopePeakMultiplier
 	var sinceAllowanceCheck int64
 	explicitBudget := opts.Scope != nil && opts.Scope.BudgetExplicit
 	if explicitBudget {
@@ -897,9 +903,11 @@ func (s *goSearchService) runContentBuild(vol *serviceVolumeIndex, reuseSidecar 
 		// Selection order is unchanged; this only costs extraction work on a
 		// build that was already going to publish incomplete.
 		if !explicitBudget {
-			if sinceAllowanceCheck += n; sinceAllowanceCheck >= contentDiskCheckEvery {
+			if sinceAllowanceCheck += n; sinceAllowanceCheck >= contentAllowanceCheckEvery {
 				sinceAllowanceCheck = 0
-				allowance = contentScopeAllowance(tmpDir, spoolWriter.StagedBytes())
+				staged := spoolWriter.StagedBytes()
+				peakMult = contentEffectivePeakMultiplier(peakMult, used, staged)
+				allowance = contentScopeAllowanceWithMultiplier(tmpDir, staged, peakMult)
 			}
 		}
 		if overBudget || n > allowance-used {
@@ -1105,7 +1113,7 @@ func (s *goSearchService) runContentBuild(vol *serviceVolumeIndex, reuseSidecar 
 		// already-large spool, so assembly reads the shared spool as before
 		// and the write-time guard stays the backstop.
 		var split []*contentSpoolGroup
-		if staged := spoolWriter.StagedBytes(); staged <= int64(contentScopeSpoolMultiplier*float64(used)) {
+		if staged := spoolWriter.StagedBytes(); contentSpoolWillSplit(used, staged) {
 			offsets := make([]int64, len(selected))
 			compLens := make([]int, len(selected))
 			for i, d := range selected {
