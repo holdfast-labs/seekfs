@@ -1894,7 +1894,6 @@ second-dict generation) — the first three fail without the overlay fix.
 Serial/parallel identity for the newly parallelized gate is covered by the
 existing `TestContentParallelContentMatchesSerial` (limits × workers).
 
-<<<<<<< HEAD
 ## 6w. Idle-aware build governor (done)
 
 Branch `content/idle-governor`. The service build paused a fixed
@@ -2005,7 +2004,7 @@ in health instead of silently assuming idleness: `loaded --json` carries a
 times the source engages with no code change (covered by
 `TestContentInputSourceSelection`, including the session-0 skip). The WTS
 sample is cached 5 s; zero times are skipped, never treated as recent.
-=======
+
 ## 6x. Build peak ≈ final size (done)
 
 Branch `content/spool-peak`. Coverage was capped by the build's transient
@@ -2172,7 +2171,6 @@ adaptation forced to the floor),
 the compressed-credit subtest in `TestContentScopeReserve`, and the
 re-targeted fits/reserve-truncation numbers. `go vet ./...` clean,
 `go test -p 1 -timeout 40m ./cmd/seekfs ./feature` passing.
->>>>>>> content/spool-peak
 
 ## 7. Carried debt / known gaps
 

@@ -12,12 +12,11 @@ refer to `docs/REFERENCE_TOOLS.md`.
 ## Running (2026-10-13)
 
 Merged so far this round: `perf/content-underfill`, `perf/name-fuzzy`,
-`fix/cli-silent-empty`, `content/idle-governor`.
+`fix/cli-silent-empty`, `content/idle-governor`, `content/spool-peak`.
 
 | Branch | Worktree | Scope |
 |---|---|---|
 | `test/suite-speed` | suitespeed | `cmd/seekfs` suite under ~5 min; harden `TestHeadlessFrameCost`; gofmt drift |
-| `content/spool-peak` | spoolpeak | Build peak ≈ final size, so more coverage per GB (G2, §6x) |
 | `content/filter-tier` | tier2 | Filter tier with no stored text, verified from disk; evaluate it as the default (G1, §6y) |
 | `content/inclusion-policy` | inclusion | Queued item 1: main-checkout-only worktrees, lower caps, lockfile/JSON/minified/cache skips, user skip list, content-hash dedupe (G3, §6z) |
 
@@ -60,6 +59,12 @@ Merged so far this round: `perf/content-underfill`, `perf/name-fuzzy`,
   `GetLastInputInfo` sees only session 0; §6w, `loaded --json` governor
   section). Fix it by having `seekfs-ui` (runs in the user session) report
   its session's last-input time to the service over the pipe.
+- **Save-time peak:** the write guard checks free space before each shard save,
+  but a save briefly holds both the section files and the output (§6x
+  residual). Account for it, or stream the save.
+- **Dense-text spool:** the fastest zstd level stores high-entropy text
+  uncompressed (1.000x). The default level gets 0.637x, about 28% more
+  coverage on dense corpora for roughly +4 s of serial encode (§6x).
 - **Slow differential test:** `TestContentGlobalLaneScopeDifferential` takes
   300–666 s. `test/suite-speed` tiers it; confirm CI still runs the full tier.
 
