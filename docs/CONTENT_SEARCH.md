@@ -1983,10 +1983,30 @@ tallies are identical across modes (Budget 600 MB, dropped 392,530 /
 scope files even when the budget keeps 71,502 — the 600 MB build is
 extraction-bound by design (§6t/§6u exactness; changing it would break the
 drop accounting). (2) Cold first-touch opens (~ms, Defender+MFT) dominate
-any full build; only the page cache fixes that. (3) The pre-existing worker
+any full build; only the page cache fixes that. (3) ~~The pre-existing worker
 adaptation (1 worker while queries are active at build start) serializes a
 build to 60+ min under continuous query load — out of scope here, but the
-next lever if loaded builds matter.
+next lever if loaded builds matter.~~ DONE (`perf/adaptive-build-workers`,
+below): the count re-samples every batch boundary instead of freezing at
+build start.
+
+**Adaptive build workers (done).** Branch `perf/adaptive-build-workers`.
+The old `contentBuildWorkerCount` (1 worker while queries were active *at
+build start*) serialized a loaded build to 60+ min even after the queries
+stopped. The service build now extracts through consecutive batch-sized
+chunks (`contentBuildAdaptivePrefetch`), each chunk running at the desired
+count re-sampled at its start and `adapt()` re-sampling at every batch
+boundary — the same point that already re-samples every governor probe, so
+no extra timers or goroutines run during the build. Desired = 1 while a
+recent/in-flight query, foreground input (governor signal, UI heartbeat
+included), or battery says busy; back to the static cap when quiet.
+Background CPU/disk pressure slows only the pause sleeps, never the workers.
+The chunk stream delivers strictly in item order, so selection, budget,
+abort and progress semantics are unchanged and output is byte-identical at
+any load pattern. The static cap is now GOMAXPROCS-aware (min of CPUs and
+GOMAXPROCS, still capped at 16) so a capped process sizes its open-file /
+decoded-doc pool from CPUs it can actually use — the memory bound on a
+low-memory box.
 
 **Session-0 input blindness (fixed).** The installed service runs as
 LocalSystem in session 0, which never receives keyboard/mouse input, so the
