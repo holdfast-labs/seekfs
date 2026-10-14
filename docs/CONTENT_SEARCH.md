@@ -1894,6 +1894,117 @@ second-dict generation) — the first three fail without the overlay fix.
 Serial/parallel identity for the newly parallelized gate is covered by the
 existing `TestContentParallelContentMatchesSerial` (limits × workers).
 
+## 6x. Build peak ≈ final size (done)
+
+Branch `content/spool-peak`. Coverage was capped by the build's transient
+disk peak, not the finished index: the service build extracted in
+scope-priority order into one raw text spool (1.0x extracted, kept until the
+last shard saved), so §6t budgeted selection at 1.5x. The finished v9 index
+is only ~0.35x, so on the real E: drive (~9 GB above its 20 GiB reserve) the
+build indexed ~2 GB of text where the final-size limit alone would allow
+several times more. The peak is now close to the final size, with identical
+output (doc records + section payloads) and no on-disk format change.
+
+**What changed (all in the spool/assembly/allowance parts; the per-batch
+pause and the query paths are untouched):**
+
+- **Compressed spool** (`content_spool.go`). The spool holds one zstd frame
+  per document (SpeedFastest + CRC) instead of raw text: 0.265x measured on
+  the 599 MB Chromium sample. Frames are independent, so assembly reads any
+  doc by (offset, compressed length) and decodes to the recorded original
+  length; a short read, checksum failure or length mismatch fails the build
+  instead of indexing wrong text. All three spool sites (service build, both
+  offline builders) share the writer/reader.
+- **Per-group reframe + progressive delete** (service sharded path). After
+  extraction the spool is copied into one file per shard group in group (FRN)
+  order and the original is deleted; each group's file is closed and removed
+  as soon as its shard is saved. Grouping is planned from the same paths and
+  actual lengths as before, so the published shards are byte-identical — and
+  group files read sequentially where the shared spool read scattered, so
+  assembly got faster (see below). The reframe is skipped when the staged
+  spool already exceeds its cap share (a corpus that compresses
+  pathologically): copying it would double an already-large spool, so
+  assembly reads the shared spool and the write-time guard backstops.
+- **Allowance** (`content_space.go`, `content_reconcile_budget.go`).
+  `contentScopePeakMultiplier` is 0.8 (was 1.5 = spool 1.0 + output 0.5):
+  the new spool cap `contentScopeSpoolMultiplier` (0.35, ~30% over the
+  measured 0.265) times two for the split spike (original + reframed copy,
+  0.7) plus margin. Assembly itself holds remaining spool plus saved shards
+  — a mix bounded by the larger share, not the sum — and the in-flight shard
+  scratch still rides the separate `contentScopeScratchSlack` (measured
+  ~100 MB against the 128 MB slack; single-file builds absorb their fixed
+  excess there too). Selection credits staged *compressed* bytes (exact),
+  not extracted bytes — crediting extracted bytes would double count the
+  bytes the spool never occupied and admit past the peak. The write-time
+  guard and monotonic reserve semantics are unchanged, and both reconciles
+  inherit the rule through the same allowance helpers (no reconcile change
+  needed).
+
+**Measured** (600 MB Chromium sample: 79,542 files selected, 79,327 docs /
+599 MB extracted, 12 shards at the 64 MB target, GOMAXPROCS=2; peak sampled
+every 100 ms over the work + output + shard trees; harness
+`zz_content_scale_local_test.go`, local-only, never committed):
+
+| | before | compressed spool | + reframe (shipped) |
+|---|---|---|---|
+| spool | 599 MB (1.000x) | 158 MB (0.265x) | 158 MB, deleted progressively |
+| peak disk | 911 MB (1.521x) | 463 MB (0.773x) | **353 MB (0.590x)** |
+| output | 210 MB (0.351x) | 210 MB, identical | 210 MB, identical |
+| wall | 2m50s | 3m30s\* | **1m22s–2m16s\*** |
+
+Output identity: the 72 section payloads (all shards, all tags) hash
+byte-identical across all runs, with the same 79,327 docs; plus
+`TestContentSpoolAssembleIdentical` (spool vs in-memory assembly) and the
+cross-worker assemble/spill identity tests stay green. \*Wall times move
+±2x with shared-box contention (documented in §6r): the middle run's
+extract (2m23s vs 1m41s) is contention, not compression. Timed directly,
+serial compression costs +8–11 s, the reframe +0.7–0.9 s and spool decode
++2.6–4.2 s total, while assembly falls 65s → 39–60s on sequential group
+reads — the shipped build is net faster than the baseline in every run.
+
+**Coverage.** Extracted bytes admitted per GB of headroom go from 1/1.5 =
+0.67 GB to 1/0.8 = 1.25 GB (1.875x). On the real E: drive (~9 GB above the
+20 GiB reserve) that is ~11 GB of text where the old rule admitted ~6 GB
+(and the pre-§6t double-charge indexed ~2 GB).
+
+**Tried and rejected (measured, not assumed):**
+
+- s2 frames for the spool: 0.347x at 346 MB/s encode vs zstd-fastest
+  0.264x at 85 MB/s — 50 MB more peak on the sample to save ~9 s serial;
+  ratio wins at this size. zstd-better (0.232x) rejected: 14 MB/s serial
+  adds ~43 s.
+- Larger spool blocks spanning docs (better ratio via cross-doc
+  redundancy): assembly reads in FRN order, which is scattered against
+  spool order, so every doc touch would decode a whole block — per-doc
+  frames keep each touch to its own bytes.
+- Upfront per-group spool files planned from source-size estimates: the
+  estimate plan can differ from the actual-length plan, which changes shard
+  boundaries and therefore output bytes; the post-hoc reframe keeps grouping
+  provably identical (same inputs) at the cost of one ~0.7 s copy pass.
+- Windows sparse hole-punching of consumed spool ranges: frames interleave
+  across groups (priority vs FRN order) and the 4 KiB cluster granularity
+  wastes half of the ~2 KB average compressed frame; the reframe frees whole
+  files instead.
+- Tightening `contentScopeEncodedMultiplier` 0.5 → 0.45: saves 6% coverage
+  for a thinner margin over the worst measured sharded output (0.381x);
+  kept 0.5, and the peak constant derives from the split spike, not the
+  sum, so the output cap only bounds assembly.
+
+**Residual:** single-file builds (at most one shard of extracted text) skip
+the reframe and briefly hold spool + section files + output together; the
+fixed excess fits inside the scratch slack by construction (≤64 MB corpus).
+A corpus past the spool cap skips the reframe and peaks at spool + output;
+the write-time guard fails it loudly rather than breaching the reserve.
+
+Tests: `TestContentSpoolRoundTrip`, `TestContentSpoolCorruptFailsClosed`,
+`TestContentSpoolSplitGroups(+CleansUp)`,
+`TestContentSpoolAssembleIdentical`,
+`TestContentServiceBuildDeletesGroupSpoolsAsItGoes` (group files strictly
+decrease across saves), `TestContentServiceBuildSkipsSplitPastSpoolCap`,
+the compressed-credit subtest in `TestContentScopeReserve`, and the
+re-targeted fits/reserve-truncation numbers. `go vet ./...` clean,
+`go test -p 1 -timeout 40m ./cmd/seekfs ./feature` passing.
+
 ## 7. Carried debt / known gaps
 
 - **Snippet case is preserved; no fixup-aware path remains.** The `.gsx` text
