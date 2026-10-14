@@ -622,16 +622,19 @@ func catchUpServiceVolume(vol *serviceVolumeIndex) error {
 		}
 		// seekfs's own artifact churn is dropped before the WAL and the overlay
 		// so the checkpoint can advance past it (nextUSN below) without either
-		// growing from records that are never indexed.
+		// growing from records that are never indexed. The overlay publishes
+		// before the WAL fsync (same visibility-before-durability order as
+		// the live replay path); a crash before the WAL lands replays the
+		// same range from the journal.
 		changes = vol.filterOwnedReplayChanges(changes)
+		vol.applyUSNChanges(changes)
+		vol.checkpoint = nextUSN
+		vol.index.Checkpoint = nextUSN
 		if err := appendWAL(vol.dbPath, nextUSN, changes); err != nil {
 			vol.state = "stale"
 			vol.staleReason = err.Error()
 			return err
 		}
-		vol.applyUSNChanges(changes)
-		vol.checkpoint = nextUSN
-		vol.index.Checkpoint = nextUSN
 	}
 	if vol.dbPath != "" {
 		vol.dirty = true
@@ -1008,12 +1011,11 @@ func (s *goSearchService) replayVolumeOnce(vol *serviceVolumeIndex, buffer []byt
 		// the checkpoint must still cover the truncated tail (see above), while
 		// seekfs's own artifact churn must not reach the WAL or the overlay.
 		changes = vol.filterOwnedReplayChanges(changes)
-		if err := appendWAL(vol.dbPath, appliedCheckpoint, changes); err != nil {
-			vol.state = "stale"
-			vol.staleReason = err.Error()
-			vol.mu.Unlock()
-			return applied, err
-		}
+		// Publish before the WAL fsync: queries see the change as soon as
+		// the overlay snapshot lands, without waiting for the disk sync.
+		// Durability is preserved — the on-disk checkpoint only advances on
+		// fold, so a crash before the WAL lands replays the same USN range
+		// from the journal instead of losing it.
 		vol.applyUSNChanges(changes)
 		vol.checkpoint = appliedCheckpoint
 		vol.index.Checkpoint = appliedCheckpoint
@@ -1026,6 +1028,12 @@ func (s *goSearchService) replayVolumeOnce(vol *serviceVolumeIndex, buffer []byt
 		vol.stallObservedCp = 0
 		vol.stallObservedAt = time.Time{}
 		vol.dirty = true
+		if err := appendWAL(vol.dbPath, appliedCheckpoint, changes); err != nil {
+			vol.state = "stale"
+			vol.staleReason = err.Error()
+			vol.mu.Unlock()
+			return applied, err
+		}
 		vol.mu.Unlock()
 		applied = true
 		fromUSN = appliedCheckpoint

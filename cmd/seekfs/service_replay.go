@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"golang.org/x/sys/windows"
@@ -10,6 +11,12 @@ import (
 	"strings"
 	"time"
 )
+
+// walkWatcherDebounce coalesces burst notifications (editor saves, build
+// outputs) before a walk-volume rebuild. A package var so tests can shorten
+// it; 50 ms is enough to merge a save burst while keeping a rename visible
+// in well under 100 ms plus the re-walk itself.
+var walkWatcherDebounce = 50 * time.Millisecond
 
 func validateUSNCheckpoint(vol *serviceVolumeIndex, journal usnJournalDataV0) error {
 	if vol.journalID != 0 && vol.journalID != journal.UsnJournalID {
@@ -314,15 +321,48 @@ func (s *goSearchService) watchWalkRoot(vol *serviceVolumeIndex, root string) {
 		reason := "watch-change"
 		if bytesReturned == 0 {
 			reason = "watch-overflow"
+		} else if !walkNotifyHasNameAction(buffer[:bytesReturned]) {
+			// Size/attribute/last-write-only churn carries no name change,
+			// and the name index has nothing new to report: skip the
+			// debounce and the full re-walk instead of rebuilding on every
+			// file write under a large walk root.
+			continue
 		}
 		select {
 		case <-s.stop:
 			return
-		case <-time.After(250 * time.Millisecond):
+		case <-time.After(walkWatcherDebounce):
 		}
 		if err := s.rebuildWalkVolumeInPlace(vol, reason); err != nil {
 			serviceLog("walk watcher rebuild error root=%s db=%s err=%v", root, vol.dbPath, err)
 		}
+	}
+}
+
+// walkNotifyHasNameAction reports whether a ReadDirectoryChangesW buffer
+// holds at least one name action (added/removed/renamed-old/renamed-new).
+// Each entry is a FILE_NOTIFY_INFORMATION record: NextEntryOffset (u32),
+// Action (u32), FileNameLength (u32), then the UTF-16 name. Only the action
+// field is inspected, so malformed names cannot mislead the verdict; any
+// framing doubt declines false (rebuild) to stay correct.
+func walkNotifyHasNameAction(buf []byte) bool {
+	off := 0
+	for {
+		if len(buf)-off < 12 {
+			return false
+		}
+		next := int(binary.LittleEndian.Uint32(buf[off:]))
+		action := binary.LittleEndian.Uint32(buf[off+4:])
+		if action == 1 || action == 2 || action == 4 || action == 5 {
+			return true
+		}
+		if next == 0 {
+			return false
+		}
+		if next < 12 || off+next >= len(buf) {
+			return false
+		}
+		off += next
 	}
 }
 
