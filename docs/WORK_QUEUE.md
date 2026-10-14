@@ -6,22 +6,24 @@ run at once (more exhausted commit memory on the dev box). Agents are Paseo
 the seekfs workspace. Each gets its own worktree at `E:\bench\wt\<name>` on its
 own branch from integ. When a slot frees, start the next queued item. Every
 merge needs a review plus a parity or recall check where results could change.
-Run the full suite with `-timeout 40m` after merges. Gap numbers (G1 … G13)
+Run the full suite with `-timeout 40m` after merges. The default tier takes
+about 3–5 min; CI also runs the soak tier. Gap numbers (G1 … G13)
 refer to `docs/REFERENCE_TOOLS.md`.
 
 ## Running (2026-10-13)
 
 Merged so far this round: `perf/content-underfill`, `perf/name-fuzzy`,
 `fix/cli-silent-empty`, `content/idle-governor`, `content/spool-peak`, `perf/ranking-signals` (G7, G8, G13), `content/inclusion-policy` (G3, §6z,
-format v10), `fix/short-term-postings` (direct-index LOWR writer
+format v10), `test/suite-speed` (default suite ~3–5 min; soak tier
+`SEEKFS_TEST_SOAK=1` in CI), `fix/short-term-postings` (direct-index LOWR writer
 corruption, exact required sources, auto-fuzzy only on zero exact hits).
 
 | Branch | Worktree | Scope |
 |---|---|---|
-| `test/suite-speed` | suitespeed | `cmd/seekfs` suite under ~5 min; harden `TestHeadlessFrameCost`; gofmt drift |
-| `content/filter-tier` | tier2 | **Owner decision 2026-10-13: fsearch model is the default.** No stored text; trigram postings plus a per-file filter; matches and snippets verified from disk; edited files read directly. Stored text only as a justified opt-in (G1, G4 partial, §6y) |
 | `perf/static-ranking` | staticrank | Queued item 0b: static ranker (no usage) right-file-first above 39% top-1, on two labeled sets; sets and counts unchanged (G13) |
 | `perf/name-lessons` | namelessons | Name-search lessons: letter-bitmap prefilter, multi-word spelling, accent folding, `'exact ^prefix suffix$ ** {a,b} in:`, typo budget by word length, current-file demotion (G11) |
+| `integ/filter-tier-merge` | tiermerge | Merging `content/filter-tier` (no stored text by default) with inclusion v10 + spool-peak; one format v11; dedupe under no-stored-text; re-measure; list regressions |
+| `perf/freshness-footprint` | footprint | Name-side change visibility (fsearch ~15 ms), restart/load time (~40 s for 1.46M), resident memory (~500 MB), idle release, on-demand folder-first indexing (G4, G5, G6) |
 
 ## Queued, in order
 
@@ -32,13 +34,6 @@ corruption, exact required sources, auto-fuzzy only on zero exact hits).
    cursor pagination; smart case for content; ripgrep line semantics for
    regex (fsearch); `sym:` definition search and a definition-line bonus;
    extension and single-file filters for grep.
-2. **Freshness and footprint (G4, G5, G6).** Name-side changes visible in
-   milliseconds (fsearch about 15 ms; dirty content reads land with the
-   filter tier); on-demand indexing (searched folder first, fsearch); a
-   restart replays only what changed; service resident memory (about 500 MB
-   for 1.46M names, versus fsearch's 21–35 MB daemon), returned to the OS
-   when idle; startup load time (about 40 s for 1.46M entries); a
-   memory-mapped content cache (fff).
 
 ## Smaller follow-ups
 
@@ -75,8 +70,6 @@ corruption, exact required sources, auto-fuzzy only on zero exact hits).
 - **Single-line JSON follow-up:** the 1 MiB / 10 MiB caps and JSON skip from
   `content/inclusion-policy` should cover the 11.4 MB single-line
   `tokenizer.json`. Verify on the next real-index recall run.
-- **Slow differential test:** `TestContentGlobalLaneScopeDifferential` takes
-  300–666 s. `test/suite-speed` tiers it; confirm CI still runs the full tier.
 
 ## Owner actions (not agent work)
 
