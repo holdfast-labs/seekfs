@@ -25,6 +25,7 @@ corruption, exact required sources, auto-fuzzy only on zero exact hits).
 | `perf/static-ranking` | staticrank | Queued item 0b: static ranker (no usage) right-file-first above 39% top-1, on two labeled sets; sets and counts unchanged (G13) |
 | `integ/filter-tier-merge` | tiermerge | Merging `content/filter-tier` (no stored text by default) with inclusion v10 + spool-peak; one format v11; dedupe under no-stored-text; re-measure; list regressions |
 | `perf/freshness-footprint` | footprint | Name-side change visibility (fsearch ~15 ms), restart/load time (~40 s for 1.46M), resident memory (~500 MB), idle release, on-demand folder-first indexing (G4, G5, G6) |
+| `feat/ui-input-and-user-signals` | uiinput | seekfs-ui reports user-session input time to the service (governor input signal); per-user ranking store keyed by caller SID |
 
 ## Queued, in order
 
