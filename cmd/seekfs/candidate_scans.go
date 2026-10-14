@@ -1324,7 +1324,7 @@ func (vol *serviceVolumeIndex) planDirSubtreeFilter(pq parsedQuery) (*boundedSca
 		len(pq.Terms) != 1 || len(pq.Exts) != 0 || len(pq.Globs) != 0 ||
 		len(pq.Dirs) != 0 || len(pq.Regexps) != 0 || len(pq.OrGroups) != 0 || len(pq.NotGroups) != 0 ||
 		len(pq.SizeFilters) != 0 || len(pq.DateFilters) != 0 || len(pq.AttrFilters) != 0 ||
-		pq.Under != "" || pq.HasModAfter || pq.Exists {
+		pq.Under != "" || pq.HasModAfter || pq.lateVerified() {
 		return nil, false
 	}
 	term := ""

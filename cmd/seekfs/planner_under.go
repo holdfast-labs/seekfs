@@ -199,7 +199,7 @@ func (vol *serviceVolumeIndex) cacheUnderRoots(key string, roots []int) {
 }
 
 func (vol *serviceVolumeIndex) underLimitedTermCandidates(roots []int, pq parsedQuery) ([]int, bool) {
-	if vol == nil || vol.index == nil || pq.CountOnly || pq.Limit <= 0 || len(roots) == 0 || len(pq.Terms) != 1 || len(pq.Exts) > 0 || len(pq.Dirs) > 0 || len(pq.Globs) > 0 || len(pq.Regexps) > 0 || pq.Type != "" || pq.HasModAfter || pq.Exists || pq.CaseSensitive || pq.hiddenBlocksTruncation() {
+	if vol == nil || vol.index == nil || pq.CountOnly || pq.Limit <= 0 || len(roots) == 0 || len(pq.Terms) != 1 || len(pq.Exts) > 0 || len(pq.Dirs) > 0 || len(pq.Globs) > 0 || len(pq.Regexps) > 0 || pq.Type != "" || pq.HasModAfter || pq.lateVerified() || pq.CaseSensitive || pq.hiddenBlocksTruncation() {
 		return nil, false
 	}
 	term := pq.Terms[0]
@@ -600,7 +600,7 @@ func (vol *serviceVolumeIndex) underDescendantsLimited(rootID, limit int) []int 
 }
 
 func (vol *serviceVolumeIndex) underPrefilter(pq parsedQuery) map[int]struct{} {
-	if vol == nil || len(pq.Regexps) > 0 || pq.CaseSensitive || pq.HasModAfter || pq.Exists {
+	if vol == nil || len(pq.Regexps) > 0 || pq.CaseSensitive || pq.HasModAfter || pq.lateVerified() {
 		return nil
 	}
 	lists := make([][]int, 0, len(pq.Exts)+len(pq.Dirs)+len(pq.Terms)+len(pq.Globs))

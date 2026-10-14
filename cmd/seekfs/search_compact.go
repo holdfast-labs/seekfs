@@ -397,7 +397,7 @@ func compactCandidateCanSkipEntryMatches(pq parsedQuery, usedCandidates bool) bo
 		return false
 	}
 	if pq.Under != "" ||
-		pq.Exists ||
+		pq.lateVerified() ||
 		len(pq.Dirs) > 0 ||
 		len(pq.Regexps) > 0 ||
 		len(pq.Parents) > 0 ||

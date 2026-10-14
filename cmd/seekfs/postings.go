@@ -1838,6 +1838,7 @@ func cloneParsedQuery(pq parsedQuery) parsedQuery {
 	out.Regexps = append([]*regexp.Regexp(nil), pq.Regexps...)
 	out.RegexTerms = append([]string(nil), pq.RegexTerms...)
 	out.Parents = append([]string(nil), pq.Parents...)
+	out.GitFilters = append([]string(nil), pq.GitFilters...)
 	out.SizeFilters = append([]sizeFilter(nil), pq.SizeFilters...)
 	out.DateFilters = append([]dateFilter(nil), pq.DateFilters...)
 	out.AttrFilters = append([]uint32(nil), pq.AttrFilters...)
@@ -1897,6 +1898,7 @@ func parseQuery(opts queryOptions) (parsedQuery, error) {
 		Exists:                 opts.Exists,
 		CWDBias:                normalizeFilterPath(opts.CWDBias),
 		RootBias:               normalizeFilterPath(opts.RootBias),
+		Near:                   normalizeFilterPath(opts.Near),
 		DeadlineUnix:           opts.DeadlineUnix,
 		Cancel:                 opts.Cancel,
 		Trace:                  opts.Trace,
@@ -1905,6 +1907,7 @@ func parseQuery(opts queryOptions) (parsedQuery, error) {
 		contentFullCandidates:  opts.contentFullCandidates,
 		contentWindow:          opts.contentWindow,
 		contentProbe:           opts.contentProbe,
+		gitCtx:                 newQueryGitContext(),
 	}
 	if opts.ModifiedAfter != "" {
 		t, err := parseTimeValue(opts.ModifiedAfter)

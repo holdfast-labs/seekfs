@@ -37,7 +37,7 @@ func (vol *serviceVolumeIndex) componentRootTopCandidates(pq parsedQuery) ([]int
 		pq.CaseSensitive || pq.Under != "" || pq.Type != "" || len(pq.Exts) > 0 ||
 		len(pq.Globs) > 0 || len(pq.Dirs) > 0 || len(pq.Regexps) > 0 ||
 		len(pq.SizeFilters) > 0 || len(pq.DateFilters) > 0 || len(pq.AttrFilters) > 0 ||
-		len(pq.OrGroups) > 0 || len(pq.NotGroups) > 0 || pq.HasModAfter || pq.Exists ||
+		len(pq.OrGroups) > 0 || len(pq.NotGroups) > 0 || pq.HasModAfter || pq.lateVerified() ||
 		pq.CWDBias != "" || pq.RootBias != "" || countNonVolumeTerms(pq.Terms) != 1 || pq.hiddenBlocksTruncation() {
 		return nil, false
 	}
@@ -154,7 +154,7 @@ func (vol *serviceVolumeIndex) componentDirectTopCandidates(pq parsedQuery) ([]i
 		pq.Under != "" || pq.Type != "" || len(pq.Exts) > 0 || len(pq.Globs) > 0 ||
 		len(pq.Dirs) > 0 || len(pq.Regexps) > 0 || len(pq.SizeFilters) > 0 ||
 		len(pq.DateFilters) > 0 || len(pq.OrGroups) > 0 || len(pq.NotGroups) > 0 ||
-		pq.HasModAfter || pq.Exists || pq.CWDBias != "" || pq.RootBias != "" ||
+		pq.HasModAfter || pq.lateVerified() || pq.CWDBias != "" || pq.RootBias != "" ||
 		countNonVolumeTerms(pq.Terms) != 1 || pq.hiddenBlocksTruncation() {
 		return nil, false
 	}
@@ -262,7 +262,7 @@ func (vol *serviceVolumeIndex) componentMultiTermTopCandidates(pq parsedQuery) (
 		pq.Under != "" || pq.Type != "" || len(pq.Exts) > 0 || len(pq.Globs) > 0 ||
 		len(pq.Dirs) > 0 || len(pq.Regexps) > 0 || len(pq.SizeFilters) > 0 ||
 		len(pq.DateFilters) > 0 || len(pq.OrGroups) > 0 || len(pq.NotGroups) > 0 ||
-		pq.HasModAfter || pq.Exists || pq.CWDBias != "" || pq.RootBias != "" ||
+		pq.HasModAfter || pq.lateVerified() || pq.CWDBias != "" || pq.RootBias != "" ||
 		countNonVolumeTerms(pq.Terms) < 2 || pq.hiddenBlocksTruncation() {
 		return nil, false
 	}
@@ -446,7 +446,7 @@ func (vol *serviceVolumeIndex) selectiveNamePathTermCandidates(pq parsedQuery) (
 		pq.Under != "" || pq.Type != "" || len(pq.Exts) > 0 || len(pq.Globs) > 0 ||
 		len(pq.Dirs) > 0 || len(pq.Regexps) > 0 || len(pq.SizeFilters) > 0 ||
 		len(pq.DateFilters) > 0 || len(pq.OrGroups) > 0 || len(pq.NotGroups) > 0 ||
-		pq.HasModAfter || pq.Exists || pq.CWDBias != "" || pq.RootBias != "" ||
+		pq.HasModAfter || pq.lateVerified() || pq.CWDBias != "" || pq.RootBias != "" ||
 		countNonVolumeTerms(pq.Terms) < 2 || pq.hiddenBlocksTruncation() {
 		return nil, false
 	}
@@ -509,7 +509,7 @@ func (vol *serviceVolumeIndex) multiTermEmptyPathCandidates(pq parsedQuery) ([]i
 		pq.Under != "" || pq.Type != "" || len(pq.Exts) > 0 || len(pq.Globs) > 0 ||
 		len(pq.Dirs) > 0 || len(pq.Regexps) > 0 || len(pq.SizeFilters) > 0 ||
 		len(pq.DateFilters) > 0 || len(pq.OrGroups) > 0 || len(pq.NotGroups) > 0 ||
-		pq.HasModAfter || pq.Exists || pq.CWDBias != "" || pq.RootBias != "" ||
+		pq.HasModAfter || pq.lateVerified() || pq.CWDBias != "" || pq.RootBias != "" ||
 		countNonVolumeTerms(pq.Terms) < 2 {
 		return nil, false
 	}

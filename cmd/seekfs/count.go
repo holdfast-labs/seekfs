@@ -301,7 +301,7 @@ func (vol *serviceVolumeIndex) fastPostingCountHidden(pq parsedQuery, hidden hid
 		return count, true
 	}
 	globExts, globsOK := simpleGlobExts(pq.Globs)
-	if vol == nil || vol.index == nil || vol.queryIndex == nil || pq.CaseSensitive || pq.Under != "" || pq.Exists || pq.HasModAfter || len(pq.AttrFilters) > 0 || len(pq.Regexps) > 0 || !globsOK || len(pq.Dirs) > 0 || len(pq.Parents) > 0 {
+	if vol == nil || vol.index == nil || vol.queryIndex == nil || pq.CaseSensitive || pq.Under != "" || pq.lateVerified() || pq.HasModAfter || len(pq.AttrFilters) > 0 || len(pq.Regexps) > 0 || !globsOK || len(pq.Dirs) > 0 || len(pq.Parents) > 0 {
 		return 0, false
 	}
 	lists := make([]postingCountCandidate, 0, len(pq.Exts)+len(globExts)+len(pq.Terms)+1)
@@ -381,7 +381,7 @@ func (vol *serviceVolumeIndex) fastPostingCountHidden(pq parsedQuery, hidden hid
 
 func (vol *serviceVolumeIndex) fastBareExtensionPathCountHidden(pq parsedQuery, hidden hiddenBaseIDs) (int, bool) {
 	if vol == nil || vol.index == nil || !pq.MatchPath || pq.CaseSensitive ||
-		pq.Under != "" || pq.Exists || pq.HasModAfter ||
+		pq.Under != "" || pq.lateVerified() || pq.HasModAfter ||
 		len(pq.Exts) > 0 || len(pq.Globs) > 0 || len(pq.Dirs) > 0 || len(pq.Regexps) > 0 ||
 		len(pq.Parents) > 0 || len(pq.OrGroups) > 0 || len(pq.NotGroups) > 0 ||
 		len(pq.SizeFilters) > 0 || len(pq.DateFilters) > 0 || len(pq.AttrFilters) > 0 ||

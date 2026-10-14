@@ -212,7 +212,7 @@ func (vol *serviceVolumeIndex) subtreeIDsInOrder(rootID int) []int {
 }
 
 func (vol *serviceVolumeIndex) exactDirCandidates(pq parsedQuery) ([]int, bool) {
-	if vol == nil || vol.index == nil || len(pq.Terms) != 1 || pq.Type != "dir" || len(pq.Dirs) > 0 || len(pq.Regexps) > 0 || pq.Under != "" || len(pq.Exts) > 0 || len(pq.Globs) > 0 || pq.HasModAfter || pq.Exists || pq.CaseSensitive {
+	if vol == nil || vol.index == nil || len(pq.Terms) != 1 || pq.Type != "dir" || len(pq.Dirs) > 0 || len(pq.Regexps) > 0 || pq.Under != "" || len(pq.Exts) > 0 || len(pq.Globs) > 0 || pq.HasModAfter || pq.lateVerified() || pq.CaseSensitive {
 		return nil, false
 	}
 	list := vol.exactNameIDs(pq.Terms[0])
@@ -274,7 +274,7 @@ func (vol *serviceVolumeIndex) unionNamePostings(terms []string) ([]int, bool) {
 }
 
 func (vol *serviceVolumeIndex) exactNameCandidates(pq parsedQuery) ([]int, bool) {
-	if vol == nil || vol.index == nil || len(pq.Terms) != 1 || len(pq.Dirs) > 0 || len(pq.Regexps) > 0 || pq.Under != "" || len(pq.Exts) > 0 || len(pq.Globs) > 0 || pq.Type != "" || pq.HasModAfter || pq.Exists || pq.CaseSensitive {
+	if vol == nil || vol.index == nil || len(pq.Terms) != 1 || len(pq.Dirs) > 0 || len(pq.Regexps) > 0 || pq.Under != "" || len(pq.Exts) > 0 || len(pq.Globs) > 0 || pq.Type != "" || pq.HasModAfter || pq.lateVerified() || pq.CaseSensitive {
 		return nil, false
 	}
 	term := pq.Terms[0]
@@ -307,7 +307,7 @@ func samePath(a, b string) bool {
 }
 
 func (vol *serviceVolumeIndex) namePrefixCandidates(pq parsedQuery) ([]int, bool) {
-	if vol == nil || vol.index == nil || len(pq.Terms) != 1 || len(pq.Dirs) > 0 || len(pq.Regexps) > 0 || pq.Under != "" || len(pq.Exts) > 0 || len(pq.Globs) > 0 || pq.Type != "" || pq.HasModAfter || pq.Exists || pq.CaseSensitive {
+	if vol == nil || vol.index == nil || len(pq.Terms) != 1 || len(pq.Dirs) > 0 || len(pq.Regexps) > 0 || pq.Under != "" || len(pq.Exts) > 0 || len(pq.Globs) > 0 || pq.Type != "" || pq.HasModAfter || pq.lateVerified() || pq.CaseSensitive {
 		return nil, false
 	}
 	term := pq.Terms[0]

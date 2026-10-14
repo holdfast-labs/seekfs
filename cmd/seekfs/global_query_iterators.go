@@ -804,7 +804,7 @@ func globalComponentQueryIterator(volumes []*serviceVolumeIndex, pq parsedQuery,
 
 func globalSimplePathORTerms(pq parsedQuery) ([]string, bool) {
 	if !pq.MatchPath || len(pq.OrGroups) != 1 || len(pq.NotGroups) != 0 || pq.Type != "" ||
-		pq.Under != "" || pq.Exists || pq.HasModAfter || len(pq.Exts) != 0 || len(pq.Dirs) != 0 ||
+		pq.Under != "" || pq.lateVerified() || pq.HasModAfter || len(pq.Exts) != 0 || len(pq.Dirs) != 0 ||
 		len(pq.Globs) != 0 || len(pq.Regexps) != 0 || len(pq.RegexTerms) != 0 || len(pq.Parents) != 0 ||
 		len(pq.SizeFilters) != 0 || len(pq.DateFilters) != 0 || len(pq.AttrFilters) != 0 ||
 		pq.CaseSensitive || len(pq.OrGroups[0]) == 0 {
@@ -820,7 +820,7 @@ func globalSimplePathORTerms(pq parsedQuery) ([]string, bool) {
 			len(alt.Dirs) != 0 || len(alt.Globs) != 0 || len(alt.Regexps) != 0 ||
 			len(alt.RegexTerms) != 0 || len(alt.Parents) != 0 || len(alt.Exts) != 0 ||
 			len(alt.SizeFilters) != 0 || len(alt.DateFilters) != 0 || len(alt.AttrFilters) != 0 ||
-			alt.Type != "" || alt.Under != "" || alt.Exists || alt.HasModAfter {
+			alt.Type != "" || alt.Under != "" || alt.lateVerified() || alt.HasModAfter {
 			return nil, false
 		}
 		terms = append(terms, altTerms[0])
@@ -927,7 +927,7 @@ func globalComponentTopIDs(volumes []*serviceVolumeIndex, pq parsedQuery, limit 
 func globalExactPathComponentTerm(pq parsedQuery) (string, bool) {
 	terms := nonVolumeTerms(pq.Terms)
 	if !pq.MatchPath || len(terms) != 1 || pq.CaseSensitive ||
-		pq.Type != "" || pq.Under != "" || pq.Exists || pq.HasModAfter ||
+		pq.Type != "" || pq.Under != "" || pq.lateVerified() || pq.HasModAfter ||
 		len(pq.Exts) != 0 || len(pq.Dirs) != 0 || len(pq.Globs) != 0 ||
 		len(pq.Regexps) != 0 || len(pq.RegexTerms) != 0 || len(pq.Parents) != 0 ||
 		len(pq.SizeFilters) != 0 || len(pq.DateFilters) != 0 || len(pq.AttrFilters) != 0 ||

@@ -8,6 +8,7 @@ import (
 	"golang.org/x/sys/windows"
 	"io"
 	"os"
+	"path/filepath"
 	"runtime/debug"
 	"strings"
 	"time"
@@ -123,9 +124,12 @@ func classifyServiceCommand(command string) serviceCommandClass {
 	switch command {
 	case "search", "info", "status":
 		return serviceCommandReadOnly
-	case "watch-delta", "plugin-list":
+	case "watch-delta", "plugin-list", "open", "recent":
 		// watch-delta is a read-only local operation but is deferred remotely
 		// until Phase 7: it exposes cursor semantics that need scoped identity.
+		// open/recent are local-only usage signals (frecency store); they
+		// mutate only the local signals file, need no elevation, and never
+		// leave the machine.
 		return serviceCommandLocalOnly
 	case "index-usn", "plugin-reload":
 		return serviceCommandMutate
@@ -189,6 +193,10 @@ func (s *goSearchService) handleServiceCommand(w io.Writer, principal servicePri
 		s.serviceCommandInfo(w, req)
 	case "search":
 		s.serviceCommandSearch(w, caps, req)
+	case "open":
+		s.serviceCommandOpen(w, req)
+	case "recent":
+		s.serviceCommandRecent(w, req)
 	case "watch-delta":
 		s.serviceCommandWatchDelta(w, req)
 	case "index-usn":
@@ -381,6 +389,9 @@ func (s *goSearchService) serviceCommandSearch(w io.Writer, caps serviceCapabili
 			resp.Results[i] = entry.Path
 		}
 		resp.Rows = entriesToJSON(matches)
+		if pq, perr := parseQuery(opts); perr == nil {
+			annotateJSONGitStatus(resp.Rows, matches, pq)
+		}
 		if caps.Remote {
 			// Content text is local-only. Strip it at the command boundary so a
 			// future transport cannot leak a snippet even if its own projection
@@ -390,6 +401,49 @@ func (s *goSearchService) serviceCommandSearch(w io.Writer, caps serviceCapabili
 	}
 	resp.Content = s.searchContentHealth(trace)
 	_ = json.NewEncoder(w).Encode(resp)
+}
+
+// serviceCommandOpen records one usage-signal access event: the user opened
+// path (optionally attributed to the normalized query that led there). It
+// feeds the frecency store and the query-history combo boost (rank_blend.go).
+// Best-effort and synchronous: opens are user-paced and the store file is
+// small, so the write lands before the response.
+func (s *goSearchService) serviceCommandOpen(w io.Writer, req *serviceRequest) {
+	path := normalizeSignalPath(req.Path)
+	if path == "" {
+		_ = json.NewEncoder(w).Encode(serviceResponse{OK: false, Message: "open requires a path"})
+		return
+	}
+	sharedSignalStore().recordOpen(path, req.OpenQuery)
+	_ = json.NewEncoder(w).Encode(serviceResponse{OK: true, Message: "recorded open for " + path})
+}
+
+// serviceCommandRecent lists recently opened files, newest first, from the
+// frecency store (local only, never leaves the machine).
+func (s *goSearchService) serviceCommandRecent(w io.Writer, req *serviceRequest) {
+	limit := req.Limit
+	if limit <= 0 {
+		limit = 20
+	}
+	if limit > 200 {
+		limit = 200
+	}
+	recent := sharedSignalStore().recent(limit)
+	rows := make([]recentFileJSON, 0, len(recent))
+	for _, r := range recent {
+		row := recentFileJSON{
+			Path:     r.Path,
+			Name:     filepath.Base(r.Path),
+			Opens:    r.Opens,
+			Score:    r.Score,
+			LastOpen: time.Unix(0, r.LastOpenUnix).Format(time.RFC3339Nano),
+		}
+		if fi, err := os.Stat(r.Path); err == nil {
+			row.Modified = fi.ModTime().Format(time.RFC3339Nano)
+		}
+		rows = append(rows, row)
+	}
+	_ = json.NewEncoder(w).Encode(serviceResponse{OK: true, Count: len(rows), Recent: rows})
 }
 
 func (s *goSearchService) serviceCommandWatchDelta(w io.Writer, req *serviceRequest) {

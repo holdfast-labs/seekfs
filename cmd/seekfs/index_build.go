@@ -883,6 +883,7 @@ func cmdSearch(args []string, countOnly bool) error {
 	exists := fs.Bool("exists", false, "verify result paths still exist")
 	cwdBias := fs.Bool("cwd-bias", false, "rank paths under the current working directory first")
 	rootBias := fs.String("root-bias", "", "rank paths under this root first")
+	near := fs.String("near", "", "rank files fewer path hops from this path higher (within a match-quality band)")
 	recent := fs.String("recent", "", "only return results modified within this duration, for example 24h")
 	modifiedAfter := fs.String("modified-after", "", "only return results modified after RFC3339 time or YYYY-MM-DD")
 	caseSensitive := fs.Bool("case", false, "case-sensitive query matching")
@@ -929,6 +930,7 @@ func cmdSearch(args []string, countOnly bool) error {
 		Under:         *under,
 		Exists:        *exists,
 		RootBias:      *rootBias,
+		Near:          *near,
 		Recent:        *recent,
 		ModifiedAfter: *modifiedAfter,
 		CaseSensitive: *caseSensitive,
@@ -973,6 +975,9 @@ func cmdSearch(args []string, countOnly bool) error {
 		}
 		if !countOnly {
 			resp.Results = entriesToJSON(matches)
+			if pq, perr := parseQuery(opts); perr == nil {
+				annotateJSONGitStatus(resp.Results, matches, pq)
+			}
 		}
 		return writeJSON(os.Stdout, resp)
 	}

@@ -35,7 +35,7 @@ func searchServiceVolumesGlobalNameSnapshot(snapshot globalQuerySnapshot, opts q
 	// top-N by rank filtered later can underfill); those queries use the
 	// complete path below.
 	if !countOnly && countNonVolumeTerms(pq.Terms) == 1 && pq.Limit > 0 &&
-		pq.Under == "" && len(pq.Dirs) == 0 && len(pq.Parents) == 0 && !pq.Exists {
+		pq.Under == "" && len(pq.Dirs) == 0 && len(pq.Parents) == 0 && !pq.lateVerified() {
 		if ranked, ok, err := globalNameTopRanked(snapshot, pq, opts.Trace); ok {
 			if err != nil {
 				return nil, true, err
@@ -87,7 +87,7 @@ func countServiceVolumesGlobalNameSnapshot(snapshot globalQuerySnapshot, opts qu
 	// verifying path below so counts stay exact.
 	if countNonVolumeTerms(pq.Terms) == 1 && len(pq.SizeFilters) == 0 && len(pq.DateFilters) == 0 &&
 		pq.Type == "" && len(pq.Dirs) == 0 && len(pq.Parents) == 0 && pq.Under == "" &&
-		!pq.Exists && !pq.HasModAfter && !pq.CaseSensitive && len(pq.AttrFilters) == 0 &&
+		!pq.lateVerified() && !pq.HasModAfter && !pq.CaseSensitive && len(pq.AttrFilters) == 0 &&
 		len(pq.Exts) == 0 && len(pq.Globs) == 0 &&
 		!globalSnapshotsHaveHidden(snapshot.overlays) {
 		count := 0
@@ -284,6 +284,10 @@ func globalNameCandidateIDs(snapshot globalQuerySnapshot, pq parsedQuery, trace 
 		volumePQ.Type = ""
 		volumePQ.Dirs = nil
 		volumePQ.Exists = false
+		// Widen the trigram to the name superset like Exists above: git: is
+		// enforced exactly by verification later (lateVerified declines the
+		// rank-truncated top-N path via queryNeedsPath).
+		volumePQ.GitFilters = nil
 		volumePQ.HasModAfter = false
 		volumePQ.CaseSensitive = false
 		dropSatisfiedVolumeTerms(&volumePQ, vol.index.Volume)

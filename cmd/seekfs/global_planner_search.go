@@ -475,7 +475,7 @@ func globalTypeTermCountShape(pq parsedQuery, typ string) (string, bool) {
 	terms := nonVolumeTerms(pq.Terms)
 	if len(terms) != 1 || len(pq.Exts) != 0 || len(pq.Dirs) != 0 || len(pq.Globs) != 0 ||
 		len(pq.Regexps) != 0 || len(pq.RegexTerms) != 0 || len(pq.Parents) != 0 ||
-		pq.Under != "" || pq.Exists || pq.HasModAfter || len(pq.SizeFilters) != 0 ||
+		pq.Under != "" || pq.lateVerified() || pq.HasModAfter || len(pq.SizeFilters) != 0 ||
 		len(pq.DateFilters) != 0 || len(pq.AttrFilters) != 0 || len(pq.OrGroups) != 0 ||
 		len(pq.NotGroups) != 0 || pq.CaseSensitive || pq.RootBias != "" || pq.CWDBias != "" {
 		return "", false

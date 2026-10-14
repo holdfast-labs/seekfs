@@ -1063,7 +1063,7 @@ func (vol *serviceVolumeIndex) countFilenameOnlyVolume(opts queryOptions, pq par
 // content count can evaluate the query from the record's name/metadata alone
 // and never reconstruct a path.
 func queryNeedsEntryPath(pq parsedQuery) bool {
-	if pq.MatchPath || pq.Under != "" || pq.Exists ||
+	if pq.MatchPath || pq.Under != "" || pq.lateVerified() ||
 		len(pq.Parents) > 0 || len(pq.Dirs) > 0 || len(pq.Regexps) > 0 {
 		return true
 	}

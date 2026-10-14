@@ -453,7 +453,7 @@ func memoSupported(pq parsedQuery) bool {
 			return false
 		}
 	}
-	if pq.Under != "" || pq.Exists {
+	if pq.Under != "" || pq.lateVerified() {
 		return false
 	}
 	if len(pq.Regexps) != 0 || len(pq.RegexTerms) != 0 {
