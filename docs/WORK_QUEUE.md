@@ -14,6 +14,13 @@ refer to `docs/REFERENCE_TOOLS.md`.
 Merged so far this round: `perf/content-underfill`, `perf/name-fuzzy`,
 `fix/cli-silent-empty`, `content/idle-governor`.
 
+Done, awaiting review and merge: `content/inclusion-policy` (G3, §6z) —
+main-checkout-only worktrees, content-hash dedupe (v10 + CXAL/CXIS),
+1 MiB / 10 MiB caps, lockfile/JSON/minified/build-output/cache skips,
+user skip list; measured before/after on Chromium and E:\bench with
+100% in-rules recall vs ripgrep. Needs the standard review plus the
+recall check re-run after any rebase (recall.py method in §6z).
+
 | Branch | Worktree | Scope |
 |---|---|---|
 | `test/suite-speed` | suitespeed | `cmd/seekfs` suite under ~5 min; harden `TestHeadlessFrameCost`; gofmt drift |
@@ -22,13 +29,7 @@ Merged so far this round: `perf/content-underfill`, `perf/name-fuzzy`,
 
 ## Queued, in order
 
-1. **Inclusion policy (G3).** Index only the main checkout and skip linked
-   git worktrees. Index identical files once (content-hash dedupe). Lower
-   caps to about 1 MB text, 10 MB inside repos. Skip lockfiles, JSON of
-   100 KB or more, minified/bundled assets and build output outside repos.
-   Add a user skip list. Broaden default excludes (caches such as Go/npm/pip,
-   `E:\bench\gocache`-style trees).
-2. **fff ranking signals (G7, G8).** Open/frecency tracking with an `open`
+1. **fff ranking signals (G7, G8).** Open/frecency tracking with an `open`
    API and boost; `near` proximity; a recently-used list; a query-history
    boost; a `git:` filter (modified/staged/untracked/…); git-status and
    recent-commit boosts; a "right file first" metric for name queries (G13).

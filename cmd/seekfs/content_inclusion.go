@@ -37,6 +37,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 )
 
@@ -506,6 +507,31 @@ func contentFilterLinkedWorktrees(repos []string, keepAll bool) (kept []string, 
 		}
 	}
 	return kept, dropped
+}
+
+// contentInclusionReasonOrder returns the Skipped reasons in stable
+// policy order for display.
+func contentInclusionReasonOrder(s contentInclusionStats) []string {
+	order := []string{"exclude", "gitignore", contentSkipUserSkip,
+		contentSkipLockfile, contentSkipLargeJSON, contentSkipMinified,
+		contentSkipBuildOutput, contentSkipCache, "system", "binary", "ext", "root", "path",
+		contentSkipSizeCap, contentSkipWorktree}
+	var out []string
+	seen := make(map[string]bool)
+	for _, r := range order {
+		if n := s.Skipped[r]; n > 0 {
+			out = append(out, r)
+			seen[r] = true
+		}
+	}
+	var rest []string
+	for r, n := range s.Skipped {
+		if n > 0 && !seen[r] {
+			rest = append(rest, r)
+		}
+	}
+	sort.Strings(rest)
+	return append(out, rest...)
 }
 
 // contentInclusionStats tallies per-reason inclusion decisions for one

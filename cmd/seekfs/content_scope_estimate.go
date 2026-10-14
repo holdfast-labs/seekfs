@@ -290,11 +290,22 @@ func scanContentScope(idx *Index, scope contentScope, volume string, maxFiles in
 	})
 	unitIndex := make(map[string]int)
 	est.BudgetBytes = resolved.BudgetBytes
+	eligibleSizes := make(map[int64]int64)
 	for _, c := range candidates {
 		est.EligibleFiles++
 		est.EligibleBytes += c.bytes
+		eligibleSizes[c.size]++
 		if !contentKnownTextExt(c.ext) {
 			est.TextCandidates++
+		}
+	}
+	// Same-size grouping over the eligible files: the dedupe candidate
+	// pool (an upper bound measured without reading bytes). Computed
+	// pre-budget so a reserve-truncated run still reports it.
+	for s, n := range eligibleSizes {
+		if n > 1 {
+			est.SameSizeFiles += n
+			est.SameSizeBytes += s * n
 		}
 	}
 	// An explicit budget truncates the priority-ordered candidates at the
@@ -303,7 +314,6 @@ func scanContentScope(idx *Index, scope contentScope, volume string, maxFiles in
 	// reserve; the anchor is the volume root, the same volume the sidecar
 	// is written to.
 	anchor := contentScopeBudgetAnchor(volume)
-	var selectedSizes []int64
 	for _, c := range candidates {
 		if resolved.BudgetExplicit {
 			if est.Bytes+c.bytes > resolved.BudgetBytes {
@@ -316,7 +326,6 @@ func scanContentScope(idx *Index, scope contentScope, volume string, maxFiles in
 		}
 		est.Files++
 		est.Bytes += c.bytes
-		selectedSizes = append(selectedSizes, c.size)
 		if listPaths {
 			est.Paths = append(est.Paths, c.item.path)
 		}
@@ -327,20 +336,6 @@ func scanContentScope(idx *Index, scope contentScope, volume string, maxFiles in
 		} else {
 			unitIndex[c.unit] = len(est.ByUnit)
 			est.ByUnit = append(est.ByUnit, contentScopeUnit{Root: c.unit, Kind: c.kind, Files: 1, Bytes: c.bytes})
-		}
-	}
-	// Same-size grouping over the selected files: the dedupe candidate
-	// pool (an upper bound measured without reading bytes).
-	{
-		bySize := make(map[int64]int64)
-		for _, s := range selectedSizes {
-			bySize[s]++
-		}
-		for s, n := range bySize {
-			if n > 1 {
-				est.SameSizeFiles += n
-				est.SameSizeBytes += s * n
-			}
 		}
 	}
 	est.ProjectedGSXBytes = int64(float64(est.Bytes) * contentScopeEncodedMultiplier)

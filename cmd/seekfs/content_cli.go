@@ -184,6 +184,14 @@ func cmdContentIndex(args []string) error {
 		return err
 	}
 	fmt.Fprintf(os.Stdout, "indexed %d documents into %s\n", len(idx.Docs), outPath)
+	if s := idx.Inclusion; len(s.Skipped) > 0 || s.Truncated > 0 || s.DedupeFiles > 0 || s.WorktreesSkipped > 0 {
+		fmt.Fprintf(os.Stdout, "inclusion:")
+		for _, r := range contentInclusionReasonOrder(s) {
+			fmt.Fprintf(os.Stdout, " %s=%d/%dB", r, s.Skipped[r], s.SkippedBytes[r])
+		}
+		fmt.Fprintf(os.Stdout, " truncated=%d/%dB dedupe=%d/%dB worktrees_skipped=%d\n",
+			s.Truncated, s.TruncatedBytes, s.DedupeFiles, s.DedupeBytes, s.WorktreesSkipped)
+	}
 	if p := idx.Policy; p != (contentBuildPolicy{}) {
 		limit := fmt.Sprintf("budget=%d", p.BudgetBytes)
 		if p.ReserveBytes > 0 {

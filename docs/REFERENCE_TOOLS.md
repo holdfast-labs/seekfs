@@ -78,11 +78,21 @@ Coverage and size (top priority: small index, content search everywhere):
    stored text, measured as a possible default).
 2. **The build's transient spool peak** (1.5× extracted) caps coverage, while
    the final index is about 0.33×. Agent work: `content/spool-peak`.
-3. **Inclusion policy:** we index every linked worktree, duplicate files, files
-   up to 32 MB raw / 16 MB text, lockfiles, large JSON and minified bundles.
-   An 11.4 MB single-line `tokenizer.json` made broad queries 4–5× slower.
-   Adopt fsearch's policy: main checkout only, content-hash dedupe, lower caps,
-   and the asset/lockfile/JSON skips.
+3. **Inclusion policy:** DONE (`content/inclusion-policy`, §6z). We index
+   only the main checkout (`[content] worktrees = "main"`, `all` opts in),
+   identical files once (content-hash dedupe, CXAL section, v10), text
+   capped at ~1 MiB outside repos (~10 MiB inside, explicit caps still
+   override), and skip lockfiles, JSON ≥ 100 KiB, minified/bundled assets
+   (names plus sampled avg line length > 2048), build-output dirs outside
+   repos, well-known cache trees, and a user `content-skip` list
+   (`plugin config content --skip`). Measured on Chromium: selection
+   468,772 files / 3.37 GB → 468,212 / 3.21 GB; full build 464,032 docs /
+   800 MB → 463,275 / 738 MB (26,195 aliases saving 25.7 MB of text);
+   E:\bench: 479,218 / 3.54 GB → 468,212 / 3.21 GB with 27 linked
+   worktrees contributing nothing. Recall inside the rules is 100% vs
+   ripgrep on 10 terms (only documented extractor-limit diffs). Every
+   decision is tallied (CXIS → `loaded --json` `inclusion`, `--estimate`,
+   build lines).
 4. **Freshness:** edits go through the USN delta, drain and fold queue, which
    adds seconds of lag. Read changed or dirty files directly at query time.
 5. **Footprint:** the service uses about 500 MB resident on E: (1.46M names)

@@ -2219,9 +2219,131 @@ size-capped, never whole-disk by default.
   index would be bound to one model's vocab, and the Rust/Python-ABI ecosystem
   does not fit the Windows-first, no-C-toolchain, single-binary build. It also
   solves a cost we do not have (PB8 showed candidate materialization, not
-  tokenization, was the bottleneck). A fast tokenizer becomes relevant only if
-  semantic/embedding search is ever added — a separate design (embeddings +
-  vector store), and a current non-goal. If lexical indexing needs more speed,
-  the levers are SIMD trigram extraction, posting compression with block-max
-  skipping (the postings are 4096-doc block-paged with first-docID skip
-  metadata since §6m), and `.gsx` mmap.
+   tokenization, was the bottleneck). A fast tokenizer becomes relevant only if
+   semantic/embedding search is ever added — a separate design (embeddings +
+   vector store), and a current non-goal. If lexical indexing needs more speed,
+   the levers are SIMD trigram extraction, posting compression with block-max
+   skipping (the postings are 4096-doc block-paged with first-docID skip
+   metadata since §6m), and `.gsx` mmap.
+
+## 6z. Inclusion policy + dedupe (done)
+
+Branch `content/inclusion-policy` (WORK_QUEUE item 1, gap G3): content
+search across the whole drive with a small index, after Noah Dunnagan's
+fsearch. Coverage per byte is the metric.
+
+**Policy.** Text files up to ~1 MiB outside git repos (~10 MiB inside;
+raw caps at 2:1 headroom), minus what git ignores, with fsearch's skips:
+lockfiles (`package-lock.json`, `yarn.lock`, `pnpm-lock.yaml`,
+`Cargo.lock`, `go.sum`, `poetry.lock`, `composer.lock`, `Gemfile.lock`
+and kin), JSON >= 100 KiB (`.json`/`.jsonc`/`.json5`; line-delimited
+`.jsonl`/`.ndjson` stay), minified/bundled assets (`*.min.*`,
+bundle/chunk names, `*.map`, plus sampled average line length > 2048
+over files >= 32 KiB), build-output dirs outside repos (`dist`,
+`build`, `out`, `target`, `bin`, `obj`, `_build`, `.next`, `.nuxt`,
+`coverage` — inside a repo git's ignore rules own directories), and
+well-known cache trees anywhere (Go/npm/pnpm/yarn/pip/uv/Cargo
+registry/`.gradle`/NuGet/browser profile caches, any `gocache` or
+`.cache` tree). Linked git worktrees (a `.git` FILE pointing at
+`<main>/.git/worktrees/<name>`) index only the main checkout by
+default (`[content] worktrees = "main" | "all"`); submodule pointers
+(`.../.git/modules/...`) and plain repos still index. The operator adds
+a `content-skip` list (paths, or globs where `*` spans a segment and a
+full `**` segment spans separators) via `plugin config content --skip`
+or `[content] skip`. Explicit `-max-raw`/`-max-text` override the caps
+uniformly. `system_excludes = false` opts out of the directory rules
+only, never the file rules. Git rules come first, then the operator
+list, then the built-ins.
+
+**Enforcement points.** `allowsReason` (scope), the fast scan's
+`admitRecord` (same predicate + record size, with a reason-attributing
+segment memo so estimate and build tally identically), the offline walk
+(DirEntry size, real worktree probe for nested checkouts), the service
+build (`contentBuildDocSafe` per-file caps + extraction-time
+`large_json`/`size_cap`/minified-content skips with canonical reasons),
+and the drain (same extraction gate; declines tombstone base docs
+through the existing path and accumulate per-reason stats the fold
+merges). Selection v6 joins the scope fingerprint, so a worktree
+appearing/vanishing or a skip-list edit reconciles through the §6p/§6u
+path (new keys still held to the reconcile budget) instead of
+rebuilding.
+
+**Dedupe.** Identical files (stored-text length + sha256, already
+computed per doc as `ContentHash`) are extracted and stored ONCE: the
+assembler keeps the first as primary (text + postings) and records the
+rest as aliases — full doc-table rows (own DocID/FRN/path/fingerprint)
+sharing the primary's `TextOff`/`TextLen` with no postings. Pairs ride
+the self-contained CXAL section; readers expand posting-derived
+candidate sets over the alias map BEFORE cap accounting, so the
+expanded set equals the pre-dedupe posting set exactly and every
+lane/cap/budget decision is unchanged (the biased-early-stop lane
+regression caught this placement). Scan shapes enumerate aliases
+directly. Folds and reshards recompute through the same assembler;
+shards dedupe within themselves (cross-shard duplicates store twice —
+the worktree filter removes the corpus-scale case). Format v9 → v10,
+everything else byte-identical (CXAL omitted when empty; per-shard
+peak unchanged plus one hash entry per unique doc). Manifests stay v5
+and carry the build CXIS. If `content/filter-tier` (§6y) also bumps the
+format, renumber at merge: this change is the version line plus
+CXAL/CXIS only.
+
+**Visibility.** Every decision is tallied: the scan accumulates
+per-reason rejections, extraction adds size/content skips and
+truncations, the assembler adds dedupe files/bytes — persisted in CXIS
+and surfaced in `loaded --json` (`inclusion` with files+bytes per skip
+reason, truncations, dedupe savings, skipped worktrees), in
+`content-index` build lines, and in `--estimate` (per-reason
+files+bytes, a legacy baseline for before/after in one run, the
+same-size dedupe pool, skipped worktrees).
+
+**Measured (2026-10-14, GOMAXPROCS=2, shared box).** Estimate path,
+`chromium.gsi` (555,849 records): legacy baseline 468,772 files /
+3,367,822,040 B; policy 468,212 / 3,214,978,499 B (−560 files/−153 MB:
+lockfile 208/5.3 MB, large_json 200/117.2 MB, minified-name 121/8.9 MB,
+cache 31/24 KB, gitignore 334/1.1 MB, binary 40,136/984.5 MB,
+`.git`-exclude 29/1.53 GB). The old binary's estimate prints byte-exact
+the same baseline (468,772 / 3,367,822,040), validating the baseline
+code. Full `--scoped` builds (8 GB explicit budget): old 464,032 docs /
+800.1 MB; new 463,275 docs / 738.4 MB (−61.7 MB, −7.7%), with 26,195
+aliases (5.7%) saving 25.7 MB of extracted text, 198 extra
+minified-content skips at extraction, 2 truncations (1.7 MB cut), and
+estimate↔build agreement on every selection reason. Per doc 1.77 →
+1.63 KB; 0.241× eligible bytes (642k docs, 4.15 GB of source per GB of
+index; old 0.256×). On `E:\bench` (own 589,951-record walk): baseline 479,218 /
+3.54 GB → policy 468,212 / 3.21 GB (−11,006 files/−327 MB), 27 linked
+worktrees skipped (the whole `wt/` farm selects nothing under
+main-only), cache 14,113 files / 15.5 GB the largest new reason.
+Post-budget selection on this box is currently 0: E: free (18.7 GB)
+sits below the 20 GiB reserve, so the default allowance is 0 and only
+an explicit `budget_bytes` selects — headroom math in §6t stands (the
+spool-peak agent is lowering the 1.5×).
+
+**Recall.** 10 terms over the full chromium build vs `rg -l -F -i
+--hidden` intersected with the implementation's own `--paths`
+selection, minus the oracle-replicated content rules (minified-content
+heuristic, 10 MiB prefix restriction, over-raw-cap containers): 8
+terms byte-identical sets; `EINVAL` +2 and `containing` +5 seekfs-side
+extras, all in PDFs/HTML (text-layer extraction reads streams rg's raw
+scan cannot — a recall gain by §2b design, except one untagged PDF
+rg reads raw and we drop for missing `/ToUnicode`, a documented §6h
+limit); 2 extras (one `.md`, one `.html`) stably in our selection but
+absent from rg's full-tree walk while present in its per-file/dir
+runs and `--no-ignore` runs — an unattributed rg-side walk filter
+after honest effort (bisected to root-walk-only, not git per
+check-ignore, not symlinks, not `.ignore` files). Zero indexed-content
+misses on all 10 terms: recall inside the rules is 100%. Method and
+scripts: `E:\bench\scratch\inclusion\recall.py` (deleted with scratch;
+per-term table in the `content/inclusion-policy` measurement commits).
+
+**Tried and rejected (measured).** Avg-line threshold below 2048: the
+2048–4096 band on chromium holds 12 files, all generated
+(`react.min.js`, `opencv.js`, test fixtures) — nothing legit within
+2× of the line, so no finer cut buys recall. Lowering to 1024 would
+take 7 more files, all still generated. `.jsonl`/`.ndjson` in the
+large-JSON skip: line-delimited logs grep cleanly, kept. `*.map` kept
+in minified (sourcemaps are build artifacts: 2 of the largest flagged
+files). Cross-shard global dedupe: needs a pre-pass over all text
+(peak = corpus) or a two-phase assemble; per-shard dedupe plus the
+worktree filter captures the measured duplication. `node_modules`
+style vendored trees inside repos: git's rules already own them; no
+extra list. s2/LZ4-class codecs stay rejected (§6n/§6o/§6s).
