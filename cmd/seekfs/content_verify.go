@@ -446,20 +446,22 @@ func (m *contentLeafMatcher) match(raw, folded []byte, leaf contentLeaf) bool {
 		if re == nil {
 			return false
 		}
-		hay := raw
-		if !m.caseSensitive {
+		// The needles are lowercased literal runs: a necessary condition on
+		// the fold for case-insensitive leaves. Case-sensitive leaves skip
+		// the prefilter (testing raw text against lowercased runs would
+		// reject true matches).
+		if needles := m.regexNeedlesFor(leaf.LeafID); len(needles) > 0 && !m.caseSensitive {
 			if folded == nil {
 				folded = contentFoldText(raw)
 			}
-			hay = folded
-		}
-		if needles := m.regexNeedlesFor(leaf.LeafID); !contentRegexNeedlesHold(hay, needles) {
-			return false
+			if !contentRegexNeedlesHold(folded, needles) {
+				return false
+			}
 		}
 		if contentRegexLineAnchored(leaf.Text) {
-			return contentRegexMatchLines(re, hay)
+			return contentRegexMatchLines(re, raw)
 		}
-		return re.Match(hay)
+		return re.Match(raw)
 	}
 	return bytes.Contains(m.haystackFor(raw, folded), m.needleOf(leaf))
 }
@@ -479,7 +481,7 @@ func (m *contentLeafMatcher) matchRawFirst(raw []byte, folded *[]byte, foldedRea
 		if re == nil {
 			return false
 		}
-		if needles := m.regexNeedlesFor(leaf.LeafID); len(needles) > 0 {
+		if needles := m.regexNeedlesFor(leaf.LeafID); len(needles) > 0 && !m.caseSensitive {
 			// The needles are lowercased runs, so test them against the
 			// fold — but a verbatim raw hit authorizes skipping the fold
 			// (raw contains folded needles only when already lowercase).
@@ -493,9 +495,6 @@ func (m *contentLeafMatcher) matchRawFirst(raw []byte, folded *[]byte, foldedRea
 				}
 			}
 			if !rawHit {
-				if m.caseSensitive {
-					return false
-				}
 				if !*foldedReady {
 					*folded = contentFoldText(raw)
 					*foldedReady = true
@@ -504,16 +503,6 @@ func (m *contentLeafMatcher) matchRawFirst(raw []byte, folded *[]byte, foldedRea
 					return false
 				}
 			}
-		}
-		if !m.caseSensitive {
-			if !*foldedReady {
-				*folded = contentFoldText(raw)
-				*foldedReady = true
-			}
-			if contentRegexLineAnchored(leaf.Text) {
-				return contentRegexMatchLines(re, *folded)
-			}
-			return re.Match(*folded)
 		}
 		if contentRegexLineAnchored(leaf.Text) {
 			return contentRegexMatchLines(re, raw)
