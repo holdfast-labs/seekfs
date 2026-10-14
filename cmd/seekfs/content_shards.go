@@ -393,7 +393,10 @@ func contentSaveShard(dir string, idx *contentIndex, files map[uint32]string, pr
 
 // contentShardHeader builds the header index a streaming shard save needs:
 // the sidecar identity (origin, watermark, policy, scope) plus the assembled
-// doc table. The caller adds the resident small sections (paths).
+// doc table. The caller adds the resident small sections (paths). Aliases
+// ride from the assembly (§6z dedupe); the caller stamps the dedupe totals
+// into Inclusion after (single-file saves) or accumulates them across
+// shards (sharded saves and folds).
 func contentShardHeader(header *contentIndex, built *contentStreamedBuild) *contentIndex {
 	return &contentIndex{
 		Version:       contentIndexVersion,
@@ -404,6 +407,8 @@ func contentShardHeader(header *contentIndex, built *contentStreamedBuild) *cont
 		Docs:          built.docs,
 		Policy:        header.Policy,
 		ScopeHash:     header.ScopeHash,
+		Inclusion:     header.Inclusion,
+		Aliases:       built.aliasPairs,
 	}
 }
 
@@ -427,7 +432,7 @@ func contentBuildFiles(built *contentStreamedBuild) map[uint32]string {
 }
 
 // contentSaveManifest atomically publishes a manifest naming shards. header
-// supplies the origin, watermark, policy and scope identity.
+// supplies the origin, watermark, policy, inclusion stats and scope identity.
 func contentSaveManifest(gsx string, header *contentIndex, shards []contentShardInfo) error {
 	m := newContentIndex()
 	m.Version = contentManifestVersion
@@ -436,6 +441,7 @@ func contentSaveManifest(gsx string, header *contentIndex, shards []contentShard
 	m.CheckpointUSN = header.CheckpointUSN
 	m.Policy = header.Policy
 	m.ScopeHash = header.ScopeHash
+	m.Inclusion = header.Inclusion
 	m.Sections[contentSectionShards] = encodeContentShards(shards)
 	return contentSaveFile(gsx, m)
 }
@@ -600,6 +606,7 @@ func contentReshardAndSave(gsx string, whole *contentIndex, header *contentIndex
 		return 0, err
 	}
 	infos := make([]contentShardInfo, 0, len(groups))
+	var df, db int64
 	for _, g := range groups {
 		k := 0
 		built, err := assembleContentIndexStreamed(func() (contentBuildDoc, bool, error) {
@@ -620,6 +627,12 @@ func contentReshardAndSave(gsx string, whole *contentIndex, header *contentIndex
 			return 0, err
 		}
 		infos = append(infos, info)
+		// Dedupe is per shard, so the split recomputes it: restamp the
+		// manifest totals over the new shards rather than the whole.
+		df += built.dedupeFiles
+		db += built.dedupeBytes
 	}
+	header.Inclusion.DedupeFiles = df
+	header.Inclusion.DedupeBytes = db
 	return len(infos), contentSaveManifest(gsx, header, infos)
 }

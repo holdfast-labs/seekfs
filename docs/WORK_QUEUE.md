@@ -12,13 +12,13 @@ refer to `docs/REFERENCE_TOOLS.md`.
 ## Running (2026-10-13)
 
 Merged so far this round: `perf/content-underfill`, `perf/name-fuzzy`,
-`fix/cli-silent-empty`, `content/idle-governor`, `content/spool-peak`, `perf/ranking-signals` (G7, G8, G13).
+`fix/cli-silent-empty`, `content/idle-governor`, `content/spool-peak`, `perf/ranking-signals` (G7, G8, G13), `content/inclusion-policy` (G3, §6z,
+format v10).
 
 | Branch | Worktree | Scope |
 |---|---|---|
 | `test/suite-speed` | suitespeed | `cmd/seekfs` suite under ~5 min; harden `TestHeadlessFrameCost`; gofmt drift |
 | `content/filter-tier` | tier2 | **Owner decision 2026-10-13: fsearch model is the default.** No stored text; trigram postings plus a per-file filter; matches and snippets verified from disk; edited files read directly. Stored text only as a justified opt-in (G1, G4 partial, §6y) |
-| `content/inclusion-policy` | inclusion | Queued item 1: main-checkout-only worktrees, lower caps, lockfile/JSON/minified/cache skips, user skip list, content-hash dedupe (G3, §6z) |
 | `fix/short-term-postings` | shortterm | Queued item 0: lossy short-term postings (underfill) and rank-neighbor false positives; exactness sweep plus differential test |
 
 ## Queued, in order
@@ -89,6 +89,9 @@ Merged so far this round: `perf/content-underfill`, `perf/name-fuzzy`,
 - **Ranking store scope:** `ranking_signals.json` lives next to the service
   state (the LocalSystem service holds one store for all local users). Decide
   whether it should be per-user before shipping on multi-user machines.
+- **Single-line JSON follow-up:** the 1 MiB / 10 MiB caps and JSON skip from
+  `content/inclusion-policy` should cover the 11.4 MB single-line
+  `tokenizer.json`. Verify on the next real-index recall run.
 - **Slow differential test:** `TestContentGlobalLaneScopeDifferential` takes
   300–666 s. `test/suite-speed` tiers it; confirm CI still runs the full tier.
 

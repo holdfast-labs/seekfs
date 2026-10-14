@@ -98,15 +98,22 @@ func contentSectionEagerVerify(tag uint32) bool {
 // singleton entries, prefix-summed block offsets; see content_postings.go),
 // nibble-packs the CXTR front-code lengths (see content_termsdict.go), and
 // drops the unread RawSize/DocLen/ModUnix doc fields from the wire
-// (80 -> 60 byte records). A sidecar whose version does not match is
-// rejected on load, so it can never be attached stale: the service sees no
-// usable base and its PF-3 build path rebuilds it. (05 is the
-// sharded-manifest version, which carries no doc table; manifests are
-// unaffected by the 06/07/08/09 bumps: a manifest names shard files, and
-// each shard carries the doc-table version itself.)
+// (80 -> 60 byte records); the 10 bump adds content-hash dedupe (§6z,
+// see content_dedupe.go: identical files are stored once, with an alias
+// map in the self-contained CXAL section) plus the CXIS inclusion-stats
+// section. Nothing else changes encoding: for a duplicate-free corpus the
+// v10 sections are byte-identical to v9 apart from the version, CXAL is
+// omitted when empty, and CXIS is always written. A sidecar whose version
+// does not match is rejected on load, so it can never be attached stale:
+// the service sees no usable base and its PF-3 build path rebuilds it.
+// (05 is the sharded-manifest version, which carries no doc table;
+// manifests are unaffected by the 06/07/08/09/10 bumps: a manifest names
+// shard files, and each shard carries the doc-table version itself. If
+// content/filter-tier (§6y) also bumps the format, renumber at merge:
+// this change is the version line plus CXAL/CXIS only.)
 var contentIndexMagic = [8]byte{'G', 'O', 'S', 'C', 'X', '0', '0', '4'}
 
-const contentIndexVersion = 9
+const contentIndexVersion = 10
 
 // contentOrigin records what the doc keys are, so a `.gsx` can never be
 // attached to a key space it does not join.
@@ -270,6 +277,13 @@ type contentIndex struct {
 	Sections      map[uint32][]byte
 	// Policy is the build's extraction policy + skip/truncation counts (CXPL).
 	Policy contentBuildPolicy
+	// Inclusion is the per-reason inclusion-policy tally (selection
+	// rejections, truncations, dedupe savings; §6z), persisted in the
+	// CXIS section. Decoded copies like Policy.
+	Inclusion contentInclusionStats
+	// Aliases is the §6z dedupe map (alias DocID -> primary DocID),
+	// persisted in the CXAL section. Decoded copies like Policy.
+	Aliases []contentAliasPair
 	// ScopeHash identifies the resolved scope. Zero means this sidecar predates
 	// scope identity and is not safe for service attachment.
 	ScopeHash [32]byte
@@ -503,6 +517,12 @@ func contentIndexEncode(idx *contentIndex) []byte {
 	if idx.ScopeHash != ([32]byte{}) {
 		idx.Sections[contentSectionScope] = idx.ScopeHash[:]
 	}
+	if sec := encodeContentAliases(idx.Aliases); len(sec) > 0 {
+		idx.Sections[contentSectionAlias] = sec
+	} else {
+		delete(idx.Sections, contentSectionAlias)
+	}
+	idx.Sections[contentSectionInclusion] = encodeContentInclusionStats(idx.Inclusion)
 
 	var body bytes.Buffer
 	headerSize := contentHeaderSize()
@@ -669,6 +689,27 @@ func contentIndexDecode(data []byte) (*contentIndex, error) {
 		}
 	}
 	idx.Docs = docs
+	// v10 sections (self-contained; a missing CXAL is no aliases, a
+	// missing CXIS is zero stats). Aliases validate against the doc
+	// table, so a corrupt map fails the load instead of misresolving.
+	if len(docs) > 0 {
+		if sec, ok := idx.Sections[contentSectionAlias]; ok {
+			pairs, err := decodeContentAliases(sec, len(docs))
+			if err != nil {
+				return nil, err
+			}
+			idx.Aliases = pairs
+		}
+	} else if sec, ok := idx.Sections[contentSectionAlias]; ok && len(sec) > 0 {
+		return nil, errors.New("content alias section without documents")
+	}
+	if sec, ok := idx.Sections[contentSectionInclusion]; ok {
+		stats, err := decodeContentInclusionStats(sec)
+		if err != nil {
+			return nil, err
+		}
+		idx.Inclusion = stats
+	}
 	if _, ok := idx.Sections[contentSectionShards]; (version == contentManifestVersion) != ok || ok && len(docs) != 0 {
 		return nil, errors.New("content index manifest is malformed")
 	}
@@ -836,6 +877,10 @@ func contentCollectPayloads(idx *contentIndex, files map[uint32]string) []conten
 	if idx.Policy != (contentBuildPolicy{}) {
 		sections[contentSectionPolicy] = idx.Policy.encode()
 	}
+	if sec := encodeContentAliases(idx.Aliases); len(sec) > 0 {
+		sections[contentSectionAlias] = sec
+	}
+	sections[contentSectionInclusion] = encodeContentInclusionStats(idx.Inclusion)
 	if idx.ScopeHash != ([32]byte{}) {
 		sections[contentSectionScope] = idx.ScopeHash[:]
 	}

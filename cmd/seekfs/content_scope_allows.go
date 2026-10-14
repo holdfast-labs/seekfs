@@ -119,6 +119,18 @@ type contentScopeResolved struct {
 	// budget joins the scope fingerprint (see contentScopeSelectionVersion).
 	BudgetExplicit bool
 	SystemExcludes bool
+	// WorktreesAll indexes linked git worktrees too; false indexes only
+	// each main checkout (linked roots never join Repos/Roots).
+	WorktreesAll bool
+	// Skip is the normalized content-skip list (paths/globs).
+	Skip []string
+	// DroppedWorktrees are the linked worktrees the main-only policy
+	// filtered out of Repos, reported for estimate/health visibility.
+	DroppedWorktrees []string
+	// InclusionOff disables the §6z inclusion skips for the estimate's
+	// legacy baseline (before vs after in one run). Never set on a
+	// persisted scope: it does not join the fingerprint.
+	InclusionOff bool
 	// Ignore applies git ignore rules inside detected worktrees in place of
 	// the name-based system excludes; IgnoreDigest fingerprints the ignore
 	// files it reads so a sidecar built under other rules is rebuilt.
@@ -249,7 +261,10 @@ func (r *contentScopeResolved) excludePrefixAt(i int) string {
 // resolve computes the effective roots/excludes. repoRoots are the detected git
 // worktree roots (contentDetectGitRepos).
 func (s contentScope) resolve(volume string, repoRoots []string) contentScopeResolved {
-	r := contentScopeResolved{Mode: s.Mode, BudgetBytes: s.BudgetBytes, BudgetExplicit: s.BudgetExplicit, SystemExcludes: s.SystemExcludes}
+	r := contentScopeResolved{Mode: s.Mode, BudgetBytes: s.BudgetBytes, BudgetExplicit: s.BudgetExplicit, SystemExcludes: s.SystemExcludes, WorktreesAll: s.WorktreesAll, Skip: s.Skip}
+	kept, dropped := contentFilterLinkedWorktrees(repoRoots, s.WorktreesAll)
+	r.DroppedWorktrees = dropped
+	repoRoots = kept
 	if s.Exts != nil {
 		r.ExtSet = s.Exts
 	} else {
@@ -332,38 +347,76 @@ func (r contentScopeResolved) rootPrefixAt(i int) string {
 // and its kind ("repo" or "root"). Both the build and the estimate use this, so
 // the extension gate, excludes, and roots are applied identically. In sniff
 // mode (the default) only known-binary extensions are rejected here; anything
-// else is admitted and head-sniffed at build time.
+// else is admitted and head-sniffed at build time. Size-gated rules (large
+// JSON) admit when the size is unknown; pass a real size via allowsSize.
 func (r contentScopeResolved) allows(path string) (unit, kind string, ok bool) {
+	unit, kind, _, ok = r.allowsReason(path, -1)
+	return unit, kind, ok
+}
+
+// allowsSize is allows with the source file size for the size-gated
+// inclusion rules (large JSON). Callers with a stat pass it; callers
+// without one use allows and get the size-agnostic decision.
+func (r contentScopeResolved) allowsSize(path string, size int64) (unit, kind string, ok bool) {
+	unit, kind, _, ok = r.allowsReason(path, size)
+	return unit, kind, ok
+}
+
+// allowsReason is the reason-carrying form of allows: on rejection it names
+// the skip reason ("exclude", "gitignore", "system", a contentSkip* code,
+// "binary", "ext" or "root"). Git rules come first, then the operator's
+// content-skip list, then the built-in inclusion skips — so a reason names
+// the first rule that fired, in policy order.
+func (r contentScopeResolved) allowsReason(path string, size int64) (unit, kind, reason string, ok bool) {
 	if r.Mode == contentScopeOff {
-		return "", "", false
+		return "", "", "exclude", false
 	}
 	p := contentNormPath(path)
 	if p == "" {
-		return "", "", false
+		return "", "", "exclude", false
 	}
 	ext := contentPathExtension(p)
 	if r.SniffText {
 		if contentBinaryRejected(ext) {
-			return "", "", false
+			return "", "", "binary", false
 		}
 	} else if _, ok := r.ExtSet[ext]; !ok {
-		return "", "", false
+		return "", "", "ext", false
 	}
 	if r.matchExcluded(p) {
-		return "", "", false
+		return "", "", "exclude", false
 	}
-	if _, inRepo := r.Ignore.repoFor(p); inRepo {
+	_, inRepo := r.Ignore.repoFor(p)
+	if inRepo {
 		// Inside a worktree git decides: tracked "build" or "vendor"
 		// directories are source, while ignored output is skipped. The
 		// original-case path drives pattern matching (case-sensitive,
 		// like git and ripgrep); p is only the normalized lookup key.
 		if r.Ignore.ignored(path, false) {
-			return "", "", false
+			return "", "", "gitignore", false
 		}
-	} else if r.SystemExcludes && contentPathHasExcludedSegment(p, contentSystemExcludeSegments) {
-		return "", "", false
 	}
-	return r.matchRoot(p)
+	base := p
+	if i := strings.LastIndexAny(p, `/\`); i >= 0 {
+		base = p[i+1:]
+	}
+	// The operator list and the built-in inclusion skips run before the
+	// legacy system segments, so a specific reason (user_skip, lockfile,
+	// build_output, cache, ...) wins over the generic "system" bucket.
+	// The estimate's legacy baseline skips this block entirely.
+	if !r.InclusionOff {
+		if reason, skip := contentInclusionSkip(p, base, ext, size, inRepo, r.SystemExcludes, r.Skip); skip {
+			return "", "", reason, false
+		}
+	}
+	if !inRepo && r.SystemExcludes && contentPathHasExcludedSegment(p, contentSystemExcludeSegments) {
+		return "", "", "system", false
+	}
+	unit, kind, ok = r.matchRoot(p)
+	if !ok {
+		return "", "", "root", false
+	}
+	return unit, kind, "", true
 }
 
 // contentKnownFolders returns the user's Documents/Desktop/Downloads when the

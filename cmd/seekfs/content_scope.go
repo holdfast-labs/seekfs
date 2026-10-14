@@ -55,6 +55,13 @@ type contentScopeConfig struct {
 	Git            *bool
 	SystemExcludes *bool
 	BudgetBytes    int64
+	// Worktrees selects linked-worktree handling: "" (default) or "main"
+	// indexes only the main checkout; "all" indexes linked worktrees too.
+	Worktrees string
+	// Skip is the operator's content-skip list: normalized paths (a path
+	// excludes itself and everything below it) or globs where * spans a
+	// segment and ** spans separators.
+	Skip []string
 }
 
 // contentScope is the resolved scope for one volume.
@@ -66,6 +73,11 @@ type contentScope struct {
 	IncludeGit     bool
 	SystemExcludes bool
 	BudgetBytes    int64
+	// WorktreesAll indexes linked git worktrees too; false (the default)
+	// indexes only each main checkout.
+	WorktreesAll bool
+	// Skip is the normalized content-skip list (paths/globs).
+	Skip []string
 	// BudgetExplicit is true when the budget came from config or environment
 	// (vs the free-space-derived default). Only an explicit budget joins the
 	// scope fingerprint.
@@ -168,6 +180,12 @@ func contentScopeForVolume(cfg appConfig, volume string) contentScope {
 		if sc.SystemExcludes != nil {
 			s.SystemExcludes = *sc.SystemExcludes
 		}
+		if sc.Worktrees != "" {
+			s.WorktreesAll = strings.EqualFold(strings.TrimSpace(sc.Worktrees), contentWorktreesAll)
+		}
+		if sc.Skip != nil {
+			s.Skip = contentNormalizeSkipPatterns(sc.Skip)
+		}
 		if sc.BudgetBytes > 0 {
 			s.BudgetBytes = sc.BudgetBytes
 			budgetSet = true
@@ -232,6 +250,12 @@ func applyContentScopeEnv(s *contentScope) bool {
 	}
 	if v := strings.TrimSpace(os.Getenv("SEEKFS_CONTENT_EXCLUDE")); v != "" {
 		s.Exclude = append(s.Exclude, normalizeContentPaths(filepath.SplitList(v))...)
+	}
+	if v := strings.TrimSpace(os.Getenv("SEEKFS_CONTENT_WORKTREES")); v != "" {
+		s.WorktreesAll = strings.EqualFold(v, contentWorktreesAll)
+	}
+	if v := strings.TrimSpace(os.Getenv("SEEKFS_CONTENT_SKIP")); v != "" {
+		s.Skip = contentNormalizeSkipPatterns(append(append([]string(nil), s.Skip...), filepath.SplitList(v)...))
 	}
 	if v := strings.TrimSpace(os.Getenv("SEEKFS_CONTENT_BUDGET_BYTES")); v != "" {
 		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 {
@@ -303,5 +327,9 @@ func applyContentScopeKey(sc *contentScopeConfig, key, value string) {
 		if _, err := fmt.Sscanf(value, "%d", &n); err == nil {
 			sc.BudgetBytes = n
 		}
+	case "worktrees":
+		sc.Worktrees = parseTOMLString(value)
+	case "skip", "content_skip", "content-skip":
+		sc.Skip = append(sc.Skip, parseTOMLStringArray(value)...)
 	}
 }

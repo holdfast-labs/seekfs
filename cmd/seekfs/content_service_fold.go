@@ -163,7 +163,14 @@ func (s *goSearchService) runContentFold(vol *serviceVolumeIndex) {
 	// was. A walk fold keeps the walk origin and restamps the wall-clock
 	// watermark (there is no journal checkpoint to advance); a USN fold
 	// advances the observed-USN checkpoint as before.
-	header := &contentIndex{Origin: base.Origin, JournalID: base.JournalID, CheckpointUSN: checkpoint, Policy: base.Policy, ScopeHash: base.ScopeHash}
+	// The folded base keeps the prior inclusion stats plus the drain-time
+	// declines since the last fold/publish (taken and reset here on the
+	// drain goroutine, the only writer). Dedupe totals are restamped
+	// after assembly below (the merge recomputes them).
+	foldInclusion := base.Inclusion
+	foldInclusion.merge(vol.contentCoord.inclusion)
+	vol.contentCoord.inclusion = contentInclusionStats{}
+	header := &contentIndex{Origin: base.Origin, JournalID: base.JournalID, CheckpointUSN: checkpoint, Policy: base.Policy, ScopeHash: base.ScopeHash, Inclusion: foldInclusion}
 	if base.Origin == contentOriginWalk {
 		if now := uint64(time.Now().UnixNano()); now > header.CheckpointUSN {
 			header.CheckpointUSN = now
@@ -225,6 +232,11 @@ func (s *goSearchService) runContentFold(vol *serviceVolumeIndex) {
 			return
 		}
 		rewritten = len(built.docs)
+		// Stamp the shard save, not the header: foldShard already
+		// snapshotted header into shard above. (The reshard path below
+		// restamps the manifest itself over its new shards.)
+		shard.Inclusion.DedupeFiles = built.dedupeFiles
+		shard.Inclusion.DedupeBytes = built.dedupeBytes
 		if built.textSize > uint64(2*contentShardTargetBytes) {
 			// Grown well past one shard through folds: publish the single
 			// file, reload it through the mmap loader, and split it into
@@ -252,6 +264,7 @@ func (s *goSearchService) runContentFold(vol *serviceVolumeIndex) {
 		// named unchanged by the new manifest.
 		plan := planContentShardedFold(reader, resolver, snap)
 		infos := make([]contentShardInfo, len(base.shards))
+		var foldBuilt []*contentStreamedBuild
 		for i, sh := range base.shards {
 			infos[i] = sh.info
 			if !plan.dirty[i] || saveErr != nil {
@@ -265,9 +278,28 @@ func (s *goSearchService) runContentFold(vol *serviceVolumeIndex) {
 				return
 			}
 			rewritten += len(built.docs)
+			foldBuilt = append(foldBuilt, built)
 			infos[i], saveErr = contentSaveShard(contentShardDir(gsx), shard, contentBuildFiles(built), sh.info.Prefixes)
 		}
 		if saveErr == nil {
+			// Restamp the dedupe totals over the new corpus: rewritten
+			// shards report their fresh assembler counts, retained
+			// shards keep their loaded ones.
+			var df, db int64
+			for i, sh := range base.shards {
+				if plan.dirty[i] {
+					continue
+				}
+				f, b := contentDedupeTotalsForIndex(sh.idx)
+				df += f
+				db += b
+			}
+			for _, b := range foldBuilt {
+				df += b.dedupeFiles
+				db += b.dedupeBytes
+			}
+			header.Inclusion.DedupeFiles = df
+			header.Inclusion.DedupeBytes = db
 			if !s.contentBuildCurrent(vol, gen, base.JournalID) {
 				vol.contentCoord.foldFailed(contentFoldRetryBackoff)
 				contentSweepShards(gsx)

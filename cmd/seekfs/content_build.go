@@ -39,21 +39,34 @@ type contentBuildOptions struct {
 	// resolved auto scope (roots, excludes, git worktrees, extension registry).
 	// The caller resolves it (contentScope.resolve) after detecting repos.
 	Scope *contentScopeResolved
+	// ScanTally, when non-nil, receives per-reason selection rejections
+	// (files + source bytes) from the scoped scan for the CXIS stats.
+	ScanTally *contentScanTally
+	// WorktreesAll indexes nested linked git worktrees in walk builds;
+	// false (default) indexes only the main checkout, like the service
+	// scope's worktrees=main.
+	WorktreesAll bool
 }
 
 func defaultContentBuildOptions() contentBuildOptions {
+	// MaxRaw/MaxText 0 means the inclusion-policy defaults (per-file
+	// caps: 1 MiB text outside git repos, 10 MiB inside). An explicit
+	// -max-raw/-max-text overrides both uniformly.
 	return contentBuildOptions{
 		MaxFiles: 2_000_000,
-		MaxRaw:   contentExtractMaxRawBytes,
-		MaxText:  contentExtractMaxTextBytes,
 		Encoding: "auto",
 	}
 }
 
 // extractSettings resolves the options into the per-build extraction policy
 // (encoding + normalized, clamped caps) that extractors read from the context.
+// Zero caps stay zero here (policy defaults, resolved per file at
+// extraction); contentWithExtractSettings normalizes them for extractors
+// that read the context directly.
 func (o contentBuildOptions) extractSettings() contentExtractSettings {
 	s := contentDefaultExtractSettings()
+	s.maxRaw, s.maxText = 0, 0
+	s.capsExplicit = o.MaxRaw > 0 || o.MaxText > 0
 	if o.Encoding != "" {
 		if m, err := parseContentEncoding(o.Encoding); err == nil {
 			s.encoding = m
@@ -65,14 +78,22 @@ func (o contentBuildOptions) extractSettings() contentExtractSettings {
 	if o.MaxText > 0 {
 		s.maxText = o.MaxText
 	}
-	s.maxRaw, s.maxText = contentNormalizeExtractCaps(s.maxRaw, s.maxText)
+	if s.capsExplicit {
+		s.maxRaw, s.maxText = contentNormalizeExtractCaps(s.maxRaw, s.maxText)
+	}
 	return s
 }
 
 // allows reports whether a path is in scope for a build.
 func (o contentBuildOptions) allows(path string) bool {
+	return o.allowsSize(path, -1)
+}
+
+// allowsSize is allows with the source size for the size-gated inclusion
+// rules (large JSON). Walk builders pass the directory entry's size.
+func (o contentBuildOptions) allowsSize(path string, size int64) bool {
 	if o.Scope != nil {
-		_, _, ok := o.Scope.allows(path)
+		_, _, ok := o.Scope.allowsSize(path, size)
 		return ok
 	}
 	if len(o.Exts) > 0 {
@@ -184,6 +205,7 @@ func buildContentIndexFromDir(ctx context.Context, root string, opts contentBuil
 	var spooled []contentWalkDoc
 	var scanned int
 	var skipped, truncated, declined, binary int64
+	var inclusion contentInclusionStats
 	// Inside a git worktree, git's ignore rules decide what is skipped; the
 	// name-based skips below only apply outside any worktree.
 	absRootOrig, aerr := filepath.Abs(root)
@@ -248,6 +270,13 @@ func buildContentIndexFromDir(ctx context.Context, root string, opts contentBuil
 			if path != root {
 				if _, serr := os.Lstat(filepath.Join(path, ".git")); serr == nil {
 					ignore.addRepo(abs)
+					// A nested linked worktree holds a second copy of
+					// the main checkout: skip it unless worktrees=all.
+					// The root itself is always indexed (explicitly
+					// requested), even when it is a linked checkout.
+					if !opts.WorktreesAll && contentLinkedWorktreeDir(path) {
+						return filepath.SkipDir
+					}
 				}
 			}
 			if _, inRepo := ignore.repoFor(abs); inRepo {
@@ -270,17 +299,32 @@ func buildContentIndexFromDir(ctx context.Context, root string, opts contentBuil
 		if ignore.ignored(absOfOrig(path), false) {
 			return nil
 		}
-		if !opts.allows(path) {
+		// d.Info carries the size without an extra stat on Windows (the
+		// find data already holds it); unknown sizes stay admitted for
+		// the size-gated rules and meet them at extraction.
+		var entrySize int64 = -1
+		if info, ierr := d.Info(); ierr == nil && info != nil {
+			entrySize = info.Size()
+		}
+		if !opts.allowsSize(path, entrySize) {
 			return nil
 		}
+		_, inRepo := ignore.repoFor(absOf(path))
+		fctx, fileRaw, _ := contentFileExtractContext(ctx, inRepo)
 		scanned++
 		if opts.MaxFiles > 0 && scanned > opts.MaxFiles {
 			return filepath.SkipAll
 		}
 		// Single-read open without recalling cloud placeholders (the §4
 		// invariant); the extractor reuses the slurped bytes in place.
-		s, serr := contentSlurpNoRecall(path, settings.maxRaw)
+		s, serr := contentSlurpNoRecall(path, fileRaw)
 		if serr != nil {
+			return nil
+		}
+		if reason, skip := contentExtractionSkip(path, s.size, fileRaw); skip {
+			inclusion.add(reason, s.size)
+			skipped++
+			s.close()
 			return nil
 		}
 		head := s.headBytes()
@@ -298,7 +342,7 @@ func buildContentIndexFromDir(ctx context.Context, root string, opts contentBuil
 		// Truncated prefix. Both are tallied into the policy section. The call
 		// is panic-isolated and deadline-bounded (contentExtractSafely), so one
 		// hostile file cannot crash or wedge the CLI build.
-		res, eerr := contentExtractSafely(ctx, e, s.reader(), s.size)
+		res, eerr := contentExtractSafely(fctx, e, s.reader(), s.size)
 		size, modUnix, modNano := s.size, s.modUnix, s.modNano
 		s.close()
 		if eerr != nil {
@@ -311,12 +355,24 @@ func buildContentIndexFromDir(ctx context.Context, root string, opts contentBuil
 		}
 		if res.Skipped {
 			skipped++
+			if contentInclusionReason(res.Reason) {
+				inclusion.add(res.Reason, size)
+			}
+			return nil
+		}
+		if res.Class == contentClassText && contentLooksMinified(res.Text) {
+			inclusion.add(contentSkipMinified, size)
+			skipped++
 			return nil
 		}
 		// Count a bounded result even when it produced no text (e.g. a depth-cap
 		// hit), so the policy counters reflect every file the extractor handled.
 		if res.Truncated {
 			truncated++
+			inclusion.Truncated++
+			if cut := size - int64(len(res.Text)); cut > 0 {
+				inclusion.TruncatedBytes += cut
+			}
 		}
 		if len(res.Text) == 0 {
 			declined++
@@ -361,7 +417,14 @@ func buildContentIndexFromDir(ctx context.Context, root string, opts contentBuil
 	if err != nil {
 		return nil, err
 	}
-	idx.Policy = contentBuildPolicy{MaxRaw: settings.maxRaw, MaxText: settings.maxText, Skipped: skipped, Truncated: truncated, Binary: binary}
+	polRaw, polText := contentInclusionCapsForFile(true, 0, 0)
+	if settings.capsExplicit {
+		polRaw, polText = settings.maxRaw, settings.maxText
+	}
+	idx.Policy = contentBuildPolicy{MaxRaw: polRaw, MaxText: polText, Skipped: skipped, Truncated: truncated, Binary: binary}
+	// The assembler already stamped the dedupe totals; merge the
+	// selection/extraction tallies around them.
+	idx.Inclusion.merge(inclusion)
 	idx.Scanned = int64(scanned)
 	idx.Declined = declined
 	return idx, nil
@@ -421,6 +484,9 @@ func assembleContentIndexStream(source contentBuildSource, tmpDir string) (*cont
 	idx := newContentIndex()
 	idx.Origin = contentOriginWalk
 	idx.Docs = built.docs
+	idx.Aliases = built.aliasPairs
+	idx.Inclusion.DedupeFiles = built.dedupeFiles
+	idx.Inclusion.DedupeBytes = built.dedupeBytes
 	if built.termPath != "" {
 		terms, err := os.ReadFile(built.termPath)
 		if err != nil {
@@ -482,6 +548,12 @@ type contentStreamedBuild struct {
 	// dictPath holds the exact CXTD section bytes (the shard's trained
 	// text dictionary), or "" when the shard encodes plain.
 	dictPath string
+	// aliasPairs holds the §6z dedupe map (alias DocID -> primary
+	// DocID); dedupeFiles/Bytes tally the shared documents and the
+	// extracted-text bytes storing them once saved.
+	aliasPairs  []contentAliasPair
+	dedupeFiles int64
+	dedupeBytes int64
 }
 
 // contentAssembleBatchDocs and contentAssembleBatchBytes bound the streaming
@@ -573,6 +645,13 @@ func assembleContentIndexStreamed(source contentBuildSource, tmpDir string) (*co
 	built := &contentStreamedBuild{}
 	var docs []contentDoc
 	var paths []string
+	// Content-hash dedupe (§6z): stored-text length + sha256 (already
+	// computed per doc as the doc table's ContentHash) maps to the
+	// primary's text location. Later identical documents become aliases:
+	// full doc-table rows sharing the primary's bytes with no postings.
+	dedupeSeen := make(map[contentDedupeKey]contentDedupeSeen)
+	var aliasPairs []contentAliasPair
+	var dedupeFiles, dedupeBytes int64
 	// Dictionary sampling (v8): the first contentDictSampleBytes of stored
 	// text train the shard's dictionary, then later blocks encode against
 	// it. Sampling rides the normal emit path — every document is still
@@ -684,6 +763,35 @@ func assembleContentIndexStreamed(source contentBuildSource, tmpDir string) (*co
 				t := &toks[i]
 				docID := uint32(len(docs))
 				paths = append(paths, d.path)
+				// Identical content is stored once: the alias keeps its
+				// own identity (DocID, FRN, path, fingerprint, hash) and
+				// addresses the primary's bytes, contributing no text or
+				// postings of its own. Empty stored text never aliases.
+				if len(t.stored) > 0 {
+					key := contentDedupeKey{length: len(t.stored), hash: t.hash}
+					if prim, dup := dedupeSeen[key]; dup {
+						docs = append(docs, contentDoc{
+							DocID:            docID,
+							FRN:              d.frn,
+							ContentType:      d.class,
+							ExtractorVersion: d.version,
+							DocLen:           t.docLen,
+							RawSize:          int64(len(t.stored)),
+							ModUnix:          d.modUnix,
+							ContentHash:      t.hash,
+							TextOff:          prim.textOff,
+							TextLen:          prim.textLen,
+							FileSize:         d.fileSize,
+							FileModNano:      d.fileModNano,
+						})
+						aliasPairs = append(aliasPairs, contentAliasPair{Alias: docID, Primary: prim.docID})
+						dedupeFiles++
+						dedupeBytes += int64(len(t.stored))
+						contentAssembleStreamHook(int(docID))
+						continue
+					}
+					dedupeSeen[key] = contentDedupeSeen{docID: docID, textOff: textLogical, textLen: uint32(len(t.stored))}
+				}
 				// Dictionary sampling rides along: accumulate stored text
 				// until the sample cap or the exhausted source, then train
 				// once and keep emitting. Emission itself never pauses, so
@@ -827,6 +935,9 @@ func assembleContentIndexStreamed(source contentBuildSource, tmpDir string) (*co
 	}
 	built.docs = docs
 	built.paths = paths
+	built.aliasPairs = aliasPairs
+	built.dedupeFiles = dedupeFiles
+	built.dedupeBytes = dedupeBytes
 	built.textPath = textPath
 	// textSize stays the logical (decompressed) stream length: shard
 	// planning and the reshard threshold budget memory and work by corpus
@@ -894,8 +1005,28 @@ func buildContentIndexForIndex(ctx context.Context, idx *Index, opts contentBuil
 	defer spoolWriter.Close()
 	var spooled []contentWalkDoc
 	var skipped, truncated, binary int64
+	var inclusion contentInclusionStats
 	var scopeBytes int64
 	count := idx.compactRecordCount()
+	// Without a resolved scope, repo membership for the per-file caps
+	// comes from the index's own git markers.
+	var detectedRepos []string
+	if opts.Scope == nil {
+		detectedRepos = contentDetectGitRepos(idx)
+	}
+	inRepoOf := func(path string) bool {
+		if opts.Scope != nil {
+			_, ok := opts.Scope.Ignore.repoFor(contentNormPath(path))
+			return ok
+		}
+		p := contentNormPath(path)
+		for _, r := range detectedRepos {
+			if p == r || len(p) > len(r) && (p[len(r)] == '\\' || p[len(r)] == '/') && p[:len(r)] == r {
+				return true
+			}
+		}
+		return false
+	}
 	var items []contentBuildItem
 	for id := 0; id < count; id++ {
 		rec := idx.compactRecord(id)
@@ -903,10 +1034,19 @@ func buildContentIndexForIndex(ctx context.Context, idx *Index, opts contentBuil
 			continue
 		}
 		path := idx.reconstructCompactPathCached(id, cache)
-		if path == "" || !opts.allows(path) {
+		size := rec.Size
+		if size < 0 {
+			size = 0
+		}
+		if path == "" || !opts.allowsSize(path, size) {
+			if opts.Scope != nil && path != "" {
+				if _, _, reason, ok := opts.Scope.allowsReason(path, size); !ok {
+					inclusion.add(reason, size)
+				}
+			}
 			continue
 		}
-		items = append(items, contentBuildItem{frn: rec.FRN, path: path})
+		items = append(items, contentBuildItem{frn: rec.FRN, path: path, inRepo: inRepoOf(path)})
 	}
 	next, stop := contentPrefetchExtract(ctx, items, contentBuildWorkers, contentBuildDocSafe)
 	defer stop()
@@ -921,6 +1061,13 @@ func buildContentIndexForIndex(ctx context.Context, idx *Index, opts contentBuil
 		doc, res, ok := got.doc, got.res, got.ok
 		if res.Truncated {
 			truncated++
+			inclusion.Truncated++
+			if cut := doc.fileSize - int64(len(doc.text)); cut > 0 {
+				inclusion.TruncatedBytes += cut
+			}
+		}
+		if !ok && res.Skipped && contentInclusionReason(res.Reason) {
+			inclusion.add(res.Reason, res.Size)
 		}
 		if ok {
 			// Only an explicit budget caps the offline build: the default
@@ -974,7 +1121,12 @@ func buildContentIndexForIndex(ctx context.Context, idx *Index, opts contentBuil
 		return nil, err
 	}
 	cidx.Origin = contentOriginUSN
-	cidx.Policy = contentBuildPolicy{MaxRaw: settings.maxRaw, MaxText: settings.maxText, Skipped: skipped, Truncated: truncated, Binary: binary}
+	polRaw, polText := contentInclusionCapsForFile(true, 0, 0)
+	if settings.capsExplicit {
+		polRaw, polText = settings.maxRaw, settings.maxText
+	}
+	cidx.Policy = contentBuildPolicy{MaxRaw: polRaw, MaxText: polText, Skipped: skipped, Truncated: truncated, Binary: binary}
+	cidx.Inclusion.merge(inclusion)
 	// Stamp the content USN checkpoint from the record index metadata: the
 	// base is complete as of the .gsi checkpoint, so restart catch-up resumes
 	// from here rather than re-reading the whole journal (WP0/PB3).

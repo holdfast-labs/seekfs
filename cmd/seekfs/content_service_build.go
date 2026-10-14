@@ -287,6 +287,10 @@ type contentBuildItem struct {
 	frn      uint64
 	path     string
 	priority int
+	// inRepo reports whether the path is inside a git worktree: the
+	// inclusion-policy size caps are ~10 MiB of text inside repos and
+	// ~1 MiB outside. Comparisons ignore it.
+	inRepo bool
 }
 
 func contentBuildItemLess(a, b contentBuildItem) bool {
@@ -482,6 +486,7 @@ func (s *goSearchService) snapshotContentBuildItems(vol *serviceVolumeIndex, opt
 		idx:      idx,
 		isWalk:   isWalk,
 		maxFiles: opts.MaxFiles,
+		tally:    opts.ScanTally,
 		prog: func(scanned, total int) {
 			vol.content.setBuildProgress(scanned, total)
 		},
@@ -538,7 +543,11 @@ func (s *goSearchService) snapshotContentBuildItemsLegacy(vol *serviceVolumeInde
 			// (bounded prefix for text, visible Skip for containers), so an
 			// over-cap file is never silently excluded here.
 			path := idx.reconstructCompactPathCached(id, cache)
-			if path == "" || !opts.allows(path) {
+			size := rec.Size
+			if size < 0 {
+				size = 0
+			}
+			if path == "" || !opts.allowsSize(path, size) {
 				continue
 			}
 			frn := rec.FRN
@@ -551,6 +560,9 @@ func (s *goSearchService) snapshotContentBuildItemsLegacy(vol *serviceVolumeInde
 				}
 			}
 			item := contentBuildItem{frn: frn, path: path}
+			if opts.Scope != nil {
+				_, item.inRepo = opts.Scope.Ignore.repoFor(contentNormPath(path))
+			}
 			if opts.MaxFiles <= 0 || len(top) < opts.MaxFiles {
 				top = append(top, item)
 				continue
@@ -581,6 +593,12 @@ func (s *goSearchService) snapshotContentBuildItemsLegacy(vol *serviceVolumeInde
 // returns ok=false for missing/oversized/binary/skipped files. The file is
 // opened with OPEN_NO_RECALL and read exactly once (contentSlurpNoRecall);
 // the extractor reuses the slurped bytes in place.
+//
+// The inclusion policy is enforced here as well as at selection: the
+// per-file size caps (1 MiB text outside repos, 10 MiB inside, unless the
+// operator overrode them), the large-JSON skip for size-blind callers, and
+// the minified-content heuristic. Policy skips carry canonical reason
+// codes (contentSkip* / contentSkipSizeCap) so builds tally per reason.
 func contentBuildDocSafe(ctx context.Context, item contentBuildItem) (doc contentBuildDoc, res contentExtractResult, ok bool) {
 	defer func() {
 		if recover() != nil {
@@ -589,26 +607,49 @@ func contentBuildDocSafe(ctx context.Context, item contentBuildItem) (doc conten
 			ok = false
 		}
 	}()
-	settings := contentExtractSettingsFromContext(ctx)
-	s, err := contentSlurpNoRecall(item.path, settings.maxRaw)
+	fctx, fileRaw, _ := contentFileExtractContext(ctx, item.inRepo)
+	s, err := contentSlurpNoRecall(item.path, fileRaw)
 	if err != nil {
 		return contentBuildDoc{}, contentExtractResult{}, false
 	}
 	defer s.close()
+	if reason, skip := contentExtractionSkip(item.path, s.size, fileRaw); skip {
+		return contentBuildDoc{}, contentExtractResult{Skipped: true, Reason: reason, Size: s.size}, false
+	}
 	e := contentExtractorForPath(item.path, s.headBytes())
 	if e == nil {
 		// No extractor claimed the head: binary (NUL in the sniff window),
 		// counted apart from skipped/declined.
-		return contentBuildDoc{}, contentExtractResult{Binary: true, Reason: "binary"}, false
+		return contentBuildDoc{}, contentExtractResult{Binary: true, Reason: "binary", Size: s.size}, false
 	}
 	// Bound one document's extraction so a hang cannot stall the serial build;
 	// contentExtractSafely nests the deadline inside the build's stop/cancel
 	// context and isolates a parser panic.
-	res, err = contentExtractSafely(ctx, e, s.reader(), s.size)
+	res, err = contentExtractSafely(fctx, e, s.reader(), s.size)
 	if err != nil || res.Skipped || len(res.Text) == 0 {
+		res.Size = s.size
 		return contentBuildDoc{}, res, false
 	}
+	if res.Class == contentClassText && contentLooksMinified(res.Text) {
+		return contentBuildDoc{}, contentExtractResult{Skipped: true, Reason: contentSkipMinified, Size: s.size}, false
+	}
 	return contentBuildDoc{path: item.path, frn: item.frn, text: res.Text, modUnix: s.modUnix, class: res.Class, version: e.Version(), fileSize: s.size, fileModNano: s.modNano}, res, true
+}
+
+// contentExtractionSkip enforces the size-gated inclusion skips at
+// extraction time, for callers whose selection did not know the size (the
+// drain's size-blind allows). A large JSON blob is skipped outright; a
+// non-text container over the file's raw cap is skipped (text over the cap
+// truncates to a bounded prefix instead, handled by the extractor).
+func contentExtractionSkip(path string, size, fileRaw int64) (string, bool) {
+	ext := contentPathExtension(path)
+	if contentLargeJSONSkip(ext, size) {
+		return contentSkipLargeJSON, true
+	}
+	if size > fileRaw && contentRegistryClaimsExt(ext) {
+		return contentSkipSizeCap, true
+	}
+	return "", false
 }
 
 // contentBuildCurrent reports whether a build may still publish: the per-volume
@@ -716,6 +757,9 @@ func (s *goSearchService) runContentBuild(vol *serviceVolumeIndex, reuseSidecar 
 		return
 	}
 	opts.Scope = &resolved
+	// Collect per-reason selection rejections for the CXIS stats.
+	var scanTally contentScanTally
+	opts.ScanTally = &scanTally
 
 	// Enter indexing for the metadata scan itself: on a large volume the
 	// scan runs minutes, and reporting "unavailable" with no progress looks
@@ -819,6 +863,9 @@ func (s *goSearchService) runContentBuild(vol *serviceVolumeIndex, reuseSidecar 
 	total := len(items)
 	done := 0
 	var used, skipped, truncated, binary int64
+	var inclusion contentInclusionStats
+	scanTally.mergeInto(&inclusion)
+	inclusion.WorktreesSkipped = int64(len(resolved.DroppedWorktrees))
 	var sinceDiskCheck int64
 	// overBudget latches once the scope budget bites; see the tally below.
 	overBudget := false
@@ -868,12 +915,19 @@ func (s *goSearchService) runContentBuild(vol *serviceVolumeIndex, reuseSidecar 
 		doc, res, ok := got.doc, got.res, got.ok
 		if ok && res.Truncated {
 			truncated++
+			inclusion.Truncated++
+			if cut := doc.fileSize - int64(len(doc.text)); cut > 0 {
+				inclusion.TruncatedBytes += cut
+			}
 		}
 		if !ok {
 			if res.Binary {
 				binary++
 			} else if res.Skipped {
 				skipped++
+				if contentInclusionReason(res.Reason) {
+					inclusion.add(res.Reason, res.Size)
+				}
 			}
 		}
 		if done%contentBuildBatchSize == 0 {
@@ -1008,11 +1062,18 @@ func (s *goSearchService) runContentBuild(vol *serviceVolumeIndex, reuseSidecar 
 	if scopeDropped > 0 && !explicitBudget {
 		reserveBytes = int64(contentScopeReserveFor(tmpDir))
 	}
+	// Name the recorded caps: the explicit operator values, or the
+	// in-repo inclusion defaults (outside-repo files use 2/1 MiB).
+	polRaw, polText := contentInclusionCapsForFile(true, 0, 0)
+	if settings.capsExplicit {
+		polRaw, polText = settings.maxRaw, settings.maxText
+	}
 	header := &contentIndex{
 		Origin:        contentOriginUSN,
 		JournalID:     journalID,
 		CheckpointUSN: uint64(checkpoint),
-		Policy:        contentBuildPolicy{MaxRaw: settings.maxRaw, MaxText: settings.maxText, Skipped: skipped, Truncated: truncated, ScopeDropped: scopeDropped, ScopeDroppedBytes: scopeDroppedBytes, BudgetBytes: budgetBytes, Binary: binary, ReserveBytes: reserveBytes},
+		Policy:        contentBuildPolicy{MaxRaw: polRaw, MaxText: polText, Skipped: skipped, Truncated: truncated, ScopeDropped: scopeDropped, ScopeDroppedBytes: scopeDroppedBytes, BudgetBytes: budgetBytes, Binary: binary, ReserveBytes: reserveBytes},
+		Inclusion:     inclusion,
 	}
 	if isWalkBuild {
 		// Walk sidecars join on the stable path hash with no journal: the
@@ -1057,6 +1118,11 @@ func (s *goSearchService) runContentBuild(vol *serviceVolumeIndex, reuseSidecar 
 		shard.Sections = map[uint32][]byte{contentSectionPaths: encodeContentPaths(built.paths)}
 		return built, shard, shardTmp, nil
 	}
+	// Sharded saves accumulate the per-shard dedupe totals for the
+	// manifest's CXIS section (single-file saves stamp them on the
+	// shard directly below).
+	var dedupeMu sync.Mutex
+	var totalDedupeFiles, totalDedupeBytes int64
 	saveShard := func(dir string, rf *os.File, order []int, prefixes []string) (contentShardInfo, error) {
 		built, shard, shardTmp, err := assemble(rf, order)
 		if shardTmp != "" {
@@ -1068,6 +1134,10 @@ func (s *goSearchService) runContentBuild(vol *serviceVolumeIndex, reuseSidecar 
 		if err := contentCheckDiskReserve(dir); err != nil {
 			return contentShardInfo{}, err
 		}
+		dedupeMu.Lock()
+		totalDedupeFiles += built.dedupeFiles
+		totalDedupeBytes += built.dedupeBytes
+		dedupeMu.Unlock()
 		return contentSaveShard(dir, shard, contentBuildFiles(built), prefixes)
 	}
 	// save assembles and writes the sidecar: one file for a corpus within a
@@ -1090,6 +1160,8 @@ func (s *goSearchService) runContentBuild(vol *serviceVolumeIndex, reuseSidecar 
 			if err := contentCheckDiskReserve(gsx); err != nil {
 				return err
 			}
+			shard.Inclusion.DedupeFiles = built.dedupeFiles
+			shard.Inclusion.DedupeBytes = built.dedupeBytes
 			saveErr := contentSaveAssembled(gsx, shard, contentBuildFiles(built))
 			// The save copies the section files into the shard; drop the
 			// scratch at once instead of holding a second copy of the output
@@ -1218,6 +1290,8 @@ func (s *goSearchService) runContentBuild(vol *serviceVolumeIndex, reuseSidecar 
 		if !s.contentBuildCurrent(vol, gen, journalID) {
 			return errContentBuildStale
 		}
+		header.Inclusion.DedupeFiles = totalDedupeFiles
+		header.Inclusion.DedupeBytes = totalDedupeBytes
 		serviceLog("content build volume=%s shards=%d", vol.volume, len(infos))
 		return contentSaveManifest(gsx, header, infos)
 	}

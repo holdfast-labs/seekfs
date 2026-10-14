@@ -188,8 +188,10 @@ func TestContentBuildDecodesLegacyEncoding(t *testing.T) {
 	if len(hits) != 1 || hits[0].Path != "latin.txt" {
 		t.Fatalf("accented term not findable: %v", contentPathsOf(hits))
 	}
-	if idx.Policy.MaxRaw != contentExtractMaxRawBytes || idx.Policy.MaxText != contentExtractMaxTextBytes {
-		t.Fatalf("default policy not recorded: %+v", idx.Policy)
+	// The recorded defaults are the in-repo inclusion caps (outside-repo
+	// files use 2/1 MiB); explicit -max-raw/-max-text overrides both.
+	if wantRaw, wantText := contentInclusionCapsForFile(true, 0, 0); idx.Policy.MaxRaw != wantRaw || idx.Policy.MaxText != wantText {
+		t.Fatalf("default policy not recorded: %+v; want %d/%d", idx.Policy, wantRaw, wantText)
 	}
 }
 
