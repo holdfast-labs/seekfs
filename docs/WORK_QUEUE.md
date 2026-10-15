@@ -103,8 +103,12 @@ GOMAXPROCS=2, peak disk 0.56x extracted. Limit-20 warm/first: rare literal
   by the build's transient peak, extracted text x1.5. Peak was 0.56x on
   Chromium. Build postings without spooling all text first, so the reserve
   admits far more of the drive.
-- **Build speed:** 44 min for 2.6 GB on Chromium at GOMAXPROCS=2. Profile
-  extraction vs tokenize vs assembly.
+- **Build speed: profiled 2026-10-15** (`perf/build-profile` NOTES.md, 799edc8). Cold
+  builds are bound by Defender real-time scanning on first open (~7-13 ms per
+  file on NVMe; warm opens 0.03 ms): blink/renderer/core 69.6 s cold vs 6.6 s
+  warm, CPU work ~6 s. 16 open workers only ~1.5x. Levers: (1) owner decision on
+  a Defender process exclusion for the service binary (~10x cold); (2) decouple
+  I/O concurrency from CPU workers (~1.5x); (3) tokenize+emit CPU (~5 s of 6).
 - **Fold cost under no stored text:** a fold re-reads every doc in the shard
   from disk (5.6 ms/doc). Keep shards small, or fold from postings only.
 - **Delta-varint spill runs:** the external section builder spills raw 8-byte
@@ -168,6 +172,10 @@ GOMAXPROCS=2, peak disk 0.56x extracted. Limit-20 warm/first: rare literal
 
 ## Owner actions (not agent work)
 
+- **Defender and build speed (decision):** content builds spend ~90% of cold
+  build time waiting on Defender scanning each file at first open. A process
+  exclusion for the seekfs service binary would remove it (it only reads
+  files), at the cost of not scanning files as seekfs opens them. Admin-only.
 - **Relaunch the live E: service on integ >= 65ff317** (elevated). The build
   reserve is now 10 GiB (was 20 GiB; approved 2026-10-15), which raises build
   headroom on E: from ~2 GB to ~12 GB; the live service keeps the old reserve
