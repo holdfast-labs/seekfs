@@ -385,11 +385,12 @@ func searchCompactWithCacheHidden(idx *Index, opts queryOptions, countOnly bool,
 				break
 			}
 		}
-		// The disk verification budget short-circuits every further verify
-		// to a miss once hit: stop the walk there instead of burning the
-		// whole candidate set past an already-incomplete page. Results are
-		// identical (every later verify would miss); only wasted reads stop.
-		if contentMatcher != nil && pq.Trace != nil && pq.Trace.DiskCapped {
+		// The disk verification budget (count or --budget time) short-circuits
+		// every further verify to a miss once hit: stop the walk there instead
+		// of burning the whole candidate set past an already-incomplete page.
+		// Results are identical (every later verify would miss); only wasted
+		// reads stop. A pre-verified page (skipEntryMatches) never gets here.
+		if contentMatcher != nil && pq.Trace != nil && (pq.Trace.DiskCapped || pq.Trace.BudgetExceeded) {
 			break
 		}
 	}
@@ -715,7 +716,7 @@ func verifyCompactContentParallel(idx *Index, pq parsedQuery, order []int, pathC
 		if !emit() {
 			return hits, nil
 		}
-		if pq.Trace != nil && pq.Trace.DiskCapped {
+		if pq.Trace != nil && (pq.Trace.DiskCapped || pq.Trace.BudgetExceeded) {
 			return hits, nil
 		}
 	}
@@ -853,6 +854,9 @@ func (vol *serviceVolumeIndex) verifyContentSupersetPage(pq parsedQuery, ranked 
 	cache := make(map[int]string)
 	page := make([]int, 0, min(pq.Limit, len(ranked)))
 	for _, id := range ranked {
+		if pq.Trace != nil && pq.Trace.BudgetExceeded {
+			return page, true
+		}
 		if pq.Trace != nil && pq.Trace.DiskCapped {
 			// The verify budget already marked the trace incomplete; keep
 			// the hits found so far as a visible partial page.

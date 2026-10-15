@@ -221,6 +221,7 @@ type serviceRequest struct {
 	Fuzzy         bool                `json:"fuzzy,omitempty"`
 	DeadlineUnix  int64               `json:"deadline_unix,omitempty"`
 	RequestSeq    int64               `json:"request_seq,omitempty"`
+	BudgetMS      int                 `json:"budget_ms,omitempty"`
 	SinceVolumes  []watchVolumeCursor `json:"since_volumes,omitempty"`
 	Baseline      bool                `json:"baseline,omitempty"`
 	// InputUnixNano carries the `input-heartbeat` op: the UI's session

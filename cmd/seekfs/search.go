@@ -31,6 +31,7 @@ func serviceRequestFromOptions(opts queryOptions, countOnly bool) serviceRequest
 		Fuzzy:         opts.Fuzzy,
 		DeadlineUnix:  opts.DeadlineUnix,
 		RequestSeq:    opts.RequestSeq,
+		BudgetMS:      opts.BudgetMS,
 	}
 }
 
@@ -51,6 +52,7 @@ func requestToOptionsFromService(req serviceRequest) queryOptions {
 		Fuzzy:         req.Fuzzy,
 		DeadlineUnix:  req.DeadlineUnix,
 		RequestSeq:    req.RequestSeq,
+		BudgetMS:      req.BudgetMS,
 	}
 }
 
@@ -384,6 +386,9 @@ func entryTypeRank(entry Entry) int {
 }
 
 func searchServiceVolumes(volumes []*serviceVolumeIndex, opts queryOptions, countOnly bool) ([]Entry, error) {
+	if opts.BudgetMS > 0 && !countOnly && opts.Trace != nil && opts.Trace.BudgetDeadline.IsZero() {
+		opts.Trace.BudgetDeadline = time.Now().Add(time.Duration(opts.BudgetMS) * time.Millisecond)
+	}
 	matches, err := searchServiceVolumesInner(volumes, opts, countOnly)
 	if err != nil || countOnly || len(matches) < 2 {
 		return matches, err

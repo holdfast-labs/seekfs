@@ -2837,3 +2837,9 @@ size-capped, never whole-disk by default.
    skipping (the postings are 4096-doc block-paged with first-docID skip
    metadata since §6m), and `.gsx` mmap.
 
+# Content query time budget
+
+Use `seekfs search --budget 150ms "content:needle"` to bound disk verification for a content query.
+The opt-in budget starts once per request; zero (the default) preserves existing behavior.
+If the deadline expires, search returns verified hits so far in normal order and reports `complete: false` and `budget_exceeded: true`.
+Name-only queries ignore this setting, and count queries remain exact by ignoring it.
