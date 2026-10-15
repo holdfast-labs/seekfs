@@ -159,7 +159,10 @@ Accuracy and ranking (fff parity):
 9. **No `sym:`** (definition search) and no definition-line bonus in content
    ranking.
 10. **Grep features:** no fuzzy (Smith-Waterman) grep, no multi-pattern OR
-     grep, no context lines, no per-query time budget or cursor pagination.
+     grep, no per-query time budget or cursor pagination.
+     **Line output and context lines: done (G10, `content/grep-lines`):**
+     `seekfs search --lines [-C N | -A N -B N] [--max-per-file N]` prints
+     ripgrep-style `path:LINE:text` / `path-LINE-text` with `--` separators.
      **Smart case for content: done (G10).** Uppercase literal content patterns
      enable query-wide sensitivity unless explicitly overridden by `case:`;
      regex escapes and classes do not trigger it. Regex is Go RE2 with no lookaround.

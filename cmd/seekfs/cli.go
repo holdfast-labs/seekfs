@@ -155,6 +155,8 @@ func normalizeSearchArgs(args []string) []string {
 		"-modified-after": true, "--modified-after": true,
 		"-interval": true, "--interval": true,
 		"-exec": true, "--exec": true, "-exec-on": true, "--exec-on": true,
+		"-max-per-file": true, "--max-per-file": true, "-C": true, "--context": true,
+		"-A": true, "-B": true,
 	}
 	boolFlags := map[string]bool{
 		"-path": true, "--path": true, "--json": true, "-json": true,
@@ -162,6 +164,7 @@ func normalizeSearchArgs(args []string) []string {
 		"--exists": true, "-exists": true, "--cwd-bias": true, "-cwd-bias": true,
 		"-case": true, "--case": true, "-exec-shell": true, "--exec-shell": true,
 		"-fuzzy": true, "--fuzzy": true,
+		"-lines": true, "--lines": true,
 	}
 	flags := make([]string, 0, len(args))
 	query := make([]string, 0, len(args))
@@ -212,7 +215,7 @@ func printUsage(w io.Writer) {
   seekfs info [-db seekfs.gsi] [--json]
   seekfs syntax
   seekfs agent
-  seekfs search [-db seekfs.db...] [--json] [-n 100] [-path] <query>
+  seekfs search [-db seekfs.db...] [--json] [-n 100] [-path] [--lines [-C N] [--max-per-file N]] <query>
   seekfs count [-db seekfs.db...] [--json] [-path] <query>
   seekfs open <path> [--query "query"] [--json] [-pipe ...]
   seekfs recent [-n 20] [--json] [-pipe ...]

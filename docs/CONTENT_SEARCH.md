@@ -235,6 +235,16 @@ unless the effective content matching is case-sensitive. The fold is the same on
 builder folds documents and the query folds the leaf with the one shared
 `contentFoldText`.
 
+**Line output (`seekfs search --lines`).** For a query with a positive content
+leaf, the CLI re-reads each hit file client-side (no protocol change) and
+prints ripgrep-style `path:LINE:text` for matching lines (any positive leaf,
+same matcher and case policy as the query, regex `^`/`$` per line, phrases
+within one line), up to `--max-per-file` (default 10). `-C N` (or `-A`/`-B`)
+adds `path-LINE-text` context with `--` between non-adjacent groups. Files that
+are not UTF-8 text (binary, extracted formats) print `path:0:<snippet>`. Lines
+over 500 bytes are cut with `…`. `--json` adds `lines: [{line, text, match}]`
+to each result (`content_lines.go`).
+
 **Typo tolerance.** A `content:` query that matches zero documents is retried
 with per-word corrections from the term dictionary (the folded CXTR words):
 each correctable word (4+ runes) of every positive term/phrase leaf is replaced

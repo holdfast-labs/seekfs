@@ -877,6 +877,12 @@ func cmdSearch(args []string, countOnly bool) error {
 	forceLocal := fs.Bool("local", false, "do not auto-query the resident service")
 	pipeName := fs.String("pipe", defaultServicePipe, "service named pipe")
 	jsonOut := fs.Bool("json", false, "write machine-readable JSON")
+	withLines := fs.Bool("lines", false, "content queries: print ripgrep-style path:LINE:text for matching lines")
+	maxPerFile := fs.Int("max-per-file", 10, "with --lines: matching lines printed per file")
+	contextN := fs.Int("context", 0, "with --lines: context lines before and after each match")
+	fs.IntVar(contextN, "C", 0, "with --lines: context lines before and after each match")
+	afterN := fs.Int("A", -1, "with --lines: context lines after each match")
+	beforeN := fs.Int("B", -1, "with --lines: context lines before each match")
 	limit := fs.Int("n", 100, "maximum results")
 	matchPath := fs.Bool("path", false, "match full path")
 	under := fs.String("under", "", "only return results under this path")
@@ -954,6 +960,16 @@ func cmdSearch(args []string, countOnly bool) error {
 			opts.Current = abs
 		}
 	}
+	if *withLines && !countOnly {
+		before, after := *contextN, *contextN
+		if *beforeN >= 0 {
+			before = *beforeN
+		}
+		if *afterN >= 0 {
+			after = *afterN
+		}
+		opts.lineOutput = &contentLineOutput{maxPerFile: *maxPerFile, before: before, after: after}
+	}
 	if *useService || autoService {
 		svcErr := searchService(*pipeName, opts, countOnly, *jsonOut)
 		if svcErr == nil {
@@ -989,6 +1005,9 @@ func cmdSearch(args []string, countOnly bool) error {
 			if pq, perr := parseQuery(opts); perr == nil {
 				annotateJSONGitStatus(resp.Results, matches, pq)
 			}
+			if p := cliContentLinePrinter(opts); p != nil {
+				p.annotateJSON(resp.Results)
+			}
 		}
 		return writeJSON(os.Stdout, resp)
 	}
@@ -997,7 +1016,12 @@ func cmdSearch(args []string, countOnly bool) error {
 		return nil
 	}
 	w := bufio.NewWriter(os.Stdout)
+	p := cliContentLinePrinter(opts)
 	for _, entry := range matches {
+		if p != nil {
+			p.print(w, entry.Path, entry.Snippet)
+			continue
+		}
 		fmt.Fprintln(w, entry.Path)
 	}
 	return w.Flush()

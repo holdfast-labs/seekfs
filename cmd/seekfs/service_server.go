@@ -854,6 +854,9 @@ func searchService(pipeName string, opts queryOptions, countOnly bool, jsonOut b
 	}
 	if jsonOut {
 		jsonResp := newJSONSearchResponse(resp, opts, countOnly)
+		if p := cliContentLinePrinter(opts); p != nil {
+			p.annotateJSON(jsonResp.Results)
+		}
 		return writeJSON(os.Stdout, jsonResp)
 	}
 	if countOnly {
@@ -866,7 +869,16 @@ func searchService(pipeName string, opts queryOptions, countOnly bool, jsonOut b
 	} else if resp.Fuzzy {
 		fmt.Fprintf(w, "(showing close matches for %q)\n", opts.Query)
 	}
-	for _, result := range resp.Results {
+	p := cliContentLinePrinter(opts)
+	for i, result := range resp.Results {
+		if p != nil {
+			snippet := ""
+			if i < len(resp.Rows) && resp.Rows[i].Path == result {
+				snippet = resp.Rows[i].Snippet
+			}
+			p.print(w, result, snippet)
+			continue
+		}
 		fmt.Fprintln(w, result)
 	}
 	return w.Flush()
