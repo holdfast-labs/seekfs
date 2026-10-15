@@ -367,9 +367,9 @@ type Index struct {
 	// accent folding (see fold.go), with the record count at build.
 	// accentBuilt reports whether the cache is valid for accentCount.
 	// Reset together with the name identity; nil on ASCII corpora.
-	accentIDs    []int32
-	accentCount  int
-	accentBuilt  bool
+	accentIDs   []int32
+	accentCount int
+	accentBuilt bool
 	// nameMemo is the single-entry per-query memo cache (name bits plus
 	// folded dir bits with the identity it was built from). It carries its
 	// own lock; entries are validated by query signature, record count and
@@ -487,7 +487,7 @@ type queryOptions struct {
 	Near string `json:"near,omitempty"`
 	// Current is the CLI --current demotion path: the file the user already
 	// has open ranks last within its match-quality band.
-	Current       string `json:"current,omitempty"`
+	Current       string       `json:"current,omitempty"`
 	Recent        string       `json:"recent,omitempty"`
 	ModifiedAfter string       `json:"modified_after,omitempty"`
 	CaseSensitive bool         `json:"case_sensitive,omitempty"`
@@ -552,9 +552,14 @@ type parsedQuery struct {
 	MatchPath         bool
 	CaseSensitive     bool
 	CaseExplicit      bool
-	Exts              []string
-	Dirs              []string
-	Globs             []string
+	// ContentSmartCase is ripgrep-style smart case for content leaves only
+	// (no explicit case:, every content leaf with letters has an uppercase
+	// literal). Name and path terms keep CaseSensitive; content matching
+	// reads contentCaseSensitive().
+	ContentSmartCase bool
+	Exts             []string
+	Dirs             []string
+	Globs            []string
 	// GlobAlts parallels Globs: precomputed brace expansions per pattern
 	// (exactly [pattern] when braceless), so verification never expands
 	// per candidate. Falls back to live expansion when short (hand-built
@@ -586,25 +591,25 @@ type parsedQuery struct {
 	// QuotedTerms holds normalized terms from double-quoted phrases. They
 	// match literally (no accent folding), preserving exact-match
 	// semantics for quoted input like `case:` does.
-	QuotedTerms map[string]struct{}
-	Regexps           []*regexp.Regexp
-	RegexTerms        []string
-	Type              string
-	Parents           []string
-	Under             string
-	Exists            bool
-	ModifiedAfter     time.Time
-	HasModAfter       bool
-	SizeFilters       []sizeFilter
-	DateFilters       []dateFilter
-	AttrFilters       []uint32
-	Content           []contentLeaf
-	Features          []featureLeaf
-	SortColumn        string
-	OrGroups          [][]parsedQuery
-	NotGroups         []parsedQuery
-	CWDBias           string
-	RootBias          string
+	QuotedTerms   map[string]struct{}
+	Regexps       []*regexp.Regexp
+	RegexTerms    []string
+	Type          string
+	Parents       []string
+	Under         string
+	Exists        bool
+	ModifiedAfter time.Time
+	HasModAfter   bool
+	SizeFilters   []sizeFilter
+	DateFilters   []dateFilter
+	AttrFilters   []uint32
+	Content       []contentLeaf
+	Features      []featureLeaf
+	SortColumn    string
+	OrGroups      [][]parsedQuery
+	NotGroups     []parsedQuery
+	CWDBias       string
+	RootBias      string
 	// Near is the proximity anchor (normalized absolute path, "" when none).
 	Near string
 	// Current is the `--current` demotion path (normalized absolute path,

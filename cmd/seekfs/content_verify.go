@@ -188,7 +188,7 @@ func asciiCaseIndex(raw, needle []byte) (idx int, ascii bool) {
 
 func newContentLeafMatcher(pq parsedQuery) *contentLeafMatcher {
 	leaves := contentAllLeaves(pq)
-	m := &contentLeafMatcher{leaves: leaves, caseSensitive: pq.CaseSensitive}
+	m := &contentLeafMatcher{leaves: leaves, caseSensitive: pq.contentCaseSensitive()}
 	for i := range leaves {
 		if leaves[i].LeafID+1 > m.size {
 			m.size = leaves[i].LeafID + 1
@@ -197,7 +197,7 @@ func newContentLeafMatcher(pq parsedQuery) *contentLeafMatcher {
 	for _, leaf := range leaves {
 		if leaf.Kind == contentLeafRegex {
 			pat := leaf.Text
-			if !pq.CaseSensitive {
+			if !pq.contentCaseSensitive() {
 				pat = "(?i)" + pat
 			}
 			re, err := regexp.Compile(pat)
@@ -257,7 +257,7 @@ func newContentLeafMatcher(pq parsedQuery) *contentLeafMatcher {
 			m.needle = make(map[int][]byte)
 		}
 		b := []byte(leaf.Text)
-		if !pq.CaseSensitive {
+		if !pq.contentCaseSensitive() {
 			b = contentFoldText(b)
 		}
 		m.needle[leaf.LeafID] = b

@@ -5,11 +5,11 @@ package main
 
 import (
 	"fmt"
-	"unicode"
 	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"unicode"
 )
 
 // contentLeavesSmartCase applies ripgrep-style smart case query-wide: every
@@ -21,30 +21,65 @@ func contentLeavesSmartCase(pq parsedQuery) bool {
 		upper, letters := contentPatternCase(leaf)
 		if letters {
 			seenLetter = true
-			if !upper { return false }
+			if !upper {
+				return false
+			}
 		}
 	}
 	return seenLetter
 }
 
+// contentCaseSensitive reports whether content leaves match case-sensitively:
+// an explicit case: (or the CaseSensitive option) or smart case.
+func (pq parsedQuery) contentCaseSensitive() bool {
+	return pq.CaseSensitive || pq.ContentSmartCase
+}
+
+// contentPatternCase reports whether a leaf's pattern has letters and a
+// literal uppercase letter. For regex, escapes (\W, \S, \p{Lu}), character
+// classes and inline flags/group names do not count, like ripgrep.
 func contentPatternCase(leaf contentLeaf) (upper, letters bool) {
-	text := leaf.Text
-	if leaf.Kind == contentLeafRegex {
-		class, escaped := false, false
-		for _, r := range text {
-			if escaped { escaped = false; continue }
-			if r == '\\' { escaped = true; continue }
-			if r == '[' { class = true; continue }
-			if r == ']' { class = false; continue }
-			if !class && unicode.IsLetter(r) {
-				letters = true
-				if unicode.IsUpper(r) { upper = true }
+	text := []rune(leaf.Text)
+	note := func(r rune) {
+		if unicode.IsLetter(r) {
+			letters = true
+			if unicode.IsUpper(r) {
+				upper = true
 			}
+		}
+	}
+	if leaf.Kind != contentLeafRegex {
+		for _, r := range text {
+			note(r)
 		}
 		return
 	}
-	for _, r := range text {
-		if unicode.IsLetter(r) { letters = true; if unicode.IsUpper(r) { upper = true } }
+	class := false
+	for i := 0; i < len(text); i++ {
+		switch r := text[i]; {
+		case r == '\\':
+			i++
+			// \p{Name} / \pL: skip the class name too.
+			if i+1 < len(text) && (text[i] == 'p' || text[i] == 'P') {
+				i++
+				if text[i] == '{' {
+					for i < len(text) && text[i] != '}' {
+						i++
+					}
+				}
+			}
+		case r == '(' && i+1 < len(text) && text[i+1] == '?':
+			// Inline flags and group names: (?i), (?P<name>...).
+			for i < len(text) && text[i] != ')' && text[i] != ':' && text[i] != '>' {
+				i++
+			}
+		case r == '[':
+			class = true
+		case r == ']':
+			class = false
+		case !class:
+			note(r)
+		}
 	}
 	return
 }

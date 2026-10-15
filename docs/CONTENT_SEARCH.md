@@ -214,10 +214,12 @@ or `plugin config content --root <path>`.
 A `content:` leaf is case-insensitive by default. Without an explicit `case:`
 token, literal uppercase letters in a content pattern enable smart-case matching;
 lowercase patterns remain case-insensitive. Regex smart case ignores escaped
-letters and character classes (for example `\S`), and only literal uppercase
+letters, character classes and inline flags (for example `\S`, `\p{Lu}`, `[A-Z]`,
+`(?i)`); only literal uppercase
 letters trigger it. Explicit `case:true` or `case:false` overrides smart case.
 Smart case is query-wide: it applies only when every content leaf containing
-letters has a literal uppercase letter. Filename/path matching is unchanged.
+letters has a literal uppercase letter. Filename/path terms keep their own case rule (`pq.CaseSensitive`);
+content matching reads `contentCaseSensitive()`.
 In insensitive matching,
 the query text is folded with Unicode `strings.ToLower` and tested for a byte
 substring anywhere in the document's verified bytes (`bytes.Contains`; v10
