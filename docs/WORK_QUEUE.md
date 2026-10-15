@@ -55,7 +55,9 @@ corruption, exact required sources, auto-fuzzy only on zero exact hits).
 | `content/stream-postings` | streampost | Build peak: candidate B (no per-group reframe copy, direct-offset spool reads, hole-punch after shard save) measured on a >= 6-shard Chromium subtree; keep only if peak/extracted drops >= 0.1 with identical output, then lower the peak multiplier |
 | `perf/static-ranking` | staticrank | **Parked** at WIP commit `761db7b` (OR-lane case unresolved, suite not green); resume only with a fresh, narrow brief (G13) |
 
-Merged 2026-10-15: `content/smart-case` (074313a, G10: an uppercase literal in
+Merged 2026-10-15: `content/grep-lines` (4daa2b3, G10: `seekfs search --lines
+[-C N | -A N -B N] [--max-per-file N]` prints rg-style `path:LINE:text`, client-side,
+`--json` adds `lines`), `content/smart-case` (074313a, G10: an uppercase literal in
 every content leaf makes content matching case-sensitive unless `case:` is
 explicit; name/path terms unaffected), the 10 GiB reserve cap (65ff317), and
 `content/verify-precision` (e045d37): a default-order page
