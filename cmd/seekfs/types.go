@@ -192,6 +192,9 @@ type jsonResult struct {
 	// resolved for the query (no git: filter and no usage signals) or the
 	// file sits outside any git worktree.
 	GitStatus string `json:"git_status,omitempty"`
+	// Lines is the `search --lines` output for a content hit (matching and
+	// context lines, re-read client-side); empty otherwise.
+	Lines []contentOutputLine `json:"lines,omitempty"`
 }
 
 func boolPtr(v bool) *bool {
@@ -530,6 +533,9 @@ type queryOptions struct {
 	// fresh probe per volume search so the signal is never shared across
 	// queries. Local-only; nil on every normal request.
 	contentProbe *contentCompletenessProbe `json:"-"`
+	// lineOutput is the CLI's --lines request; client-side only (never sent
+	// to the service, never serialized).
+	lineOutput *contentLineOutput `json:"-"`
 }
 
 // contentCompletenessProbe carries the reduced default-order path's
