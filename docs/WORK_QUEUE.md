@@ -53,8 +53,13 @@ corruption, exact required sources, auto-fuzzy only on zero exact hits).
 | Branch | Worktree | Scope |
 |---|---|---|
 | `content/stream-postings` | streampost | **Design phase only** (no code): why v11 still spools all text, and the smallest change to bring the build peak from 0.8x extracted to <= 0.35x (E: has ~2 GB headroom over the 20 GB reserve). Report in `NOTES.md`; coordinator reviews before code |
-| `content/verify-precision` | verifyprec | Restarted 2026-10-15 on `opencode/openai/gpt-6-luna`: large supersets verified in rank order with early stop instead of the name-order fallback. `content:mutex` on full Chromium verifies 2,157 files for 20 hits (591 ms warm, 8.3 s first) and reports incomplete; make limit-N queries early-stop (~2N verifies, complete). Also regex cost, `count content:struct` exactness |
 | `perf/static-ranking` | staticrank | **Parked** at WIP commit `761db7b` (OR-lane case unresolved, suite not green); resume only with a fresh, narrow brief (G13) |
+
+Merged 2026-10-15: `content/verify-precision` (e045d37): a default-order page
+whose posting superset exceeds the relevance window verifies it in rank order
+and stops at the page instead of a name-order scan. Full Chromium limit 20:
+`content:mutex` 2,157 -> 228 verifies, 591 -> 142 ms, 20 hits; `ext:cc mutex`
+155 -> 52 ms. A superset past the window stays `incomplete` (conservative).
 
 Merged 2026-10-14: `feat/ui-input-and-user-signals`, `integ/filter-tier-merge`
 (v11, no stored text by default), `perf/adaptive-build-workers`,
@@ -92,6 +97,15 @@ GOMAXPROCS=2, peak disk 0.56x extracted. Limit-20 warm/first: rare literal
   extraction vs tokenize vs assembly.
 - **Fold cost under no stored text:** a fold re-reads every doc in the shard
   from disk (5.6 ms/doc). Keep shards small, or fold from postings only.
+- **Delta-varint spill runs:** the external section builder spills raw 8-byte
+  (key, docID) records: 1.02x of extracted text per shard on a blink subtree,
+  vs ~0.18x if delta+varint coded per key. Shrinks per-shard scratch (fixed
+  slack) and build IO about 5x (streampost NOTES.md, 2026-10-15).
+- **Host-sensitive reconcile tests:** `TestContentAttachReconciles{WorktreePolicyToMain,
+  WorktreePolicyToAll,VanishedWorktree}` end `stale` when TEMP is on C:
+  (nearly full) and pass with TEMP on E: (fails back to at least 878b6d2, so
+  environmental). Free space/reserve is not the cause (reserve is 0 in tests).
+  Run suites with TMP/TEMP=E:ench\scratch	mp until found.
 - **Typo fallback scope:** content typo fallback fires on scoped zero-result
   queries even when exact matches exist elsewhere (`async` → `sync`). Decide
   whether it should only fire when the whole index has no exact match (from
