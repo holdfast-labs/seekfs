@@ -52,7 +52,7 @@ corruption, exact required sources, auto-fuzzy only on zero exact hits).
 
 | Branch | Worktree | Scope |
 |---|---|---|
-| `content/stream-postings` | streampost | **Design phase only** (no code): why v11 still spools all text, and the smallest change to bring the build peak from 0.8x extracted to <= 0.35x (E: has ~2 GB headroom over the 20 GB reserve). Report in `NOTES.md`; coordinator reviews before code |
+| `content/stream-postings` | streampost | Build peak: candidate B (no per-group reframe copy, direct-offset spool reads, hole-punch after shard save) measured on a >= 6-shard Chromium subtree; keep only if peak/extracted drops >= 0.1 with identical output, then lower the peak multiplier |
 | `perf/static-ranking` | staticrank | **Parked** at WIP commit `761db7b` (OR-lane case unresolved, suite not green); resume only with a fresh, narrow brief (G13) |
 
 Merged 2026-10-15: `content/verify-precision` (e045d37): a default-order page
