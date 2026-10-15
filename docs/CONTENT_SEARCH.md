@@ -649,6 +649,16 @@ Residual / known limitations (all explicit deferrals):
   the service runs with `-lowmem`.
 - **Completeness residual.** A window-capped superset whose true matches fall in
   `[userLimit, window)` reports `incomplete` conservatively (the safe direction).
+- **Large posting supersets verify in rank order.** A default-order page
+  (no root/cwd bias, not regex-only) materializes the full posting superset even
+  past the relevance window, sorts it in result order and disk-verifies only
+  until the page fills (`verifyContentSupersetPage`, `search_compact.go`),
+  instead of discarding it for an unfiltered name-order scan. The page is the
+  exact top; a superset past the window reports the window-capped signal, so a
+  filled page stays `incomplete` (the completeness residual above). A disk-cap
+  hit keeps the partial page. Full Chromium v11, limit 20, best-of-3:
+  `content:mutex` 2,157 -> 228 verifies, 591 -> 142 ms, 5 -> 20 hits;
+  `ext:cc content:mutex` 512 -> 132 verifies, 155 -> 52 ms.
 - **M2.** `contentExtractSafely` runs extraction in a goroutine and returns on
   `ectx.Done()`, so a context-ignoring extractor cannot wedge the serial drain,
   the service build, or the offline walk builder. The residual is the abandoned

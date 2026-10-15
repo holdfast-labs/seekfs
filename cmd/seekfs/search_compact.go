@@ -385,6 +385,13 @@ func searchCompactWithCacheHidden(idx *Index, opts queryOptions, countOnly bool,
 				break
 			}
 		}
+		// The disk verification budget short-circuits every further verify
+		// to a miss once hit: stop the walk there instead of burning the
+		// whole candidate set past an already-incomplete page. Results are
+		// identical (every later verify would miss); only wasted reads stop.
+		if contentMatcher != nil && pq.Trace != nil && pq.Trace.DiskCapped {
+			break
+		}
 	}
 	return results, nil
 }
@@ -682,7 +689,10 @@ func verifyCompactContentParallel(idx *Index, pq parsedQuery, order []int, pathC
 		close(out)
 	}()
 	// Merger (this goroutine): emit in candidate order, stopping at exactly
-	// the limit like the serial walk.
+	// the limit like the serial walk. The disk verification budget is shared
+	// mutable trace state, so stop feeding it once hit: every further verify
+	// short-circuits to a miss anyway, and an uncapped feeder would burn the
+	// whole candidate set past an already-incomplete page.
 	hits := make([]Entry, 0, min(limit, 1024))
 	pending := make(map[uint64]contentVerifyResult)
 	var expect uint64
@@ -703,6 +713,9 @@ func verifyCompactContentParallel(idx *Index, pq parsedQuery, order []int, pathC
 	for res := range out {
 		pending[res.seq] = res
 		if !emit() {
+			return hits, nil
+		}
+		if pq.Trace != nil && pq.Trace.DiskCapped {
 			return hits, nil
 		}
 	}
@@ -827,6 +840,33 @@ func scanCandidateMatches(vol *serviceVolumeIndex, idx *Index, pq parsedQuery, r
 	}
 	_, ok := compactCandidateEntryIfMatchIn(vol, idx, pq, recIndex, pathCache, true, false, matcher)
 	return ok
+}
+
+// verifyContentSupersetPage verifies candidates in result order until the
+// requested page is full. A full page is exact because all omitted candidates
+// rank later; a short page exhausts the available superset.
+func (vol *serviceVolumeIndex) verifyContentSupersetPage(pq parsedQuery, ranked []int) ([]int, bool) {
+	if vol == nil || vol.index == nil || pq.Limit <= 0 || len(ranked) == 0 {
+		return nil, false
+	}
+	matcher := newContentLeafMatcher(pq)
+	cache := make(map[int]string)
+	page := make([]int, 0, min(pq.Limit, len(ranked)))
+	for _, id := range ranked {
+		if pq.Trace != nil && pq.Trace.DiskCapped {
+			// The verify budget already marked the trace incomplete; keep
+			// the hits found so far as a visible partial page.
+			return page, true
+		}
+		cache = boundPathCache(cache)
+		if scanCandidateMatches(vol, vol.index, pq, id, cache, matcher) {
+			page = append(page, id)
+			if len(page) == pq.Limit {
+				return page, true
+			}
+		}
+	}
+	return page, true
 }
 
 func dropSatisfiedVolumeTerms(pq *parsedQuery, volume string) {
@@ -1025,8 +1065,25 @@ func (vol *serviceVolumeIndex) nameTermCandidates(pq parsedQuery) ([]int, bool) 
 			// inline, stopping at the window.
 			bounded := !pq.contentFullCandidates && !pq.CountOnly && pq.Limit > 0 &&
 				pq.SortColumn != "relevance" && pq.hidden.empty()
+			// The default-order driver (searchContentServiceVolumes) verifies
+			// only the page but probes broadness against the completeness
+			// window, so cap there, not at the page limit. An unbiased
+			// default-order page whose superset fits the disk verification
+			// budget materializes it in full (cap 0) instead of truncating at
+			// the window and falling through to an unfiltered name-order scan:
+			// the page then fills after ~page verifies. The verify loop stops
+			// at the limit in this exact order with the exact predicate, so
+			// sets, order, and the completeness signal are unchanged (the
+			// superset is complete, hence supersetBelowWindow). Biased and
+			// walk-origin queries keep the window cap so their early-stop
+			// scans stay the source; supersets past the disk budget keep it
+			// too, so a capped broad query still burns at most ~budget+window
+			// verifies and the allocation gate (TestContentBroadAllocationBudget)
+			// holds.
+			useFullSuperset := bounded && pq.contentWindow > 0 && pq.contentProbe != nil &&
+				pq.RootBias == "" && pq.CWDBias == "" && !contentLeavesAllRegex(pq)
 			candidateCap := 0
-			if bounded {
+			if bounded && !useFullSuperset {
 				// Probe broadness against the completeness window, not the
 				// verify limit: a single-volume default-order query verifies
 				// only its page limit but must still surface a candidate
@@ -1036,7 +1093,38 @@ func (vol *serviceVolumeIndex) nameTermCandidates(pq parsedQuery) ([]int, bool) 
 					candidateCap = pq.contentWindow
 				}
 			}
+			if useFullSuperset {
+				// A capped intersection is deliberately rejected by the posting
+				// reader because its prefix is not a candidate superset. Materialize
+				// the complete posting superset, then only disk-verify the ranked page.
+				candidateCap = 0
+			}
 			if candidates, ok, capped := vol.contentCandidatesBounded(pq, candidateCap); ok {
+				if useFullSuperset && len(candidates) > 0 {
+					sortCandidateIDs(candidates, pq, vol.index, vol.rankForQuery(pq))
+					if page, verified := vol.verifyContentSupersetPage(pq, candidates); verified {
+						if pq.contentProbe != nil {
+							// The page is the exact rank-ordered top: later
+							// candidates rank after it. The total match count is
+							// not proven below the window, though, so a superset
+							// past the window carries the same window-capped
+							// signal as the truncated path (a filled page marks
+							// the result incomplete, without widening).
+							if len(candidates) > pq.contentWindow {
+								pq.contentProbe.windowCapped = true
+							} else if len(candidates) < pq.contentWindow {
+								pq.contentProbe.supersetBelowWindow = true
+							}
+						}
+						if !pq.CountOnly && pq.contentCandidateMeta != nil {
+							pq.contentCandidateMeta.verified = true
+						}
+						pq.Trace.setSource("content-candidates", len(candidates))
+						return page, true
+					}
+					pq.Trace.setSource("content-candidates", len(candidates))
+					return nil, true
+				}
 				if capped && bounded && pq.contentWindow > 0 && pq.contentProbe != nil {
 					// The reduced default-order path caps materialization at the
 					// completeness window, so when the posting superset exceeds
@@ -1047,14 +1135,16 @@ func (vol *serviceVolumeIndex) nameTermCandidates(pq parsedQuery) ([]int, bool) 
 					// could hold more matches.
 					pq.contentProbe.windowCapped = true
 				}
+				// A default-order page verifies the rank-ordered posting
+				// superset directly (see useFullSuperset above): a fully
+				// materialized superset strictly smaller than the completeness
+				// window proves every match fits below it, so the reduced path
+				// is complete without widening.
+				if !capped && bounded && pq.contentWindow > 0 && pq.contentProbe != nil &&
+					len(candidates) < pq.contentWindow {
+					pq.contentProbe.supersetBelowWindow = true
+				}
 				if !capped || !bounded {
-					// A fully materialized superset strictly smaller than the
-					// completeness window proves every match fits below it, so
-					// the reduced path is complete without widening.
-					if !capped && bounded && pq.contentWindow > 0 && pq.contentProbe != nil &&
-						len(candidates) < pq.contentWindow {
-						pq.contentProbe.supersetBelowWindow = true
-					}
 					// Single-volume filename parity: the filename path orders
 					// its candidates by rankForQuery(pq) (name rank for the
 					// default order; size/modified/extension/type/path for
