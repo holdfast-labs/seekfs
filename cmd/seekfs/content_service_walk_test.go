@@ -748,9 +748,9 @@ func TestContentWalkRegexScanFindsMatch(t *testing.T) {
 
 // The bounded scan verifies path-free when the query reads no path, but
 // walk content resolution keys on the entry path: with more matching docs
-// than the relevance window, the posting superset caps and the rank-ordered
-// scan decides, so the scan (and the entry-free count) must still find the
-// matches. Catches a total-miss regression (0 results instead of the page).
+// than the relevance window, the full posting superset is verified in rank
+// order up to the page, so that page (and the entry-free count) must still
+// find the matches. Catches a total-miss regression (0 results instead of the page).
 func TestContentWalkCappedScanFindsMatch(t *testing.T) {
 	stubContentBuildSync(t)
 	stubContentCatchUpSync(t)
@@ -780,8 +780,8 @@ func TestContentWalkCappedScanFindsMatch(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(got) != 20 || trace.Source != "content-scan" {
-		t.Fatalf("capped walk scan = %d results via %q; want 20 via content-scan", len(got), trace.Source)
+	if len(got) != 20 || trace.Source != "content-candidates" {
+		t.Fatalf("capped walk scan = %d results via %q; want 20 via content-candidates", len(got), trace.Source)
 	}
 	n, ok, err := countServiceVolumes([]*serviceVolumeIndex{vol}, queryOptions{Query: "content:commonword", Trace: &searchTrace{}})
 	if err != nil || !ok || n != files {
