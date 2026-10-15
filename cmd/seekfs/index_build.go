@@ -896,6 +896,7 @@ func cmdSearch(args []string, countOnly bool) error {
 	caseSensitive := fs.Bool("case", false, "case-sensitive query matching")
 	fuzzy := fs.Bool("fuzzy", false, "append close matches (edit distance) below exact results")
 	budget := fs.Duration("budget", 0, "maximum wall-clock time for content verification (for example 150ms)")
+	cursor := fs.String("cursor", "", "continue a search page from an opaque cursor")
 	if err := fs.Parse(normalizeSearchArgs(args)); err != nil {
 		return err
 	}
@@ -945,6 +946,7 @@ func cmdSearch(args []string, countOnly bool) error {
 		CaseSensitive: *caseSensitive,
 		Fuzzy:         *fuzzy,
 		BudgetMS:      int(budget.Milliseconds()),
+		Cursor:        *cursor,
 	}
 	if *cwdBias {
 		cwd, err := os.Getwd()

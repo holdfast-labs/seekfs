@@ -317,6 +317,20 @@ func (s *goSearchService) serviceCommandSearch(w io.Writer, caps serviceCapabili
 		return
 	}
 	opts := requestToOptionsFromService(*req)
+	cursorOffset := 0
+	if req.Cursor != "" {
+		var cursorErr error
+		cursorOffset, cursorErr = decodeSearchCursor(req.Cursor, opts)
+		if cursorErr != nil {
+			s.indexMu.RUnlock()
+			_ = json.NewEncoder(w).Encode(serviceResponse{OK: false, Message: cursorErr.Error()})
+			return
+		}
+	}
+	pageLimit := normalizedLimit(opts.Limit, false)
+	if req.Cursor != "" && !req.CountOnly {
+		opts.Limit = cursorOffset + pageLimit
+	}
 	if opts.BudgetMS > 0 && !req.CountOnly {
 		// Budget starts once for the complete request, not once per volume.
 		opts.Trace = &searchTrace{BudgetDeadline: time.Now().Add(time.Duration(opts.BudgetMS) * time.Millisecond)}
@@ -402,6 +416,13 @@ func (s *goSearchService) serviceCommandSearch(w io.Writer, caps serviceCapabili
 		_ = json.NewEncoder(w).Encode(serviceResponse{OK: false, Message: err.Error()})
 		return
 	}
+	if req.Cursor != "" && !req.CountOnly {
+		if cursorOffset >= len(matches) {
+			matches = nil
+		} else {
+			matches = matches[cursorOffset:]
+		}
+	}
 	if caps.Remote {
 		// Remote logs use only the coarse public source category and omit
 		// planner/decline detail: internal sources can embed query-derived
@@ -411,6 +432,9 @@ func (s *goSearchService) serviceCommandSearch(w io.Writer, caps serviceCapabili
 		serviceLog("search query=%q ms=%.1f planner=%s source=%s decline=%s filename_driver=%s candidates=%d results=%d", req.Query, searchMS, trace.PlannerMode, trace.Source, trace.Decline, trace.FilenameDriver, trace.Candidates, len(matches))
 	}
 	resp := serviceResponse{OK: true, Count: len(matches), SearchMS: searchMS, Fuzzy: fuzzyApplied, FuzzyCorrection: fuzzyCorrection, Source: trace.Source, Decline: trace.Decline, Candidates: trace.Candidates, PlannerMode: trace.PlannerMode, EligibleVolumes: trace.EligibleVolumes, BlocksDecoded: trace.BlocksDecoded, BlocksSkipped: trace.BlocksSkipped, ScalarDriver: trace.ScalarDriver, ScalarInterval: trace.ScalarInterval, RecordsVerified: trace.ScalarRecordsVerified, ComponentDriver: trace.ComponentDriver, ComponentRoots: trace.ComponentRoots, ComponentIntervals: trace.ComponentIntervals, ComponentCardinality: trace.ComponentCardinality, ComponentSelfHits: trace.ComponentSelfHits, ComponentBounds: trace.ComponentBounds, ComponentRecordsVerified: trace.ComponentRecordsVerified, FilenameDriver: trace.FilenameDriver, FilenameRequiredGrams: trace.FilenameRequiredGrams, FilenamePostingHint: trace.FilenamePostingHint, FilenameRecordsVerified: trace.FilenameRecordsVerified, OverlayBaseWindow: trace.OverlayBaseWindow, PostingPrefetchBytes: trace.PostingPrefetchBytes, PostingPrefetchRanges: trace.PostingPrefetchRanges, PostingPrefetchPages: trace.PostingPrefetchPages, Terms: trace.Terms, Declines: trace.Declines, Fallback: trace.Fallback, Complete: trace.completePtr(), BudgetExceeded: trace.BudgetExceeded}
+	if !req.CountOnly && len(matches) == pageLimit {
+		resp.NextCursor = encodeSearchCursor(requestToOptionsFromService(*req), cursorOffset+pageLimit)
+	}
 	if !req.CountOnly {
 		resp.Results = make([]string, len(matches))
 		for i, entry := range matches {
@@ -936,6 +960,7 @@ func newJSONSearchResponse(resp serviceResponse, opts queryOptions, countOnly bo
 		Complete:                 resp.Complete,
 		Content:                  resp.Content,
 		BudgetExceeded:           resp.BudgetExceeded,
+		NextCursor:               resp.NextCursor,
 	}
 	if !countOnly {
 		if len(resp.Rows) > 0 {

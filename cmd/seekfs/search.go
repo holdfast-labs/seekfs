@@ -1,9 +1,11 @@
 package main
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"os"
 	"path/filepath"
@@ -11,6 +13,45 @@ import (
 	"strings"
 	"time"
 )
+
+type searchCursor struct {
+	Version int    `json:"v"`
+	Offset  int    `json:"o"`
+	Query   uint64 `json:"h"`
+}
+
+func queryOptionsHash(opts queryOptions) uint64 {
+	pq, _ := parseQuery(opts)
+	key := struct {
+		Query, Under, Path, Sort, CWDBias, RootBias, Near, Current, Recent, ModifiedAfter string
+		CaseSensitive, Fuzzy                                                              bool
+	}{
+		opts.Query, opts.Under, fmt.Sprint(opts.MatchPath || queryLooksLoosePathScoped(opts.Query)), pq.SortColumn, opts.CWDBias, opts.RootBias, opts.Near, opts.Current, opts.Recent, opts.ModifiedAfter, opts.CaseSensitive, opts.Fuzzy}
+	b, _ := json.Marshal(key)
+	h := fnv.New64a()
+	_, _ = h.Write(b)
+	return h.Sum64()
+}
+
+func encodeSearchCursor(opts queryOptions, offset int) string {
+	b, _ := json.Marshal(searchCursor{Version: 1, Offset: offset, Query: queryOptionsHash(opts)})
+	return base64.RawURLEncoding.EncodeToString(b)
+}
+
+func decodeSearchCursor(token string, opts queryOptions) (int, error) {
+	b, err := base64.RawURLEncoding.DecodeString(token)
+	if err != nil {
+		return 0, errors.New("malformed cursor")
+	}
+	var c searchCursor
+	if err = json.Unmarshal(b, &c); err != nil || c.Version != 1 || c.Offset < 0 {
+		return 0, errors.New("malformed cursor")
+	}
+	if c.Query != queryOptionsHash(opts) {
+		return 0, errors.New("cursor does not match this query")
+	}
+	return c.Offset, nil
+}
 
 func serviceRequestFromOptions(opts queryOptions, countOnly bool) serviceRequest {
 	return serviceRequest{
@@ -32,6 +73,7 @@ func serviceRequestFromOptions(opts queryOptions, countOnly bool) serviceRequest
 		DeadlineUnix:  opts.DeadlineUnix,
 		RequestSeq:    opts.RequestSeq,
 		BudgetMS:      opts.BudgetMS,
+		Cursor:        opts.Cursor,
 	}
 }
 
@@ -53,6 +95,7 @@ func requestToOptionsFromService(req serviceRequest) queryOptions {
 		DeadlineUnix:  req.DeadlineUnix,
 		RequestSeq:    req.RequestSeq,
 		BudgetMS:      req.BudgetMS,
+		Cursor:        req.Cursor,
 	}
 }
 

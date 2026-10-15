@@ -159,8 +159,10 @@ Accuracy and ranking (fff parity):
 9. **No `sym:`** (definition search) and no definition-line bonus in content
    ranking.
 10. **Grep features:** no fuzzy (Smith-Waterman) grep, no multi-pattern OR
-      grep, no cursor pagination. **Per-query time budget: done (G10):**
-      content searches accept `--budget <duration>`; cursor pagination remains open.
+       grep. **Per-query time budget and cursor pagination: done (G10):**
+      content searches accept `--budget <duration>`; search JSON supports offset
+      cursors through `next_cursor` / `--cursor` (each page reruns the query up to
+      its offset, so cost grows with depth).
      **Line output and context lines: done (G10, `content/grep-lines`):**
      `seekfs search --lines [-C N | -A N -B N] [--max-per-file N]` prints
      ripgrep-style `path:LINE:text` / `path-LINE-text` with `--` separators.
