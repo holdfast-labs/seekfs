@@ -158,6 +158,10 @@ GOMAXPROCS=2, peak disk 0.56x extracted. Limit-20 warm/first: rare literal
 
 ## Owner actions (not agent work)
 
+- **Relaunch the live E: service on integ >= 65ff317** (elevated). The build
+  reserve is now 10 GiB (was 20 GiB; approved 2026-10-15), which raises build
+  headroom on E: from ~2 GB to ~12 GB; the live service keeps the old reserve
+  until it runs the new binary.
 - **Patch release decision:** two bugs in released v1.11.0 are fixed on
   integ and could be cherry-picked to `main` for v1.11.1:
   - CLI silent-empty: service errors exit 0 with no output (two lines in
