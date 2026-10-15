@@ -409,8 +409,10 @@ func applyQueryToken(pq *parsedQuery, raw string) error {
 		}
 	case raw == "case:" || raw == "case:true":
 		pq.CaseSensitive = true
+		pq.CaseExplicit = true
 	case raw == "case:false":
 		pq.CaseSensitive = false
+		pq.CaseExplicit = true
 	case raw == "type:file" || raw == "type:dir":
 		pq.Type = strings.TrimPrefix(raw, "type:")
 	case strings.HasPrefix(raw, "content:"):

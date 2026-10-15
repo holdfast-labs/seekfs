@@ -551,6 +551,7 @@ type parsedQuery struct {
 	Impossible        bool
 	MatchPath         bool
 	CaseSensitive     bool
+	CaseExplicit      bool
 	Exts              []string
 	Dirs              []string
 	Globs             []string

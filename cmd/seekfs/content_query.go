@@ -5,11 +5,49 @@ package main
 
 import (
 	"fmt"
+	"unicode"
 	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
 )
+
+// contentLeavesSmartCase applies ripgrep-style smart case query-wide: every
+// content leaf containing letters must contain a literal uppercase letter.
+func contentLeavesSmartCase(pq parsedQuery) bool {
+	leaves := contentAllLeaves(pq)
+	seenLetter := false
+	for _, leaf := range leaves {
+		upper, letters := contentPatternCase(leaf)
+		if letters {
+			seenLetter = true
+			if !upper { return false }
+		}
+	}
+	return seenLetter
+}
+
+func contentPatternCase(leaf contentLeaf) (upper, letters bool) {
+	text := leaf.Text
+	if leaf.Kind == contentLeafRegex {
+		class, escaped := false, false
+		for _, r := range text {
+			if escaped { escaped = false; continue }
+			if r == '\\' { escaped = true; continue }
+			if r == '[' { class = true; continue }
+			if r == ']' { class = false; continue }
+			if !class && unicode.IsLetter(r) {
+				letters = true
+				if unicode.IsUpper(r) { upper = true }
+			}
+		}
+		return
+	}
+	for _, r := range text {
+		if unicode.IsLetter(r) { letters = true; if unicode.IsUpper(r) { upper = true } }
+	}
+	return
+}
 
 // contentLeafKind discriminates the three content constraint forms.
 type contentLeafKind uint8

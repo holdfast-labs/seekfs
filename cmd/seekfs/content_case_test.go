@@ -9,6 +9,27 @@ import (
 	"testing"
 )
 
+func TestContentSmartCase(t *testing.T) {
+	selected := true
+	servicePluginContentSelection.Store(&selected)
+	t.Cleanup(func() { servicePluginContentSelection.Store(nil) })
+	tests := []struct { query string; sensitive bool }{
+		{"content:mutex", false},
+		{"content:Mutex", true},
+		{`content:/\w+Foo/`, true},
+		{`content:/\w+foo/`, false},
+		{`content:/\S/`, false},
+		{"case:false content:Mutex", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.query, func(t *testing.T) {
+			pq, err := parseQuery(queryOptions{Query: tt.query})
+			if err != nil { t.Fatal(err) }
+			if pq.CaseSensitive != tt.sensitive { t.Fatalf("CaseSensitive = %v, want %v", pq.CaseSensitive, tt.sensitive) }
+		})
+	}
+}
+
 // PF-6a: a case-sensitive content leaf (case:true) matches only the exact case;
 // the default remains case-insensitive and matches both spellings.
 func TestContentServiceCaseSensitiveTermLeaf(t *testing.T) {
@@ -25,7 +46,7 @@ func TestContentServiceCaseSensitiveTermLeaf(t *testing.T) {
 		t.Fatalf("case:true content:Needle = %v; want [upper.txt]", got)
 	}
 
-	both, err := contentServiceSearch(t, vol, "content:Needle", false)
+	both, err := contentServiceSearch(t, vol, "case:false content:Needle", false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -59,7 +80,7 @@ func TestContentServiceCaseSensitiveRegexLeaf(t *testing.T) {
 		t.Fatalf("case:true content:/Needle/ = %v; want [upper.txt]", got)
 	}
 
-	both, err := contentServiceSearch(t, vol, "content:/Needle/", false)
+	both, err := contentServiceSearch(t, vol, "case:false content:/Needle/", false)
 	if err != nil {
 		t.Fatal(err)
 	}

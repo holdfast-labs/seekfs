@@ -1923,6 +1923,7 @@ func parseQuery(opts queryOptions) (parsedQuery, error) {
 		Raw:                    opts.Query,
 		MatchPath:              opts.MatchPath || queryLooksPathScoped(opts.Query),
 		CaseSensitive:          opts.CaseSensitive,
+		CaseExplicit:           opts.CaseSensitive,
 		Fuzzy:                  opts.Fuzzy,
 		Under:                  normalizeFilterPath(opts.Under),
 		Exists:                 opts.Exists,
@@ -1982,6 +1983,9 @@ func parseQuery(opts queryOptions) (parsedQuery, error) {
 	// with no content leaves is a no-op; a content: token only returns from
 	// applyQueryToken, not from parseQuery, so this runs for content queries too.
 	contentAssignLeafIDs(&pq)
+	if !pq.CaseExplicit && contentLeavesSmartCase(pq) {
+		pq.CaseSensitive = true
+	}
 	if pq.isEmpty() {
 		return pq, errors.New("query has no searchable terms or filters")
 	}

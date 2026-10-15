@@ -211,7 +211,14 @@ or `plugin config content --root <path>`.
 
 ### 2b. Content matching semantics
 
-A `content:` leaf is a **case-insensitive literal substring** match by default:
+A `content:` leaf is case-insensitive by default. Without an explicit `case:`
+token, literal uppercase letters in a content pattern enable smart-case matching;
+lowercase patterns remain case-insensitive. Regex smart case ignores escaped
+letters and character classes (for example `\S`), and only literal uppercase
+letters trigger it. Explicit `case:true` or `case:false` overrides smart case.
+Smart case is query-wide: it applies only when every content leaf containing
+letters has a literal uppercase letter. Filename/path matching is unchanged.
+In insensitive matching,
 the query text is folded with Unicode `strings.ToLower` and tested for a byte
 substring anywhere in the document's verified bytes (`bytes.Contains`; v10
 reads the file from disk — there is no stored text anymore, see §6y). There is
@@ -222,7 +229,7 @@ literal substring. `case:true` selects case-sensitive matching (the raw,
 case-preserving verified bytes are compared byte-for-byte with no fold). For
 precision the index cannot express literally — word boundaries, alternation,
 anchors — use the regex form `content:/pattern/`, which is compiled with `(?i)`
-unless `case:true` is set. The fold is the same on both sides because the
+unless the effective content matching is case-sensitive. The fold is the same on both sides because the
 builder folds documents and the query folds the leaf with the one shared
 `contentFoldText`.
 
