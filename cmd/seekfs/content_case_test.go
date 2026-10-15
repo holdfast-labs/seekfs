@@ -140,13 +140,14 @@ func TestContentServiceUnicodeFoldPrefilterSuperset(t *testing.T) {
 	}
 
 	// The insensitive form folds both spellings to the same bytes, proving the
-	// index fold is Unicode-aware and not a byte-truncating ASCII lower.
-	both, err := contentServiceSearch(t, vol, "content:Café", false)
+	// index fold is Unicode-aware and not a byte-truncating ASCII lower
+	// (explicit case:false: smart case would make the uppercase C sensitive).
+	both, err := contentServiceSearch(t, vol, "case:false content:Café", false)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if got := namesOf(both); len(got) != 2 || got[0] != "lower.txt" || got[1] != "upper.txt" {
-		t.Fatalf("content:Café = %v; want [lower.txt upper.txt]", got)
+		t.Fatalf("case:false content:Café = %v; want [lower.txt upper.txt]", got)
 	}
 }
 
