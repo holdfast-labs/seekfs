@@ -553,12 +553,6 @@ func entryMatchesWithContentMatcher(vol *serviceVolumeIndex, entry Entry, pq par
 	if !entryMatchesScalar(entry, pq, matchPath) {
 		return false
 	}
-	if pq.Trace != nil && !pq.Trace.BudgetDeadline.IsZero() && !time.Now().Before(pq.Trace.BudgetDeadline) {
-		pq.Trace.BudgetExceeded = true
-		pq.Trace.setContentIncomplete()
-		pq.Trace.setComplete(false)
-		return false
-	}
 	if m == nil {
 		m = newContentLeafMatcher(pq)
 	}
@@ -722,7 +716,15 @@ func (vol *serviceVolumeIndex) contentTextForEntryPath(entry *Entry, livePath st
 	}
 	read := func(p string) ([]byte, bool) {
 		if trace != nil {
-			if trace.DiskCapped {
+			if trace.DiskCapped || trace.BudgetExceeded {
+				return nil, false
+			}
+			// The per-request time budget (--budget, budget_ms) stops new
+			// disk reads like the verify cap does: hits found so far stay,
+			// the result is marked incomplete.
+			if !trace.BudgetDeadline.IsZero() && !time.Now().Before(trace.BudgetDeadline) {
+				trace.BudgetExceeded = true
+				trace.setContentIncomplete()
 				return nil, false
 			}
 			if trace.DiskVerified >= contentDiskVerifyBudget {

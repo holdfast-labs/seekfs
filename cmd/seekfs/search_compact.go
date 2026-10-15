@@ -337,9 +337,6 @@ func searchCompactWithCacheHidden(idx *Index, opts queryOptions, countOnly bool,
 		return []Entry{}, nil
 	}
 	for pos := 0; pos < compactOrderLen(order, idx.compactRecordCount()); pos++ {
-		if pq.Trace != nil && pq.Trace.BudgetExceeded {
-			break
-		}
 		if pos&1023 == 0 && queryCanceled(pq) {
 			return nil, errQueryCanceled
 		}
@@ -388,11 +385,12 @@ func searchCompactWithCacheHidden(idx *Index, opts queryOptions, countOnly bool,
 				break
 			}
 		}
-		// The disk verification budget short-circuits every further verify
-		// to a miss once hit: stop the walk there instead of burning the
-		// whole candidate set past an already-incomplete page. Results are
-		// identical (every later verify would miss); only wasted reads stop.
-		if contentMatcher != nil && pq.Trace != nil && pq.Trace.DiskCapped {
+		// The disk verification budget (count or --budget time) short-circuits
+		// every further verify to a miss once hit: stop the walk there instead
+		// of burning the whole candidate set past an already-incomplete page.
+		// Results are identical (every later verify would miss); only wasted
+		// reads stop. A pre-verified page (skipEntryMatches) never gets here.
+		if contentMatcher != nil && pq.Trace != nil && (pq.Trace.DiskCapped || pq.Trace.BudgetExceeded) {
 			break
 		}
 	}
@@ -718,7 +716,7 @@ func verifyCompactContentParallel(idx *Index, pq parsedQuery, order []int, pathC
 		if !emit() {
 			return hits, nil
 		}
-		if pq.Trace != nil && pq.Trace.DiskCapped {
+		if pq.Trace != nil && (pq.Trace.DiskCapped || pq.Trace.BudgetExceeded) {
 			return hits, nil
 		}
 	}
