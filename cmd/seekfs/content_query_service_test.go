@@ -310,6 +310,32 @@ func TestContentServiceCandidatesSuperset(t *testing.T) {
 	}
 }
 
+// A posting superset past the completeness window is verified in rank order
+// and stops at the page: ~limit disk reads instead of a name-order scan. Every
+// file matches here, so the match set reaches the window and the result stays
+// marked incomplete (the window-capped signal), exactly as the full oracle.
+func TestContentLargePostingSupersetVerifiesPage(t *testing.T) {
+	files := make([]contentFixtureFile, 4200)
+	for i := range files {
+		files[i] = contentFixtureFile{frn: uint64(i + 2), name: fmt.Sprintf("file-%05d.txt", i), text: "needle in indexed text"}
+	}
+	vol := newContentQueryVolume(t, files)
+	trace := &searchTrace{}
+	probe := &contentCompletenessProbe{}
+	matches, err := searchServiceVolumes([]*serviceVolumeIndex{vol}, queryOptions{
+		Query: "content:needle", Limit: 20, Trace: trace, contentWindow: 4096, contentProbe: probe,
+	}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(matches) != 20 || !trace.ContentIncomplete {
+		t.Fatalf("large posting superset returned %d hits, incomplete=%v; want 20, true", len(matches), trace.ContentIncomplete)
+	}
+	if trace.DiskVerified > 20 {
+		t.Fatalf("ranked page verified %d files, want at most 20", trace.DiskVerified)
+	}
+}
+
 func TestContentServiceCountParity(t *testing.T) {
 	vol := newContentQueryVolume(t, []contentFixtureFile{
 		{2, "notes.txt", "alpha needle beta"},

@@ -782,6 +782,55 @@ func TestContentOrUnionStreamMatchesMaterializedUnion(t *testing.T) {
 	}
 }
 
+// Deterministic early-stop fixture: on a corpus where many files contain the
+// term, a limit-N content query verifies ~N files, not the whole posting
+// superset or the disk budget. Uses the selective term (a handful of docs)
+// so the page is provably complete: the rank-ordered posting superset is
+// verified in result order and the walk stops at the limit. A second arm
+// covers the broad term (every doc matches): verification stays bounded at
+// ~the page even though the completeness window conservatively reports
+// incomplete past 4096 matches by design.
+func TestContentBroadTermEarlyStop(t *testing.T) {
+	t.Setenv("SEEKFS_CONTENT_SEARCH", "1")
+	const limit = 20
+	vol, _ := sharedBoundedFlatVolumes(t)
+	vols := []*serviceVolumeIndex{vol}
+	trace := &searchTrace{}
+	matches, err := searchServiceVolumes(vols, queryOptions{Query: "content:pelican", Limit: limit, Trace: trace}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(matches) == 0 || len(matches) > limit {
+		t.Fatalf("got %d hits; want 1..%d", len(matches), limit)
+	}
+	// The selective superset is small and every match fits the page, so the
+	// walk stops after the superset with the page complete and verifies at
+	// most ~2N files (parallel fan-out bounds the over-verification).
+	if trace.DiskVerified > 2*limit {
+		t.Fatalf("DiskVerified=%d for a %d-hit page; want at most ~%d (early stop)", trace.DiskVerified, len(matches), 2*limit)
+	}
+	if trace.DiskCapped || trace.ContentIncomplete {
+		t.Fatalf("selective page reported incomplete (verified=%d capped=%v)", trace.DiskVerified, trace.DiskCapped)
+	}
+	// Broad arm: every doc matches, so the window probe reports incomplete by
+	// design — but verification still stops near the page instead of burning
+	// the disk budget (512) on the unfiltered scan.
+	broadTrace := &searchTrace{}
+	broadMatches, err := searchServiceVolumes(vols, queryOptions{Query: "content:download", Limit: limit, Trace: broadTrace}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(broadMatches) != limit {
+		t.Fatalf("broad: got %d hits; want %d", len(broadMatches), limit)
+	}
+	if broadTrace.DiskVerified > 2*limit+128 {
+		t.Fatalf("broad: DiskVerified=%d for a %d-hit page; want at most ~%d (early stop)", broadTrace.DiskVerified, len(broadMatches), 2*limit+128)
+	}
+	if broadTrace.DiskCapped {
+		t.Fatalf("broad: page hit the disk cap (verified=%d)", broadTrace.DiskVerified)
+	}
+}
+
 // Item 9: when the bias root holds matches, a biased broad query stops the scan
 // as soon as the biased page is full, instead of scanning to the candidate
 // budget. The candidate count in the trace is the scan's output size. Uses the
