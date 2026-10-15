@@ -626,7 +626,7 @@ func contentFuzzyRewriteTrials(volumes []*serviceVolumeIndex, opts queryOptions)
 		return nil, false
 	}
 	pq, err := parseQuery(opts)
-	if err != nil || pq.CaseSensitive || !queryHasPositiveContentLeaf(pq) {
+	if err != nil || pq.contentCaseSensitive() || !queryHasPositiveContentLeaf(pq) {
 		return nil, false
 	}
 	var words []string

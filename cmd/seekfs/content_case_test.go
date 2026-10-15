@@ -9,6 +9,49 @@ import (
 	"testing"
 )
 
+// Smart case (ripgrep): a content leaf with a literal uppercase letter makes
+// content matching case-sensitive unless case: is explicit. It never changes
+// name/path matching (pq.CaseSensitive).
+func TestContentSmartCase(t *testing.T) {
+	selected := true
+	servicePluginContentSelection.Store(&selected)
+	t.Cleanup(func() { servicePluginContentSelection.Store(nil) })
+	tests := []struct {
+		query     string
+		content   bool // contentCaseSensitive()
+		nameTerms bool // CaseSensitive
+	}{
+		{"content:mutex", false, false},
+		{"content:Mutex", true, false},
+		{"content:Mutex foo", true, false},
+		{`content:"Quick fox"`, true, false},
+		{"content:Mutex content:lock", false, false},
+		{`content:/\w+Foo/`, true, false},
+		{`content:/\w+foo/`, false, false},
+		{`content:/\S/`, false, false},
+		{`content:/\p{Lu}x/`, false, false},
+		{`content:/(?i)foo/`, false, false},
+		{`content:/[A-Z]oo/`, false, false},
+		{"content:123", false, false},
+		{"case:false content:Mutex", false, false},
+		{"case:true content:mutex", true, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.query, func(t *testing.T) {
+			pq, err := parseQuery(queryOptions{Query: tt.query})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := pq.contentCaseSensitive(); got != tt.content {
+				t.Fatalf("contentCaseSensitive = %v, want %v", got, tt.content)
+			}
+			if pq.CaseSensitive != tt.nameTerms {
+				t.Fatalf("CaseSensitive (name terms) = %v, want %v", pq.CaseSensitive, tt.nameTerms)
+			}
+		})
+	}
+}
+
 // PF-6a: a case-sensitive content leaf (case:true) matches only the exact case;
 // the default remains case-insensitive and matches both spellings.
 func TestContentServiceCaseSensitiveTermLeaf(t *testing.T) {
@@ -25,7 +68,7 @@ func TestContentServiceCaseSensitiveTermLeaf(t *testing.T) {
 		t.Fatalf("case:true content:Needle = %v; want [upper.txt]", got)
 	}
 
-	both, err := contentServiceSearch(t, vol, "content:Needle", false)
+	both, err := contentServiceSearch(t, vol, "case:false content:Needle", false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -59,7 +102,7 @@ func TestContentServiceCaseSensitiveRegexLeaf(t *testing.T) {
 		t.Fatalf("case:true content:/Needle/ = %v; want [upper.txt]", got)
 	}
 
-	both, err := contentServiceSearch(t, vol, "content:/Needle/", false)
+	both, err := contentServiceSearch(t, vol, "case:false content:/Needle/", false)
 	if err != nil {
 		t.Fatal(err)
 	}

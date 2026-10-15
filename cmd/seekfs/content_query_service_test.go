@@ -123,7 +123,7 @@ func TestContentServiceTermQueryCaseInsensitive(t *testing.T) {
 		{3, "b.md", "nothing here"},
 		{4, "c.md", "Needle in markdown"},
 	})
-	for _, query := range []string{"content:needle", "content:NEEDLE"} {
+	for _, query := range []string{"content:needle", "case:false content:NEEDLE"} {
 		matches, err := contentServiceSearch(t, vol, query, false)
 		if err != nil {
 			t.Fatalf("%s: %v", query, err)

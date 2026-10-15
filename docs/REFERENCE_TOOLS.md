@@ -159,8 +159,10 @@ Accuracy and ranking (fff parity):
 9. **No `sym:`** (definition search) and no definition-line bonus in content
    ranking.
 10. **Grep features:** no fuzzy (Smith-Waterman) grep, no multi-pattern OR
-    grep, no context lines, no per-query time budget or cursor pagination, and
-    no smart case for content. Regex is Go RE2 with no lookaround.
+     grep, no context lines, no per-query time budget or cursor pagination.
+     **Smart case for content: done (G10).** Uppercase literal content patterns
+     enable query-wide sensitivity unless explicitly overridden by `case:`;
+     regex escapes and classes do not trigger it. Regex is Go RE2 with no lookaround.
 11. **Query language: done (`perf/name-lessons`, §G11-notes).**
     `'exact`, `^prefix`, `suffix$` name anchors (always on the file name;
     stripped text joins Terms so posting lanes engage); `**` path globs
