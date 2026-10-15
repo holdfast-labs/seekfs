@@ -109,7 +109,9 @@ GOMAXPROCS=2, peak disk 0.56x extracted. Limit-20 warm/first: rare literal
   file on NVMe; warm opens 0.03 ms): blink/renderer/core 69.6 s cold vs 6.6 s
   warm, CPU work ~6 s. 16 open workers only ~1.5x. Levers: (1) owner decision on
   a Defender process exclusion for the service binary (~10x cold); (2) decouple
-  I/O concurrency from CPU workers (~1.5x); (3) tokenize+emit CPU (~5 s of 6).
+  I/O concurrency from CPU workers: TRIED (`perf/build-io-concurrency` 871319b,
+  not merged): 175 vs 179 files/s cold, the scan rate is the ceiling;
+  (3) tokenize+emit CPU (~5 s of 6), only matters warm or after (1).
 - **Fold cost under no stored text:** a fold re-reads every doc in the shard
   from disk (5.6 ms/doc). Keep shards small, or fold from postings only.
 - **Delta-varint spill runs:** the external section builder spills raw 8-byte
