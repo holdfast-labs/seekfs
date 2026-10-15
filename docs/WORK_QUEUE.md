@@ -52,7 +52,6 @@ corruption, exact required sources, auto-fuzzy only on zero exact hits).
 
 | Branch | Worktree | Scope |
 |---|---|---|
-| `content/stream-postings` | streampost | Build peak: candidate B (no per-group reframe copy, direct-offset spool reads, hole-punch after shard save) measured on a >= 6-shard Chromium subtree; keep only if peak/extracted drops >= 0.1 with identical output, then lower the peak multiplier |
 | `perf/static-ranking` | staticrank | **Parked** at WIP commit `761db7b` (OR-lane case unresolved, suite not green); resume only with a fresh, narrow brief (G13) |
 
 Merged 2026-10-15: `content/cursor` (607d38b, G10: `--cursor` / `next_cursor` offset
@@ -98,11 +97,13 @@ GOMAXPROCS=2, peak disk 0.56x extracted. Limit-20 warm/first: rare literal
 
 ## Smaller follow-ups
 
-- **Whole-drive coverage: stream postings without a full text spool.** The
-  reserve-governed default (no explicit budget, the real E: drive) is limited
-  by the build's transient peak, extracted text x1.5. Peak was 0.56x on
-  Chromium. Build postings without spooling all text first, so the reserve
-  admits far more of the drive.
+- **Whole-drive coverage, build peak: CLOSED 2026-10-15** (`content/stream-postings`
+  NOTES.md). Spooling posting runs instead of text: raw runs are ~1.02x of text
+  (worse than the 0.27x text spool). Dropping the per-group spool reframe
+  (shared sparse spool + hole punch): `chrome/` 354 MB, 6 shards, peak 0.70x ->
+  0.96x (the shared spool lives to the end; holes do not free interleaved
+  frames), so reverted. Coverage lever taken instead: reserve cap 20 -> 10 GiB
+  (65ff317), ~6x build headroom on E:.
 - **Build speed: profiled 2026-10-15** (`perf/build-profile` NOTES.md, 799edc8). Cold
   builds are bound by Defender real-time scanning on first open (~7-13 ms per
   file on NVMe; warm opens 0.03 ms): blink/renderer/core 69.6 s cold vs 6.6 s
