@@ -241,6 +241,7 @@ type jsonSearchResponse struct {
 	Content                  *contentHealth `json:"content,omitempty"`
 	Results                  []jsonResult   `json:"results,omitempty"`
 	BudgetExceeded           bool           `json:"budget_exceeded,omitempty"`
+	NextCursor               string         `json:"next_cursor,omitempty"`
 }
 
 type jsonInfoResponse struct {
@@ -538,6 +539,7 @@ type queryOptions struct {
 	// lineOutput is the CLI's --lines request; client-side only (never sent
 	// to the service, never serialized).
 	lineOutput *contentLineOutput `json:"-"`
+	Cursor     string             `json:"cursor,omitempty"`
 }
 
 // contentCompletenessProbe carries the reduced default-order path's

@@ -2843,3 +2843,8 @@ Use `seekfs search --budget 150ms "content:needle"` to bound disk verification f
 The opt-in budget starts once per request; zero (the default) preserves existing behavior.
 If the deadline expires, search returns verified hits so far in normal order and reports `complete: false` and `budget_exceeded: true`.
 Name-only queries ignore this setting, and count queries remain exact by ignoring it.
+Search JSON responses may include `next_cursor` when a page is full. Pass that
+opaque token back with `seekfs search --cursor TOKEN` to fetch the next page;
+tokens are bound to the query and its result-affecting options. Each page
+re-runs the query up to its offset plus the requested page size, so cost grows
+with page depth; this is intended for interactive paging.

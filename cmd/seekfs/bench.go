@@ -233,4 +233,5 @@ type serviceRequest struct {
 	// remote transport for connection-scoped cancellation.  It never crosses
 	// the wire and is never set from client-supplied input.
 	CancelOverride func() bool `json:"-"`
+	Cursor         string      `json:"cursor,omitempty"`
 }

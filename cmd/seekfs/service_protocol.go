@@ -86,7 +86,8 @@ type serviceResponse struct {
 	// Governor reports which content-build governor signals are live in
 	// this process vs unavailable, so "no user activity" is never confused
 	// with "cannot see user activity" (notably input in session 0).
-	Governor *governorHealth `json:"governor,omitempty"`
+	Governor   *governorHealth `json:"governor,omitempty"`
+	NextCursor string          `json:"next_cursor,omitempty"`
 }
 
 // redactContentText clears local-only matched content text (snippets) from the

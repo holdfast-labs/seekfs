@@ -149,8 +149,8 @@ func looksLikeSearchWithoutSubcommand(args []string) bool {
 func normalizeSearchArgs(args []string) []string {
 	valueFlags := map[string]bool{
 		"--under": true, "-db": true, "--db": true, "-n": true, "--n": true,
-		"--budget": true,
-		"-config":  true, "--config": true, "-pipe": true, "--pipe": true,
+		"--budget": true, "--cursor": true,
+		"-config": true, "--config": true, "-pipe": true, "--pipe": true,
 		"-root-bias": true, "--root-bias": true, "-recent": true, "--recent": true,
 		"-near": true, "--near": true, "-current": true, "--current": true,
 		"-modified-after": true, "--modified-after": true,
