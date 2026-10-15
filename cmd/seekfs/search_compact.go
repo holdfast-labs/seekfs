@@ -337,6 +337,9 @@ func searchCompactWithCacheHidden(idx *Index, opts queryOptions, countOnly bool,
 		return []Entry{}, nil
 	}
 	for pos := 0; pos < compactOrderLen(order, idx.compactRecordCount()); pos++ {
+		if pq.Trace != nil && pq.Trace.BudgetExceeded {
+			break
+		}
 		if pos&1023 == 0 && queryCanceled(pq) {
 			return nil, errQueryCanceled
 		}
@@ -853,6 +856,9 @@ func (vol *serviceVolumeIndex) verifyContentSupersetPage(pq parsedQuery, ranked 
 	cache := make(map[int]string)
 	page := make([]int, 0, min(pq.Limit, len(ranked)))
 	for _, id := range ranked {
+		if pq.Trace != nil && pq.Trace.BudgetExceeded {
+			return page, true
+		}
 		if pq.Trace != nil && pq.Trace.DiskCapped {
 			// The verify budget already marked the trace incomplete; keep
 			// the hits found so far as a visible partial page.

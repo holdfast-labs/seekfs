@@ -18,6 +18,7 @@ import (
 	"os"
 	"regexp"
 	"sort"
+	"time"
 	"unicode/utf8"
 )
 
@@ -550,6 +551,12 @@ func entryMatchesWithContentMatcher(vol *serviceVolumeIndex, entry Entry, pq par
 	// compounds with a selective filename side (ext:cc + content:mutex skips
 	// every non-.cc candidate's text fetch).
 	if !entryMatchesScalar(entry, pq, matchPath) {
+		return false
+	}
+	if pq.Trace != nil && !pq.Trace.BudgetDeadline.IsZero() && !time.Now().Before(pq.Trace.BudgetDeadline) {
+		pq.Trace.BudgetExceeded = true
+		pq.Trace.setContentIncomplete()
+		pq.Trace.setComplete(false)
 		return false
 	}
 	if m == nil {

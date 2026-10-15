@@ -895,6 +895,7 @@ func cmdSearch(args []string, countOnly bool) error {
 	modifiedAfter := fs.String("modified-after", "", "only return results modified after RFC3339 time or YYYY-MM-DD")
 	caseSensitive := fs.Bool("case", false, "case-sensitive query matching")
 	fuzzy := fs.Bool("fuzzy", false, "append close matches (edit distance) below exact results")
+	budget := fs.Duration("budget", 0, "maximum wall-clock time for content verification (for example 150ms)")
 	if err := fs.Parse(normalizeSearchArgs(args)); err != nil {
 		return err
 	}
@@ -943,6 +944,7 @@ func cmdSearch(args []string, countOnly bool) error {
 		ModifiedAfter: *modifiedAfter,
 		CaseSensitive: *caseSensitive,
 		Fuzzy:         *fuzzy,
+		BudgetMS:      int(budget.Milliseconds()),
 	}
 	if *cwdBias {
 		cwd, err := os.Getwd()

@@ -73,6 +73,7 @@ type serviceResponse struct {
 	Fallback                 string              `json:"fallback,omitempty"`
 	Complete                 *bool               `json:"complete,omitempty"`
 	Results                  []string            `json:"results,omitempty"`
+	BudgetExceeded           bool                `json:"budget_exceeded,omitempty"`
 	Rows                     []jsonResult        `json:"rows,omitempty"`
 	DBs                      []dbInfo            `json:"dbs,omitempty"`
 	Runtime                  *runtimeMemoryInfo  `json:"runtime,omitempty"`

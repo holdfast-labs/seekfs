@@ -240,6 +240,7 @@ type jsonSearchResponse struct {
 	Complete                 *bool          `json:"complete,omitempty"`
 	Content                  *contentHealth `json:"content,omitempty"`
 	Results                  []jsonResult   `json:"results,omitempty"`
+	BudgetExceeded           bool           `json:"budget_exceeded,omitempty"`
 }
 
 type jsonInfoResponse struct {
@@ -504,6 +505,7 @@ type queryOptions struct {
 	// index) searches leave it nil and fall back to the current process
 	// user's store. Local-only; never crosses the wire.
 	SignalStore *signalStore `json:"-"`
+	BudgetMS    int          `json:"budget_ms,omitempty"`
 	// Per-query content budgets. Zero means "use the default"; they are never
 	// globals, so concurrent queries cannot race on each other's limits.
 	ContentCandidateBudget int `json:"content_candidate_budget,omitempty"`
@@ -726,8 +728,10 @@ type searchTrace struct {
 	// DiskCapped marks the trace incomplete: the result is a visible
 	// subset, never a silent truncation; a count refuses outright. Delta
 	// hits never count (memory, not disk). Local-only plumbing.
-	DiskVerified int  `json:"-"`
-	DiskCapped   bool `json:"-"`
+	DiskVerified   int       `json:"-"`
+	DiskCapped     bool      `json:"-"`
+	BudgetExceeded bool      `json:"budget_exceeded,omitempty"`
+	BudgetDeadline time.Time `json:"-"`
 }
 
 type traceTerm struct {
