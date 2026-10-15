@@ -1051,11 +1051,11 @@ func TestContentServiceBuildReserveDropsExactFilesAndBytes(t *testing.T) {
 	stubContentBuildSync(t)
 	oldFree, oldTotal := contentFreeBytesFn, contentTotalBytesFn
 	defer func() { contentFreeBytesFn, contentTotalBytesFn = oldFree, oldTotal }()
-	// 20 GiB reserve (5% of 500 GiB, capped) plus the in-flight shard
+	// 10 GiB reserve (5% of 500 GiB, capped) plus the in-flight shard
 	// scratch, and 9 bytes of headroom: the build peak (compressed spool +
 	// output, ×0.8) allows 11 extracted bytes.
 	contentTotalBytesFn = func(_ string) (uint64, error) { return 500 << 30, nil }
-	contentFreeBytesFn = func(_ string) (uint64, error) { return (20 << 30) + contentScopeScratchSlack() + 9, nil }
+	contentFreeBytesFn = func(_ string) (uint64, error) { return contentScopeReserveMaxBytes + contentScopeScratchSlack() + 9, nil }
 	dir := t.TempDir()
 	bodies := map[string]string{
 		"a.txt": "alpha",
@@ -1090,11 +1090,11 @@ func TestContentServiceBuildReserveDropsExactFilesAndBytes(t *testing.T) {
 	if built.Policy.ScopeDroppedBytes != int64(len("charlie?")) {
 		t.Fatalf("reserve index policy = %+v; want dropped_bytes=%d", built.Policy, len("charlie?"))
 	}
-	if built.Policy.BudgetBytes != 0 || built.Policy.ReserveBytes != 20<<30 {
+	if built.Policy.BudgetBytes != 0 || built.Policy.ReserveBytes != contentScopeReserveMaxBytes {
 		t.Fatalf("reserve index policy = %+v; want budget=0 reserve=20GiB", built.Policy)
 	}
 	h := vol.content.healthSnapshot(0)
-	if h.ScopeDropped != 1 || h.ReserveBytes != 20<<30 || h.BudgetBytes != 0 {
+	if h.ScopeDropped != 1 || h.ReserveBytes != contentScopeReserveMaxBytes || h.BudgetBytes != 0 {
 		t.Fatalf("reserve health = %+v; want exact dropped files and the reserve", h)
 	}
 	if !h.Incomplete {
@@ -1397,7 +1397,7 @@ func TestContentServiceBuildAdaptsToIncompressibleSpool(t *testing.T) {
 		const cp = int64(106)
 		stubContentCatchUpJournal(t, usnJournalDataV0{UsnJournalID: journal, FirstUsn: 1, LowestValidUsn: 1, NextUsn: cp})
 		vol, gsx := contentBuildTestVolume(t, dir, journal, uint64(cp), recs)
-		reserve := uint64(20 << 30)
+		reserve := uint64(contentScopeReserveMaxBytes)
 		contentTotalBytesFn = func(_ string) (uint64, error) { return 500 << 30, nil }
 		free0 := reserve + slack + headroom
 		// Transient + output bytes this build holds on the sidecar volume:

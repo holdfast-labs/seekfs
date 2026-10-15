@@ -433,21 +433,21 @@ func TestContentScopeReserve(t *testing.T) {
 		contentFreeBytesFn, contentTotalBytesFn, contentDiskReserveBytes = oldFree, oldTotal, oldReserve
 	}()
 	vol := `E:\`
-	// A 300 GiB volume: reserve is 5% (15 GiB), inside [10, 20] GiB.
+	// A 300 GiB volume: 5% (15 GiB) is capped at 10 GiB.
 	contentTotalBytesFn = func(_ string) (uint64, error) { return 300 << 30, nil }
 	contentFreeBytesFn = func(_ string) (uint64, error) { return 100 << 30, nil }
-	if got := contentScopeReserveFor(vol); got != 15<<30 {
-		t.Fatalf("reserve(300GiB) = %d; want 15 GiB", got)
+	if got := contentScopeReserveFor(vol); got != contentScopeReserveMaxBytes {
+		t.Fatalf("reserve(300GiB) = %d; want the 10 GiB cap", got)
 	}
 	// A 100 GiB volume: 5% (5 GiB) is raised to the 10 GiB floor.
 	contentTotalBytesFn = func(_ string) (uint64, error) { return 100 << 30, nil }
 	if got := contentScopeReserveFor(vol); got != contentScopeReserveMinBytes {
 		t.Fatalf("reserve(100GiB) = %d; want the 10 GiB floor", got)
 	}
-	// A 2 TiB volume: 5% (~102 GiB) is capped at 20 GiB.
+	// A 2 TiB volume: 5% (~102 GiB) is capped at 10 GiB.
 	contentTotalBytesFn = func(_ string) (uint64, error) { return 2 << 40, nil }
 	if got := contentScopeReserveFor(vol); got != contentScopeReserveMaxBytes {
-		t.Fatalf("reserve(2TiB) = %d; want the 20 GiB cap", got)
+		t.Fatalf("reserve(2TiB) = %d; want the 10 GiB cap", got)
 	}
 	// Unknown capacity falls back to the fixed reserve (0 in the test
 	// suite, which disables the reserve there).
@@ -458,11 +458,11 @@ func TestContentScopeReserve(t *testing.T) {
 	}
 	contentDiskReserveBytes = 0
 	// Allowance budgets the build's peak (spool + output): (free - reserve -
-	// shard scratch) / peak multiplier, on a 2 TiB volume (20 GiB reserve)
+	// shard scratch) / peak multiplier, on a 2 TiB volume (10 GiB reserve)
 	// with 100 GiB free.
 	contentTotalBytesFn = func(_ string) (uint64, error) { return 2 << 40, nil }
 	contentFreeBytesFn = func(_ string) (uint64, error) { return 100 << 30, nil }
-	headroom := uint64(80<<30) - contentScopeScratchSlack()
+	headroom := uint64(90<<30) - contentScopeScratchSlack()
 	if got, want := contentScopeAllowance(vol, 0), int64(float64(headroom)/contentScopePeakMultiplier); got != want {
 		t.Fatalf("allowance = %d; want %d", got, want)
 	}
@@ -491,15 +491,15 @@ func TestContentScopeReserve(t *testing.T) {
 	if contentScopeFitsReserve(vol, 1) {
 		t.Fatal("below the reserve nothing fits")
 	}
-	// The fits check agrees with the allowance: 100 GiB free, 20 GiB
-	// reserve: 90 GiB extracted peaks at 72 GiB (fits in ~80 GiB of
-	// headroom); 110 GiB peaks at 88 GiB (breaches).
+	// The fits check agrees with the allowance: 100 GiB free, 10 GiB
+	// reserve: 110 GiB extracted peaks at 88 GiB (fits in ~90 GiB of
+	// headroom); 115 GiB peaks at 92 GiB (breaches).
 	contentFreeBytesFn = func(_ string) (uint64, error) { return 100 << 30, nil }
-	if !contentScopeFitsReserve(vol, 90<<30) {
-		t.Fatal("90 GiB extracted must fit: a 72 GiB peak leaves the 20 GiB reserve")
+	if !contentScopeFitsReserve(vol, 110<<30) {
+		t.Fatal("110 GiB extracted must fit: an 88 GiB peak leaves the 10 GiB reserve")
 	}
-	if contentScopeFitsReserve(vol, 110<<30) {
-		t.Fatal("110 GiB extracted must not fit: an 88 GiB peak breaches the reserve")
+	if contentScopeFitsReserve(vol, 115<<30) {
+		t.Fatal("115 GiB extracted must not fit: a 92 GiB peak breaches the reserve")
 	}
 	// Anchors: bare volumes anchor at the root, absolute paths at themselves,
 	// anything else anchors nowhere.
@@ -517,10 +517,10 @@ func TestContentScopeReserve(t *testing.T) {
 func TestContentScopeEstimateReserveTruncates(t *testing.T) {
 	oldFree, oldTotal := contentFreeBytesFn, contentTotalBytesFn
 	defer func() { contentFreeBytesFn, contentTotalBytesFn = oldFree, oldTotal }()
-	// 20 GiB reserve (5% of 500 GiB, capped), 9 bytes of headroom: allowance
+	// 10 GiB reserve (5% of 500 GiB, capped), 9 bytes of headroom: allowance
 	// is 18 extracted bytes.
 	contentTotalBytesFn = func(_ string) (uint64, error) { return 500 << 30, nil }
-	contentFreeBytesFn = func(_ string) (uint64, error) { return (20 << 30) + 9, nil }
+	contentFreeBytesFn = func(_ string) (uint64, error) { return contentScopeReserveMaxBytes + 9, nil }
 	d := uint32(os.ModeDir)
 	recs := []CompactRecord{
 		{FRN: 1, Parent: -1, Mode: d, Name: "."},

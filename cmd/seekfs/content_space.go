@@ -35,14 +35,17 @@ var contentTotalBytesFn = contentTotalDiskBytes
 // contentScopeReserveFraction, contentScopeReserveMinBytes and
 // contentScopeReserveMaxBytes define the free-space reserve a content build
 // leaves on the volume holding the sidecar: 5% of the volume's capacity,
-// clamped to [10 GiB, 20 GiB]. Sharding bounds build/fold memory per shard, so
+// clamped to [10 GiB, 10 GiB], i.e. 10 GiB on any volume of known size. The
+// cap was 20 GiB until 2026-10-15; the owner lowered it because v11's final
+// index is ~0.24x of extracted text and a 20 GiB reserve on a nearly full
+// drive left ~2 GB of build headroom. Sharding bounds build/fold memory per shard, so
 // disk space is the binding constraint. The same reserve governs selection
 // (how much text to index) and the write-time guard, so the two agree.
 const contentScopeReserveFraction = 0.05
 
 const contentScopeReserveMinBytes = 10 << 30
 
-const contentScopeReserveMaxBytes = 20 << 30
+const contentScopeReserveMaxBytes = 10 << 30
 
 // contentScopeSpoolMultiplier caps the spool's share of the build peak per
 // selected extracted byte. The spool holds one zstd frame per document

@@ -158,7 +158,7 @@ of the candidates to project the binary share (`projected_text_files`).
 There is no default extracted-text budget: the default scope indexes
 everything selected, and selection stops only when the projected index would
 push the volume holding the sidecar below a free-space reserve — 5% of the
-volume's capacity, clamped to [10 GiB, 20 GiB] (see `contentScopeReserveFor`
+volume's capacity, clamped to [10 GiB, 10 GiB] (10 GiB on any volume of known size; the cap was 20 GiB until 2026-10-15) (see `contentScopeReserveFor`
 in `content_space.go`). Sharding bounds build and fold memory per 64 MiB shard,
 so the budget is really disk space. Selection budgets the build's peak, not
 just its output: the text spool (1× extracted) lives next to the sidecar until
@@ -1160,7 +1160,7 @@ No stored-text change was needed and none is proposed.
 **Budget policy (done, with the reserve code in `content_space.go`).**
 There is no default byte budget: the default scope indexes everything
 selected and stops only when the build's projected peak (extracted × 1.5:
-spool plus index, see §6t) would breach the volume's free-space reserve — 5% of capacity in [10 GiB, 20 GiB],
+spool plus index, see §6t) would breach the volume's free-space reserve — 5% of capacity in [10 GiB, 10 GiB],
 monotonic (it never grows as free space shrinks) and shared by selection and
 the write-time guard, with no fail-open (allowance 0 at or below the
 reserve; unknown free space leaves selection unlimited with the write guard

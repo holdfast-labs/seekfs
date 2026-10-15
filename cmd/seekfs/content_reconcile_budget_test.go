@@ -12,7 +12,7 @@ func stubContentNoHeadroom(t *testing.T) {
 	oldFree, oldTotal := contentFreeBytesFn, contentTotalBytesFn
 	t.Cleanup(func() { contentFreeBytesFn, contentTotalBytesFn = oldFree, oldTotal })
 	contentTotalBytesFn = func(_ string) (uint64, error) { return 500 << 30, nil }
-	contentFreeBytesFn = func(_ string) (uint64, error) { return 20 << 30, nil }
+	contentFreeBytesFn = func(_ string) (uint64, error) { return contentScopeReserveMaxBytes, nil }
 }
 
 func TestContentReconcileTrimNew(t *testing.T) {
