@@ -16,6 +16,8 @@ long debugging loops with no checkpoint, multi-hour sessions resending a
 growing context, full-suite output pasted into context, polling, coordinator
 "FYI"/"continue" prompts, and 4 agents re-reading the same files.
 
+- Agent model since 2026-10-15: `opencode/openai/gpt-6-luna`, mode `build`
+  (Muse routes are out of credits).
 - Run 1–2 agents at a time, not 4. Do not enable paid provider balance without
   asking the owner.
 - Give each agent a narrow brief with an explicit stopping point: "commit and stop
@@ -35,7 +37,7 @@ growing context, full-suite output pasted into context, polling, coordinator
 - The coordinator does small finishing work (commit, merge, suite run)
   directly instead of spawning an agent for it.
 
-## Running (2026-10-14)
+## Running (2026-10-15)
 
 Merged so far this round: `perf/content-underfill`, `perf/name-fuzzy`,
 `fix/cli-silent-empty`, `content/idle-governor`, `content/spool-peak`, `perf/ranking-signals` (G7, G8, G13), `content/inclusion-policy` (G3, §6z,
@@ -50,7 +52,8 @@ corruption, exact required sources, auto-fuzzy only on zero exact hits).
 
 | Branch | Worktree | Scope |
 |---|---|---|
-| `content/verify-precision` | verifyprec | `content:mutex` on full Chromium verifies 2,157 files for 20 hits (591 ms warm, 8.3 s first) and reports incomplete; make limit-N queries early-stop (~2N verifies, complete). Also regex cost, `count content:struct` exactness |
+| `content/stream-postings` | streampost | **Design phase only** (no code): why v11 still spools all text, and the smallest change to bring the build peak from 0.8x extracted to <= 0.35x (E: has ~2 GB headroom over the 20 GB reserve). Report in `NOTES.md`; coordinator reviews before code |
+| `content/verify-precision` | verifyprec | Restarted 2026-10-15 on `opencode/openai/gpt-6-luna`: large supersets verified in rank order with early stop instead of the name-order fallback. `content:mutex` on full Chromium verifies 2,157 files for 20 hits (591 ms warm, 8.3 s first) and reports incomplete; make limit-N queries early-stop (~2N verifies, complete). Also regex cost, `count content:struct` exactness |
 | `perf/static-ranking` | staticrank | **Parked** at WIP commit `761db7b` (OR-lane case unresolved, suite not green); resume only with a fresh, narrow brief (G13) |
 
 Merged 2026-10-14: `feat/ui-input-and-user-signals`, `integ/filter-tier-merge`
