@@ -18,6 +18,9 @@ func isVolumeRoot(path string) bool {
 }
 
 func countServiceVolumes(volumes []*serviceVolumeIndex, opts queryOptions) (int, bool, error) {
+	if opts.parsedOverride == nil {
+		opts, _ = contentFuzzyExpandQuery(volumes, opts)
+	}
 	pq, err := parseQuery(opts)
 	if err != nil {
 		return 0, true, err

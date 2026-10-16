@@ -321,6 +321,7 @@ Query filters:
                     whole-word match (foo matches foobar). Needs the
                     content plugin (seekfs plugin add content); content:/re/ is a regex
                     match for word boundaries or alternation.
+  content~:word     Case-insensitive indexed word match within edit distance (default 1/2).
   a|b               OR alternatives within a term, such as ext:png|jpg.
   !term, -term      Exclude a term or filter.
 

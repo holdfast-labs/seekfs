@@ -4,9 +4,53 @@ import (
 	"encoding/json"
 	"fmt"
 	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 )
+
+func TestFuzzyGrepExplicitIndexedContent(t *testing.T) {
+	vol := newContentQueryVolume(t, []contentFixtureFile{{1, "mutex.txt", "mutex"}, {2, "muter.txt", "muter"}, {3, "flux.txt", "flux"}, {4, "mutexes.txt", "mutexes"}, {5, "mux.txt", "mux"}})
+	for q, want := range map[string][]string{"content~:mutex": {"muter.txt", "mutex.txt"}, "content~2:mutex": {"muter.txt", "mutex.txt", "mutexes.txt"}} {
+		got, err := contentServiceSearch(t, vol, q, false)
+		if err != nil {
+			t.Fatalf("%s: %v", q, err)
+		}
+		names := namesOf(got)
+		sort.Strings(names)
+		if strings.Join(names, ",") != strings.Join(want, ",") {
+			t.Fatalf("%s = %v, want %v", q, names, want)
+		}
+	}
+	// Fuzzy words ignore smart case: an uppercase letter does not make the
+	// expanded variants case-sensitive.
+	if got, err := contentServiceSearch(t, vol, "content~:Mutex", false); err != nil || len(got) != 2 {
+		t.Fatalf("content~:Mutex = %v, %v; want 2 hits", namesOf(got), err)
+	}
+	if got, err := contentServiceSearch(t, vol, "content~:mux", false); err != nil || strings.Join(namesOf(got), ",") != "mux.txt" {
+		t.Fatalf("content~:mux = %v, %v", namesOf(got), err)
+	}
+	for q, want := range map[string]int{"content~:mutex ext:txt": 2, "content~:mutex mutex": 1} {
+		if got, err := contentServiceSearch(t, vol, q, false); err != nil || len(got) != want {
+			t.Fatalf("%s = %v, %v; want %d", q, namesOf(got), err, want)
+		}
+	}
+	if n := contentServiceCount(t, []*serviceVolumeIndex{vol}, "content~:mutex"); n != 2 {
+		t.Fatalf("count = %d, want 2", n)
+	}
+	if _, err := parseQuery(queryOptions{Query: `content~:"two words"`}); err == nil {
+		t.Fatal("phrase fuzzy query parsed")
+	}
+	pq, err := parseQuery(queryOptions{Query: "content~:muter"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// muter and mutex are one edit apart; flux is not.
+	lines := contentMatchingLines([]byte("muter\nmutex\nflux\n"), newContentLeafMatcher(pq), contentPositiveLeaves(pq), 10, 0, 0)
+	if len(lines) != 2 || lines[0].Text != "muter" || lines[1].Text != "mutex" {
+		t.Fatalf("fuzzy lines = %+v", lines)
+	}
+}
 
 // contentFixtureFile is one record + content document for the service tests.
 type contentFixtureFile struct {
@@ -979,5 +1023,24 @@ func TestContentServiceSnapshotCarriesContentState(t *testing.T) {
 	got := namesOf(matches)
 	if len(got) != 2 || got[0] != "a.txt" || got[1] != "b.md" {
 		t.Fatalf("snapshot content search = %v; want [a.txt b.md]", got)
+	}
+}
+
+func TestContentHasWholeWord(t *testing.T) {
+	for _, tc := range []struct {
+		hay, word string
+		want      bool
+	}{
+		{"a mutex here", "mutex", true},
+		{"mutexes", "mutex", false},
+		{"my_mutex", "mutex", false},
+		{"(mutex)", "mutex", true},
+		{"mutex", "mutex", true},
+		{"premutex mutex", "mutex", true},
+		{"mutexé", "mutex", false},
+	} {
+		if got := contentHasWholeWord([]byte(tc.hay), []byte(tc.word)); got != tc.want {
+			t.Errorf("contentHasWholeWord(%q, %q) = %v; want %v", tc.hay, tc.word, got, tc.want)
+		}
 	}
 }

@@ -429,6 +429,9 @@ func entryTypeRank(entry Entry) int {
 }
 
 func searchServiceVolumes(volumes []*serviceVolumeIndex, opts queryOptions, countOnly bool) ([]Entry, error) {
+	if opts.parsedOverride == nil {
+		opts, _ = contentFuzzyExpandQuery(volumes, opts)
+	}
 	if opts.BudgetMS > 0 && !countOnly && opts.Trace != nil && opts.Trace.BudgetDeadline.IsZero() {
 		opts.Trace.BudgetDeadline = time.Now().Add(time.Duration(opts.BudgetMS) * time.Millisecond)
 	}
