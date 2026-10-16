@@ -52,11 +52,13 @@ corruption, exact required sources, auto-fuzzy only on zero exact hits).
 
 | Branch | Worktree | Scope |
 |---|---|---|
-| `content/accent-fold` | accentfold | Content accent folding in the index (format v12, rebuild on upgrade): `resume` finds `résumé`; accented query letters stay exact; regex stays accent-sensitive |
-| `content/fuzzy-grep` | fuzzygrep | `content~:word` / `content~N:word`: OR over dictionary words within edit distance (G10 fuzzy grep) |
 | `perf/static-ranking` | staticrank | **Parked** at WIP commit `761db7b` (OR-lane case unresolved, suite not green); resume only with a fresh, narrow brief (G13) |
 
-Merged 2026-10-15: `content/typo-scope` (da7def5: the typo fallback never corrects
+Merged 2026-10-15: `content/accent-fold` (69a061a, content format **v12**: terms,
+grams and filter bits are accent-folded; `resume` finds `résumé`, an accented query
+letter stays exact, regex stays accent-sensitive; v11 sidecars rebuild),
+`content/fuzzy-grep` (ef020f3, `content~:word` / `content~N:word` over dictionary
+variants, whole words, case-insensitive), `content/typo-scope` (da7def5: the typo fallback never corrects
 a word present in any content dictionary or delta), `content/cursor` (607d38b, G10: `--cursor` / `next_cursor` offset
 pagination bound to a query hash; each page re-runs up to offset+limit),
 `content/time-budget` (a3a94f8, G10: opt-in `--budget 150ms` /
@@ -161,9 +163,7 @@ GOMAXPROCS=2, peak disk 0.56x extracted. Limit-20 warm/first: rare literal
 - **Live restart validation:** the deferred USN catch-up (restart serves in
   about 0.3 s) was measured on a copy. Validate it on the live E: service at
   the next relaunch (elevated), since the live load used to take about 40 s.
-- **Content accent folding:** names fold accents (`resume` → `résumé`), but
-  content matching is still case-folded only. Folding content needs an
-  index-format change; fold it into the next format bump.
+- **Content accent folding:** DONE (`content/accent-fold`, v12).
 - **Ranking store scope:** DONE (`feat/ui-input-and-user-signals`). Per-user
   `ranking_signals-<SID>.json` files next to the service state, keyed by the
   pipe client's SID, ACL-restricted to SYSTEM + Administrators + owner;
@@ -179,7 +179,7 @@ GOMAXPROCS=2, peak disk 0.56x extracted. Limit-20 warm/first: rare literal
   build time waiting on Defender scanning each file at first open. A process
   exclusion for the seekfs service binary would remove it (it only reads
   files), at the cost of not scanning files as seekfs opens them. Admin-only.
-- **Relaunch the live E: service on integ >= 65ff317** (elevated). The build
+- **Relaunch the live E: service on integ >= 69a061a** (elevated). Also triggers the v12 content rebuild (accent folding). The build
   reserve is now 10 GiB (was 20 GiB; approved 2026-10-15), which raises build
   headroom on E: from ~2 GB to ~12 GB; the live service keeps the old reserve
   until it runs the new binary.
