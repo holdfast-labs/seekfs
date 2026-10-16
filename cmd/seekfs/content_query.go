@@ -18,6 +18,9 @@ func contentLeavesSmartCase(pq parsedQuery) bool {
 	leaves := contentAllLeaves(pq)
 	seenLetter := false
 	for _, leaf := range leaves {
+		if leaf.Fuzzy {
+			continue // content~ is always case-insensitive
+		}
 		upper, letters := contentPatternCase(leaf)
 		if letters {
 			seenLetter = true
@@ -97,9 +100,12 @@ const (
 // from the canonical DFS order of content leaves so repeated parseQuery calls
 // agree; per-leaf verification keys on it.
 type contentLeaf struct {
-	Kind   contentLeafKind
-	Text   string
-	LeafID int
+	Kind          contentLeafKind
+	Text          string
+	LeafID        int
+	Fuzzy         bool
+	FuzzyDistance int
+	WholeWord     bool
 }
 
 // contentSearchEnabled honors the environment override, then the service's
@@ -169,6 +175,18 @@ func parseContentLeaf(raw string) (contentLeaf, error) {
 		return contentLeaf{Kind: contentLeafPhrase, Text: contentUnquoteToken(raw)}, nil
 	}
 	return contentLeaf{Kind: contentLeafTerm, Text: raw}, nil
+}
+
+func singleContentWord(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		if !(unicode.IsLetter(r) || unicode.IsDigit(r) || r == '_') {
+			return false
+		}
+	}
+	return true
 }
 
 // queryHasPositiveContentLeaf reports whether the query tree contains a content

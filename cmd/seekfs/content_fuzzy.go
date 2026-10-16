@@ -596,6 +596,148 @@ func contentFuzzyRewriteLeaves(pq *parsedQuery, fn func(*contentLeaf)) {
 	}
 }
 
+// contentFuzzyExpandQuery replaces each explicit fuzzy leaf with an OR over
+// indexed vocabulary terms. Variants are ranked by document frequency.
+// contentFuzzyGrepDistance is a content~ leaf's edit distance: explicit
+// content~N, else by word length (0 below 4 runes, 1 for 4-7, 2 for 8+).
+func contentFuzzyGrepDistance(leaf contentLeaf) int {
+	if leaf.FuzzyDistance >= 0 {
+		return leaf.FuzzyDistance
+	}
+	switch n := utf8.RuneCountInString(leaf.Text); {
+	case n < 4:
+		return 0
+	case n < 8:
+		return 1
+	default:
+		return 2
+	}
+}
+
+func contentFuzzyExpandQuery(volumes []*serviceVolumeIndex, opts queryOptions) (queryOptions, bool) {
+	pq, err := parseQuery(opts)
+	if err != nil {
+		return opts, false
+	}
+	readers, delta := contentFuzzyReaders(volumes), contentFuzzyDeltaWords(volumes)
+	var impossible bool
+	hasFuzzy := false
+	var expand func(*parsedQuery)
+	expand = func(q *parsedQuery) {
+		var keepContent []contentLeaf
+		for _, leaf := range q.Content {
+			if !leaf.Fuzzy {
+				keepContent = append(keepContent, leaf)
+				continue
+			}
+			hasFuzzy = true
+			tau := contentFuzzyGrepDistance(leaf)
+			word := string(contentFoldText([]byte(leaf.Text)))
+			variants := make(map[string]int)
+			dicts := make([]*contentTermDict, 0)
+			for _, r := range readers {
+				if r == nil || r.idx == nil {
+					continue
+				}
+				if len(r.idx.shards) > 0 {
+					for _, sh := range r.idx.shards {
+						if sh != nil && sh.reader != nil {
+							dicts = append(dicts, sh.reader.terms)
+						}
+					}
+				} else {
+					dicts = append(dicts, r.terms)
+				}
+			}
+			wr, wb := []rune(word), []byte(word)
+			if tau > 0 {
+				mask, ascii := fuzzyLetterMask(word), true
+				for _, b := range wb {
+					if b >= 0x80 {
+						ascii = false
+						break
+					}
+				}
+				sp := fuzzyPigeonholePieces(word, tau)
+				pieces := make([][]byte, 0, len(sp))
+				for _, p := range sp {
+					pieces = append(pieces, []byte(p))
+				}
+				for _, d := range dicts {
+					contentFuzzyScanIndex(d, wr, wb, ascii, mask, pieces, tau, variants)
+				}
+				contentFuzzyVariantMembership(dicts, nil, word, tau, variants)
+			}
+			for dw, df := range delta {
+				if dw == word {
+					continue
+				}
+				dr := []rune(dw)
+				if len(dr) >= len(wr)-tau && len(dr) <= len(wr)+tau && damerauLevenshteinBounded(dr, wr, tau) <= tau {
+					variants[dw] += df
+				}
+			}
+			if c := delta[word]; c > 0 {
+				variants[word] += c
+			}
+			// Include exact dictionary terms even though the variant helper intentionally excludes its seed.
+			for _, d := range dicts {
+				if c, ok := contentFuzzyDictCount(d, word); ok {
+					variants[word] += c
+				}
+			}
+			for term := range variants {
+				if damerauLevenshteinBounded([]rune(term), wr, tau) > tau {
+					delete(variants, term)
+				}
+			}
+			terms := make([]contentFuzzyCandidate, 0, len(variants))
+			for term, df := range variants {
+				terms = append(terms, contentFuzzyCandidate{term: term, df: df})
+			}
+			sort.Slice(terms, func(i, j int) bool {
+				if terms[i].df != terms[j].df {
+					return terms[i].df > terms[j].df
+				}
+				return terms[i].term < terms[j].term
+			})
+			if len(terms) > 64 {
+				terms = terms[:64]
+			}
+			if len(terms) == 0 {
+				impossible = true
+				continue
+			}
+			group := make([]parsedQuery, 0, len(terms))
+			for _, term := range terms {
+				group = append(group, parsedQuery{Content: []contentLeaf{{Kind: contentLeafTerm, Text: term.term, WholeWord: true}}})
+			}
+			q.OrGroups = append(q.OrGroups, group)
+		}
+		q.Content = keepContent
+		for i := range q.OrGroups {
+			for j := range q.OrGroups[i] {
+				expand(&q.OrGroups[i][j])
+			}
+		}
+		for i := range q.NotGroups {
+			expand(&q.NotGroups[i])
+		}
+	}
+	expand(&pq)
+	if !hasFuzzy {
+		return opts, true
+	}
+	if impossible {
+		pq.Impossible = true
+	}
+	// The variant leaves are new: give every leaf a distinct id, since the
+	// matcher keys needles and match flags by LeafID.
+	contentAssignLeafIDs(&pq)
+	opts.parsedOverride = &pq
+	return opts, true
+}
+
 // contentFuzzyRewrite is one retried query tree plus the corrected words to
 // display when it wins.
 type contentFuzzyRewrite struct {

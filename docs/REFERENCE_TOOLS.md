@@ -158,8 +158,9 @@ Accuracy and ranking (fff parity):
     decoding).
 9. **No `sym:`** (definition search) and no definition-line bonus in content
    ranking.
-10. **Grep features:** no fuzzy (Smith-Waterman) grep, no multi-pattern OR
-       grep. **Per-query time budget and cursor pagination: done (G10):**
+10. **Grep features:** indexed fuzzy word grep (`content~:word`, optional
+        `content~2:word`) done (G10); no Smith-Waterman scoring. Multi-pattern OR
+        grep remains open. **Per-query time budget and cursor pagination: done (G10):**
       content searches accept `--budget <duration>`; search JSON supports offset
       cursors through `next_cursor` / `--cursor` (each page reruns the query up to
       its offset, so cost grows with depth).

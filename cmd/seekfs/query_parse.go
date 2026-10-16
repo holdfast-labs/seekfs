@@ -425,6 +425,34 @@ func applyQueryToken(pq *parsedQuery, raw string) error {
 			return contentUnavailableError()
 		}
 		return nil
+	case strings.HasPrefix(raw, "content~"):
+		colon := strings.IndexByte(raw, ':')
+		if colon < 0 || !strings.HasPrefix(raw, "content~") {
+			return fmt.Errorf("invalid fuzzy content query %q; use content~:word or content~2:word", raw)
+		}
+		distance := -1
+		distText := strings.TrimPrefix(raw[:colon], "content~")
+		if distText != "" {
+			n, err := strconv.Atoi(distText)
+			if err != nil || n < 0 || n > 2 {
+				return fmt.Errorf("invalid fuzzy content distance %q; expected 0, 1, or 2", distText)
+			}
+			distance = n
+		}
+		leaf, err := parseContentLeaf(raw[colon+1:])
+		if err != nil {
+			return err
+		}
+		if leaf.Kind != contentLeafTerm || !singleContentWord(leaf.Text) {
+			return fmt.Errorf("content~ accepts a single word (letters, digits, and underscore) only")
+		}
+		leaf.Fuzzy = true
+		leaf.FuzzyDistance = distance
+		pq.Content = append(pq.Content, leaf)
+		if !contentSearchEnabled() {
+			return contentUnavailableError()
+		}
+		return nil
 	case isUnknownFilterToken(raw):
 		return fmt.Errorf("unsupported filter %q; supported: path: parent: ext: dir: glob: regex: type: case: size: dm: attrib: git: near: in: content: (needs SEEKFS_CONTENT_SEARCH=1) sort:size sort:modified sort:extension sort:type sort:path (and !term, a|b)", raw)
 	case looksLikeImplicitFilenameGlob(raw):
@@ -779,7 +807,8 @@ func mergeInUnders(pq *parsedQuery) {
 	pq.Under = deepest
 }
 
-func queryPlainTerms(raw string, caseSensitive, matchPath bool) []string {	raw = strings.TrimSpace(raw)
+func queryPlainTerms(raw string, caseSensitive, matchPath bool) []string {
+	raw = strings.TrimSpace(raw)
 	if raw == "" {
 		return nil
 	}

@@ -245,6 +245,13 @@ are not UTF-8 text (binary, extracted formats) print `path:0:<snippet>`. Lines
 over 500 bytes are cut with `…`. `--json` adds `lines: [{line, text, match}]`
 to each result (`content_lines.go`).
 
+**Explicit fuzzy words.** `content~:word` matches documents containing any
+indexed word within the default edit distance (0 below 4 runes, 1 for 4–7,
+2 for 8+); `content~2:word` explicitly requests distance 2. Matching is
+case-insensitive regardless of smart case, uses indexed dictionary variants
+and normal content postings/verification, and caps expansion at 64 terms.
+Only a single letters/digits/underscore word is accepted.
+
 **Typo tolerance.** A `content:` query that matches zero documents is retried
 with per-word corrections from the term dictionary (the folded CXTR words):
 each correctable word (4+ runes) of every positive term/phrase leaf is replaced

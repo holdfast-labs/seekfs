@@ -442,6 +442,14 @@ func (m *contentLeafMatcher) haystackFor(raw, folded []byte) []byte {
 // prefilter-free tail down to the lines, and never changes unanchored
 // results.
 func (m *contentLeafMatcher) match(raw, folded []byte, leaf contentLeaf) bool {
+	if leaf.WholeWord {
+		// content~ variants are dictionary terms: match them as whole words
+		// (contentTermsOf boundaries) on the same haystack as plain terms.
+		if !m.caseSensitive && folded == nil {
+			folded = contentFoldText(raw)
+		}
+		return contentHasWholeWord(m.haystackFor(raw, folded), m.needleOf(leaf))
+	}
 	if leaf.Kind == contentLeafRegex {
 		re := m.regex[leaf.LeafID]
 		if re == nil {
@@ -477,6 +485,12 @@ func (m *contentLeafMatcher) match(raw, folded []byte, leaf contentLeaf) bool {
 // asciiCaseIndex finds exactly the ASCII matches and defers to the fold
 // whenever non-ASCII bytes could hide one.
 func (m *contentLeafMatcher) matchRawFirst(raw []byte, folded *[]byte, foldedReady *bool, leaf contentLeaf) bool {
+	if leaf.WholeWord {
+		if !m.caseSensitive && !*foldedReady {
+			*folded, *foldedReady = contentFoldText(raw), true
+		}
+		return m.match(raw, *folded, leaf)
+	}
 	if leaf.Kind == contentLeafRegex {
 		re := m.regex[leaf.LeafID]
 		if re == nil {
@@ -1706,4 +1720,30 @@ func searchContentServiceVolumes(volumes []*serviceVolumeIndex, opts queryOption
 	opts.Trace.setPlannerMode("service-content")
 	opts.Trace.setComplete(opts.Trace == nil || (!opts.Trace.ContentPartial && !opts.Trace.ContentIncomplete))
 	return results, nil
+}
+
+// contentHasWholeWord reports whether word occurs in hay delimited by non-word
+// bytes, with contentTermsOf's word bytes (ASCII alphanumerics, '_', and any
+// byte >= 0x80), so it agrees with the indexed terms without tokenizing the
+// whole document per leaf.
+func contentHasWholeWord(hay, word []byte) bool {
+	if len(word) == 0 {
+		return false
+	}
+	isWord := func(b byte) bool {
+		return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9') || b == '_' || b >= 0x80
+	}
+	for off := 0; off < len(hay); {
+		i := bytes.Index(hay[off:], word)
+		if i < 0 {
+			return false
+		}
+		i += off
+		end := i + len(word)
+		if (i == 0 || !isWord(hay[i-1])) && (end == len(hay) || !isWord(hay[end])) {
+			return true
+		}
+		off = i + 1
+	}
+	return false
 }

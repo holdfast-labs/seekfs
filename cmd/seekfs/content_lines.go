@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 	"unicode/utf8"
 )
 
@@ -78,6 +79,16 @@ func contentLineMatches(m *contentLeafMatcher, line []byte, positive []contentLe
 		folded = contentFoldText(line)
 	}
 	for _, leaf := range positive {
+		if leaf.Fuzzy {
+			word := string(contentFoldText([]byte(leaf.Text)))
+			tau := contentFuzzyGrepDistance(leaf)
+			for term := range contentTermsOf(line) {
+				if damerauLevenshteinBounded([]rune(strings.ToLower(term)), []rune(word), tau) <= tau {
+					return true
+				}
+			}
+			continue
+		}
 		if m.match(line, folded, leaf) {
 			return true
 		}
