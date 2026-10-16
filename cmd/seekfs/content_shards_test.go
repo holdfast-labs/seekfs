@@ -1,11 +1,11 @@
 package main
 
 import (
-	"sync"
 	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
+	"sync"
 	"testing"
 )
 
