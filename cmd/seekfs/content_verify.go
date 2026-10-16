@@ -523,7 +523,7 @@ func (m *contentLeafMatcher) match(raw, folded []byte, leaf contentLeaf) bool {
 func (m *contentLeafMatcher) matchRawFirst(raw []byte, folded *[]byte, foldedReady *bool, leaf contentLeaf) bool {
 	if leaf.WholeWord {
 		if !m.caseSensitive && !*foldedReady {
-			*folded, *foldedReady = contentFoldAccent(raw), true
+			*folded, *foldedReady = contentFoldAccentAppend((*folded)[:0], raw), true
 		}
 		return m.match(raw, *folded, leaf)
 	}
@@ -548,7 +548,7 @@ func (m *contentLeafMatcher) matchRawFirst(raw []byte, folded *[]byte, foldedRea
 			if !rawHit {
 				if !*foldedReady {
 					// Shared per-entry cache: always the accent fold.
-					*folded = contentFoldAccent(raw)
+					*folded = contentFoldAccentAppend((*folded)[:0], raw)
 					*foldedReady = true
 				}
 				if !contentRegexNeedlesHold(*folded, needles) {
@@ -574,7 +574,7 @@ func (m *contentLeafMatcher) matchRawFirst(raw []byte, folded *[]byte, foldedRea
 		}
 	}
 	if !*foldedReady {
-		*folded = contentFoldAccent(raw)
+		*folded = contentFoldAccentAppend((*folded)[:0], raw)
 		*foldedReady = true
 	}
 	if m.accentNeedle[leaf.LeafID] {
@@ -625,8 +625,13 @@ func entryMatchesWithContentMatcher(vol *serviceVolumeIndex, entry Entry, pq par
 	if text, ok := vol.contentTextForEntryTrace(&entry, pq.Trace); ok {
 		// Fold the document at most once for the whole entry, and only if a
 		// case-insensitive leaf actually needs it; case-sensitive leaves read
-		// the raw text. No per-leaf allocation.
+		// the raw text. The fold lands in a pooled scratch buffer so each
+		// verify reuses one buffer instead of allocating a per-file copy.
 		var folded []byte
+		if !m.caseSensitive {
+			folded = contentFoldScratchGet()
+			defer func() { contentFoldScratchPut(folded) }()
+		}
 		foldedReady := false
 		for _, leaf := range m.leaves {
 			if leaf.Sym {
@@ -1034,9 +1039,12 @@ func attachContentSnippets(entries []Entry, volByPath map[string]*serviceVolumeI
 		if text, ok := vol.contentTextForEntry(&entries[i]); ok {
 			var folded []byte
 			if !m.caseSensitive {
-				folded = contentFoldAccent(text)
+				folded = contentFoldAccentAppend(contentFoldScratchGet()[:0], text)
 			}
 			entries[i].Snippet = contentSnippet(entries[i].Path, text, folded, positive, m)
+			if !m.caseSensitive {
+				contentFoldScratchPut(folded)
+			}
 		}
 	}
 }

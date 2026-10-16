@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"math/rand"
 	"testing"
 )
@@ -110,10 +111,7 @@ func TestContentAccentFoldFuzzyLines(t *testing.T) {
 	}
 }
 
-// contentFoldAccent's per-rune fast path must stay byte-identical to the
-// whole-string foldAccentLower that v12 sidecars were built with, or indexed
-// terms/grams would stop matching their queries.
-func TestContentFoldAccentMatchesWholeStringFold(t *testing.T) {
+func accentFoldParityInputs() []string {
 	inputs := []string{
 		"", "plain ascii MUTEX_", "café CAFÉ Café", "e\u0301 decomposed É",
 		"STRASSE straße ẞ", "İstanbul ı I", "ＦＵＬＬ　ｗｉｄｔｈ", "日本語テスト",
@@ -131,10 +129,36 @@ func TestContentFoldAccentMatchesWholeStringFold(t *testing.T) {
 		}
 		inputs = append(inputs, string(rs))
 	}
-	for _, in := range inputs {
+	return inputs
+}
+
+// contentFoldAccent's per-rune fast path must stay byte-identical to the
+// whole-string foldAccentLower that v12 sidecars were built with, or indexed
+// terms/grams would stop matching their queries.
+func TestContentFoldAccentMatchesWholeStringFold(t *testing.T) {
+	for _, in := range accentFoldParityInputs() {
 		want := foldAccentLower(in)
 		if got := string(contentFoldAccent([]byte(in))); got != want {
 			t.Fatalf("contentFoldAccent(%q) = %q; want %q", in, got, want)
 		}
+	}
+}
+
+// contentFoldAccentAppend is the verify path's buffer-reusing fold: appending
+// into a scratch buffer (dst[:0], x) must be byte-identical to
+// contentFoldAccent(x), including when dst carries reused capacity.
+func TestContentFoldAccentAppendMatchesContentFoldAccent(t *testing.T) {
+	scratch := make([]byte, 0, 128)
+	for _, in := range accentFoldParityInputs() {
+		src := []byte(in)
+		want := contentFoldAccent(src)
+		got := contentFoldAccentAppend(scratch[:0], src)
+		if !bytes.Equal(got, want) {
+			t.Fatalf("contentFoldAccentAppend(scratch[:0], %q) = %q; want %q", in, got, want)
+		}
+		if got = contentFoldAccentAppend(nil, src); !bytes.Equal(got, want) {
+			t.Fatalf("contentFoldAccentAppend(nil, %q) = %q; want %q", in, got, want)
+		}
+		scratch = got // reuse whatever capacity the append left
 	}
 }

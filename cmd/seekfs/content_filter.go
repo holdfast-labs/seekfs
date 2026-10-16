@@ -488,7 +488,7 @@ func contentDiskExtractOnce(path string, settings contentExtractSettings) ([]byt
 	ctx := contentWithExtractSettings(context.Background(), settings)
 	inRepo, _ := contentInRepoFromContext(ctx)
 	fctx, fileRaw, _ := contentFileExtractContext(ctx, inRepo)
-	s, err := contentSlurpNoRecall(path, fileRaw)
+	s, err := contentSlurpNoRecallVerify(path, fileRaw)
 	if err != nil {
 		return nil, err
 	}

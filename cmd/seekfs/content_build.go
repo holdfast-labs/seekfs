@@ -1147,6 +1147,74 @@ func contentFoldAccent(text []byte) []byte {
 	return out
 }
 
+// contentFoldAccentAppend appends the v12 fold of src to dst, reusing dst's
+// storage. contentFoldAccentAppend(dst[:0], src) is byte-identical to
+// contentFoldAccent(src); passing a scratch buffer with capacity lets the
+// verify path fold every document into one reused buffer instead of allocating
+// a full-size copy per file.
+func contentFoldAccentAppend(dst, src []byte) []byte {
+	if isASCIIBytes(src) {
+		return contentFoldTextAppend(dst, src)
+	}
+	out := dst
+	for i := 0; i < len(src); {
+		c := src[i]
+		if c < utf8.RuneSelf {
+			if 'A' <= c && c <= 'Z' {
+				c += 'a' - 'A'
+			}
+			out = append(out, c)
+			i++
+			continue
+		}
+		r, size := utf8.DecodeRune(src[i:])
+		out = append(out, contentFoldAccentRune(r)...)
+		i += size
+	}
+	return out
+}
+
+// contentFoldTextAppend is contentFoldText appending to dst instead of
+// allocating: the ASCII lowercasing rule is identical.
+func contentFoldTextAppend(dst, src []byte) []byte {
+	out := dst
+	for _, b := range src {
+		if b >= 'A' && b <= 'Z' {
+			b += 'a' - 'A'
+		}
+		out = append(out, b)
+	}
+	return out
+}
+
+// contentFoldScratchPool reuses per-verify fold buffers. Buffers larger than
+// contentFoldScratchMax are dropped on return so one huge document cannot pin
+// memory across the pool.
+var contentFoldScratchPool sync.Pool
+
+// contentFoldScratchMax caps a pooled fold buffer at 4 MiB, matching the verify
+// read buffer cap: reuse pays off for the characteristic small source file, and
+// a larger fold is rare enough that holding its capacity would only inflate RSS.
+const contentFoldScratchMax = 4 << 20
+
+// contentFoldScratchGet returns an empty scratch buffer (reusing pooled
+// capacity when available).
+func contentFoldScratchGet() []byte {
+	if v := contentFoldScratchPool.Get(); v != nil {
+		return v.([]byte)[:0]
+	}
+	return nil
+}
+
+// contentFoldScratchPut returns a scratch buffer to the pool, dropping
+// zero-capacity and over-cap buffers.
+func contentFoldScratchPut(b []byte) {
+	if cap(b) == 0 || cap(b) > contentFoldScratchMax {
+		return
+	}
+	contentFoldScratchPool.Put(b[:0])
+}
+
 // contentFoldAccentLow caches foldAccentLower for runes below 0x800 (Latin,
 // Greek, Cyrillic, Hebrew, Arabic); higher runes use contentFoldAccentHigh.
 var contentFoldAccentLow = func() (t [0x800]string) {
