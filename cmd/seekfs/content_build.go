@@ -1403,6 +1403,10 @@ type contentPathTable struct {
 	restartIx []int // blob-relative offset of each restart record
 	cacheRun  int   // restart run currently cached, -1 when empty
 	cacheKeys []string
+	// mu guards the cache: one reader serves parallel verify workers and
+	// concurrent queries, so unsynchronized cache rebuilds would return
+	// another doc's path.
+	mu sync.Mutex
 }
 
 // openContentPaths validates the CXPT section's structure and returns a lazy
@@ -1507,6 +1511,8 @@ func (t *contentPathTable) path(doc uint32) string {
 	if r >= len(t.restartIx) {
 		return ""
 	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
 	if r != t.cacheRun {
 		if t.cacheKeys == nil {
 			t.cacheKeys = make([]string, 0, t.interval)
