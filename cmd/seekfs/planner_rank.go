@@ -214,6 +214,10 @@ func contentRelevanceOf(vol *serviceVolumeIndex, entry Entry, pq parsedQuery, m 
 	}
 	matched := make([]bool, m.size)
 	for _, leaf := range m.leaves {
+		if leaf.Sym {
+			matched[leaf.LeafID] = m.sym[leaf.LeafID].defines(entry.Path, text)
+			continue
+		}
 		matched[leaf.LeafID] = m.match(text, folded, leaf)
 	}
 	rel.score, rel.first = contentScoreAt(entry, pq, pq.MatchPath, matched, text, folded, m)
@@ -233,6 +237,12 @@ func contentScoreAt(entry Entry, pq parsedQuery, matchPath bool, matched []bool,
 			continue
 		}
 		score++
+		// Definition-line bonus: a file that defines an identifier-like
+		// term outranks files that only mention it (one extra point, the
+		// weight of one more matched leaf).
+		if sm := m.sym[leaf.LeafID]; sm != nil && !leaf.Sym && sm.defines(entry.Path, text) {
+			score++
+		}
 		if leaf.Kind == contentLeafRegex {
 			continue
 		}

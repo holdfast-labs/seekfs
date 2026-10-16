@@ -18,8 +18,8 @@ func contentLeavesSmartCase(pq parsedQuery) bool {
 	leaves := contentAllLeaves(pq)
 	seenLetter := false
 	for _, leaf := range leaves {
-		if leaf.Fuzzy {
-			continue // content~ is always case-insensitive
+		if leaf.Fuzzy || leaf.Sym {
+			continue // content~ is case-insensitive; sym: names are exact anyway
 		}
 		upper, letters := contentPatternCase(leaf)
 		if letters {
@@ -106,6 +106,7 @@ type contentLeaf struct {
 	Fuzzy         bool
 	FuzzyDistance int
 	WholeWord     bool
+	Sym           bool
 }
 
 // contentSearchEnabled honors the environment override, then the service's

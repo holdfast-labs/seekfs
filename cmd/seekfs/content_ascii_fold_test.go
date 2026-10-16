@@ -137,7 +137,7 @@ func TestContentSnippetASCIIEquals(t *testing.T) {
 			pq := parsedQuery{Content: []contentLeaf{leaf}}
 			m := newContentLeafMatcher(pq)
 			folded := contentFoldAccent(raw) // the v12 per-entry fold callers pass
-			got := contentSnippet(raw, folded, []contentLeaf{leaf}, m)
+			got := contentSnippet("", raw, folded, []contentLeaf{leaf}, m)
 			// Reference: the historical slow path, spelled out.
 			want := ""
 			if m.match(raw, folded, leaf) {
