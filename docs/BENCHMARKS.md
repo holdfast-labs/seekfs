@@ -272,6 +272,70 @@ Active-path cost is bounded by `BenchmarkSignalReorderPage`: ~112 µs for a
 100-entry page with half the hits carrying frecency evidence (~1 µs/hit +
 page sort); the empty-store gate is a few map lookups.
 
+## Content right-file-first (`bench/content-rightfile`)
+
+2026-10-16 local benchmark of the CONTENT pipeline's ability to put the
+defining file of a symbol first. Harness: a scratch-only Go test in
+`cmd/seekfs/zz_rightfile_local_test.go` (never committed), run with
+`GOMAXPROCS=2`. It builds one content index over the corpus through the same
+production service path as the build-profile harness (walkRoot + saveIndex +
+loadIndexForService + ensureContentBuild, then waits for the ready state) and
+reuses it for every label; per label it calls `searchServiceVolumes` with
+`Limit 20` for four query forms and records the 1-based rank of the defining
+file (0 = not in the top 20).
+
+Corpus: `E:\bench\chromium\third_party\blink\renderer\core` (~9.1k files,
+Defender-warm). Labels (100): C++ symbols defined in exactly one corpus file
+and referenced (whole-word) in ≥ 3 other files — 60 classes/structs defined in
+a `.h` (`^(class|struct) (CORE_EXPORT )?Name\b[^;]*$`) and 40 out-of-line
+functions defined in a `.cc` (`^\S.*\bClass::Name\(`, first line ending in
+`{`). A function is eligible only when exactly one qualified `Class::Name`
+exists corpus-wide, and its query is the bare identifier so `sym:` accepts it.
+Selection is deterministic (sorted by name, seed-42 shuffle). Ground truth is
+the defining file.
+
+Four forms per label: (a) `content:<sym>`, (b) `content:<sym>
+sort:relevance` (definition-line bonus), (c) `sym:<sym>` (definition search),
+(d) `<sym>` (plain filename query, reference baseline). Rates are of the
+defining file ranking top-1 / top-5 / top-20; MRR is the mean reciprocal rank
+(0 for a miss).
+
+| form | kind | top-1 | top-5 | top-20 | MRR |
+| --- | --- | --- | --- | --- | --- |
+| `content:<sym>` | overall | 17.0% | 62.0% | 86.0% | 0.342 |
+| `content:<sym> sort:relevance` | overall | 63.0% | 97.0% | 100.0% | 0.788 |
+| `sym:<sym>` | overall | 59.0% | 98.0% | 100.0% | 0.776 |
+| `<sym>` (filename) | overall | 0.0% | 0.0% | 1.0% | 0.002 |
+| `content:<sym>` | class | 0.0% | 53.3% | 86.7% | 0.209 |
+| `content:<sym> sort:relevance` | class | 56.7% | 96.7% | 100.0% | 0.750 |
+| `sym:<sym>` | class | 40.0% | 98.3% | 100.0% | 0.678 |
+| `<sym>` (filename) | class | 0.0% | 0.0% | 1.7% | 0.003 |
+| `content:<sym>` | function | 42.5% | 75.0% | 85.0% | 0.542 |
+| `content:<sym> sort:relevance` | function | 72.5% | 97.5% | 100.0% | 0.845 |
+| `sym:<sym>` | function | 87.5% | 97.5% | 100.0% | 0.924 |
+| `<sym>` (filename) | function | 0.0% | 0.0% | 0.0% | 0.000 |
+
+The default content order rarely opens with the definition (17.0% top-1,
+86.0% top-20): symbols referenced broadly are buried under files that merely
+mention them. The definition-line bonus under `sort:relevance` is the single
+largest lever (63.0% top-1, 100% top-20) and lands every label; `sym:`
+definition search is close behind (59.0% top-1) and is strongest on functions
+(87.5% top-1), whose names are unique here. Plain filename search cannot find
+content symbols at all (0% top-1) because corpus files are snake_case: the
+symbol name is not a substring of the basename.
+
+Worst misses for (a) `content:<sym>` (10 labels whose defining file was not in
+the top 20; all rank 0): `Attr`, `CSSVariableData`, `ContentLayoutObject`,
+`ExecutionContext`, `InterpolationValue`, `LineBreaker`, `NavigationState`,
+`NonInterpolableValue`, `QualifiedName`, `Sanitize`. Worst ranks for (b)
+`content:<sym> sort:relevance` (no misses; every label in the top 20):
+`top` 8, `DOMTokenList` 7, `PaintControllerPaintTest` 6, `ExecutionContext` 5,
+then `AbortController`, `CSSFunctionRule`, `HasWebView`, `PageTransitionEvent`,
+`PerformanceEventTiming`, `ScriptableDocumentParser` at 3. Several of these are
+high-frequency generic names (`used` 1922 ref files, `top` 582,
+`QualifiedName` 440), which the ≥ 3 reference rule admits; they are the
+residual hard cases once the definition bonus applies.
+
 ## Name-search lessons (`perf/name-lessons`, G11)
 
 2026-10-14 local profile, chromium walk index (555,849 records),
