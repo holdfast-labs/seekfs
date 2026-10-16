@@ -52,10 +52,13 @@ corruption, exact required sources, auto-fuzzy only on zero exact hits).
 
 | Branch | Worktree | Scope |
 |---|---|---|
+| `perf/footprint-content` | footprint | Measure-first: service memory (heap, working set) idle and during/after a content build and queries; top retainers; proposals |
 | `bench/content-rightfile` | rightfile | Content right-file-first metric (100 labeled symbols, blink/renderer/core): baseline before the sym ranking bonus |
 | `perf/static-ranking` | staticrank | **Parked** at WIP commit `761db7b` (OR-lane case unresolved, suite not green); resume only with a fresh, narrow brief (G13) |
 
-Merged 2026-10-15: `content/sym` (2ea5d74, G9: `sym:Name` definition search by
+Merged 2026-10-15: `perf/content-regex` (2247ca3: per-rune cached accent fold,
+byte-identical; parallel superset page; regex on the full superset; chrome/
+`mutex_\w+` 2.47 s -> 0.40 s), `content/sym` (2ea5d74, G9: `sym:Name` definition search by
 per-language patterns at query time; `sort:relevance` +1 for defining files),
 `content/accent-fold` (69a061a, content format **v12**: terms,
 grams and filter bits are accent-folded; `resume` finds `résumé`, an accented query
