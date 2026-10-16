@@ -39,3 +39,17 @@ Opportunities (largest first):
 4. Shard composition (8.6 MB): check for per-doc maps that could be slices.
 5. Query transients: per-verify file buffers (+140 MB private across 20
    queries); a pooled read buffer would cap the peak.
+
+## Zero-copy postings (2026-10-15, perf/footprint-content)
+
+Footprint harness before (commit b9fc845): `MEM content attached heapInuse=91 MB`
+(WS=239 MB, private=143 MB). After zero-copy entry/block views:
+`MEM content-attached heapInuse=66.3 MB` (WS=206.9 MB, private=117.7 MB).
+The mapped section now supplies both tables directly; the decoder retains only
+the block-offset prefix array (bounded by block count).
+
+## Done: zero-copy posting index (opportunity 1)
+
+Entries/block metas read from the mapped section; one uint32 offset per block.
+chrome/ v12: heap after content attach 91 -> 66 MB; private after idle
+release 144 -> 119 MB; WS after idle release 243 -> 218 MB.

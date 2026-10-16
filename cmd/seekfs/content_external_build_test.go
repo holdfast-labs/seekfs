@@ -108,8 +108,8 @@ func TestContentExternalMultiBlock(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(idx.entries) != 1 || idx.entries[0].blockCount != 2 {
-		t.Fatalf("blocks = %+v, want 2 for one 5000-posting key", idx.entries)
+	if idx.entryCount() != 1 || idx.entryAt(0).blockCount != 2 {
+		t.Fatalf("blocks = %d, want 2 for one 5000-posting key", idx.entryAt(0).blockCount)
 	}
 	got, ok := idx.lookup("alp")
 	if !ok || len(got) != n {
