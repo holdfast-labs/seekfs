@@ -114,6 +114,10 @@ type contentLeafMatcher struct {
 	regexGrams   map[int][][][]uint32
 	regexNeedles map[int][][]byte
 	accentNeedle map[int]bool
+	// sym holds the compiled definition patterns (content_sym.go) per leaf:
+	// sym: leaves, and plain identifier-like term leaves for the
+	// definition-line ranking bonus. Built once here; read-only after.
+	sym map[int]*contentSymMatcher
 }
 
 // isASCIIBytes reports whether b has no byte >= 0x80.
@@ -191,6 +195,15 @@ func asciiCaseIndex(raw, needle []byte) (idx int, ascii bool) {
 func newContentLeafMatcher(pq parsedQuery) *contentLeafMatcher {
 	leaves := contentAllLeaves(pq)
 	m := &contentLeafMatcher{leaves: leaves, caseSensitive: pq.contentCaseSensitive()}
+	for _, leaf := range leaves {
+		// Fuzzy variants (WholeWord, not Sym) skip this: up to 64 per word.
+		if leaf.Sym || leaf.Kind == contentLeafTerm && !leaf.WholeWord && !leaf.Fuzzy && contentLooksLikeIdentifier(leaf.Text) {
+			if m.sym == nil {
+				m.sym = make(map[int]*contentSymMatcher)
+			}
+			m.sym[leaf.LeafID] = newContentSymMatcher(leaf.Text)
+		}
+	}
 	for i := range leaves {
 		if leaves[i].LeafID+1 > m.size {
 			m.size = leaves[i].LeafID + 1
@@ -617,7 +630,7 @@ func entryMatchesWithContentMatcher(vol *serviceVolumeIndex, entry Entry, pq par
 		foldedReady := false
 		for _, leaf := range m.leaves {
 			if leaf.Sym {
-				matched[leaf.LeafID] = contentHasDefinition(text, entry.Path, leaf.Text)
+				matched[leaf.LeafID] = m.sym[leaf.LeafID].defines(entry.Path, text)
 			} else {
 				matched[leaf.LeafID] = m.matchRawFirst(text, &folded, &foldedReady, leaf)
 			}
@@ -953,8 +966,15 @@ func contentFoldRunesToRaw(raw []byte, n int) int {
 // hoisted by the caller so this is O(leaves) per result, not O(leaves) plus
 // matcher construction. The caller passes the raw text and, for a
 // case-insensitive query, the once-per-entry folded copy (nil otherwise).
-func contentSnippet(raw, folded []byte, positive []contentLeaf, m *contentLeafMatcher) string {
+func contentSnippet(path string, raw, folded []byte, positive []contentLeaf, m *contentLeafMatcher) string {
 	for _, leaf := range positive {
+		if leaf.Sym {
+			// The snippet is the definition line itself.
+			if ls, le, ok := m.sym[leaf.LeafID].definitionLine(path, raw); ok {
+				return contentSnippetWindow(raw, ls, le-ls)
+			}
+			continue
+		}
 		if leaf.Kind == contentLeafRegex || !m.match(raw, folded, leaf) {
 			continue
 		}
@@ -1016,7 +1036,7 @@ func attachContentSnippets(entries []Entry, volByPath map[string]*serviceVolumeI
 			if !m.caseSensitive {
 				folded = contentFoldAccent(text)
 			}
-			entries[i].Snippet = contentSnippet(text, folded, positive, m)
+			entries[i].Snippet = contentSnippet(entries[i].Path, text, folded, positive, m)
 		}
 	}
 }

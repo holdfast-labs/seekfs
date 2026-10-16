@@ -3,7 +3,15 @@
 `sym:Name` performs query-time definition search for identifier `Name` using
 language-specific source-line patterns (Go, C/C++, Python, JS/TS, Rust, Java,
 C#, Kotlin, and generic fallbacks). It reuses content postings and verification;
-no index format change is required. `--lines` prints the definition matches.
+no index format change is required. Only lines containing the name are tested,
+with patterns compiled once per query (`content_sym.go`); C-family and JVM
+shapes ending in `;` without a body are declarations or calls, not definitions,
+and lines starting with control words (`return`, `if`, `new`, ...) never count.
+`--lines` and the snippet show the definition line. Under `sort:relevance`, a
+plain identifier-like `content:Name` leaf scores one extra point (the weight of
+one more matched leaf) in files that define it, so defining files rank ahead of
+files that only mention the name. The default content order is filename order
+(unchanged), so `sym:` is the way to get definitions first by default.
 
 Branch: `integ/content-main`. Status: P0–P5 complete and reviewed, and the PF-1–PF-7
 parity packages landed. P4's two planner surfaces (`sort:relevance` and snippets)

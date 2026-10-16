@@ -36,6 +36,12 @@ type contentOutputLine struct {
 // of the positive leaves, at most maxPerFile) plus before/after context lines,
 // in file order. Phrases match within one line; they never span a newline.
 func contentMatchingLines(raw []byte, m *contentLeafMatcher, positive []contentLeaf, maxPerFile, before, after int) []contentOutputLine {
+	return contentMatchingLinesAt("", raw, m, positive, maxPerFile, before, after)
+}
+
+// contentMatchingLinesAt is contentMatchingLines for the file at path, whose
+// extension picks the sym: definition patterns.
+func contentMatchingLinesAt(path string, raw []byte, m *contentLeafMatcher, positive []contentLeaf, maxPerFile, before, after int) []contentOutputLine {
 	if m == nil || len(positive) == 0 {
 		return nil
 	}
@@ -50,7 +56,7 @@ func contentMatchingLines(raw []byte, m *contentLeafMatcher, positive []contentL
 	var hits []int
 	for i := range lines {
 		lines[i] = bytes.TrimSuffix(lines[i], []byte{'\r'})
-		if len(hits) < maxPerFile && contentLineMatches(m, lines[i], positive) {
+		if len(hits) < maxPerFile && contentLineMatches(m, path, lines[i], positive) {
 			hits = append(hits, i)
 		}
 	}
@@ -72,13 +78,17 @@ func contentMatchingLines(raw []byte, m *contentLeafMatcher, positive []contentL
 	return out
 }
 
-func contentLineMatches(m *contentLeafMatcher, line []byte, positive []contentLeaf) bool {
+func contentLineMatches(m *contentLeafMatcher, path string, line []byte, positive []contentLeaf) bool {
 	var folded []byte
 	if !m.caseSensitive {
 		folded = contentFoldAccent(line)
 	}
 	for _, leaf := range positive {
 		if leaf.Sym {
+			// sym: prints definition lines only.
+			if m.sym[leaf.LeafID].lineDefines(contentSymLangOf(path), line) {
+				return true
+			}
 			continue
 		}
 		if leaf.Fuzzy {
@@ -122,7 +132,7 @@ func contentFileLines(path string, m *contentLeafMatcher, positive []contentLeaf
 	if err != nil || bytes.IndexByte(raw, 0) >= 0 || !utf8.Valid(raw) {
 		return nil, false
 	}
-	return contentMatchingLines(raw, m, positive, o.maxPerFile, o.before, o.after), true
+	return contentMatchingLinesAt(path, raw, m, positive, o.maxPerFile, o.before, o.after), true
 }
 
 // contentLinePrinter prints ripgrep-style lines for content hits:
