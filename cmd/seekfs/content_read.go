@@ -269,10 +269,10 @@ func (r *contentReader) filterRow(docID uint32) (contentFilterRow, bool) {
 		}
 		return contentFilterRow{}, false
 	}
-	if r.filter == nil || int(docID) >= len(r.filter.Rows) {
+	if r.filter == nil {
 		return contentFilterRow{}, false
 	}
-	return r.filter.Rows[docID], true
+	return r.filter.row(int(docID))
 }
 
 // filterRoot returns the build root for resolving relative document paths.

@@ -3,8 +3,44 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 )
+
+// TestContentFilterDecodeAlloc proves the filter section no longer
+// materializes one Go struct per document: decoding 100k rows must allocate
+// only the per-document offset table plus the section header, well under
+// 1 MiB (the old []contentFilterRow header alone was ~3.2 MB).
+func TestContentFilterDecodeAlloc(t *testing.T) {
+	const n = 100_000
+	bits := make([]byte, 128) // class 0 width; sized to alias cheaply
+	rows := make([]contentFilterRow, n)
+	for i := range rows {
+		rows[i] = contentFilterRow{Class: 0, Bits: bits}
+	}
+	enc := encodeContentFilterSection(1, 1, false, "", "", rows)
+	if _, err := decodeContentFilterSection(enc, n); err != nil {
+		t.Fatalf("warmup decode: %v", err)
+	}
+	runtime.GC()
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	dec, err := decodeContentFilterSection(enc, n)
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	runtime.ReadMemStats(&after)
+	runtime.KeepAlive(dec)
+	if delta := after.TotalAlloc - before.TotalAlloc; delta >= 1<<20 {
+		t.Fatalf("decode of %d rows allocated %d bytes; want < 1 MiB", n, delta)
+	}
+	if dec.rowCount() != n {
+		t.Fatalf("rowCount = %d; want %d", dec.rowCount(), n)
+	}
+	if row, ok := dec.row(n - 1); !ok || row.Class != 0 {
+		t.Fatalf("last row = %+v, %v", row, ok)
+	}
+}
 
 func TestContentFilterHashIsFrozen(t *testing.T) {
 	// Golden stability: the same input must hash the same across runs, and
@@ -64,11 +100,12 @@ func TestContentFilterSectionRoundTrip(t *testing.T) {
 	if dec.MaxRaw != 1<<20 || dec.MaxText != 1<<19 || !dec.CapsExplicit || dec.Root != `E:\root` || dec.Encoding != "latin1" {
 		t.Fatalf("decoded identity = %+v", dec)
 	}
-	if len(dec.Rows) != 3 {
-		t.Fatalf("decoded %d rows; want 3", len(dec.Rows))
+	if dec.rowCount() != 3 {
+		t.Fatalf("decoded %d rows; want 3", dec.rowCount())
 	}
 	for i := range rows {
-		if dec.Rows[i].Class != rows[i].Class || string(dec.Rows[i].Bits) != string(rows[i].Bits) {
+		got, ok := dec.row(i)
+		if !ok || got.Class != rows[i].Class || string(got.Bits) != string(rows[i].Bits) {
 			t.Fatalf("row %d mismatch", i)
 		}
 	}
@@ -89,7 +126,7 @@ func TestContentFilterSectionRoundTrip(t *testing.T) {
 	}
 	// Empty corpus encodes a valid empty section.
 	empty, err := decodeContentFilterSection(encodeContentFilterSection(0, 0, false, "", "", nil), 0)
-	if err != nil || len(empty.Rows) != 0 {
+	if err != nil || empty.rowCount() != 0 {
 		t.Fatalf("empty section = %v, %v", empty, err)
 	}
 	// Unknown flags are refused, never misread (the flags uvarint follows
@@ -374,7 +411,7 @@ func TestContentFilterV11SectionPresent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if r.filter == nil || len(r.filter.Rows) != 1 {
+	if r.filter == nil || r.filter.rowCount() != 1 {
 		t.Fatalf("reader filter rows = %v", r.filter)
 	}
 }
