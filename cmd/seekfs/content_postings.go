@@ -124,9 +124,34 @@ const (
 
 // contentPostingIndex is the decoded dictionary plus lazy block access.
 type contentPostingIndex struct {
-	entries   []contentPostingEntry
-	blocks    []contentBlockMeta
+	entryData []byte
+	blockData []byte
 	blockBlob []byte
+	blockOff  []uint32
+}
+
+func (idx *contentPostingIndex) entryCount() int { return len(idx.entryData) / contentPostingEntrySize }
+func (idx *contentPostingIndex) blockCount() int { return len(idx.blockData) / contentBlockMetaSize }
+func (idx *contentPostingIndex) entryAt(i int) contentPostingEntry {
+	p := idx.entryData[i*contentPostingEntrySize:]
+	e := contentPostingEntry{}
+	copy(e.key[:], p[:3])
+	e.single = p[3] == contentPostingEntrySingle
+	if e.single {
+		e.count, e.singleDoc = 1, binary.LittleEndian.Uint32(p[4:])
+	} else {
+		e.firstBlock, e.blockCount = binary.LittleEndian.Uint32(p[4:]), binary.LittleEndian.Uint32(p[8:])
+		if uint64(e.firstBlock)+uint64(e.blockCount) <= uint64(idx.blockCount()) {
+			for b := e.firstBlock; b < e.firstBlock+e.blockCount; b++ {
+				e.count += idx.blockAt(int(b)).count
+			}
+		}
+	}
+	return e
+}
+func (idx *contentPostingIndex) blockAt(i int) contentBlockMeta {
+	p := idx.blockData[i*contentBlockMetaSize:]
+	return contentBlockMeta{firstDocID: binary.LittleEndian.Uint32(p), count: binary.LittleEndian.Uint32(p[4:]), byteOffset: idx.blockOff[i], byteLen: binary.LittleEndian.Uint32(p[8:])}
 }
 
 // encodeContentPostingBlock encodes one block's docIDs (ascending),
@@ -323,34 +348,27 @@ func decodeContentPostingIndex(data []byte) (*contentPostingIndex, error) {
 	if keyBlobLen != 0 {
 		return nil, errors.New("content postings carry an unexpected key blob")
 	}
-	if off+entryCount*contentPostingEntrySize+blockCount*contentBlockMetaSize+keyBlobLen+blockBlobLen > len(data) {
+	if entryCount > (len(data)-off)/contentPostingEntrySize || blockCount > (len(data)-off-entryCount*contentPostingEntrySize)/contentBlockMetaSize || uint64(off)+uint64(entryCount)*contentPostingEntrySize+uint64(blockCount)*contentBlockMetaSize+uint64(keyBlobLen)+uint64(blockBlobLen) > uint64(len(data)) {
 		return nil, errors.New("content postings length mismatch")
 	}
-	idx := &contentPostingIndex{
-		entries: make([]contentPostingEntry, entryCount),
-		blocks:  make([]contentBlockMeta, blockCount),
-	}
+	entryData := data[off : off+entryCount*contentPostingEntrySize]
+	idx := &contentPostingIndex{entryData: entryData}
 	for i := 0; i < entryCount; i++ {
-		p := off + i*contentPostingEntrySize
-		copy(idx.entries[i].key[:], data[p:p+3])
-		switch data[p+3] {
+		p := i * contentPostingEntrySize
+		prev := (i - 1) * contentPostingEntrySize
+		switch entryData[p+3] {
 		case contentPostingEntryMulti:
-			idx.entries[i].firstBlock = binary.LittleEndian.Uint32(data[p+4:])
-			idx.entries[i].blockCount = binary.LittleEndian.Uint32(data[p+8:])
-			if idx.entries[i].blockCount == 0 {
+			if binary.LittleEndian.Uint32(entryData[p+8:]) == 0 {
 				return nil, errors.New("content postings multi entry without blocks")
 			}
 		case contentPostingEntrySingle:
-			idx.entries[i].single = true
-			idx.entries[i].count = 1
-			idx.entries[i].singleDoc = binary.LittleEndian.Uint32(data[p+4:])
-			if binary.LittleEndian.Uint32(data[p+8:]) != 0 {
+			if binary.LittleEndian.Uint32(entryData[p+8:]) != 0 {
 				return nil, errors.New("content postings singleton reserved word nonzero")
 			}
 		default:
 			return nil, errors.New("content postings bad entry flags")
 		}
-		if i > 0 && bytes.Compare(idx.entries[i-1].key[:], idx.entries[i].key[:]) >= 0 {
+		if i > 0 && bytes.Compare(entryData[prev:prev+3], entryData[p:p+3]) >= 0 {
 			return nil, errors.New("content postings keys out of order")
 		}
 	}
@@ -358,19 +376,17 @@ func decodeContentPostingIndex(data []byte) (*contentPostingIndex, error) {
 	// Rebuild the dropped firstBlock/count/byteOffset fields in one pass:
 	// blocks are laid out in key order, so offsets prefix-sum the lengths
 	// and entries prefix-sum the block counts.
+	idx.blockData = data[off : off+blockCount*contentBlockMetaSize]
+	idx.blockOff = make([]uint32, blockCount+1)
 	var blobOff uint64
 	for i := 0; i < blockCount; i++ {
-		p := off + i*contentBlockMetaSize
-		idx.blocks[i] = contentBlockMeta{
-			firstDocID: binary.LittleEndian.Uint32(data[p:]),
-			count:      binary.LittleEndian.Uint32(data[p+4:]),
-			byteOffset: uint32(blobOff),
-			byteLen:    binary.LittleEndian.Uint32(data[p+8:]),
-		}
-		if idx.blocks[i].count == 0 || idx.blocks[i].count > contentPostingBlockSize {
+		p := i * contentBlockMetaSize
+		count, byteLen := binary.LittleEndian.Uint32(idx.blockData[p+4:]), binary.LittleEndian.Uint32(idx.blockData[p+8:])
+		if count == 0 || count > contentPostingBlockSize {
 			return nil, errors.New("content postings bad block count")
 		}
-		blobOff += uint64(idx.blocks[i].byteLen)
+		idx.blockOff[i] = uint32(blobOff)
+		blobOff += uint64(byteLen)
 		if blobOff > uint64(blockBlobLen) {
 			return nil, errors.New("content postings block out of range")
 		}
@@ -379,31 +395,33 @@ func decodeContentPostingIndex(data []byte) (*contentPostingIndex, error) {
 		return nil, errors.New("content postings blob length mismatch")
 	}
 	var nextFirst uint32
-	for i := range idx.entries {
-		e := &idx.entries[i]
-		if e.single {
+	for i := 0; i < idx.entryCount(); i++ {
+		p := entryData[i*contentPostingEntrySize:]
+		if p[3] == contentPostingEntrySingle {
 			continue
 		}
 		// The stored firstBlock must match the prefix sum: entries own
 		// contiguous block runs, so any gap or overlap is corruption.
-		if e.firstBlock != nextFirst {
+		firstBlock, blocks := binary.LittleEndian.Uint32(p[4:]), binary.LittleEndian.Uint32(p[8:])
+		if firstBlock != nextFirst {
 			return nil, errors.New("content postings first block mismatch")
 		}
-		if uint64(e.firstBlock)+uint64(e.blockCount) > uint64(len(idx.blocks)) {
+		if uint64(firstBlock)+uint64(blocks) > uint64(idx.blockCount()) {
 			return nil, errors.New("content postings entry out of range")
 		}
 		var sum uint32
-		for _, b := range idx.blocks[e.firstBlock : e.firstBlock+e.blockCount] {
-			sum += b.count
+		for b := firstBlock; b < firstBlock+blocks; b++ {
+			sum += idx.blockAt(int(b)).count
 		}
-		e.count = sum
-		nextFirst += e.blockCount
+		_ = sum
+		nextFirst += blocks
 	}
-	if int(nextFirst) != len(idx.blocks) {
+	if int(nextFirst) != idx.blockCount() {
 		return nil, errors.New("content postings trailing blocks")
 	}
 	off += blockCount * contentBlockMetaSize
 	idx.blockBlob = data[off : off+blockBlobLen]
+	idx.blockOff[blockCount] = uint32(blobOff)
 	return idx, nil
 }
 
@@ -476,13 +494,14 @@ func (idx *contentPostingIndex) postings(key string) (next func() (uint32, uint3
 	}
 	var want [3]byte
 	copy(want[:], key)
-	i := sort.Search(len(idx.entries), func(i int) bool {
-		return bytes.Compare(idx.entries[i].key[:], want[:]) >= 0
+	i := sort.Search(idx.entryCount(), func(i int) bool {
+		p := idx.entryData[i*contentPostingEntrySize:]
+		return bytes.Compare(p[:3], want[:]) >= 0
 	})
-	if i >= len(idx.entries) || idx.entries[i].key != want {
+	if i >= idx.entryCount() || !bytes.Equal(idx.entryData[i*contentPostingEntrySize:i*contentPostingEntrySize+3], want[:]) {
 		return nil, false
 	}
-	e := idx.entries[i]
+	e := idx.entryAt(i)
 	if e.single {
 		doc := e.singleDoc
 		done := false
@@ -497,7 +516,7 @@ func (idx *contentPostingIndex) postings(key string) (next func() (uint32, uint3
 			return doc, 0, true
 		}, true
 	}
-	if int64(e.firstBlock)+int64(e.blockCount) > int64(len(idx.blocks)) {
+	if int64(e.firstBlock)+int64(e.blockCount) > int64(idx.blockCount()) {
 		return nil, false
 	}
 	block, endBlock := e.firstBlock, e.firstBlock+e.blockCount
@@ -517,7 +536,7 @@ func (idx *contentPostingIndex) postings(key string) (next func() (uint32, uint3
 		if block >= endBlock {
 			return false
 		}
-		meta := idx.blocks[block]
+		meta := idx.blockAt(int(block))
 		block++
 		if uint64(meta.byteOffset)+uint64(meta.byteLen) > uint64(len(idx.blockBlob)) {
 			return false

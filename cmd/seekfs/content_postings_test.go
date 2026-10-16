@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/binary"
+	"runtime"
 	"testing"
 )
 
@@ -35,8 +36,36 @@ func TestContentPostingCodecRoundTrip(t *testing.T) {
 		t.Fatal("lookup of a non-gram key must fail")
 	}
 	// Non-3-byte keys are not encoded.
-	if len(idx.entries) != 2 {
-		t.Fatalf("entries = %d; want 2 (only 3-byte keys encode)", len(idx.entries))
+	if idx.entryCount() != 2 {
+		t.Fatalf("entries = %d; want 2 (only 3-byte keys encode)", idx.entryCount())
+	}
+}
+
+func TestContentPostingDecodeAllocatesByBlocks(t *testing.T) {
+	const n = 100000
+	data := make([]byte, 16+n*contentPostingEntrySize)
+	binary.LittleEndian.PutUint32(data, n)
+	for i := 0; i < n; i++ {
+		p := data[16+i*contentPostingEntrySize:]
+		p[0], p[1], p[2], p[3] = byte(i>>16), byte(i>>8), byte(i), contentPostingEntrySingle
+		binary.LittleEndian.PutUint32(p[4:], uint32(i))
+	}
+	allocs := testing.AllocsPerRun(3, func() {
+		idx, err := decodeContentPostingIndex(data)
+		if err != nil || idx.entryCount() != n {
+			panic("decode failed")
+		}
+	})
+	runtime.GC()
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	idx, err := decodeContentPostingIndex(data)
+	runtime.ReadMemStats(&after)
+	if err != nil || idx.entryCount() != n {
+		t.Fatal("decode failed")
+	}
+	if allocs > 2 || after.TotalAlloc-before.TotalAlloc >= 2<<20 {
+		t.Fatalf("decode allocations = %.1f; expected O(blocks)", allocs)
 	}
 }
 
@@ -81,11 +110,11 @@ func TestContentPostingLookupRejectsOutOfRangeEntry(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if idx.entries[0].single {
+	if idx.entryAt(0).single {
 		t.Fatal("two-posting key must not be a singleton entry")
 	}
-	idx.entries[0].firstBlock = 9999
-	idx.entries[0].blockCount = 10
+	binary.LittleEndian.PutUint32(idx.entryData[4:], 9999)
+	binary.LittleEndian.PutUint32(idx.entryData[8:], 10)
 	if _, ok := idx.lookup("alp"); ok {
 		t.Fatal("lookup accepted an out-of-range block entry")
 	}
@@ -125,10 +154,11 @@ func TestContentPostingDenseBlockBitmap(t *testing.T) {
 	if err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	if len(idx.blocks) != 1 {
-		t.Fatalf("blocks = %d; want 1", len(idx.blocks))
+	if idx.blockCount() != 1 {
+		t.Fatalf("blocks = %d; want 1", idx.blockCount())
 	}
-	payload := idx.blockBlob[idx.blocks[0].byteOffset : idx.blocks[0].byteOffset+idx.blocks[0].byteLen]
+	b0 := idx.blockAt(0)
+	payload := idx.blockBlob[b0.byteOffset : b0.byteOffset+b0.byteLen]
 	if payload[0] != contentPostingBlockBitmap {
 		t.Fatalf("dense block kind = %d; want bitmap (%d)", payload[0], contentPostingBlockBitmap)
 	}
@@ -159,7 +189,8 @@ func TestContentPostingSparseBlockStaysList(t *testing.T) {
 	if err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	payload := idx.blockBlob[idx.blocks[0].byteOffset : idx.blocks[0].byteOffset+idx.blocks[0].byteLen]
+	b0 := idx.blockAt(0)
+	payload := idx.blockBlob[b0.byteOffset : b0.byteOffset+b0.byteLen]
 	if payload[0] != contentPostingBlockList {
 		t.Fatal("sparse block must stay a delta list")
 	}
@@ -223,21 +254,21 @@ func TestContentPostingSingletonEntry(t *testing.T) {
 	if err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	if len(idx.entries) != 2 {
-		t.Fatalf("entries = %d; want 2", len(idx.entries))
+	if idx.entryCount() != 2 {
+		t.Fatalf("entries = %d; want 2", idx.entryCount())
 	}
-	if !idx.entries[0].single || idx.entries[0].singleDoc != 42 {
-		t.Fatalf("one = %+v; want singleton doc 42", idx.entries[0])
+	if !idx.entryAt(0).single || idx.entryAt(0).singleDoc != 42 {
+		t.Fatalf("one = %+v; want singleton doc 42", idx.entryAt(0))
 	}
-	if idx.entries[1].single {
+	if idx.entryAt(1).single {
 		t.Fatal("two-posting key must not be a singleton")
 	}
-	if len(idx.blocks) != 1 {
-		t.Fatalf("blocks = %d; want 1 (singleton owns none)", len(idx.blocks))
+	if idx.blockCount() != 1 {
+		t.Fatalf("blocks = %d; want 1 (singleton owns none)", idx.blockCount())
 	}
 	// The rebuilt firstBlock prefix sum must skip the singleton.
-	if idx.entries[1].firstBlock != 0 || idx.entries[1].count != 2 {
-		t.Fatalf("two = %+v; want firstBlock 0 count 2", idx.entries[1])
+	if idx.entryAt(1).firstBlock != 0 || idx.entryAt(1).count != 2 {
+		t.Fatalf("two = %+v; want firstBlock 0 count 2", idx.entryAt(1))
 	}
 	got, ok := idx.lookup("one")
 	if !ok || len(got) != 1 || got[0].docID != 42 {
@@ -285,8 +316,8 @@ func TestContentPostingPrunesDenseKeys(t *testing.T) {
 	if got, ok := idx.lookup("ccc"); !ok || len(got) != 1 || got[0].docID != 7 {
 		t.Fatalf("ccc = %+v, %v; want singleton 7", got, ok)
 	}
-	if len(idx.entries) != 2 {
-		t.Fatalf("entries = %d; want 2 (bbb multi, ccc singleton)", len(idx.entries))
+	if idx.entryCount() != 2 {
+		t.Fatalf("entries = %d; want 2 (bbb multi, ccc singleton)", idx.entryCount())
 	}
 }
 
@@ -356,13 +387,13 @@ func TestContentPostingV9PrefixSumsValidated(t *testing.T) {
 	if err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	if len(idx.blocks) != 2 {
-		t.Fatalf("blocks = %d; want 2 (aaa and ccc)", len(idx.blocks))
+	if idx.blockCount() != 2 {
+		t.Fatalf("blocks = %d; want 2 (aaa and ccc)", idx.blockCount())
 	}
-	if idx.entries[2].firstBlock != 1 || idx.entries[0].count != 2 || idx.entries[2].count != 3 {
-		t.Fatalf("rebuilt fields wrong: %+v", idx.entries)
+	if idx.entryAt(2).firstBlock != 1 || idx.entryAt(0).count != 2 || idx.entryAt(2).count != 3 {
+		t.Fatalf("rebuilt fields wrong")
 	}
-	if idx.blocks[0].byteOffset != 0 || idx.blocks[1].byteOffset != idx.blocks[0].byteLen {
-		t.Fatalf("rebuilt offsets wrong: %+v", idx.blocks)
+	if idx.blockAt(0).byteOffset != 0 || idx.blockAt(1).byteOffset != idx.blockAt(0).byteLen {
+		t.Fatalf("rebuilt offsets wrong")
 	}
 }
