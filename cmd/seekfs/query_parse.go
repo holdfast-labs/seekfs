@@ -425,6 +425,16 @@ func applyQueryToken(pq *parsedQuery, raw string) error {
 			return contentUnavailableError()
 		}
 		return nil
+	case strings.HasPrefix(raw, "sym:"):
+		name := strings.TrimPrefix(raw, "sym:")
+		if !singleContentWord(name) {
+			return fmt.Errorf("sym: accepts a single identifier only")
+		}
+		pq.Content = append(pq.Content, contentLeaf{Kind: contentLeafTerm, Text: name, WholeWord: true, Sym: true})
+		if !contentSearchEnabled() {
+			return contentUnavailableError()
+		}
+		return nil
 	case strings.HasPrefix(raw, "content~"):
 		colon := strings.IndexByte(raw, ':')
 		if colon < 0 || !strings.HasPrefix(raw, "content~") {

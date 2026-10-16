@@ -78,6 +78,9 @@ func contentLineMatches(m *contentLeafMatcher, line []byte, positive []contentLe
 		folded = contentFoldAccent(line)
 	}
 	for _, leaf := range positive {
+		if leaf.Sym {
+			continue
+		}
 		if leaf.Fuzzy {
 			word := string(contentFoldAccent([]byte(leaf.Text)))
 			tau := contentFuzzyGrepDistance(leaf)

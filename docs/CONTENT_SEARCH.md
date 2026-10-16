@@ -1,5 +1,10 @@
 # Content Search — Design, Status, and Handoff
 
+`sym:Name` performs query-time definition search for identifier `Name` using
+language-specific source-line patterns (Go, C/C++, Python, JS/TS, Rust, Java,
+C#, Kotlin, and generic fallbacks). It reuses content postings and verification;
+no index format change is required. `--lines` prints the definition matches.
+
 Branch: `integ/content-main`. Status: P0–P5 complete and reviewed, and the PF-1–PF-7
 parity packages landed. P4's two planner surfaces (`sort:relevance` and snippets)
 are implemented and tested; §6m landed the compact v7 index (blocked

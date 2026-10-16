@@ -106,6 +106,7 @@ type contentLeaf struct {
 	Fuzzy         bool
 	FuzzyDistance int
 	WholeWord     bool
+	Sym           bool
 }
 
 // contentSearchEnabled honors the environment override, then the service's

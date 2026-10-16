@@ -616,7 +616,11 @@ func entryMatchesWithContentMatcher(vol *serviceVolumeIndex, entry Entry, pq par
 		var folded []byte
 		foldedReady := false
 		for _, leaf := range m.leaves {
-			matched[leaf.LeafID] = m.matchRawFirst(text, &folded, &foldedReady, leaf)
+			if leaf.Sym {
+				matched[leaf.LeafID] = contentHasDefinition(text, entry.Path, leaf.Text)
+			} else {
+				matched[leaf.LeafID] = m.matchRawFirst(text, &folded, &foldedReady, leaf)
+			}
 		}
 	}
 	return entryMatchesContentAt(entry, pq, matchPath, matched)

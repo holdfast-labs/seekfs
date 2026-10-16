@@ -156,8 +156,9 @@ Accuracy and ranking (fff parity):
     (fixed in `fix/short-term-postings`: the direct LOWR writer now emits the
     canonical split per-token layout, and corrupt sections fall back to exact
     decoding).
-9. **No `sym:`** (definition search) and no definition-line bonus in content
-   ranking.
+9. **Definition search: DONE (`content/sym`).** `sym:Name` finds definition
+    lines by source extension without changing the v12 index; plain identifier
+    `content:Name` is intended to favor defining files.
 10. **Grep features:** indexed fuzzy word grep (`content~:word`, optional
         `content~2:word`) done (G10); no Smith-Waterman scoring. Multi-pattern OR
         grep remains open. **Per-query time budget and cursor pagination: done (G10):**
