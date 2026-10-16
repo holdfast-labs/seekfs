@@ -1124,7 +1124,50 @@ func contentFoldAccent(text []byte) []byte {
 	if isASCIIBytes(text) {
 		return contentFoldText(text)
 	}
-	return []byte(foldAccentLower(string(text)))
+	// Byte-identical to foldAccentLower(string(text)), but per rune: ASCII
+	// lowercases in place and only non-ASCII runes take the NFD + strip-Mn
+	// path, through a per-rune cache. Folding a whole mostly-ASCII file with
+	// one non-ASCII byte through norm.NFD cost ~16 ms/file on Chromium
+	// verifies (72% of a content:mutex_ query).
+	out := make([]byte, 0, len(text))
+	for i := 0; i < len(text); {
+		c := text[i]
+		if c < utf8.RuneSelf {
+			if 'A' <= c && c <= 'Z' {
+				c += 'a' - 'A'
+			}
+			out = append(out, c)
+			i++
+			continue
+		}
+		r, size := utf8.DecodeRune(text[i:])
+		out = append(out, contentFoldAccentRune(r)...)
+		i += size
+	}
+	return out
+}
+
+// contentFoldAccentLow caches foldAccentLower for runes below 0x800 (Latin,
+// Greek, Cyrillic, Hebrew, Arabic); higher runes use contentFoldAccentHigh.
+var contentFoldAccentLow = func() (t [0x800]string) {
+	for r := rune(0x80); r < 0x800; r++ {
+		t[r] = foldAccentLower(string(r))
+	}
+	return t
+}()
+
+var contentFoldAccentHigh sync.Map // rune -> string
+
+func contentFoldAccentRune(r rune) string {
+	if r < 0x800 {
+		return contentFoldAccentLow[r]
+	}
+	if v, ok := contentFoldAccentHigh.Load(r); ok {
+		return v.(string)
+	}
+	f := foldAccentLower(string(r))
+	contentFoldAccentHigh.Store(r, f)
+	return f
 }
 
 func contentFoldCaseExact(text []byte) []byte {
