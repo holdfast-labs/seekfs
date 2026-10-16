@@ -52,11 +52,12 @@ corruption, exact required sources, auto-fuzzy only on zero exact hits).
 
 | Branch | Worktree | Scope |
 |---|---|---|
+| `content/accent-fold` | accentfold | Content accent folding in the index (format v12, rebuild on upgrade): `resume` finds `résumé`; accented query letters stay exact; regex stays accent-sensitive |
 | `content/fuzzy-grep` | fuzzygrep | `content~:word` / `content~N:word`: OR over dictionary words within edit distance (G10 fuzzy grep) |
-| `content/typo-scope` | typoscope | Typo fallback never corrects a word that exists in any content dictionary (`await` under a scope) |
 | `perf/static-ranking` | staticrank | **Parked** at WIP commit `761db7b` (OR-lane case unresolved, suite not green); resume only with a fresh, narrow brief (G13) |
 
-Merged 2026-10-15: `content/cursor` (607d38b, G10: `--cursor` / `next_cursor` offset
+Merged 2026-10-15: `content/typo-scope` (da7def5: the typo fallback never corrects
+a word present in any content dictionary or delta), `content/cursor` (607d38b, G10: `--cursor` / `next_cursor` offset
 pagination bound to a query hash; each page re-runs up to offset+limit),
 `content/time-budget` (a3a94f8, G10: opt-in `--budget 150ms` /
 `budget_ms` stops new disk verifies at the deadline; partial page in order,
@@ -125,10 +126,7 @@ GOMAXPROCS=2, peak disk 0.56x extracted. Limit-20 warm/first: rare literal
   (nearly full) and pass with TEMP on E: (fails back to at least 878b6d2, so
   environmental). Free space/reserve is not the cause (reserve is 0 in tests).
   Run suites with TMP/TEMP=E:ench\scratch	mp until found.
-- **Typo fallback scope:** content typo fallback fires on scoped zero-result
-  queries even when exact matches exist elsewhere (`async` → `sync`). Decide
-  whether it should only fire when the whole index has no exact match (from
-  the recall run, `E:\bench\scratch\recall\REPORT.md`).
+- **Typo fallback scope:** DONE (`content/typo-scope`, da7def5).
 - **Single-line JSON:** an 11.4 MB single-line `tokenizer.json` makes every
   broad query 4–5× slower. Covered by item 1's caps; verify after.
 - **Extraction past the budget:** after the budget bites, builds keep
