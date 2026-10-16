@@ -459,7 +459,7 @@ func (m *contentLeafMatcher) match(raw, folded []byte, leaf contentLeaf) bool {
 		// content~ variants are dictionary terms: match them as whole words
 		// (contentTermsOf boundaries) on the same haystack as plain terms.
 		if !m.caseSensitive && folded == nil {
-			folded = contentFoldText(raw)
+			folded = contentFoldAccent(raw)
 		}
 		return contentHasWholeWord(m.haystackFor(raw, folded), m.needleOf(leaf))
 	}
@@ -510,7 +510,7 @@ func (m *contentLeafMatcher) match(raw, folded []byte, leaf contentLeaf) bool {
 func (m *contentLeafMatcher) matchRawFirst(raw []byte, folded *[]byte, foldedReady *bool, leaf contentLeaf) bool {
 	if leaf.WholeWord {
 		if !m.caseSensitive && !*foldedReady {
-			*folded, *foldedReady = contentFoldText(raw), true
+			*folded, *foldedReady = contentFoldAccent(raw), true
 		}
 		return m.match(raw, *folded, leaf)
 	}
@@ -534,7 +534,8 @@ func (m *contentLeafMatcher) matchRawFirst(raw []byte, folded *[]byte, foldedRea
 			}
 			if !rawHit {
 				if !*foldedReady {
-					*folded = contentFoldText(raw)
+					// Shared per-entry cache: always the accent fold.
+					*folded = contentFoldAccent(raw)
 					*foldedReady = true
 				}
 				if !contentRegexNeedlesHold(*folded, needles) {

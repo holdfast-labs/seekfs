@@ -92,3 +92,19 @@ func TestContentAccentFoldRegexUnchanged(t *testing.T) {
 		t.Fatalf("regex should remain accent-sensitive: got=%v err=%v", namesOf(got), err)
 	}
 }
+
+// content~ and --lines see the accent-folded words too: a fuzzy query finds
+// and prints an accented spelling within the distance.
+func TestContentAccentFoldFuzzyLines(t *testing.T) {
+	selected := true
+	servicePluginContentSelection.Store(&selected)
+	t.Cleanup(func() { servicePluginContentSelection.Store(nil) })
+	pq, err := parseQuery(queryOptions{Query: "content~:resume"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := contentMatchingLines([]byte("my résumé\nnothing\nresumes here\n"), newContentLeafMatcher(pq), contentPositiveLeaves(pq), 10, 0, 0)
+	if len(lines) != 2 || lines[0].Line != 1 || lines[1].Line != 3 {
+		t.Fatalf("fuzzy accent lines = %+v; want lines 1 and 3", lines)
+	}
+}
