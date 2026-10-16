@@ -52,11 +52,12 @@ corruption, exact required sources, auto-fuzzy only on zero exact hits).
 
 | Branch | Worktree | Scope |
 |---|---|---|
-| `content/sym` | sym | G9: `sym:Name` definition search (query-time per-language definition patterns) + definition-line ranking bonus for `content:Name` |
 | `bench/content-rightfile` | rightfile | Content right-file-first metric (100 labeled symbols, blink/renderer/core): baseline before the sym ranking bonus |
 | `perf/static-ranking` | staticrank | **Parked** at WIP commit `761db7b` (OR-lane case unresolved, suite not green); resume only with a fresh, narrow brief (G13) |
 
-Merged 2026-10-15: `content/accent-fold` (69a061a, content format **v12**: terms,
+Merged 2026-10-15: `content/sym` (2ea5d74, G9: `sym:Name` definition search by
+per-language patterns at query time; `sort:relevance` +1 for defining files),
+`content/accent-fold` (69a061a, content format **v12**: terms,
 grams and filter bits are accent-folded; `resume` finds `résumé`, an accented query
 letter stays exact, regex stays accent-sensitive; v11 sidecars rebuild),
 `content/fuzzy-grep` (ef020f3, `content~:word` / `content~N:word` over dictionary
