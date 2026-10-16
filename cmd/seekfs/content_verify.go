@@ -113,6 +113,7 @@ type contentLeafMatcher struct {
 	grams        map[int][]uint32
 	regexGrams   map[int][][][]uint32
 	regexNeedles map[int][][]byte
+	accentNeedle map[int]bool
 }
 
 // isASCIIBytes reports whether b has no byte >= 0x80.
@@ -230,8 +231,8 @@ func newContentLeafMatcher(pq parsedQuery) *contentLeafMatcher {
 					if !contentTermTrigramSafe(run) {
 						continue
 					}
-					rg = append(rg, contentFilterGramsOf([]byte(run)))
-					safe = append(safe, run)
+					rg = append(rg, contentFilterGramsOf(contentFoldAccent([]byte(run))))
+					safe = append(safe, string(contentFoldAccent([]byte(run))))
 				}
 				if len(rg) == 0 {
 					constrained = false
@@ -258,8 +259,16 @@ func newContentLeafMatcher(pq parsedQuery) *contentLeafMatcher {
 			m.needle = make(map[int][]byte)
 		}
 		b := []byte(leaf.Text)
+		if m.accentNeedle == nil {
+			m.accentNeedle = make(map[int]bool)
+		}
+		m.accentNeedle[leaf.LeafID] = !pq.contentCaseSensitive() && string(contentFoldAccent(b)) == string(contentFoldText(b))
 		if !pq.contentCaseSensitive() {
-			b = contentFoldText(b)
+			if m.accentNeedle[leaf.LeafID] {
+				b = contentFoldAccent(b)
+			} else {
+				b = contentFoldCaseExact(b)
+			}
 		}
 		m.needle[leaf.LeafID] = b
 		if m.needleASCII == nil {
@@ -271,7 +280,7 @@ func newContentLeafMatcher(pq parsedQuery) *contentLeafMatcher {
 		}
 		// The prefilter folds every leaf (a raw match implies the folded
 		// match), so the grams always derive from the folded needle.
-		m.grams[leaf.LeafID] = contentFilterGramsOf(contentFoldText([]byte(leaf.Text)))
+		m.grams[leaf.LeafID] = contentFilterGramsOf(contentFoldAccent([]byte(leaf.Text)))
 	}
 	return m
 }
@@ -416,7 +425,11 @@ func (m *contentLeafMatcher) needleOf(leaf contentLeaf) []byte {
 	}
 	b := []byte(leaf.Text)
 	if !m.caseSensitive {
-		b = contentFoldText(b)
+		if m.accentNeedle[leaf.LeafID] {
+			b = contentFoldAccent(b)
+		} else {
+			b = contentFoldCaseExact(b)
+		}
 	}
 	return b
 }
@@ -461,7 +474,7 @@ func (m *contentLeafMatcher) match(raw, folded []byte, leaf contentLeaf) bool {
 		// reject true matches).
 		if needles := m.regexNeedlesFor(leaf.LeafID); len(needles) > 0 && !m.caseSensitive {
 			if folded == nil {
-				folded = contentFoldText(raw)
+				folded = contentFoldAccent(raw)
 			}
 			if !contentRegexNeedlesHold(folded, needles) {
 				return false
@@ -472,7 +485,17 @@ func (m *contentLeafMatcher) match(raw, folded []byte, leaf contentLeaf) bool {
 		}
 		return re.Match(raw)
 	}
-	return bytes.Contains(m.haystackFor(raw, folded), m.needleOf(leaf))
+	if m.caseSensitive {
+		return bytes.Contains(raw, m.needleOf(leaf))
+	}
+	if m.accentNeedle[leaf.LeafID] {
+		// folded is the caller's once-per-entry contentFoldAccent(raw).
+		if folded == nil {
+			folded = contentFoldAccent(raw)
+		}
+		return bytes.Contains(folded, m.needleOf(leaf))
+	}
+	return bytes.Contains(contentFoldCaseExact(raw), m.needleOf(leaf))
 }
 
 // matchRawFirst is match with a lazy fold: a case-insensitive leaf whose
@@ -537,10 +560,13 @@ func (m *contentLeafMatcher) matchRawFirst(raw []byte, folded *[]byte, foldedRea
 		}
 	}
 	if !*foldedReady {
-		*folded = contentFoldText(raw)
+		*folded = contentFoldAccent(raw)
 		*foldedReady = true
 	}
-	return bytes.Contains(*folded, needle)
+	if m.accentNeedle[leaf.LeafID] {
+		return bytes.Contains(*folded, needle)
+	}
+	return bytes.Contains(contentFoldCaseExact(raw), needle)
 }
 
 // entryMatchesWithContent mirrors entryMatches but also enforces content leaves
@@ -852,6 +878,60 @@ func contentFoldSpanToRaw(raw, folded []byte, off, end int) (rawOff, rawEnd int)
 	return rawOff, rawEnd
 }
 
+// contentFoldAccentWithOffsets maps each output byte back to the source rune
+// that produced it. The returned final boundary maps to len(raw).
+func contentFoldAccentWithOffsets(raw []byte) ([]byte, []int) {
+	folded := contentFoldAccent(raw)
+	offsets := make([]int, 0, len(folded)+1)
+	for i := 0; i < len(raw); {
+		_, size := utf8.DecodeRune(raw[i:])
+		if size < 1 {
+			size = 1
+		}
+		part := contentFoldAccent(raw[i : i+size])
+		for range part {
+			offsets = append(offsets, i)
+		}
+		i += size
+	}
+	offsets = append(offsets, len(raw))
+	return folded, offsets
+}
+
+func contentFoldCaseExactWithOffsets(raw []byte) ([]byte, []int) {
+	folded := contentFoldCaseExact(raw)
+	offsets := make([]int, 0, len(folded)+1)
+	for i := 0; i < len(raw); {
+		_, size := utf8.DecodeRune(raw[i:])
+		if size < 1 {
+			size = 1
+		}
+		part := contentFoldCaseExact(raw[i : i+size])
+		for range part {
+			offsets = append(offsets, i)
+		}
+		i += size
+	}
+	offsets = append(offsets, len(raw))
+	return folded, offsets
+}
+
+func contentAccentSpanToRaw(raw []byte, offsets []int, off, end int) (int, int) {
+	if off < 0 {
+		off = 0
+	}
+	if end < off {
+		end = off
+	}
+	if off >= len(offsets) {
+		return len(raw), len(raw)
+	}
+	if end >= len(offsets) {
+		end = len(offsets) - 1
+	}
+	return offsets[off], offsets[end]
+}
+
 // contentFoldRunesToRaw advances n runes into raw.
 func contentFoldRunesToRaw(raw []byte, n int) int {
 	i := 0
@@ -886,6 +966,13 @@ func contentSnippet(raw, folded []byte, positive []contentLeaf, m *contentLeafMa
 			}
 		}
 		hay := m.haystackFor(raw, folded)
+		var offsets []int
+		if !m.caseSensitive && m.accentNeedle[leaf.LeafID] {
+			hay, offsets = contentFoldAccentWithOffsets(raw)
+		}
+		if !m.caseSensitive && !m.accentNeedle[leaf.LeafID] {
+			hay, offsets = contentFoldCaseExactWithOffsets(raw)
+		}
 		off := contentLeafFirstOffset(hay, needle)
 		if off < 0 {
 			continue
@@ -896,7 +983,12 @@ func contentSnippet(raw, folded []byte, positive []contentLeaf, m *contentLeafMa
 		// The folded offset maps to the raw offset by rune index; the match
 		// length is the raw span between the two mapped boundaries, so a
 		// case-changing fold (é -> É) still windows the real bytes.
-		rawOff, rawEnd := contentFoldSpanToRaw(raw, folded, off, off+len(needle))
+		var rawOff, rawEnd int
+		if offsets != nil {
+			rawOff, rawEnd = contentAccentSpanToRaw(raw, offsets, off, off+len(needle))
+		} else {
+			rawOff, rawEnd = contentFoldSpanToRaw(raw, hay, off, off+len(needle))
+		}
 		return contentSnippetWindow(raw, rawOff, rawEnd-rawOff)
 	}
 	return ""
@@ -917,7 +1009,7 @@ func attachContentSnippets(entries []Entry, volByPath map[string]*serviceVolumeI
 		if text, ok := vol.contentTextForEntry(&entries[i]); ok {
 			var folded []byte
 			if !m.caseSensitive {
-				folded = contentFoldText(text)
+				folded = contentFoldAccent(text)
 			}
 			entries[i].Snippet = contentSnippet(text, folded, positive, m)
 		}
@@ -1114,7 +1206,7 @@ func (vol *serviceVolumeIndex) contentCandidatesBounded(pq parsedQuery, cap int)
 				}
 				continue
 			}
-			term := string(contentFoldText([]byte(leaf.Text)))
+			term := string(contentFoldAccent([]byte(leaf.Text)))
 			if !contentTermTrigramSafe(term) {
 				// A gram the builder skipped (control byte) would look up
 				// empty and falsely report zero; fall back to a scan.
@@ -1305,6 +1397,7 @@ func contentRegexLeafStream(reader *contentReader, leaf contentLeaf, mask []bool
 	for _, runs := range disjuncts {
 		var runStreams []func() (uint32, bool)
 		for _, run := range runs {
+			run = string(contentFoldAccent([]byte(run)))
 			if !contentTermTrigramSafe(run) {
 				// A gram the builder skipped (control byte) cannot
 				// constrain; the disjunct's remaining runs still do.
@@ -1338,7 +1431,7 @@ func contentAltCandidateStream(reader *contentReader, alt parsedQuery, mask []bo
 			}
 			continue
 		}
-		term := string(contentFoldText([]byte(leaf.Text)))
+		term := string(contentFoldAccent([]byte(leaf.Text)))
 		if !contentTermTrigramSafe(term) {
 			return nil, false, false
 		}

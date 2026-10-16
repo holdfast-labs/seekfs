@@ -112,12 +112,15 @@ func contentSectionEagerVerify(tag uint32) bool {
 // never be attached stale: the service sees no usable base and its PF-3
 // build path rebuilds it. Both parents' v10 sidecars (stored-text
 // v10 and no-text v10 are different formats under one number) rebuild.
+// Version 12 changes the persisted term, trigram, and filter normalization
+// from lowercase-only to accent-folded; v11 sidecars must rebuild. V12 writers
+// still emit no CXST/CXTD sections and use the same doc-table encoding.
 // (05 is the sharded-manifest version, which carries no doc table;
-// manifests are unaffected by the 06/07/08/09/10/11 bumps: a manifest names
+// manifests are unaffected by the 06/07/08/09/10/11/12 bumps: a manifest names
 // shard files, and each shard carries the doc-table version itself.)
 var contentIndexMagic = [8]byte{'G', 'O', 'S', 'C', 'X', '0', '0', '4'}
 
-const contentIndexVersion = 11
+const contentIndexVersion = 12
 
 // contentOrigin records what the doc keys are, so a `.gsx` can never be
 // attached to a key space it does not join.

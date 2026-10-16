@@ -20,6 +20,8 @@ import (
 	"sync"
 	"time"
 	"unicode/utf8"
+
+	"golang.org/x/text/unicode/norm"
 )
 
 // contentBuildOptions bounds and scopes a build. MaxFiles caps files scanned;
@@ -577,7 +579,7 @@ type contentTokenizedDoc struct {
 // so parallel assembly produces byte-identical output.
 func contentTokenizeDocForBuild(text []byte) contentTokenizedDoc {
 	stored := contentStoredText(text)
-	folded := contentFoldText(stored)
+	folded := contentFoldAccent(stored)
 	return contentTokenizedDoc{
 		textLen: uint32(len(stored)),
 		docLen:  uint32(len(folded)),
@@ -1114,6 +1116,19 @@ func contentFoldText(repaired []byte) []byte {
 		return out
 	}
 	return []byte(strings.ToLower(string(repaired)))
+}
+
+// contentFoldAccent is the v12 persisted fold, equivalent to filename folding.
+// Pure ASCII keeps the existing allocation-efficient lowercase path.
+func contentFoldAccent(text []byte) []byte {
+	if isASCIIBytes(text) {
+		return contentFoldText(text)
+	}
+	return []byte(foldAccentLower(string(text)))
+}
+
+func contentFoldCaseExact(text []byte) []byte {
+	return []byte(norm.NFD.String(strings.ToLower(string(text))))
 }
 
 // contentPathKey is the stable 64-bit identity of a walk-relative path: FNV-1a

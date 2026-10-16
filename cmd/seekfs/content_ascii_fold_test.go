@@ -142,12 +142,20 @@ func TestContentSnippetASCIIEquals(t *testing.T) {
 			want := ""
 			if m.match(raw, folded, leaf) {
 				needle := m.needleOf(leaf)
-				off := contentLeafFirstOffset(m.haystackFor(raw, folded), needle)
+				hay := contentFoldAccent(raw)
+				if !m.accentNeedle[leaf.LeafID] {
+					hay = contentFoldCaseExact(raw)
+				}
+				off := contentLeafFirstOffset(hay, needle)
 				if off >= 0 {
 					if m.caseSensitive {
 						want = contentSnippetWindow(raw, off, len(needle))
 					} else {
-						rawOff, rawEnd := contentFoldSpanToRaw(raw, folded, off, off+len(needle))
+						_, offsets := contentFoldAccentWithOffsets(raw)
+						if !m.accentNeedle[leaf.LeafID] {
+							_, offsets = contentFoldCaseExactWithOffsets(raw)
+						}
+						rawOff, rawEnd := contentAccentSpanToRaw(raw, offsets, off, off+len(needle))
 						want = contentSnippetWindow(raw, rawOff, rawEnd-rawOff)
 					}
 				}
@@ -194,15 +202,26 @@ func TestVerifyDocContentASCIIEquals(t *testing.T) {
 		if !complete {
 			t.Fatalf("needle %q: tiny corpus hit the disk cap", term)
 		}
+		// Reference fold (v12 smart accent): an unaccented needle matches the
+		// accent-folded text, an accented one the case-folded NFD text.
+		accentInsensitive := string(contentFoldAccent([]byte(term))) == term
+		refFold := func(text []byte) ([]byte, []int, []byte) {
+			if accentInsensitive {
+				lower, offsets := contentFoldAccentWithOffsets(text)
+				return lower, offsets, contentFoldAccent([]byte(term))
+			}
+			lower, offsets := contentFoldCaseExactWithOffsets(text)
+			return lower, offsets, contentFoldCaseExact([]byte(term))
+		}
 		for _, h := range hits {
 			// Reference decision + offset + snippet, spelled out slowly.
 			text := raws[int(h.DocID)]
-			lower := contentFoldText(text)
-			off := bytes.Index(lower, []byte(term))
+			lower, offsets, needle := refFold(text)
+			off := bytes.Index(lower, needle)
 			if off < 0 {
 				t.Fatalf("needle %q doc %d: hit but slow path misses", term, h.DocID)
 			}
-			rawOff, rawEnd := contentFoldSpanToRaw(text, lower, off, off+len(term))
+			rawOff, rawEnd := contentAccentSpanToRaw(text, offsets, off, off+len(needle))
 			if h.Offset != rawOff {
 				t.Fatalf("needle %q doc %d: offset=%d want %d", term, h.DocID, h.Offset, rawOff)
 			}
@@ -224,7 +243,7 @@ func TestVerifyDocContentASCIIEquals(t *testing.T) {
 			if len(text) == 0 {
 				continue
 			}
-			if bytes.Contains(contentFoldText(text), []byte(term)) {
+			if lower, _, needle := refFold(text); bytes.Contains(lower, needle) {
 				t.Fatalf("needle %q doc %d: slow path hits but fast path missed", term, id)
 			}
 		}

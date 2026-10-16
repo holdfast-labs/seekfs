@@ -76,7 +76,7 @@ func contentMatchingLines(raw []byte, m *contentLeafMatcher, positive []contentL
 func contentLineMatches(m *contentLeafMatcher, line []byte, positive []contentLeaf) bool {
 	var folded []byte
 	if !m.caseSensitive {
-		folded = contentFoldText(line)
+		folded = contentFoldAccent(line)
 	}
 	for _, leaf := range positive {
 		if leaf.Fuzzy {

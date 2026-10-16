@@ -328,12 +328,19 @@ func (r *contentReader) docPath(docID uint32) string {
 // disk verification cap stopped it with records unvisited (a visible subset,
 // never silent).
 func (r *contentReader) search(term string, limit int) ([]contentHit, bool) {
-	t := strings.ToLower(term)
+	t := string(contentFoldAccent([]byte(term)))
 	if t == "" {
 		return nil, true
 	}
+	accentInsensitive := string(contentFoldAccent([]byte(term))) == string(contentFoldText([]byte(term)))
 	needle := []byte(t)
-	grams := contentFilterGramsOf(needle)
+	if !accentInsensitive {
+		needle = contentFoldCaseExact([]byte(term))
+	}
+	// Filter bits are built from the accent-folded text (v12), so the gate
+	// tests the accent-folded query; an accent-exact needle is only the
+	// verify-time haystack form.
+	grams := contentFilterGramsOf([]byte(t))
 	next := r.candidateStream(t)
 	if len(r.aliasExpand) > 0 {
 		ids := r.expandAliasDocIDs(collectDocIDStream(next, 0))
@@ -354,7 +361,7 @@ func (r *contentReader) search(term string, limit int) ([]contentHit, bool) {
 		if !ok {
 			return hits, true
 		}
-		if hit, ok, capped := r.verifyDiskContent(id, needle, grams, &verified); capped {
+		if hit, ok, capped := r.verifyDiskContent(id, needle, grams, accentInsensitive, &verified); capped {
 			return hits, false
 		} else if ok {
 			hits = append(hits, *hit)
@@ -373,7 +380,7 @@ func (r *contentReader) search(term string, limit int) ([]contentHit, bool) {
 // pre-folded query bytes and grams its precomputed filter keys, both hoisted
 // by the caller. capped reports the per-query disk verification budget
 // (contentDiskVerifyBudget) stopped the read.
-func (r *contentReader) verifyDiskContent(id uint32, needle []byte, grams []uint32, verified *int) (*contentHit, bool, bool) {
+func (r *contentReader) verifyDiskContent(id uint32, needle []byte, grams []uint32, accentInsensitive bool, verified *int) (*contentHit, bool, bool) {
 	if len(grams) > 0 {
 		row, ok := r.filterRow(id)
 		if !ok {
@@ -395,7 +402,7 @@ func (r *contentReader) verifyDiskContent(id uint32, needle []byte, grams []uint
 	if !ok {
 		return nil, false, false
 	}
-	if isASCIIBytes(needle) {
+	if accentInsensitive && isASCIIBytes(needle) {
 		if off, ascii := asciiCaseIndex(text, needle); ascii {
 			if off < 0 {
 				return nil, false, false
@@ -408,12 +415,18 @@ func (r *contentReader) verifyDiskContent(id uint32, needle []byte, grams []uint
 			}, true, false
 		}
 	}
-	lower := contentFoldText(text)
+	var lower []byte
+	var offsets []int
+	if accentInsensitive {
+		lower, offsets = contentFoldAccentWithOffsets(text)
+	} else {
+		lower, offsets = contentFoldCaseExactWithOffsets(text)
+	}
 	off := bytes.Index(lower, needle)
 	if off < 0 {
 		return nil, false, false
 	}
-	rawOff, rawEnd := contentFoldSpanToRaw(text, lower, off, off+len(needle))
+	rawOff, rawEnd := contentAccentSpanToRaw(text, offsets, off, off+len(needle))
 	return &contentHit{
 		Path:    r.docPath(id),
 		DocID:   id,

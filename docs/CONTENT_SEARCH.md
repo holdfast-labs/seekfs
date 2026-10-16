@@ -33,9 +33,9 @@ non-path terms and other unsupported filename roots, multi-usable-volume
 queries, truncated catch-up (`healthIncomplete`), a missing overlay snapshot,
 and biased queries while the volume carries overlay activity (see the WP7
 section of the roadmap for the precise list and rationale). The documented §7
-residuals remain. `.gsx` doc tables are format **v10** (no stored text: the
+residuals remain. `.gsx` doc tables are format **v12** (no stored text: the
 index is trigram postings plus a per-file bloom filter, and every match and
-snippet verifies by reading the file from disk — §6y; v9 and older sidecars
+snippet verifies by reading the file from disk — §6y; v11 and older sidecars
 fail the version gate and rebuild) and sharded manifests are
 **v5** (see §6i). P4 document-extraction
 quality remains deferred (see §7). Content search is off by default; with
@@ -220,9 +220,10 @@ letters trigger it. Explicit `case:true` or `case:false` overrides smart case.
 Smart case is query-wide: it applies only when every content leaf containing
 letters has a literal uppercase letter. Filename/path terms keep their own case rule (`pq.CaseSensitive`);
 content matching reads `contentCaseSensitive()`.
-In insensitive matching,
-the query text is folded with Unicode `strings.ToLower` and tested for a byte
-substring anywhere in the document's verified bytes (`bytes.Contains`; v10
+In insensitive matching, an unaccented term/phrase is matched through the v12
+accent fold; a query containing accents keeps those accents significant. Both
+folded forms are tested for a byte substring anywhere in the document's verified
+bytes (`bytes.Contains`; v12
 reads the file from disk — there is no stored text anymore, see §6y). There is
 **no tokenization, word-boundary check, or stemming**, so `content:foo` matches
 a document containing `foobar` or `xfoox` but does **not** match one containing
@@ -231,9 +232,13 @@ literal substring. `case:true` selects case-sensitive matching (the raw,
 case-preserving verified bytes are compared byte-for-byte with no fold). For
 precision the index cannot express literally — word boundaries, alternation,
 anchors — use the regex form `content:/pattern/`, which is compiled with `(?i)`
-unless the effective content matching is case-sensitive. The fold is the same on both sides because the
-builder folds documents and the query folds the leaf with the one shared
-`contentFoldText`.
+unless the effective content matching is case-sensitive. Regex stays accent-
+sensitive because it runs on raw text. The v12 builder persists terms, trigrams,
+and per-file filter bits using the filename-equivalent NFD/mark-removal/
+fullwidth/lowercase fold. Unaccented case-insensitive term/phrase queries verify
+on this accent-folded view; accented queries use lowercase-only verification,
+preserving the requested accent. Folded match offsets map back to raw bytes for
+snippets and `--lines`. V11 sidecars fail the format gate and rebuild.
 
 **Line output (`seekfs search --lines`).** For a query with a positive content
 leaf, the CLI re-reads each hit file client-side (no protocol change) and
@@ -327,11 +332,12 @@ when none is usable the query errors rather than returning empty.
   source), so results can never resolve to the wrong record.
 - **One doc per FRN, `DocID == index`** in the FRN-sorted doc table;
   `contentIndexDecode` enforces it. Cross-file content dedup is deferred.
-- **One repair, one fold.** `contentRepairText` = lossy repair preserving case
+- **One repair, two folds.** `contentRepairText` = lossy repair preserving case
   (the stored text and `ContentHash = sha256Of(repaired)`, so base↔delta change
-  detection compares like with like); `contentFoldText` = `strings.ToLower`, the
-  case-folded view the term/gram index and case-insensitive matching use. The
-  prefilter is folded, verification is case-aware (`case:true` → byte-exact).
+  detection compares like with like); `contentFoldText` is lowercase-only for
+  accent-specific queries and raw regex; `contentFoldAccent` is the v12 term,
+  gram, and filter view and the unaccented-query haystack. `case:true` remains
+  byte-exact, and regex remains accent-sensitive.
 - **Lock order.** `contentResolvePath` takes `indexMu.RLock()` then `vol.mu`
   (matching the persist/rebuild swap). The drain passes a **private** path cache;
   it must never touch `vol.pathCache` (search trims that under `searchMu`).
