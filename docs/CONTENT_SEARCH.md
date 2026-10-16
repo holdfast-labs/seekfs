@@ -707,6 +707,19 @@ Residual / known limitations (all explicit deferrals):
   hit keeps the partial page. Full Chromium v11, limit 20, best-of-3:
   `content:mutex` 2,157 -> 228 verifies, 591 -> 142 ms, 5 -> 20 hits;
   `ext:cc content:mutex` 512 -> 132 verifies, 155 -> 52 ms.
+- **Verify cost (2026-10-15).** `contentFoldAccent` (v12) folded any file with one
+  non-ASCII byte through whole-text NFD (~16 ms/file, 72% of a `content:mutex_`
+  query); it now lowercases ASCII in place and folds non-ASCII runes through a
+  per-rune cache, byte-identical to `foldAccentLower` (tested), so v12 sidecars
+  stay valid. The rank-ordered superset page verifies in parallel batches
+  (4 per worker; at most one batch past the page), and pure-regex queries use
+  the full-superset path in scan order instead of the capped name-order scan.
+  `chrome/` (v12), limit 20, warm best-of-3: `content:/mutex_\w+/` 2.47 s ->
+  0.40 s, `content:mutex_` 2.58 s -> 0.55 s, `content:/Get\w+ForTesting/` 758 ms
+  -> 65 ms, `kMax\w+` 189 -> 200 ms, `TODO\(\w+\)` 23 -> 17 ms. Known limit: the
+  index is case-folded, so a case-sensitive (smart-case) regex such as
+  `Get\w+ForTesting` also gets `getXForTesting` candidates (Java) and can hit
+  the 512-verify cap (`incomplete`; rg finds 2,116 files there).
 - **M2.** `contentExtractSafely` runs extraction in a goroutine and returns on
   `ectx.Done()`, so a context-ignoring extractor cannot wedge the serial drain,
   the service build, or the offline walk builder. The residual is the abandoned

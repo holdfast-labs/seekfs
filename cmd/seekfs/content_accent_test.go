@@ -1,6 +1,7 @@
 package main
 
 import (
+	"math/rand"
 	"testing"
 )
 
@@ -106,5 +107,34 @@ func TestContentAccentFoldFuzzyLines(t *testing.T) {
 	lines := contentMatchingLines([]byte("my résumé\nnothing\nresumes here\n"), newContentLeafMatcher(pq), contentPositiveLeaves(pq), 10, 0, 0)
 	if len(lines) != 2 || lines[0].Line != 1 || lines[1].Line != 3 {
 		t.Fatalf("fuzzy accent lines = %+v; want lines 1 and 3", lines)
+	}
+}
+
+// contentFoldAccent's per-rune fast path must stay byte-identical to the
+// whole-string foldAccentLower that v12 sidecars were built with, or indexed
+// terms/grams would stop matching their queries.
+func TestContentFoldAccentMatchesWholeStringFold(t *testing.T) {
+	inputs := []string{
+		"", "plain ascii MUTEX_", "café CAFÉ Café", "e\u0301 decomposed É",
+		"STRASSE straße ẞ", "İstanbul ı I", "ＦＵＬＬ　ｗｉｄｔｈ", "日本語テスト",
+		"Ελληνικά ΣΊΣΥΦΟΣ", "Кириллица ЁЖ", "עברית", "العربية", "हिन्दी देवनागरी",
+		"한국어 조선말", "emoji \U0001F600 x", "mixed é\u0308\u0301 marks",
+		"bad \xff\xfe utf8 \xc3", "© 2026 The Chromium Authors — ™",
+		"Å Ω K \u212a \u2126", "ǅ ǆ ǲ", "ﬁ ﬀ ligatures",
+	}
+	rng := rand.New(rand.NewSource(20261015))
+	alphabet := []rune("aZ_ 9éÉİıßẞ日ΣЁ\u0301\u0308\u212aＡ\U0001F600ǅ©")
+	for i := 0; i < 2000; i++ {
+		rs := make([]rune, 1+rng.Intn(40))
+		for j := range rs {
+			rs[j] = alphabet[rng.Intn(len(alphabet))]
+		}
+		inputs = append(inputs, string(rs))
+	}
+	for _, in := range inputs {
+		want := foldAccentLower(in)
+		if got := string(contentFoldAccent([]byte(in))); got != want {
+			t.Fatalf("contentFoldAccent(%q) = %q; want %q", in, got, want)
+		}
 	}
 }

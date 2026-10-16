@@ -851,22 +851,62 @@ func (vol *serviceVolumeIndex) verifyContentSupersetPage(pq parsedQuery, ranked 
 		return nil, false
 	}
 	matcher := newContentLeafMatcher(pq)
-	cache := make(map[int]string)
 	page := make([]int, 0, min(pq.Limit, len(ranked)))
-	for _, id := range ranked {
-		if pq.Trace != nil && pq.Trace.BudgetExceeded {
+	stopped := func() bool {
+		// The verify cap / time budget already marked the trace incomplete;
+		// keep the hits found so far as a visible partial page.
+		return pq.Trace != nil && (pq.Trace.BudgetExceeded || pq.Trace.DiskCapped)
+	}
+	// Verify in small parallel batches (like verifyCompactContentParallel),
+	// then take hits in rank order: the page is identical to the serial walk
+	// and over-verification is under one batch.
+	workers := contentParallelWorkers()
+	if workers < 1 {
+		workers = 1
+	}
+	batch := 4 * workers
+	ok := make([]bool, batch)
+	caches := make([]map[int]string, workers)
+	for w := range caches {
+		caches[w] = make(map[int]string)
+	}
+	for start := 0; start < len(ranked); start += batch {
+		if stopped() {
 			return page, true
 		}
-		if pq.Trace != nil && pq.Trace.DiskCapped {
-			// The verify budget already marked the trace incomplete; keep
-			// the hits found so far as a visible partial page.
-			return page, true
+		end := min(start+batch, len(ranked))
+		n := end - start
+		clear(ok)
+		if workers == 1 || n == 1 {
+			for i := 0; i < n && !stopped(); i++ {
+				caches[0] = boundPathCache(caches[0])
+				ok[i] = scanCandidateMatches(vol, vol.index, pq, ranked[start+i], caches[0], matcher)
+			}
+		} else {
+			var next atomic.Int64
+			var wg sync.WaitGroup
+			for w := 0; w < workers; w++ {
+				wg.Add(1)
+				go func(w int) {
+					defer wg.Done()
+					for {
+						i := int(next.Add(1)) - 1
+						if i >= n || stopped() {
+							return
+						}
+						caches[w] = boundPathCache(caches[w])
+						ok[i] = scanCandidateMatches(vol, vol.index, pq, ranked[start+i], caches[w], matcher)
+					}
+				}(w)
+			}
+			wg.Wait()
 		}
-		cache = boundPathCache(cache)
-		if scanCandidateMatches(vol, vol.index, pq, id, cache, matcher) {
-			page = append(page, id)
-			if len(page) == pq.Limit {
-				return page, true
+		for i := 0; i < n; i++ {
+			if ok[i] {
+				page = append(page, ranked[start+i])
+				if len(page) == pq.Limit {
+					return page, true
+				}
 			}
 		}
 	}
@@ -1085,7 +1125,7 @@ func (vol *serviceVolumeIndex) nameTermCandidates(pq parsedQuery) ([]int, bool) 
 			// verifies and the allocation gate (TestContentBroadAllocationBudget)
 			// holds.
 			useFullSuperset := bounded && pq.contentWindow > 0 && pq.contentProbe != nil &&
-				pq.RootBias == "" && pq.CWDBias == "" && !contentLeavesAllRegex(pq)
+				pq.RootBias == "" && pq.CWDBias == ""
 			candidateCap := 0
 			if bounded && !useFullSuperset {
 				// Probe broadness against the completeness window, not the
@@ -1105,7 +1145,15 @@ func (vol *serviceVolumeIndex) nameTermCandidates(pq parsedQuery) ([]int, bool) 
 			}
 			if candidates, ok, capped := vol.contentCandidatesBounded(pq, candidateCap); ok {
 				if useFullSuperset && len(candidates) > 0 {
-					sortCandidateIDs(candidates, pq, vol.index, vol.rankForQuery(pq))
+					// Pure-regex queries keep the historical scan order (see the
+					// capped branch below); verifying their prefiltered superset
+					// in that order emits the scan's sequence without its
+					// name-order walk over files that cannot match.
+					if contentLeavesAllRegex(pq) {
+						vol.sortCandidateIDsByScanOrder(candidates, pq)
+					} else {
+						sortCandidateIDs(candidates, pq, vol.index, vol.rankForQuery(pq))
+					}
 					if page, verified := vol.verifyContentSupersetPage(pq, candidates); verified {
 						if pq.contentProbe != nil {
 							// The page is the exact rank-ordered top: later
