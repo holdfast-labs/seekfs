@@ -138,3 +138,41 @@ func TestContentSymRelevanceBonusAndLines(t *testing.T) {
 		t.Fatalf("sym:Run lines = %+v; want only line 2", lines)
 	}
 }
+
+func TestContentSymbolQueryKeyAndPromotion(t *testing.T) {
+	selected := true
+	servicePluginContentSelection.Store(&selected)
+	t.Cleanup(func() { servicePluginContentSelection.Store(nil) })
+	for q, want := range map[string]string{
+		"content:TabStripModel":   "tabstripmodel",
+		"sym:tab_strip_model":     "tabstripmodel",
+		"content:Profile ext:h":   "profile",
+		"content:Foo content:Bar": "", // two identifiers: no single symbol
+		`content:"tab strip"`:     "", // phrase
+		"content:ab":              "", // too short
+		"content~:TabStripModel":  "", // fuzzy
+		`content:/TabStrip\w+/`:   "", // regex
+	} {
+		pq, err := parseQuery(queryOptions{Query: q})
+		if err != nil {
+			t.Fatalf("%s: %v", q, err)
+		}
+		if got := contentSymbolQueryKey(pq); got != want {
+			t.Errorf("contentSymbolQueryKey(%q) = %q; want %q", q, got, want)
+		}
+	}
+	idx := &Index{Compact: true}
+	for _, name := range []string{"a.cc", "tab_strip_model.cc", "b.h", "tab_strip_model.h", "TabStripModel.java", "tab_strip_model_unittest.cc"} {
+		idx.Records = append(idx.Records, CompactRecord{Name: name, Parent: -1})
+	}
+	ids := []int{0, 1, 2, 3, 4, 5}
+	promoteSymbolNamedCandidates(ids, idx, "tabstripmodel")
+	var got []string
+	for _, id := range ids {
+		got = append(got, idx.compactNameAt(id))
+	}
+	want := "tab_strip_model.h,tab_strip_model.cc,TabStripModel.java,a.cc,b.h,tab_strip_model_unittest.cc"
+	if strings.Join(got, ",") != want {
+		t.Fatalf("promoted order = %v; want %s", got, want)
+	}
+}

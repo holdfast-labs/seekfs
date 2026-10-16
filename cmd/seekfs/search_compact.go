@@ -1153,6 +1153,7 @@ func (vol *serviceVolumeIndex) nameTermCandidates(pq parsedQuery) ([]int, bool) 
 						vol.sortCandidateIDsByScanOrder(candidates, pq)
 					} else {
 						sortCandidateIDs(candidates, pq, vol.index, vol.rankForQuery(pq))
+						promoteSymbolNamedCandidates(candidates, vol.index, contentSymbolQueryKey(pq))
 					}
 					if page, verified := vol.verifyContentSupersetPage(pq, candidates); verified {
 						if pq.contentProbe != nil {
@@ -1217,6 +1218,12 @@ func (vol *serviceVolumeIndex) nameTermCandidates(pq parsedQuery) ([]int, bool) 
 						} else {
 							sortCandidateIDs(candidates, pq, vol.index, vol.rankForQuery(pq))
 						}
+					}
+					// Default order and relevance: files named after a queried
+					// symbol go first (relevance verifies a bounded window in
+					// this order, so the defining file stays inside it).
+					if pq.SortColumn == "" || pq.SortColumn == "relevance" {
+						promoteSymbolNamedCandidates(candidates, vol.index, contentSymbolQueryKey(pq))
 					}
 					pq.Trace.setSource("content-candidates", len(candidates))
 					return candidates, true

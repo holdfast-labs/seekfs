@@ -2,8 +2,10 @@ package main
 
 import (
 	"container/heap"
+	"path/filepath"
 	"runtime"
 	"sort"
+	"strings"
 	"sync"
 )
 
@@ -282,10 +284,32 @@ func sortContentEntriesByRelevance(entries []Entry, volByPath map[string]*servic
 	}
 	defaultPQ := pq
 	defaultPQ.SortColumn = ""
+	// Tie-break equal scores by "named after the queried symbol" (headers
+	// first): a class's header and its .cc both define it, the header is
+	// the definition a reader wants.
+	symKey := contentSymbolQueryKey(pq)
+	named := make([]int, len(entries))
+	if symKey != "" {
+		for i := range entries {
+			name := entries[i].Name
+			if dot := strings.IndexByte(name, '.'); dot > 0 {
+				name = name[:dot]
+			}
+			if contentNormalizeSymbolName(name) == symKey {
+				named[i] = 1
+				if contentIsHeaderName(entries[i].Name) {
+					named[i] = 2
+				}
+			}
+		}
+	}
 	sort.SliceStable(order, func(a, b int) bool {
 		i, j := order[a], order[b]
 		if rel[i].score != rel[j].score {
 			return rel[i].score > rel[j].score
+		}
+		if named[i] != named[j] {
+			return named[i] > named[j]
 		}
 		if rel[i].first != rel[j].first {
 			return rel[i].first < rel[j].first
@@ -393,4 +417,82 @@ func (vol *serviceVolumeIndex) orderForQuery(pq parsedQuery) []uint32 {
 		return vol.pathOrderForRank()
 	}
 	return vol.mappedOrCompactNameOrder()
+}
+
+// contentSymbolQueryKey returns the normalized identifier of a content query
+// that names one symbol (a single identifier-like positive term or sym:
+// leaf), or "" otherwise. Files named after the symbol (TabStripModel ->
+// tab_strip_model.h, Profile -> profile.h, Foo -> Foo.java) are almost always
+// where it is defined, so candidate ordering puts them first: a free,
+// no-disk signal that keeps the defining file inside the verify budget.
+func contentSymbolQueryKey(pq parsedQuery) string {
+	key := ""
+	for _, leaf := range pq.Content {
+		if leaf.Kind != contentLeafTerm || leaf.Fuzzy || (leaf.WholeWord && !leaf.Sym) || !contentLooksLikeIdentifier(leaf.Text) {
+			continue
+		}
+		if key != "" {
+			return "" // more than one identifier: no single symbol
+		}
+		key = contentNormalizeSymbolName(leaf.Text)
+	}
+	if len(key) < 3 {
+		return ""
+	}
+	return key
+}
+
+// contentNormalizeSymbolName lowercases and drops '_' and '-', so snake,
+// kebab and camel spellings of one name compare equal.
+func contentNormalizeSymbolName(s string) string {
+	b := make([]byte, 0, len(s))
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c == '_' || c == '-':
+			continue
+		case c >= 'A' && c <= 'Z':
+			c += 'a' - 'A'
+		}
+		b = append(b, c)
+	}
+	return string(b)
+}
+
+// promoteSymbolNamedCandidates stably moves candidates whose file name (up to
+// the first '.') normalizes to key to the front, keeping relative order.
+func promoteSymbolNamedCandidates(ids []int, idx *Index, key string) {
+	if key == "" || idx == nil || len(ids) < 2 {
+		return
+	}
+	named := make([]int, 0, 4)
+	rest := ids[:0:0]
+	for _, id := range ids {
+		name := idx.compactNameAt(id)
+		if dot := strings.IndexByte(name, '.'); dot > 0 {
+			name = name[:dot]
+		}
+		if len(name) >= len(key) && contentNormalizeSymbolName(name) == key {
+			named = append(named, id)
+		} else {
+			rest = append(rest, id)
+		}
+	}
+	if len(named) == 0 {
+		return
+	}
+	// C-family headers carry the type definitions; .cc/.cpp the members.
+	sort.SliceStable(named, func(i, j int) bool {
+		return contentIsHeaderName(idx.compactNameAt(named[i])) && !contentIsHeaderName(idx.compactNameAt(named[j]))
+	})
+	copy(ids, named)
+	copy(ids[len(named):], rest)
+}
+
+func contentIsHeaderName(name string) bool {
+	switch strings.ToLower(filepath.Ext(name)) {
+	case ".h", ".hh", ".hpp", ".hxx":
+		return true
+	}
+	return false
 }
