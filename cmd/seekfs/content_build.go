@@ -1383,7 +1383,33 @@ func encodeContentPaths(paths []string) []byte {
 	return out.Bytes()
 }
 
-func decodeContentPaths(data []byte, docCount int) ([]string, error) {
+// contentPathTable reconstructs docID -> path lazily from the CXPT section.
+// Paths stay front-coded in the (mapped) section: a path is decoded on access
+// from the nearest restart, so attaching a large corpus holds no per-doc path
+// strings, only the restart offsets. data aliases the index mapping, so the
+// owning contentIndex must outlive the table (it does: the reader holds idx).
+//
+// The typed-from-wire restart keys are validated once at open and then dropped;
+// the per-reader cache keeps the one restart run the last lookups landed in so
+// sequential walks (fold re-reads, result listing) cost one decode per run
+// rather than per path.
+type contentPathTable struct {
+	data      []byte // CXPT payload (aliases the index mapping)
+	n         int
+	interval  int
+	blobOff   int
+	blobLen   int
+	permOff   int
+	restartIx []int // blob-relative offset of each restart record
+	cacheRun  int   // restart run currently cached, -1 when empty
+	cacheKeys []string
+}
+
+// openContentPaths validates the CXPT section's structure and returns a lazy
+// table. It fails closed on structural corruption (header, restart offsets,
+// permutation) without decoding every path; the section's CRC is verified
+// eagerly at load, so a data-corrupt blob never reaches here.
+func openContentPaths(data []byte, docCount int) (*contentPathTable, error) {
 	if len(data) < 16 {
 		return nil, errors.New("content paths truncated")
 	}
@@ -1398,14 +1424,14 @@ func decodeContentPaths(data []byte, docCount int) ([]string, error) {
 		if restartCount != 0 || blobLen != 0 {
 			return nil, errors.New("content paths length mismatch")
 		}
-		return nil, nil
+		return &contentPathTable{cacheRun: -1}, nil
 	}
 	if interval <= 0 || restartCount != (n+interval-1)/interval || blobLen < 0 {
 		return nil, errors.New("content paths header mismatch")
 	}
 	off := 16
-	restarts := make([]string, 0, restartCount)
 	restartIx := make([]int, 0, restartCount)
+	restartKey := make([]string, 0, restartCount)
 	for r := 0; r < restartCount; r++ {
 		if off+8 > len(data) {
 			return nil, errors.New("content paths restarts truncated")
@@ -1416,7 +1442,7 @@ func decodeContentPaths(data []byte, docCount int) ([]string, error) {
 		if pathLen < 0 || off+pathLen > len(data) {
 			return nil, errors.New("content paths restart truncated")
 		}
-		restarts = append(restarts, string(data[off:off+pathLen]))
+		restartKey = append(restartKey, string(data[off:off+pathLen]))
 		restartIx = append(restartIx, blobOff)
 		off += pathLen
 	}
@@ -1424,47 +1450,90 @@ func decodeContentPaths(data []byte, docCount int) ([]string, error) {
 		return nil, errors.New("content paths length mismatch")
 	}
 	blob := data[off : off+blobLen]
-	off += blobLen
-	// Decode the sorted paths, verifying order and restart alignment: a
-	// corrupt blob fails here, not in a later lookup. Equal adjacent paths
-	// are allowed (two docs may share a stored path across origins).
-	sorted := make([]string, 0, n)
-	prev := ""
-	pos := 0
-	for i := 0; i < n; i++ {
-		if i%interval == 0 {
-			if pos != restartIx[i/interval] {
-				return nil, errors.New("content paths restart offset mismatch")
-			}
+	blobOff := off
+	permOff := off + blobLen
+	// Restart offsets must ascend from the blob start and stay in range; each
+	// restart record is self-contained (shared prefix zero), so decoding it
+	// with an empty predecessor must reproduce the stored restart key. This
+	// catches a corrupt restart table without materializing the whole blob.
+	for r := 0; r < restartCount; r++ {
+		if r == 0 && restartIx[r] != 0 {
+			return nil, errors.New("content paths restart offset mismatch")
 		}
-		key, next, ok := decodeLegacyFrontCodedKey(blob, pos, prev)
+		if restartIx[r] < 0 || restartIx[r] >= blobLen || (r > 0 && restartIx[r] <= restartIx[r-1]) {
+			return nil, errors.New("content paths restart offset mismatch")
+		}
+		key, _, ok := decodeLegacyFrontCodedKey(blob, restartIx[r], "")
 		if !ok {
 			return nil, errors.New("content paths key truncated")
 		}
-		if key < prev {
-			return nil, errors.New("content paths out of order")
-		}
-		if i%interval == 0 && key != restarts[i/interval] {
+		if key != restartKey[r] {
 			return nil, errors.New("content paths restart key mismatch")
 		}
-		prev = key
-		pos = next
-		sorted = append(sorted, key)
 	}
-	if pos != len(blob) {
-		return nil, errors.New("content paths blob length mismatch")
-	}
-	// The permutation must be exact: every sorted position named exactly
-	// once, or a docID would resolve to another document's path.
-	out := make([]string, n)
+	// The permutation must be exact: every sorted position named exactly once,
+	// or a docID would resolve to another document's path.
 	seen := make([]bool, n)
 	for doc := 0; doc < n; doc++ {
-		p := int(binary.LittleEndian.Uint32(data[off+doc*4:]))
+		p := int(binary.LittleEndian.Uint32(data[permOff+doc*4:]))
 		if p < 0 || p >= n || seen[p] {
 			return nil, errors.New("content paths permutation mismatch")
 		}
 		seen[p] = true
-		out[doc] = sorted[p]
 	}
-	return out, nil
+	return &contentPathTable{
+		data:      data,
+		n:         n,
+		interval:  interval,
+		blobOff:   blobOff,
+		blobLen:   blobLen,
+		permOff:   permOff,
+		restartIx: restartIx,
+		cacheRun:  -1,
+	}, nil
+}
+
+// path returns the stored path for a docID, reconstructing it from the nearest
+// restart. An out-of-range docID or a decode fault yields "".
+func (t *contentPathTable) path(doc uint32) string {
+	if t == nil || int(doc) >= t.n {
+		return ""
+	}
+	p := int(binary.LittleEndian.Uint32(t.data[t.permOff+int(doc)*4:]))
+	if p < 0 || p >= t.n {
+		return ""
+	}
+	r := p / t.interval
+	if r >= len(t.restartIx) {
+		return ""
+	}
+	if r != t.cacheRun {
+		if t.cacheKeys == nil {
+			t.cacheKeys = make([]string, 0, t.interval)
+		} else {
+			t.cacheKeys = t.cacheKeys[:0]
+		}
+		blob := t.data[t.blobOff : t.blobOff+t.blobLen]
+		key := ""
+		pos := t.restartIx[r]
+		limit := (r + 1) * t.interval
+		if limit > t.n {
+			limit = t.n
+		}
+		for j := r * t.interval; j < limit; j++ {
+			next, npos, ok := decodeLegacyFrontCodedKey(blob, pos, key)
+			if !ok {
+				t.cacheRun = -1
+				return ""
+			}
+			key, pos = next, npos
+			t.cacheKeys = append(t.cacheKeys, key)
+		}
+		t.cacheRun = r
+	}
+	i := p - r*t.interval
+	if i < 0 || i >= len(t.cacheKeys) {
+		return ""
+	}
+	return t.cacheKeys[i]
 }

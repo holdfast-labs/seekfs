@@ -142,6 +142,11 @@ func contentComposeShards(manifest *contentIndex, gsx string) error {
 		return err
 	}
 	var docs []contentDoc
+	total := 0
+	for _, info := range infos {
+		total += info.Docs
+	}
+	docs = make([]contentDoc, 0, total)
 	size := manifest.EncodedSize
 	for _, info := range infos {
 		idx, err := contentLoadFileMapped(filepath.Join(dir, info.File))
@@ -162,6 +167,11 @@ func contentComposeShards(manifest *contentIndex, gsx string) error {
 			d.DocID += base
 			docs = append(docs, d)
 		}
+		// The composite doc table is now the single copy: point the shard's
+		// Docs at its slice of it (global DocIDs) so the shard's own decoded
+		// table is freed. Shard-local structures (paths, filter rows, postings,
+		// aliases) stay local-keyed; shard code reads DocIDs by index.
+		idx.Docs = docs[int(base):len(docs)]
 		size += idx.EncodedSize
 		shards = append(shards, &contentShard{info: info, idx: idx, reader: reader, base: base})
 	}
@@ -562,12 +572,15 @@ func contentShardFoldDiskSource(vol *serviceVolumeIndex, sh *contentShard, incom
 	var base []contentDoc
 	var paths []string
 	if sh != nil && sh.idx != nil && sh.reader != nil {
-		for _, d := range sh.idx.Docs {
+		// Shard Docs carry global DocIDs (they alias the composite table);
+		// the reader indexes paths by local DocID, so step by position.
+		for i := range sh.idx.Docs {
+			d := sh.idx.Docs[i]
 			if _, gone := drop[d.FRN]; gone {
 				continue
 			}
 			base = append(base, d)
-			paths = append(paths, sh.reader.docPath(d.DocID))
+			paths = append(paths, sh.reader.docPath(uint32(i)))
 		}
 	}
 	return newContentFoldDiskSource(vol, base, paths, incoming, settings, ctx, livePath)

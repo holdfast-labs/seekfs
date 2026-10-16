@@ -257,7 +257,10 @@ func contentDedupeTotalsForIndex(idx *contentIndex) (files, bytes int64) {
 		aliasSet[p.Alias] = struct{}{}
 	}
 	for i := range idx.Docs {
-		if _, ok := aliasSet[idx.Docs[i].DocID]; ok {
+		// Alias IDs are index-relative, and every index validates (or sets)
+		// DocID==position, so the position is the doc's local ID even when a
+		// composite shard's Docs carry rebased global DocIDs.
+		if _, ok := aliasSet[uint32(i)]; ok {
 			files++
 			bytes += int64(idx.Docs[i].TextLen)
 		}
