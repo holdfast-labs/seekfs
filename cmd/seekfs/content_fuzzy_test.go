@@ -104,6 +104,38 @@ func TestContentFuzzyNeverFiresOnExactMatches(t *testing.T) {
 	}
 }
 
+func TestContentFuzzyDoesNotCorrectKnownWordOutsideScope(t *testing.T) {
+	vol := newContentQueryVolume(t, []contentFixtureFile{
+		{2, `a\await.txt`, "await"},
+		{3, `b\wait.txt`, "wait"},
+	})
+	opts := queryOptions{Query: "content:await", Under: `C:\fixture\b`, Limit: 100}
+	matches, err := searchServiceVolumes([]*serviceVolumeIndex{vol}, opts, false)
+	if err != nil {
+		t.Fatalf("search: %v", err)
+	}
+	if len(matches) != 0 {
+		t.Fatalf("scoped exact query matched %d; want zero", len(matches))
+	}
+	if _, _, ok := tryContentFuzzyRewrite([]*serviceVolumeIndex{vol}, opts, matches); ok {
+		t.Fatal("known word was corrected despite having no scoped results")
+	}
+}
+
+func TestContentFuzzyStillCorrectsAbsentTypo(t *testing.T) {
+	vol := newContentQueryVolume(t, []contentFixtureFile{
+		{2, "a.txt", "await"},
+		{3, "b.txt", "wait"},
+	})
+	got, ok, correction := contentFuzzyServiceSearch(t, vol, "content:awiat")
+	if !ok || (correction != "await" && correction != "wait") {
+		t.Fatalf("typo correction = %q, ok=%v; want await or wait", correction, ok)
+	}
+	if len(got) == 0 {
+		t.Fatal("corrected typo returned no results")
+	}
+}
+
 // case:true and regex leaves are never corrected.
 func TestContentFuzzyRespectsCaseAndRegex(t *testing.T) {
 	vol := newContentQueryVolume(t, contentFuzzyTestFiles())
@@ -161,6 +193,19 @@ func TestContentFuzzyPhraseCorrectsEachWord(t *testing.T) {
 	}
 	if len(got) != 1 {
 		t.Fatalf("corrected phrase matched %d; want 1", len(got))
+	}
+}
+
+func TestContentFuzzyPhraseCorrectsOnlyUnknownWords(t *testing.T) {
+	vol := newContentQueryVolume(t, []contentFixtureFile{
+		{2, "a.txt", "await confirmation of delivery"},
+	})
+	got, ok, correction := contentFuzzyServiceSearch(t, vol, `content:"await confirmtion"`)
+	if !ok || correction != "confirmation" {
+		t.Fatalf("phrase correction = %q, ok=%v; want confirmation only", correction, ok)
+	}
+	if len(got) != 1 {
+		t.Fatalf("corrected phrase matched %d docs; want 1", len(got))
 	}
 }
 
