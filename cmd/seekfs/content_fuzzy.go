@@ -483,7 +483,7 @@ func contentFuzzyDeltaWords(volumes []*serviceVolumeIndex) map[string]int {
 			continue
 		}
 		for _, doc := range d.live() {
-			for w, c := range contentTermsOf(doc.Text) {
+			for w, c := range contentTermsOfFolded(contentFoldAccent(doc.Text)) {
 				if utf8.RuneCountInString(w) < contentFuzzyMinWordRunes {
 					continue
 				}
@@ -579,7 +579,7 @@ func contentFuzzyApplyCorrection(folded string, corr map[string]string) string {
 // the folded text is exact-equivalent to retrying with the raw text.
 func contentFuzzyLeafBase(text string) string {
 	text = strings.TrimSuffix(text, "~")
-	return string(contentFoldText([]byte(text)))
+	return string(contentFoldAccent([]byte(text)))
 }
 
 // contentFuzzyRewriteLeaves applies fn to every positive content leaf: the
@@ -816,7 +816,7 @@ func countContentFuzzyRewrite(volumes []*serviceVolumeIndex, opts queryOptions, 
 // query string to its best dictionary term, for the `content -db` command. It
 // returns the corrected text and the corrected words for display.
 func contentFuzzyCorrectOfflineText(r *contentReader, text string) (string, string, bool) {
-	folded := string(contentFoldText([]byte(text)))
+	folded := string(contentFoldAccent([]byte(text)))
 	words := contentFuzzyCorrectableWords(folded)
 	if len(words) == 0 {
 		return "", "", false

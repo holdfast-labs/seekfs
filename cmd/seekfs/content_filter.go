@@ -301,7 +301,7 @@ func frameContentFilterFile(rowsPath, filterPath string, id contentFilterID, cou
 // for a case-sensitive query, whose raw match implies the folded match — so
 // the prefilter stays a superset. Empty for sub-3-byte leaves.
 func contentFilterLeafGrams(leafText string) []uint32 {
-	return contentFilterGramsOf(contentFoldText([]byte(leafText)))
+	return contentFilterGramsOf(contentFoldAccent([]byte(leafText)))
 }
 
 // contentFilterRegexGramsMatch reports whether precomputed required-literal

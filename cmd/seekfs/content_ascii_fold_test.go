@@ -142,12 +142,20 @@ func TestContentSnippetASCIIEquals(t *testing.T) {
 			want := ""
 			if m.match(raw, folded, leaf) {
 				needle := m.needleOf(leaf)
-				off := contentLeafFirstOffset(m.haystackFor(raw, folded), needle)
+				hay := contentFoldAccent(raw)
+				if !m.accentNeedle[leaf.LeafID] {
+					hay = contentFoldCaseExact(raw)
+				}
+				off := contentLeafFirstOffset(hay, needle)
 				if off >= 0 {
 					if m.caseSensitive {
 						want = contentSnippetWindow(raw, off, len(needle))
 					} else {
-						rawOff, rawEnd := contentFoldSpanToRaw(raw, folded, off, off+len(needle))
+						_, offsets := contentFoldAccentWithOffsets(raw)
+						if !m.accentNeedle[leaf.LeafID] {
+							_, offsets = contentFoldCaseExactWithOffsets(raw)
+						}
+						rawOff, rawEnd := contentAccentSpanToRaw(raw, offsets, off, off+len(needle))
 						want = contentSnippetWindow(raw, rawOff, rawEnd-rawOff)
 					}
 				}
