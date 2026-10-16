@@ -204,7 +204,10 @@ Accuracy and ranking (fff parity):
 12. **Integration:** no JSON-lines stdio mode (optional, low priority).
     **Out of scope: an MCP server.** The owner ruled it out on 2026-10-13;
     do not build one, even though fsearch and fff ship MCP tools.
-13. **Reported metrics: right-file-first added (`perf/ranking-signals`).**
+13. **Reported metrics: right-file-first for names and CONTENT.** Content
+    (100 Blink symbols, BENCHMARKS.md): defining file top-1 70% default /
+    86% `sort:relevance` / 92% `sym:` (functions 42.5% by default order).
+    Names (`perf/ranking-signals`):
     One-typo / two-typo top-1 stay 99.5% / 93.0% (N=200 seed 42 / N=100 seed
     7, chromium). New path-level metric on 100 labeled chromium targets at
     `-n 100` (`E:\bench\scratch\ranking\rightfile.py`, scratch-only): plain

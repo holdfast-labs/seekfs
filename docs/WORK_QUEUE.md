@@ -53,10 +53,12 @@ corruption, exact required sources, auto-fuzzy only on zero exact hits).
 
 | Branch | Worktree | Scope |
 |---|---|---|
-| `bench/content-rightfile` | rightfile | Content right-file-first metric (100 labeled symbols, blink/renderer/core): baseline before the sym ranking bonus |
 | `perf/static-ranking` | staticrank | **Parked** at WIP commit `761db7b` (OR-lane case unresolved, suite not green); resume only with a fresh, narrow brief (G13) |
 
-Merged 2026-10-16: `perf/footprint-content` (63f43ee: zero-copy posting index;
+Merged 2026-10-16: symbol-named candidates first (191148d; content right-file-first
+top-1 17% -> 70% default, 63% -> 86% relevance, 59% -> 92% sym:, BENCHMARKS.md),
+`perf/footprint-rows` (zero-copy filter rows, heap 66 -> 63 MB on chrome/),
+`perf/footprint-content` (63f43ee: zero-copy posting index;
 chrome/ heap after content attach 91 -> 66 MB; measurement notes on the branch).
 
 Merged 2026-10-15: `perf/content-regex` (2247ca3: per-rune cached accent fold,
