@@ -254,7 +254,10 @@ a few trials: single-word rewrites, then the combined rewrite). Exact results
 are never altered — fuzzy only fires on a total miss — and `case:true` queries,
 regex leaves, and NOT leaves are never corrected. Sharded indexes merge
 candidates across shards, and the resident delta vocabulary covers unflushed
-changes. The response sets `fuzzy` plus `fuzzy_correction` (the corrected
+changes. A word present in any eligible volume dictionary or delta vocabulary
+is treated as correctly spelled, even when the current scope has no hits; in a
+phrase, only absent words are candidates for correction. The response sets
+`fuzzy` plus `fuzzy_correction` (the corrected
 words), so the UI summary says "Showing results for receive" and counts agree
 with searches. Measured on the Chromium content sample (62k docs, 500 random
 5+ letter words, one random edit each): 98.4% top-1 at p50 ~24 ms / p99

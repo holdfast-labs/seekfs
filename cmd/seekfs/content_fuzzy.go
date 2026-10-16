@@ -652,6 +652,24 @@ func contentFuzzyRewriteTrials(volumes []*serviceVolumeIndex, opts queryOptions)
 	}
 	best := make(map[string][]contentFuzzyCandidate, len(words))
 	for _, w := range words {
+		// A word present anywhere in the vocabulary is intentional, even when
+		// this query's path/content scope has no matching document. Check the
+		// sorted dictionaries and delta map before doing the variant scans.
+		known := false
+		for _, r := range readers {
+			if r != nil && r.terms != nil {
+				if _, ok := contentFuzzyDictCount(r.terms, w); ok {
+					known = true
+					break
+				}
+			}
+		}
+		if known {
+			continue
+		}
+		if _, ok := deltaWords[w]; ok {
+			continue
+		}
 		if c := contentFuzzyCorrections(readers, deltaWords, w, 2); len(c) > 0 {
 			best[w] = c
 		}
