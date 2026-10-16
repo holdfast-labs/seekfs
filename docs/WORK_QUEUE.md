@@ -52,6 +52,8 @@ corruption, exact required sources, auto-fuzzy only on zero exact hits).
 
 | Branch | Worktree | Scope |
 |---|---|---|
+| `content/sym` | sym | G9: `sym:Name` definition search (query-time per-language definition patterns) + definition-line ranking bonus for `content:Name` |
+| `bench/content-rightfile` | rightfile | Content right-file-first metric (100 labeled symbols, blink/renderer/core): baseline before the sym ranking bonus |
 | `perf/static-ranking` | staticrank | **Parked** at WIP commit `761db7b` (OR-lane case unresolved, suite not green); resume only with a fresh, narrow brief (G13) |
 
 Merged 2026-10-15: `content/accent-fold` (69a061a, content format **v12**: terms,
