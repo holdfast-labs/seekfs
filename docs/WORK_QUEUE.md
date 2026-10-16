@@ -55,6 +55,13 @@ corruption, exact required sources, auto-fuzzy only on zero exact hits).
 |---|---|---|
 | `perf/static-ranking` | staticrank | **Parked** at WIP commit `761db7b` (OR-lane case unresolved, suite not green); resume only with a fresh, narrow brief (G13) |
 
+Merged 2026-10-16: `perf/footprint-shards` (b329cd3: lazy front-coded paths with a
+locked restart cache, one composite doc table; heap after content attach
+63.5 -> 45.3 MB on chrome/), `perf/query-transients` (231b7f0: pooled verify read
+and fold buffers; 20 queries allocate 1662 -> 1184 MB, private 283 -> 237 MB).
+Content attach heap on chrome/ today: 91 -> 45 MB. Next: doc table view (~7 MB,
+~60 mutation sites), name index (~28 MB).
+
 Merged 2026-10-16: symbol-named candidates first (191148d; content right-file-first
 top-1 17% -> 70% default, 63% -> 86% relevance, 59% -> 92% sym:, BENCHMARKS.md),
 `perf/footprint-rows` (zero-copy filter rows, heap 66 -> 63 MB on chrome/),
