@@ -113,7 +113,7 @@ func TestMatchRawFirstEqualsMatch(t *testing.T) {
 			leaf := contentLeaf{Kind: contentLeafTerm, Text: string(needleRaw), LeafID: 0}
 			pq := parsedQuery{Content: []contentLeaf{leaf}}
 			m := newContentLeafMatcher(pq)
-			folded := contentFoldText(raw)
+			folded := contentFoldAccent(raw) // the v12 per-entry fold callers pass
 			want := m.match(raw, folded, leaf)
 			var lazy []byte
 			ready := false
@@ -136,7 +136,7 @@ func TestContentSnippetASCIIEquals(t *testing.T) {
 			leaf := contentLeaf{Kind: contentLeafTerm, Text: string(needleRaw), LeafID: 0}
 			pq := parsedQuery{Content: []contentLeaf{leaf}}
 			m := newContentLeafMatcher(pq)
-			folded := contentFoldText(raw)
+			folded := contentFoldAccent(raw) // the v12 per-entry fold callers pass
 			got := contentSnippet(raw, folded, []contentLeaf{leaf}, m)
 			// Reference: the historical slow path, spelled out.
 			want := ""
