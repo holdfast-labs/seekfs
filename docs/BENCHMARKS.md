@@ -300,20 +300,24 @@ sort:relevance` (definition-line bonus), (c) `sym:<sym>` (definition search),
 defining file ranking top-1 / top-5 / top-20; MRR is the mean reciprocal rank
 (0 for a miss).
 
-| form | kind | top-1 | top-5 | top-20 | MRR |
+Baseline (integ ac8750d) vs symbol-named candidates first (191148d):
+
+| form | kind | top-1 before | top-1 after | MRR before | MRR after |
 | --- | --- | --- | --- | --- | --- |
-| `content:<sym>` | overall | 17.0% | 62.0% | 86.0% | 0.342 |
-| `content:<sym> sort:relevance` | overall | 63.0% | 97.0% | 100.0% | 0.788 |
-| `sym:<sym>` | overall | 59.0% | 98.0% | 100.0% | 0.776 |
-| `<sym>` (filename) | overall | 0.0% | 0.0% | 1.0% | 0.002 |
-| `content:<sym>` | class | 0.0% | 53.3% | 86.7% | 0.209 |
-| `content:<sym> sort:relevance` | class | 56.7% | 96.7% | 100.0% | 0.750 |
-| `sym:<sym>` | class | 40.0% | 98.3% | 100.0% | 0.678 |
-| `<sym>` (filename) | class | 0.0% | 0.0% | 1.7% | 0.003 |
-| `content:<sym>` | function | 42.5% | 75.0% | 85.0% | 0.542 |
-| `content:<sym> sort:relevance` | function | 72.5% | 97.5% | 100.0% | 0.845 |
-| `sym:<sym>` | function | 87.5% | 97.5% | 100.0% | 0.924 |
-| `<sym>` (filename) | function | 0.0% | 0.0% | 0.0% | 0.000 |
+| `content:<sym>` | overall | 17.0% | 70.0% | 0.342 | 0.771 |
+| `content:<sym> sort:relevance` | overall | 63.0% | 86.0% | 0.788 | 0.923 |
+| `sym:<sym>` | overall | 59.0% | 92.0% | 0.776 | 0.955 |
+| `<sym>` (filename) | overall | 0.0% | 0.0% | 0.002 | 0.002 |
+| `content:<sym>` | class | 0.0% | 88.3% | 0.209 | 0.924 |
+| `content:<sym> sort:relevance` | class | 56.7% | 95.0% | 0.750 | 0.975 |
+| `sym:<sym>` | class | 40.0% | 95.0% | 0.678 | 0.975 |
+| `content:<sym>` | function | 42.5% | 42.5% | 0.542 | 0.542 |
+| `content:<sym> sort:relevance` | function | 72.5% | 72.5% | 0.845 | 0.845 |
+| `sym:<sym>` | function | 87.5% | 87.5% | 0.924 | 0.924 |
+
+After: top-5 is 90% (default), 99% (relevance), 99% (sym). Function
+definitions live in files not named after the function, so the name signal
+does not move them; `sym:` and `sort:relevance` are the forms for functions.
 
 The default content order rarely opens with the definition (17.0% top-1,
 86.0% top-20): symbols referenced broadly are buried under files that merely
