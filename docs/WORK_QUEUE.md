@@ -52,6 +52,8 @@ corruption, exact required sources, auto-fuzzy only on zero exact hits).
 
 | Branch | Worktree | Scope |
 |---|---|---|
+| `content/fuzzy-grep` | fuzzygrep | `content~:word` / `content~N:word`: OR over dictionary words within edit distance (G10 fuzzy grep) |
+| `content/typo-scope` | typoscope | Typo fallback never corrects a word that exists in any content dictionary (`await` under a scope) |
 | `perf/static-ranking` | staticrank | **Parked** at WIP commit `761db7b` (OR-lane case unresolved, suite not green); resume only with a fresh, narrow brief (G13) |
 
 Merged 2026-10-15: `content/cursor` (607d38b, G10: `--cursor` / `next_cursor` offset
@@ -175,7 +177,7 @@ GOMAXPROCS=2, peak disk 0.56x extracted. Limit-20 warm/first: rare literal
 
 ## Owner actions (not agent work)
 
-- **Defender and build speed (decision):** content builds spend ~90% of cold
+- **Defender and build speed (owner deprioritized 2026-10-15: features first):** content builds spend ~90% of cold
   build time waiting on Defender scanning each file at first open. A process
   exclusion for the seekfs service binary would remove it (it only reads
   files), at the cost of not scanning files as seekfs opens them. Admin-only.
