@@ -127,14 +127,38 @@ func contentFilterMayMatch(row contentFilterRow, grams []uint32) bool {
 }
 
 // contentFilterSection is a decoded CXFL section: the build identity plus one
-// row per document in DocID order.
+// row per document in DocID order. Rows are not materialized as structs;
+// rowOff holds one offset per document into data (the mapped section bytes),
+// pointing at the class byte, and row(i) decodes the row on access. Bits
+// alias data.
 type contentFilterSection struct {
 	MaxRaw       int64
 	MaxText      int64
 	CapsExplicit bool
 	Root         string
 	Encoding     string
-	Rows         []contentFilterRow
+	data         []byte
+	rowOff       []uint32
+}
+
+// rowCount reports the number of document rows in the section.
+func (f *contentFilterSection) rowCount() int {
+	if f == nil {
+		return 0
+	}
+	return len(f.rowOff)
+}
+
+// row decodes the filter row for document index i on access: the class byte
+// sizes the bits that follow it in the mapped section.
+func (f *contentFilterSection) row(i int) (contentFilterRow, bool) {
+	if f == nil || i < 0 || i >= len(f.rowOff) {
+		return contentFilterRow{}, false
+	}
+	off := int(f.rowOff[i])
+	class := int(f.data[off])
+	want := int(contentFilterClassBits[class] / 8)
+	return contentFilterRow{Class: class, Bits: f.data[off+1 : off+1+want]}, true
 }
 
 // encodeContentFilterSection serializes rows in DocID order with the build
@@ -240,11 +264,13 @@ func decodeContentFilterSection(data []byte, docCount int) (*contentFilterSectio
 	if fl&^uint64(1) != 0 {
 		return nil, fmt.Errorf("unsupported content filter flags %d", fl)
 	}
-	f.Rows = make([]contentFilterRow, 0, count)
+	f.data = data
+	f.rowOff = make([]uint32, count)
 	for i := 0; i < count; i++ {
 		if off+1 > len(data) {
 			return nil, errors.New("content filter row truncated")
 		}
+		f.rowOff[i] = uint32(off)
 		class := int(data[off])
 		off++
 		if class < 0 || class >= len(contentFilterClassBits) {
@@ -254,7 +280,6 @@ func decodeContentFilterSection(data []byte, docCount int) (*contentFilterSectio
 		if off+want > len(data) {
 			return nil, errors.New("content filter row truncated")
 		}
-		f.Rows = append(f.Rows, contentFilterRow{Class: class, Bits: data[off : off+want]})
 		off += want
 	}
 	if off != len(data) {
