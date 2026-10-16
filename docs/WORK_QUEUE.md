@@ -16,7 +16,8 @@ long debugging loops with no checkpoint, multi-hour sessions resending a
 growing context, full-suite output pasted into context, polling, coordinator
 "FYI"/"continue" prompts, and 4 agents re-reading the same files.
 
-- Agent model since 2026-10-15: `opencode/openai/gpt-6-luna`, mode `build`
+- Agent model since 2026-10-16: `opencode/deepseek-v4.1-flash-free` (free), mode `build`;
+  `opencode/openai/gpt-6-luna` when its 5-hour window allows
   (Muse routes are out of credits).
 - Run 1–2 agents at a time, not 4. Do not enable paid provider balance without
   asking the owner.
@@ -52,9 +53,11 @@ corruption, exact required sources, auto-fuzzy only on zero exact hits).
 
 | Branch | Worktree | Scope |
 |---|---|---|
-| `perf/footprint-content` | footprint | Measure-first: service memory (heap, working set) idle and during/after a content build and queries; top retainers; proposals |
 | `bench/content-rightfile` | rightfile | Content right-file-first metric (100 labeled symbols, blink/renderer/core): baseline before the sym ranking bonus |
 | `perf/static-ranking` | staticrank | **Parked** at WIP commit `761db7b` (OR-lane case unresolved, suite not green); resume only with a fresh, narrow brief (G13) |
+
+Merged 2026-10-16: `perf/footprint-content` (63f43ee: zero-copy posting index;
+chrome/ heap after content attach 91 -> 66 MB; measurement notes on the branch).
 
 Merged 2026-10-15: `perf/content-regex` (2247ca3: per-rune cached accent fold,
 byte-identical; parallel superset page; regex on the full superset; chrome/
