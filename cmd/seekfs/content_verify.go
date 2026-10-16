@@ -232,7 +232,7 @@ func newContentLeafMatcher(pq parsedQuery) *contentLeafMatcher {
 						continue
 					}
 					rg = append(rg, contentFilterGramsOf(contentFoldAccent([]byte(run))))
-					safe = append(safe, string(contentFoldText([]byte(run))))
+					safe = append(safe, string(contentFoldAccent([]byte(run))))
 				}
 				if len(rg) == 0 {
 					constrained = false
@@ -465,7 +465,9 @@ func (m *contentLeafMatcher) match(raw, folded []byte, leaf contentLeaf) bool {
 		// the prefilter (testing raw text against lowercased runs would
 		// reject true matches).
 		if needles := m.regexNeedlesFor(leaf.LeafID); len(needles) > 0 && !m.caseSensitive {
-			folded = contentFoldText(raw)
+			if folded == nil {
+				folded = contentFoldAccent(raw)
+			}
 			if !contentRegexNeedlesHold(folded, needles) {
 				return false
 			}
@@ -479,7 +481,11 @@ func (m *contentLeafMatcher) match(raw, folded []byte, leaf contentLeaf) bool {
 		return bytes.Contains(raw, m.needleOf(leaf))
 	}
 	if m.accentNeedle[leaf.LeafID] {
-		return bytes.Contains(contentFoldAccent(raw), m.needleOf(leaf))
+		// folded is the caller's once-per-entry contentFoldAccent(raw).
+		if folded == nil {
+			folded = contentFoldAccent(raw)
+		}
+		return bytes.Contains(folded, m.needleOf(leaf))
 	}
 	return bytes.Contains(contentFoldCaseExact(raw), m.needleOf(leaf))
 }

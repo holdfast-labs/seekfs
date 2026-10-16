@@ -337,7 +337,10 @@ func (r *contentReader) search(term string, limit int) ([]contentHit, bool) {
 	if !accentInsensitive {
 		needle = contentFoldCaseExact([]byte(term))
 	}
-	grams := contentFilterGramsOf(needle)
+	// Filter bits are built from the accent-folded text (v12), so the gate
+	// tests the accent-folded query; an accent-exact needle is only the
+	// verify-time haystack form.
+	grams := contentFilterGramsOf([]byte(t))
 	next := r.candidateStream(t)
 	if len(r.aliasExpand) > 0 {
 		ids := r.expandAliasDocIDs(collectDocIDStream(next, 0))

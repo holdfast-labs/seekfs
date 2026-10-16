@@ -210,7 +210,7 @@ func contentRelevanceOf(vol *serviceVolumeIndex, entry Entry, pq parsedQuery, m 
 	}
 	var folded []byte
 	if !m.caseSensitive {
-		folded = contentFoldText(text)
+		folded = contentFoldAccent(text)
 	}
 	matched := make([]bool, m.size)
 	for _, leaf := range m.leaves {
