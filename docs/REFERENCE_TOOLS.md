@@ -73,12 +73,18 @@ machine are not required.
 
 Coverage and size (top priority: small index, content search everywhere):
 
-1. **Stored text** is about 58% of the v9 index. fsearch stores none and
-   verifies from disk. **Owner decision (2026-10-13): adopt the no-stored-text,
-   verify-from-disk model as the default.** Agent work: `content/filter-tier` (tier 2 with no
-   stored text, measured as a possible default).
-2. **The build's transient spool peak** (1.5× extracted) caps coverage, while
-   the final index is about 0.33×. Agent work: `content/spool-peak`.
+1. **Stored text: DONE** (format v11, 2026-10-14; default). No stored text:
+   trigram postings + per-file filter, matches verified from disk. Full
+   Chromium: 463,273 docs in 615 MB (fsearch: ~600 MB). v12 (2026-10-15)
+   accent-folds terms/grams/filter. Remaining latency gaps: regex
+   (`mutex_\w+` ~725 ms warm, ~3 s cold) and cold first-touch verifies
+   (Defender on-open scan, ~7 ms/file; owner deprioritized Defender work).
+2. **Build peak: CLOSED** (measured 2026-10-15, WORK_QUEUE.md). Neither
+   spooling posting runs nor dropping the spool reframe lowers the peak
+   (0.70x -> 0.96x on a 6-shard build). Coverage lever taken instead: the
+   free-space reserve cap 20 -> 10 GiB. Whole-drive coverage on the real E:
+   drive is still unmeasured since v11/v12 and the new reserve (needs a
+   service relaunch).
 3. **Inclusion policy:** DONE (`content/inclusion-policy`, §6z). We index
    only the main checkout (`[content] worktrees = "main"`, `all` opts in),
    identical files once (content-hash dedupe, CXAL section, v10), text
