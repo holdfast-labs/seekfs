@@ -15,6 +15,7 @@ import (
 	"io"
 	"os"
 	"strings"
+	"sync"
 )
 
 // contentClass* discriminates how a document's text was produced, for telemetry
@@ -379,6 +380,9 @@ type contentSlurpedFile struct {
 	// modUnix/modNano are the stat()'d mtime in seconds and nanoseconds.
 	modUnix int64
 	modNano int64
+	// pooled reports that data was drawn from contentVerifyBufPool and must be
+	// returned there by close (verify reads only).
+	pooled bool
 }
 
 // contentSlurpNoRecall opens path without recalling cloud placeholders,
@@ -387,6 +391,50 @@ type contentSlurpedFile struct {
 // extractor to stream under its own cap. A missing file, a directory, or a
 // stat failure is an error; the caller maps that to a skip.
 func contentSlurpNoRecall(path string, maxRaw int64) (*contentSlurpedFile, error) {
+	return contentSlurpNoRecallMode(path, maxRaw, false)
+}
+
+// contentSlurpNoRecallVerify is contentSlurpNoRecall for the verify read path:
+// the buffered case draws its read buffer from contentVerifyBufPool so repeated
+// verifies reuse capacity instead of allocating and dropping one buffer per
+// file. Safe because every extractor decodes into its own storage (the text
+// extractor copies through contentDecodeForIndex and re-slices), so the stored
+// text the caller keeps never aliases the returned read buffer.
+func contentSlurpNoRecallVerify(path string, maxRaw int64) (*contentSlurpedFile, error) {
+	return contentSlurpNoRecallMode(path, maxRaw, true)
+}
+
+// contentVerifyBufPool reuses verify read buffers. Buffers larger than
+// contentVerifyBufPoolMax are dropped on return so one huge file cannot pin
+// memory across the pool.
+var contentVerifyBufPool sync.Pool
+
+// contentVerifyBufPoolMax caps a pooled verify read buffer at 4 MiB: reuse is
+// worth it for the characteristic small source file, and anything larger is
+// rare enough that holding its capacity would only inflate RSS.
+const contentVerifyBufPoolMax = 4 << 20
+
+// contentVerifyBufGet returns a buffer of length size, reusing pooled capacity
+// when it is large enough.
+func contentVerifyBufGet(size int) []byte {
+	if v := contentVerifyBufPool.Get(); v != nil {
+		if b := v.([]byte); cap(b) >= size {
+			return b[:size]
+		}
+	}
+	return make([]byte, size)
+}
+
+// contentVerifyBufPut returns a buffer to the pool, dropping zero-capacity and
+// over-cap buffers.
+func contentVerifyBufPut(b []byte) {
+	if cap(b) == 0 || cap(b) > contentVerifyBufPoolMax {
+		return
+	}
+	contentVerifyBufPool.Put(b[:0])
+}
+
+func contentSlurpNoRecallMode(path string, maxRaw int64, reuse bool) (*contentSlurpedFile, error) {
 	if maxRaw <= 0 {
 		maxRaw = contentExtractMaxRawBytes
 	}
@@ -426,13 +474,22 @@ func contentSlurpNoRecall(path string, maxRaw int64) (*contentSlurpedFile, error
 		s.head = head
 		return s, nil
 	}
-	buf := make([]byte, size)
+	var buf []byte
+	if reuse {
+		buf = contentVerifyBufGet(int(size))
+	} else {
+		buf = make([]byte, size)
+	}
 	n, rerr := f.ReadAt(buf, 0)
 	_ = f.Close()
 	if rerr != nil && !errors.Is(rerr, io.EOF) {
+		if reuse {
+			contentVerifyBufPut(buf)
+		}
 		return nil, rerr
 	}
 	s.data = buf[:n]
+	s.pooled = reuse
 	return s, nil
 }
 
@@ -466,6 +523,11 @@ func (s *contentSlurpedFile) close() {
 	if s != nil && s.file != nil {
 		_ = s.file.Close()
 		s.file = nil
+	}
+	if s != nil && s.pooled && s.data != nil {
+		contentVerifyBufPut(s.data)
+		s.data = nil
+		s.pooled = false
 	}
 }
 
