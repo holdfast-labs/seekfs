@@ -92,7 +92,7 @@ type contentReader struct {
 	idx     *contentIndex
 	terms   *contentTermDict
 	grams   *contentPostingIndex
-	paths   []string
+	paths   *contentPathTable
 	filter  *contentFilterSection
 	extract contentExtractSettings
 	// pruned is the CXGP pruned-gram set: dense grams the builder dropped
@@ -178,14 +178,10 @@ func openContentReader(idx *contentIndex) (*contentReader, error) {
 	}
 	r := &contentReader{
 		idx:     idx,
-		paths:   make([]string, len(idx.Docs)),
 		extract: contentDefaultExtractSettings(),
 	}
-	for i := range idx.Docs {
-		r.paths[i] = ""
-	}
 	if sec := idx.Sections[contentSectionPaths]; len(sec) > 0 {
-		paths, err := decodeContentPaths(sec, len(idx.Docs))
+		paths, err := openContentPaths(sec, len(idx.Docs))
 		if err != nil {
 			return nil, err
 		}
@@ -308,10 +304,10 @@ func (r *contentReader) docPath(docID uint32) string {
 		}
 		return ""
 	}
-	if int(docID) < len(r.paths) {
-		return r.paths[docID]
+	if r.paths == nil {
+		return ""
 	}
-	return ""
+	return r.paths.path(docID)
 }
 
 // search returns documents whose text contains term (case-insensitive

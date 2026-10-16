@@ -1,6 +1,8 @@
 package main
 
 import (
+	"sync"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
@@ -348,5 +350,42 @@ func TestContentFoldReshardsGrownSingleFileBase(t *testing.T) {
 	}
 	if hits, _ := contentServiceSearch(t, f.vol, "content:betaneedle", false); len(hits) != 1 {
 		t.Fatalf("untouched doc lost by reshard: %v", hits)
+	}
+}
+
+// The lazy path table is shared by parallel verify workers and concurrent
+// queries: concurrent lookups across restart runs must each return their own
+// doc's path.
+func TestContentPathTableConcurrentLookups(t *testing.T) {
+	paths := make([]string, 2000)
+	for i := range paths {
+		paths[i] = fmt.Sprintf(`C:\dir%03d\file%05d.txt`, i%97, i)
+	}
+	tbl, err := openContentPaths(encodeContentPaths(paths), len(paths))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wg sync.WaitGroup
+	errs := make(chan string, 8)
+	for w := 0; w < 8; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			for k := 0; k < 5000; k++ {
+				i := (k*7919 + w*104729) % len(paths)
+				if got := tbl.path(uint32(i)); got != paths[i] {
+					select {
+					case errs <- fmt.Sprintf("path(%d) = %q; want %q", i, got, paths[i]):
+					default:
+					}
+					return
+				}
+			}
+		}(w)
+	}
+	wg.Wait()
+	close(errs)
+	for e := range errs {
+		t.Fatal(e)
 	}
 }
