@@ -11,7 +11,7 @@ package main
 // blocks as it goes.
 //
 // Memory ceiling: peak transient memory is arenaBytes + the merge heap (one
-// record per run) + the output being assembled. The returned section is still
+// posting per run) + the output being assembled. The returned section is still
 // O(index) in memory because contentIndex holds sections as []byte; this builder
 // removes the raw posting map transient, not the encoded output.
 //
@@ -43,18 +43,23 @@ const contentExternalRecordOverhead = 6 // keyLen(2)+docID(4)
 // the historical 2 KiB.
 const contentExternalRunBufSize = 8 << 10
 
-// contentExternalRunWriteBufSize buffers spill-run writes: one 8-byte record
-// per posting, so 64 KiB batches ~8k records per flush. Writers are
-// sequential (one spill at a time), so this never multiplies by run count.
+// contentExternalRunWriteBufSize buffers spill-run writes: one group per key,
+// so 64 KiB batches many keys per flush. Writers are sequential (one spill at
+// a time), so this never multiplies by run count.
 const contentExternalRunWriteBufSize = 64 << 10
 
-// contentExternalRecordSize is the fixed on-disk run record: the 3-byte gram
-// key, one zero pad, and the LE uint32 docID. All builder keys are 3-byte
-// grams (the contract since v7), so the historical uvarint length prefix and
-// uvarint docID only cost per-record encode/decode branches; the fixed form
-// reads with one ReadFull and no varint parsing. Run files are temp-only
-// (never shipped); the merged sections are unaffected.
-const contentExternalRecordSize = 8
+// Spill-run format (temp-only, never shipped): a run is a sequence of
+// per-key groups, each
+//
+//	[3-byte key][uvarint n >= 1][uvarint first docID][uvarint delta]*(n-1)
+//
+// where delta is docID[i]-docID[i-1] (> 0 because a key's docIDs are unique
+// and ascending within a run). Records in a run are sorted by (key, docID),
+// so every key's postings are contiguous and become one group; grouping and
+// delta-encoding shrink a run to a small fraction of the old fixed
+// 8-bytes-per-posting form. io.EOF is a clean end only at a group boundary;
+// EOF inside a group (mid-key, mid-varint) is a torn run and errors.
+const contentExternalRunKeySize = 3
 
 type contentExternalRecord struct {
 	key   string
@@ -245,13 +250,21 @@ func (b *contentExternalSectionBuilder) spillRadix() error {
 	return nil
 }
 
-// runFileWriter streams sorted records into one run file in the fixed
-// 8-byte form (3-byte key, zero pad, LE docID).
+// runFileWriter streams sorted records into one run file in the grouped
+// delta-varint form. Callers feed records in (key, docID) order; the writer
+// buffers the current key's docIDs and emits one group when the key changes
+// or at commit. Every writeRecords call in a sorted run is key-aligned (a
+// key's records are contiguous), so a group is never split across calls, but
+// the carry-over state makes that robust regardless.
 type runFileWriter struct {
-	f       *os.File
-	bw      *bufio.Writer
-	path    string
-	scratch [contentExternalRecordSize]byte
+	f      *os.File
+	bw     *bufio.Writer
+	path   string
+	hasKey bool
+	key    [contentExternalRunKeySize]byte
+	docs   []uint32 // current group's docIDs, reused across keys
+	hdr    [contentExternalRunKeySize + 2*binary.MaxVarintLen64]byte
+	delta  [binary.MaxVarintLen64]byte
 }
 
 func createRunFileWriter(tmpDir string) (*runFileWriter, error) {
@@ -263,11 +276,15 @@ func createRunFileWriter(tmpDir string) (*runFileWriter, error) {
 }
 
 func (w *runFileWriter) writeOne(r *contentExternalRecord) error {
-	w.scratch[0], w.scratch[1], w.scratch[2] = r.key[0], r.key[1], r.key[2]
-	w.scratch[3] = 0
-	binary.LittleEndian.PutUint32(w.scratch[4:], r.docID)
-	_, err := w.bw.Write(w.scratch[:])
-	return err
+	if !w.hasKey || r.key[0] != w.key[0] || r.key[1] != w.key[1] || r.key[2] != w.key[2] {
+		if err := w.flushGroup(); err != nil {
+			return err
+		}
+		w.key = [contentExternalRunKeySize]byte{r.key[0], r.key[1], r.key[2]}
+		w.hasKey = true
+	}
+	w.docs = append(w.docs, r.docID)
+	return nil
 }
 
 func (w *runFileWriter) writeRecords(recs []contentExternalRecord) error {
@@ -279,8 +296,39 @@ func (w *runFileWriter) writeRecords(recs []contentExternalRecord) error {
 	return nil
 }
 
-// commit flushes, closes and keeps the run file, returning its path.
+// flushGroup emits the buffered key's docIDs as one delta-varint group.
+func (w *runFileWriter) flushGroup() error {
+	if !w.hasKey || len(w.docs) == 0 {
+		w.hasKey = false
+		w.docs = w.docs[:0]
+		return nil
+	}
+	out := w.hdr[:0]
+	out = append(out, w.key[0], w.key[1], w.key[2])
+	out = binary.AppendUvarint(out, uint64(len(w.docs)))
+	out = binary.AppendUvarint(out, uint64(w.docs[0]))
+	if _, err := w.bw.Write(out); err != nil {
+		return err
+	}
+	prev := w.docs[0]
+	for _, d := range w.docs[1:] {
+		out = binary.AppendUvarint(w.delta[:0], uint64(d-prev))
+		if _, err := w.bw.Write(out); err != nil {
+			return err
+		}
+		prev = d
+	}
+	w.hasKey = false
+	w.docs = w.docs[:0]
+	return nil
+}
+
+// commit flushes the pending group, closes and keeps the run file, returning
+// its path.
 func (w *runFileWriter) commit() (string, error) {
+	if err := w.flushGroup(); err != nil {
+		return "", w.abort(err)
+	}
 	if err := w.bw.Flush(); err != nil {
 		_ = w.f.Close()
 		_ = os.Remove(w.path)
@@ -301,34 +349,18 @@ func (w *runFileWriter) abort(err error) error {
 	return err
 }
 
-// spillSorted writes the (already sorted) pending buffer to a fresh run file.
+// spillSorted writes the (already sorted) pending buffer to a fresh run file
+// through the shared grouped-delta writer.
 func (b *contentExternalSectionBuilder) spillSorted() error {
-	f, err := os.CreateTemp(b.tmpDir, "cxext-*.run")
+	rw, err := createRunFileWriter(b.tmpDir)
 	if err != nil {
 		return err
 	}
-	path := f.Name()
-	bw := bufio.NewWriterSize(f, contentExternalRunWriteBufSize)
-	var scratch [contentExternalRecordSize]byte
-	for i := range b.buf {
-		r := &b.buf[i]
-		scratch[0], scratch[1], scratch[2] = r.key[0], r.key[1], r.key[2]
-		scratch[3] = 0
-		binary.LittleEndian.PutUint32(scratch[4:], r.docID)
-		if _, err := bw.Write(scratch[:]); err != nil {
-			bw.Flush()
-			f.Close()
-			os.Remove(path)
-			return err
-		}
+	if err := rw.writeRecords(b.buf); err != nil {
+		return rw.abort(err)
 	}
-	if err := bw.Flush(); err != nil {
-		f.Close()
-		os.Remove(path)
-		return err
-	}
-	if err := f.Close(); err != nil {
-		os.Remove(path)
+	path, err := rw.commit()
+	if err != nil {
 		return err
 	}
 	b.runs = append(b.runs, path)
@@ -385,17 +417,19 @@ func (b *contentExternalSectionBuilder) removeRuns() error {
 	return firstErr
 }
 
-// contentRunReader streams records from one spilled run, one at a time.
-// The key lives in a fixed array (never appended to, never reallocated);
-// key views it for the merge heap.
+// contentRunReader streams postings from one spilled run, one per advance().
+// It decodes a group header, then yields the group's docIDs in order, reading
+// uvarints from the buffered reader. The key lives in a fixed array (never
+// appended to, never reallocated); key views it for the merge heap.
 type contentRunReader struct {
 	f      *os.File
 	br     *bufio.Reader
-	keyBuf [3]byte
+	keyBuf [contentExternalRunKeySize]byte
 	key    []byte
-	recBuf [contentExternalRecordSize]byte
 	docID  uint32
-	done   bool
+	// left counts group docIDs not yet yielded (after the current one).
+	left uint64
+	done bool
 }
 
 func newContentRunReader(path string) (*contentRunReader, error) {
@@ -412,21 +446,40 @@ func newContentRunReader(path string) (*contentRunReader, error) {
 	return r, nil
 }
 
-// advance loads the next fixed-size record. io.EOF at a record boundary
-// means the run is exhausted; any other read error is returned.
+// advance loads the next posting. io.EOF at a group boundary (no key bytes
+// remain) means the run is exhausted; EOF inside a group — after a partial
+// key or in the middle of a uvarint — is a torn run and returns an error
+// rather than stopping silently.
 func (r *contentRunReader) advance() error {
-	buf := r.recBuf[:]
-	if _, err := io.ReadFull(r.br, buf); err != nil {
-		// io.EOF means zero bytes (a clean record boundary); a short
-		// tail is a torn run and errors rather than truncating silently.
+	if r.left > 0 {
+		delta, err := binary.ReadUvarint(r.br)
+		if err != nil {
+			return err
+		}
+		r.docID += uint32(delta)
+		r.left--
+		return nil
+	}
+	if _, err := io.ReadFull(r.br, r.keyBuf[:]); err != nil {
 		if err == io.EOF {
 			r.done = true
 			return nil
 		}
 		return err
 	}
-	copy(r.keyBuf[:], buf[:3])
-	r.docID = binary.LittleEndian.Uint32(buf[4:])
+	n, err := binary.ReadUvarint(r.br)
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return errors.New("content run: empty group")
+	}
+	first, err := binary.ReadUvarint(r.br)
+	if err != nil {
+		return err
+	}
+	r.docID = uint32(first)
+	r.left = n - 1
 	return nil
 }
 
