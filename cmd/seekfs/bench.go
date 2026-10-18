@@ -213,17 +213,23 @@ type serviceRequest struct {
 	Current string `json:"current,omitempty"`
 	// Path + OpenQuery carry the `open` command (recorded access event for
 	// Path, attributed to normalized query OpenQuery when non-empty).
-	Path          string              `json:"path,omitempty"`
-	OpenQuery     string              `json:"open_query,omitempty"`
-	Recent        string              `json:"recent,omitempty"`
-	ModifiedAfter string              `json:"modified_after,omitempty"`
-	CaseSensitive bool                `json:"case_sensitive,omitempty"`
-	Fuzzy         bool                `json:"fuzzy,omitempty"`
-	DeadlineUnix  int64               `json:"deadline_unix,omitempty"`
-	RequestSeq    int64               `json:"request_seq,omitempty"`
-	BudgetMS      int                 `json:"budget_ms,omitempty"`
-	SinceVolumes  []watchVolumeCursor `json:"since_volumes,omitempty"`
-	Baseline      bool                `json:"baseline,omitempty"`
+	Path          string `json:"path,omitempty"`
+	OpenQuery     string `json:"open_query,omitempty"`
+	Recent        string `json:"recent,omitempty"`
+	ModifiedAfter string `json:"modified_after,omitempty"`
+	CaseSensitive bool   `json:"case_sensitive,omitempty"`
+	Fuzzy         bool   `json:"fuzzy,omitempty"`
+	DeadlineUnix  int64  `json:"deadline_unix,omitempty"`
+	RequestSeq    int64  `json:"request_seq,omitempty"`
+	BudgetMS      int    `json:"budget_ms,omitempty"`
+	// BudgetDisabled carries an explicit "no wall-clock content bound"
+	// (--budget 0). Omission also leaves the historical time-unbounded default.
+	BudgetDisabled bool `json:"budget_disabled,omitempty"`
+	// ContentDiskVerifyBudget carries the CLI --content-verify-budget override
+	// to the resident service; 0 keeps the service default.
+	ContentDiskVerifyBudget int                 `json:"content_disk_verify_budget,omitempty"`
+	SinceVolumes            []watchVolumeCursor `json:"since_volumes,omitempty"`
+	Baseline                bool                `json:"baseline,omitempty"`
 	// InputUnixNano carries the `input-heartbeat` op: the UI's session
 	// GetLastInputInfo-derived last-input time as unix nanos (UTC). The
 	// service treats the freshest report as its input signal; zero/negative

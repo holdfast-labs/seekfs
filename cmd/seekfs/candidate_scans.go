@@ -641,19 +641,23 @@ func (vol *serviceVolumeIndex) boundedScanCandidatesParallel(pq parsedQuery, ord
 	quit := make(chan struct{})
 	var quitOnce sync.Once
 	stop := func() { quitOnce.Do(func() { close(quit) }) }
-	defer stop()
 	type scanJob struct {
 		seq uint64
 		pos int
 	}
 	type scanResult struct {
-		seq uint64
-		id  int
-		ok  bool
+		seq      uint64
+		id       int
+		ok       bool
+		verified bool
 	}
 	work := make(chan scanJob, 64)
 	out := make(chan scanResult, 64)
 	var wg sync.WaitGroup
+	defer func() {
+		stop()
+		wg.Wait()
+	}()
 	var visited atomic.Int64
 	var canceled atomic.Bool
 	// Feeder: the only goroutine that walks the order.
@@ -703,9 +707,34 @@ func (vol *serviceVolumeIndex) boundedScanCandidatesParallel(pq parsedQuery, ord
 					}
 					id := compactUint32OrderAt(order, job.pos)
 					localCache = boundPathCache(localCache)
-					res := scanResult{seq: job.seq, id: id}
-					if scanCandidateMatches(vol, vol.index, pq, id, localCache, matcher) {
-						res.ok = true
+					res := scanResult{seq: job.seq, id: id, verified: true}
+					candidatePQ := pq
+					var candidateState atomic.Bool
+					candidatePQ.contentVerifyState = &candidateState
+					if pq.Trace != nil && pq.Trace.deadlineReached() {
+						pq.Trace.markBudgetExceeded()
+						res.verified = false
+					} else {
+						if contentVerifyParallelTestHook != nil {
+							used := int64(0)
+							if pq.Trace != nil && pq.Trace.disk != nil {
+								used = pq.Trace.disk.used.Load()
+							}
+							contentVerifyParallelTestHook(int(job.seq), id, "scan-start", used, false, pq.Trace.stopDiskVerify())
+						}
+						if scanCandidateMatches(vol, vol.index, candidatePQ, id, localCache, matcher) {
+							res.ok = true
+						}
+						if contentVerifyParallelTestHook != nil {
+							used := int64(0)
+							if pq.Trace != nil && pq.Trace.disk != nil {
+								used = pq.Trace.disk.used.Load()
+							}
+							contentVerifyParallelTestHook(int(job.seq), id, "scan-done", used, res.ok, pq.Trace.stopDiskVerify())
+						}
+					}
+					if candidateState.Load() {
+						res.verified = false
 					}
 					select {
 					case out <- res:
@@ -735,6 +764,11 @@ func (vol *serviceVolumeIndex) boundedScanCandidatesParallel(pq parsedQuery, ord
 				return true
 			}
 			delete(pending, expect)
+			if !res.verified {
+				// A later worker may finish after an earlier rank reached the
+				// disk cap/deadline. Emit only the contiguous verified frontier.
+				return false
+			}
 			expect++
 			if res.ok {
 				ids = append(ids, res.id)

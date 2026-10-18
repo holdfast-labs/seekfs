@@ -2,6 +2,7 @@ package main
 
 import (
 	"container/list"
+	"math"
 	"regexp"
 	"strings"
 	"sync"
@@ -506,11 +507,28 @@ type queryOptions struct {
 	// index) searches leave it nil and fall back to the current process
 	// user's store. Local-only; never crosses the wire.
 	SignalStore *signalStore `json:"-"`
-	BudgetMS    int          `json:"budget_ms,omitempty"`
+	// BudgetMS is the caller's explicit wall-clock content budget in ms
+	// (--budget). It is 0 when omitted or explicitly zero; BudgetDisabled retains
+	// that CLI distinction across the wire. The restored default leaves time
+	// unbounded unless BudgetMS is positive.
+	BudgetMS int `json:"budget_ms,omitempty"`
+	// BudgetDisabled marks an explicit "run with no wall-clock content bound"
+	// (--budget 0). Omitted also leaves time unbounded under the historical
+	// default; the marker preserves the explicit selection for compatible wire
+	// behavior. The finite disk safety valve remains independent.
+	BudgetDisabled bool `json:"budget_disabled,omitempty"`
 	// Per-query content budgets. Zero means "use the default"; they are never
 	// globals, so concurrent queries cannot race on each other's limits.
 	ContentCandidateBudget int `json:"content_candidate_budget,omitempty"`
 	ContentScanVisitBudget int `json:"content_scan_visit_budget,omitempty"`
+	// ContentDiskVerifyBudget overrides the per-query disk verification budget
+	// (contentDiskVerifyBudget, default 512) for this
+	// request; values <= 0 keep the default and larger values are clamped to
+	// contentDiskVerifyBudgetMax.
+	// Wire-visible so the resident service honors an opted-in read bound
+	// (--content-verify-budget). Never a global, so concurrent queries cannot
+	// race on each other's bound.
+	ContentDiskVerifyBudget int `json:"content_disk_verify_budget,omitempty"`
 	// contentCount, when non-nil, makes the content compact scan count matches
 	// in place instead of materializing and retaining []Entry. Local-only.
 	contentCount *int `json:"-"`
@@ -539,7 +557,13 @@ type queryOptions struct {
 	// lineOutput is the CLI's --lines request; client-side only (never sent
 	// to the service, never serialized).
 	lineOutput *contentLineOutput `json:"-"`
-	Cursor     string             `json:"cursor,omitempty"`
+	// lineBudget metadata is returned by the service so client-side --lines
+	// enrichment shares the same absolute deadline and remaining disk-read cap.
+	// Local-only; it is never sent in service requests.
+	lineBudgetMetadata      bool
+	lineBudgetDeadline      time.Time
+	lineDiskVerifyRemaining *int
+	Cursor                  string `json:"cursor,omitempty"`
 }
 
 // contentCompletenessProbe carries the reduced default-order path's
@@ -641,8 +665,9 @@ type parsedQuery struct {
 	Cancel       func() bool
 	Trace        *searchTrace
 	// Per-query content budgets copied from queryOptions; 0 means use default.
-	ContentCandidateBudget int
-	ContentScanVisitBudget int
+	ContentCandidateBudget  int
+	ContentScanVisitBudget  int
+	ContentDiskVerifyBudget int
 	// contentFullCandidates mirrors queryOptions.contentFullCandidates so
 	// nameTermCandidates can bypass the bounded content-candidate fast path.
 	contentFullCandidates bool
@@ -655,6 +680,10 @@ type parsedQuery struct {
 	// contentCandidateMeta carries a candidate source's self-report back to
 	// searchCompact for the current search call (never shared across queries).
 	contentCandidateMeta *contentCandidateMeta
+	// contentVerifyState is a per-candidate status shared with the content text
+	// reader. A failed budget reservation marks this candidate unverified even
+	// when another worker later completes out of order.
+	contentVerifyState *atomic.Bool
 	// hidden is the overlay hidden-base-ID set captured once for this search
 	// call and threaded into the bounded candidate scan, so the scan's
 	// early-stop guard drops exactly the records the caller's verify loop drops
@@ -730,10 +759,244 @@ type searchTrace struct {
 	// DiskCapped marks the trace incomplete: the result is a visible
 	// subset, never a silent truncation; a count refuses outright. Delta
 	// hits never count (memory, not disk). Local-only plumbing.
+	//
+	// During a query the live accounting lives in disk (an atomic, pointer-
+	// shared reservation): every verify worker reserves a slot there, so the
+	// cap is exact and race-free even though a searchTrace is copied by value.
+	// DiskVerified / DiskCapped / BudgetExceeded are published copies filled by
+	// publishDiskBudget once the query settles, for readers and serialization.
 	DiskVerified   int       `json:"-"`
 	DiskCapped     bool      `json:"-"`
 	BudgetExceeded bool      `json:"budget_exceeded,omitempty"`
 	BudgetDeadline time.Time `json:"-"`
+	// DiskVerifyBudget is the resolved per-query disk verification cap
+	// (contentDiskVerifyBudget, or the caller's clampContentDiskVerifyBudget
+	// override). 0 keeps the built-in default. Local-only plumbing.
+	DiskVerifyBudget int `json:"-"`
+	// disk is the per-query shared reservation behind DiskVerifyBudget. It is a
+	// pointer so a searchTrace stays copyable (go vet copylocks); every copy
+	// shares one accounting. nil means uncapped (bounded callers).
+	disk *contentDiskBudget `json:"-"`
+}
+
+// contentDiskBudget is the per-query disk-verification reservation shared by
+// every content verify worker. The atomic used-counter makes the cap exact and
+// race-free: the limit-th take() reserves a read, and the (limit+1)-th fails
+// and latches capped, so no worker ever reads past the bound under contention.
+// A past wall-clock deadline (--budget) latches exceeded instead; the two are
+// tracked separately so a pre-verified page (no disk reads) is truncated by the
+// deadline but never by an earlier disk cap.
+type contentDiskBudget struct {
+	limit             int64
+	used              atomic.Int64
+	capped            atomic.Bool
+	exceeded          atomic.Bool
+	incomplete        atomic.Bool
+	enrichmentSkipped atomic.Bool
+}
+
+// take reserves one disk read against the cap. It returns false (and latches
+// capped) once limit reads are already reserved.
+func (b *contentDiskBudget) take() bool {
+	if b == nil {
+		return true
+	}
+	for {
+		cur := b.used.Load()
+		if cur >= b.limit {
+			b.capped.Store(true)
+			return false
+		}
+		if b.used.CompareAndSwap(cur, cur+1) {
+			return true
+		}
+	}
+}
+
+// remaining reports how many disk reads are still reservable. It is used to
+// keep the cap boundary deterministic (see verifyContentSupersetPage).
+func (b *contentDiskBudget) remaining() int64 {
+	if b == nil {
+		return math.MaxInt64
+	}
+	r := b.limit - b.used.Load()
+	if r < 0 {
+		return 0
+	}
+	return r
+}
+
+// capFiresWithin reports whether a batch of n more reads could exhaust the
+// exact disk cap. Callers verify such a boundary batch serially, in rank order,
+// so the capped page is a deterministic rank-prefix rather than whichever
+// workers happened to win the last slots.
+func (t *searchTrace) capFiresWithin(n int) bool {
+	if t == nil || t.disk == nil {
+		return false
+	}
+	return t.disk.remaining() < int64(n)
+}
+
+// ensureDiskBudget resolves the query's shared disk reservation if the caller
+// has not already done so. Idempotent and single-threaded: call it at a content
+// search/count entry point before any verify worker starts.
+func (pq parsedQuery) ensureDiskBudget() {
+	if pq.Trace != nil {
+		pq.Trace.initDiskBudget()
+	}
+}
+
+// initDiskBudget resolves the query's disk cap into a shared reservation. Call
+// it once per query, single-threaded, before any verify worker starts.
+func (t *searchTrace) initDiskBudget() {
+	if t == nil || t.disk != nil {
+		return
+	}
+	limit := t.DiskVerifyBudget
+	if limit <= 0 {
+		limit = contentDiskVerifyBudget
+	}
+	t.disk = &contentDiskBudget{limit: int64(limit)}
+}
+
+// acquireDiskRead reports whether the caller may perform one disk content
+// verification. It enforces the wall-clock deadline (latching exceeded) and
+// then reserves a slot against the exact disk cap. A nil trace (bounded
+// callers) or an uninitialized trace is uncapped.
+func (t *searchTrace) acquireDiskRead() bool {
+	if t == nil {
+		return true
+	}
+	b := t.disk
+	if b == nil {
+		return true
+	}
+	if !t.BudgetDeadline.IsZero() && !time.Now().Before(t.BudgetDeadline) {
+		b.exceeded.Store(true)
+		b.incomplete.Store(true)
+		return false
+	}
+	if !b.take() {
+		b.incomplete.Store(true)
+		return false
+	}
+	return true
+}
+
+// acquireOptionalDiskRead shares the per-query deadline and exact read cap for
+// presentation-only work (snippets, line/context output) without changing the
+// completeness of already verified matches when that enrichment is skipped.
+func (t *searchTrace) acquireOptionalDiskRead() bool {
+	if t == nil || t.disk == nil {
+		return true
+	}
+	b := t.disk
+	if !t.BudgetDeadline.IsZero() && !time.Now().Before(t.BudgetDeadline) {
+		b.enrichmentSkipped.Store(true)
+		return false
+	}
+	if !b.take() {
+		b.enrichmentSkipped.Store(true)
+		return false
+	}
+	return true
+}
+
+func (t *searchTrace) optionalEnrichmentSkipped() bool {
+	return t != nil && t.disk != nil && t.disk.enrichmentSkipped.Load()
+}
+
+func (t *searchTrace) markOptionalEnrichmentSkipped() {
+	if t != nil && t.disk != nil {
+		t.disk.enrichmentSkipped.Store(true)
+	}
+}
+
+// armContentDeadline arms the query's wall-clock content deadline from the
+// caller's selection: BudgetDisabled (explicit --budget 0) leaves it unarmed;
+// an explicit budgetMS>0 uses that; omitted or zero budget has no implicit
+// deadline under the restored default (contentDefaultBudgetMS is 0).
+// It is a no-op when a deadline is already armed or when the resolved value is
+// 0. Call it only on content paths (queryHasAnyContentLeaf): the deadline is
+// consulted exclusively by disk verification (acquireDiskRead/deadlineReached),
+// so name-only queries must not pay for it.
+func (t *searchTrace) armContentDeadline(budgetMS int, disabled bool) {
+	if t == nil || !t.BudgetDeadline.IsZero() {
+		return
+	}
+	ms := contentBudgetDeadlineMS(budgetMS, disabled)
+	if ms <= 0 {
+		return
+	}
+	t.BudgetDeadline = time.Now().Add(time.Duration(ms) * time.Millisecond)
+}
+
+// contentBudgetDeadlineMS resolves the effective wall-clock content budget in
+// milliseconds. It returns 0 when no deadline should be armed: explicit zero,
+// omission under the restored default, or a test-selected disabled default.
+func contentBudgetDeadlineMS(budgetMS int, disabled bool) int {
+	if disabled {
+		return 0
+	}
+	if budgetMS > 0 {
+		return budgetMS
+	}
+	if contentDefaultBudgetMS > 0 {
+		return contentDefaultBudgetMS
+	}
+	return 0
+}
+
+// stopDiskVerify reports whether further disk verifications would only miss:
+// the exact cap or the wall-clock deadline has latched.
+func (t *searchTrace) stopDiskVerify() bool {
+	if t == nil || t.disk == nil {
+		return false
+	}
+	return t.disk.capped.Load() || t.disk.exceeded.Load()
+}
+
+// deadlineReached reports whether the wall-clock deadline has passed, without
+// latching. Used to cancel work that reads no disk (e.g. reconstructing an
+// already-verified page).
+func (t *searchTrace) deadlineReached() bool {
+	return t != nil && !t.BudgetDeadline.IsZero() && !time.Now().Before(t.BudgetDeadline)
+}
+
+func (t *searchTrace) markBudgetExceeded() {
+	if t == nil || t.disk == nil {
+		return
+	}
+	t.disk.exceeded.Store(true)
+	t.disk.incomplete.Store(true)
+}
+
+// contentIncomplete reports the current incompleteness, reading the live
+// shared reservation while a query runs (before publishDiskBudget copies it to
+// the plain field).
+func (t *searchTrace) contentIncomplete() bool {
+	if t == nil {
+		return false
+	}
+	if t.disk != nil {
+		return t.disk.incomplete.Load()
+	}
+	return t.ContentIncomplete
+}
+
+// publishDiskBudget copies the settled shared reservation onto the trace's
+// plain fields for readers and JSON serialization. Call once, after the query
+// returns and all workers have stopped.
+func (t *searchTrace) publishDiskBudget() {
+	if t == nil || t.disk == nil {
+		return
+	}
+	t.DiskVerified = int(t.disk.used.Load())
+	t.DiskCapped = t.disk.capped.Load()
+	t.BudgetExceeded = t.disk.exceeded.Load()
+	if t.disk.incomplete.Load() {
+		t.ContentIncomplete = true
+	}
 }
 
 type traceTerm struct {
@@ -851,9 +1114,16 @@ func (t *searchTrace) setFallback(route string) {
 }
 
 func (t *searchTrace) setContentIncomplete() {
-	if t != nil {
-		t.ContentIncomplete = true
+	if t == nil {
+		return
 	}
+	// With a live reservation the write goes through shared atomic state (many
+	// verify workers may call this concurrently) and is published later.
+	if t.disk != nil {
+		t.disk.incomplete.Store(true)
+		return
+	}
+	t.ContentIncomplete = true
 }
 
 func (t *searchTrace) setComplete(complete bool) {

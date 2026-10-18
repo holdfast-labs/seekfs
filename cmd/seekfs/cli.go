@@ -133,7 +133,8 @@ func looksLikeSearchWithoutSubcommand(args []string) bool {
 			arg == "-current" || arg == "--current" || strings.HasPrefix(arg, "-current=") || strings.HasPrefix(arg, "--current=") ||
 			arg == "-recent" || arg == "--recent" || strings.HasPrefix(arg, "-recent=") || strings.HasPrefix(arg, "--recent=") ||
 			arg == "-modified-after" || arg == "--modified-after" || strings.HasPrefix(arg, "-modified-after=") || strings.HasPrefix(arg, "--modified-after=") ||
-			arg == "-case" || arg == "--case" {
+			arg == "-case" || arg == "--case" ||
+			arg == "--content-verify-budget" || strings.HasPrefix(arg, "--content-verify-budget=") {
 			return true
 		}
 	}
@@ -150,7 +151,8 @@ func normalizeSearchArgs(args []string) []string {
 	valueFlags := map[string]bool{
 		"--under": true, "-db": true, "--db": true, "-n": true, "--n": true,
 		"--budget": true, "--cursor": true,
-		"-config": true, "--config": true, "-pipe": true, "--pipe": true,
+		"--content-verify-budget": true,
+		"-config":                 true, "--config": true, "-pipe": true, "--pipe": true,
 		"-root-bias": true, "--root-bias": true, "-recent": true, "--recent": true,
 		"-near": true, "--near": true, "-current": true, "--current": true,
 		"-modified-after": true, "--modified-after": true,
@@ -216,12 +218,15 @@ func printUsage(w io.Writer) {
   seekfs info [-db seekfs.gsi] [--json]
   seekfs syntax
   seekfs agent
-  seekfs search [-db seekfs.db...] [--json] [-n 100] [-path] [--lines [-C N] [--max-per-file N]] <query>
-  seekfs count [-db seekfs.db...] [--json] [-path] <query>
+  seekfs search [-db seekfs.db...] [--json] [-n 100] [-path] [--lines [-C N] [--max-per-file N]] [--budget 150ms] [--content-verify-budget N] <query>
+    --content-verify-budget: content disk-verification cap per query (0 = default 512, max 100000)
+  seekfs count [-db seekfs.db...] [--json] [-path] [--budget 150ms] [--content-verify-budget N] <query>
+    --content-verify-budget: content disk-verification cap per query (0 = default 512, max 100000)
+    --budget: opt-in wall-clock bound for content verification (omitted or 0 = unbounded; bounds search and count when positive)
   seekfs open <path> [--query "query"] [--json] [-pipe ...]
   seekfs recent [-n 20] [--json] [-pipe ...]
   seekfs content-index (-root <dir> | -db <gsi>) [-out content.gsx] [-under <path>] [-ext .go,.md]
-  seekfs content -db content.gsx [-n 100] [--json] <term>
+  seekfs content -db content.gsx [-n 100] [--json] [--budget 150ms] <term>
   seekfs watch "<query>" [-interval 2s] [-n 10000] [-under PATH] [-exec CMD] [-pipe \\.\pipe\seekfs-service]
   seekfs version
 

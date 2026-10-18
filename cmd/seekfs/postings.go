@@ -1914,32 +1914,34 @@ func parseQuery(opts queryOptions) (parsedQuery, error) {
 		out.Cancel = opts.Cancel
 		out.ContentCandidateBudget = opts.ContentCandidateBudget
 		out.ContentScanVisitBudget = opts.ContentScanVisitBudget
+		out.ContentDiskVerifyBudget = opts.ContentDiskVerifyBudget
 		out.contentFullCandidates = opts.contentFullCandidates
 		out.contentWindow = opts.contentWindow
 		out.contentProbe = opts.contentProbe
 		return out, nil
 	}
 	pq := parsedQuery{
-		Raw:                    opts.Query,
-		MatchPath:              opts.MatchPath || queryLooksPathScoped(opts.Query),
-		CaseSensitive:          opts.CaseSensitive,
-		CaseExplicit:           opts.CaseSensitive,
-		Fuzzy:                  opts.Fuzzy,
-		Under:                  normalizeFilterPath(opts.Under),
-		Exists:                 opts.Exists,
-		CWDBias:                normalizeFilterPath(opts.CWDBias),
-		RootBias:               normalizeFilterPath(opts.RootBias),
-		Near:                   normalizeFilterPath(opts.Near),
-		Current:                normalizeFilterPath(opts.Current),
-		DeadlineUnix:           opts.DeadlineUnix,
-		Cancel:                 opts.Cancel,
-		Trace:                  opts.Trace,
-		ContentCandidateBudget: opts.ContentCandidateBudget,
-		ContentScanVisitBudget: opts.ContentScanVisitBudget,
-		contentFullCandidates:  opts.contentFullCandidates,
-		contentWindow:          opts.contentWindow,
-		contentProbe:           opts.contentProbe,
-		gitCtx:                 newQueryGitContext(),
+		Raw:                     opts.Query,
+		MatchPath:               opts.MatchPath || queryLooksPathScoped(opts.Query),
+		CaseSensitive:           opts.CaseSensitive,
+		CaseExplicit:            opts.CaseSensitive,
+		Fuzzy:                   opts.Fuzzy,
+		Under:                   normalizeFilterPath(opts.Under),
+		Exists:                  opts.Exists,
+		CWDBias:                 normalizeFilterPath(opts.CWDBias),
+		RootBias:                normalizeFilterPath(opts.RootBias),
+		Near:                    normalizeFilterPath(opts.Near),
+		Current:                 normalizeFilterPath(opts.Current),
+		DeadlineUnix:            opts.DeadlineUnix,
+		Cancel:                  opts.Cancel,
+		Trace:                   opts.Trace,
+		ContentCandidateBudget:  opts.ContentCandidateBudget,
+		ContentScanVisitBudget:  opts.ContentScanVisitBudget,
+		ContentDiskVerifyBudget: opts.ContentDiskVerifyBudget,
+		contentFullCandidates:   opts.contentFullCandidates,
+		contentWindow:           opts.contentWindow,
+		contentProbe:            opts.contentProbe,
+		gitCtx:                  newQueryGitContext(),
 	}
 	if opts.ModifiedAfter != "" {
 		t, err := parseTimeValue(opts.ModifiedAfter)

@@ -1055,7 +1055,9 @@ func TestContentServiceBuildReserveDropsExactFilesAndBytes(t *testing.T) {
 	// scratch, and 9 bytes of headroom: the build peak (compressed spool +
 	// output, ×0.8) allows 11 extracted bytes.
 	contentTotalBytesFn = func(_ string) (uint64, error) { return 500 << 30, nil }
-	contentFreeBytesFn = func(_ string) (uint64, error) { return contentScopeReserveMaxBytes + contentScopeScratchSlack() + 9, nil }
+	contentFreeBytesFn = func(_ string) (uint64, error) {
+		return contentScopeReserveMaxBytes + contentScopeScratchSlack() + 9, nil
+	}
 	dir := t.TempDir()
 	bodies := map[string]string{
 		"a.txt": "alpha",

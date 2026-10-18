@@ -232,10 +232,29 @@ func (s *goSearchService) featureVolumeMatches(vol *serviceVolumeIndex, v *featu
 }
 
 func (s *goSearchService) searchFeatureQuery(opts queryOptions, countOnly bool) ([]Entry, int, error) {
+	if opts.Trace == nil {
+		opts.Trace = &searchTrace{}
+	}
+	defer func() {
+		if opts.Trace.deadlineReached() {
+			opts.Trace.markBudgetExceeded()
+		}
+		opts.Trace.publishDiskBudget()
+	}()
 	s.initializeFeatures()
 	pq, err := parseQuery(opts)
 	if err != nil {
 		return nil, 0, err
+	}
+	// A feature query may carry a content leaf (verified from disk); resolve the
+	// exact per-query disk reservation here, before any verification, and honor
+	// the wall-clock budget for the content part. See contentDiskBudget.
+	if opts.Trace != nil {
+		opts.Trace.DiskVerifyBudget = contentDiskVerifyBudgetOf(pq)
+		opts.Trace.initDiskBudget()
+		if queryHasAnyContentLeaf(pq) {
+			opts.Trace.armContentDeadline(opts.BudgetMS, opts.BudgetDisabled)
+		}
 	}
 	if !queryHasFeatureLeaf(pq) {
 		return nil, 0, fmt.Errorf("no feature predicate")

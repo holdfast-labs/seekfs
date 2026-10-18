@@ -804,17 +804,18 @@ func TestContentBroadTermEarlyStop(t *testing.T) {
 		t.Fatalf("got %d hits; want 1..%d", len(matches), limit)
 	}
 	// The selective superset is small and every match fits the page, so the
-	// walk stops after the superset with the page complete and verifies at
-	// most ~2N files (parallel fan-out bounds the over-verification).
-	if trace.DiskVerified > 2*limit {
-		t.Fatalf("DiskVerified=%d for a %d-hit page; want at most ~%d (early stop)", trace.DiskVerified, len(matches), 2*limit)
+	// walk stops after the superset with the page complete; verification may
+	// over-read one parallel batch and optional snippets read each returned file
+	// once more under the same exact cap.
+	if maxReads := 2*limit + 4*contentParallelWorkers() + len(matches); trace.DiskVerified > maxReads {
+		t.Fatalf("DiskVerified=%d for a %d-hit page including snippets; want at most ~%d (early stop)", trace.DiskVerified, len(matches), maxReads)
 	}
 	if trace.DiskCapped || trace.ContentIncomplete {
 		t.Fatalf("selective page reported incomplete (verified=%d capped=%v)", trace.DiskVerified, trace.DiskCapped)
 	}
 	// Broad arm: every doc matches, so the window probe reports incomplete by
 	// design — but verification still stops near the page instead of burning
-	// the disk budget (512) on the unfiltered scan.
+	// the disk safety valve on the unfiltered scan.
 	broadTrace := &searchTrace{}
 	broadMatches, err := searchServiceVolumes(vols, queryOptions{Query: "content:download", Limit: limit, Trace: broadTrace}, false)
 	if err != nil {

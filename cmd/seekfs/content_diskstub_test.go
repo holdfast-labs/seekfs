@@ -2,17 +2,24 @@ package main
 
 import "testing"
 
-// uncappedDiskVerify lifts the per-query disk verification budget for the
-// test (restored on cleanup). Logic-differential tests prove two paths
-// answer identically over thousand-doc corpora; with the production budget
-// both arms would cap at different verify orders and diverge on the
-// completeness flag alone. Boundedness itself is proven separately by
-// small-budget cap tests (TestContentDiskVerifyBudget*).
+// uncappedDiskVerify lifts the per-query disk verification budget AND the
+// default wall-clock bound for the test (both restored on cleanup).
+// Logic-differential tests prove two paths answer identically over
+// thousand-doc corpora; with the production bounds both arms would stop at
+// different verify orders and diverge on the completeness flag alone.
+// Boundedness itself is proven separately by the small-budget cap tests and
+// the default-deadline tests (TestContentDiskVerifyBudget*,
+// TestContentDefaultBudget*).
 func uncappedDiskVerify(t testing.TB) {
 	t.Helper()
 	prev := contentDiskVerifyBudget
+	prevMS := contentDefaultBudgetMS
 	contentDiskVerifyBudget = 1 << 30
-	t.Cleanup(func() { contentDiskVerifyBudget = prev })
+	contentDefaultBudgetMS = 0
+	t.Cleanup(func() {
+		contentDiskVerifyBudget = prev
+		contentDefaultBudgetMS = prevMS
+	})
 }
 
 // stubContentDiskText substitutes fixture text for disk reads until the test

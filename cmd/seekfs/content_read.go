@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 	"unicode/utf8"
 )
 
@@ -324,6 +325,19 @@ func (r *contentReader) docPath(docID uint32) string {
 // disk verification cap stopped it with records unvisited (a visible subset,
 // never silent).
 func (r *contentReader) search(term string, limit int) ([]contentHit, bool) {
+	return r.searchWithBudget(term, limit, 0)
+}
+
+// searchWithBudget is the offline reader's opt-in time-bounded counterpart.
+// The ordinary search method remains exhaustive for internal callers/tests;
+// the standalone content CLI supplies a deadline only for a positive explicit
+// --budget. A timed-out scan returns its verified prefix and complete=false;
+// each already-started file read remains non-interruptible.
+func (r *contentReader) searchWithBudget(term string, limit, budgetMS int) ([]contentHit, bool) {
+	var deadline time.Time
+	if budgetMS > 0 {
+		deadline = time.Now().Add(time.Duration(budgetMS) * time.Millisecond)
+	}
 	t := string(contentFoldAccent([]byte(term)))
 	if t == "" {
 		return nil, true
@@ -353,6 +367,9 @@ func (r *contentReader) search(term string, limit int) ([]contentHit, bool) {
 	var hits []contentHit
 	verified := 0
 	for {
+		if !deadline.IsZero() && !time.Now().Before(deadline) {
+			return hits, false
+		}
 		id, ok := next()
 		if !ok {
 			return hits, true
@@ -364,6 +381,9 @@ func (r *contentReader) search(term string, limit int) ([]contentHit, bool) {
 			if limit > 0 && len(hits) >= limit {
 				return hits, true
 			}
+		}
+		if !deadline.IsZero() && !time.Now().Before(deadline) {
+			return hits, false
 		}
 	}
 }
@@ -431,10 +451,12 @@ func (r *contentReader) verifyDiskContent(id uint32, needle []byte, grams []uint
 	}, true, false
 }
 
-// contentDiskVerifyBudget caps one query (service or offline) to this many
-// disk verifications (open, extract, match). Past it the query stops and
-// reports complete:false rather than reading the whole drive. Delta hits
-// never count (memory, not disk). A var so tests pin it.
+// contentDiskVerifyBudget is the per-query disk-verification safety valve used
+// when the caller sets no explicit --content-verify-budget. The historical
+// default remains 512 reads; a positive --budget is an additional opt-in time
+// bound. Past this valve the query stops and reports complete:false rather than
+// reading the whole drive.
+// Delta hits never count (memory, not disk). A var so tests pin it.
 var contentDiskVerifyBudget = 512
 
 // candidates returns the docIDs that could contain term: trigram intersection

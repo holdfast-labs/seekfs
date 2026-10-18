@@ -28,8 +28,8 @@ func TestFoldAccentLowerBasics(t *testing.T) {
 		{"Só Danço", "so danco"},
 		{"naïve", "naive"},
 		{"café", "cafe"},
-		{"ＡＢＣ", "abc"},       // fullwidth folds to ASCII
-		{"ﬁle", "ﬁle"},         // ligature has no decomposition to ASCII: unchanged
+		{"ＡＢＣ", "abc"}, // fullwidth folds to ASCII
+		{"ﬁle", "ﬁle"}, // ligature has no decomposition to ASCII: unchanged
 		{"hello-world_2.0", "hello-world_2.0"},
 	}
 	for _, c := range cases {
@@ -570,7 +570,8 @@ func TestQueryFoldUnionActiveGate(t *testing.T) {
 	}
 }
 
-func TestCompactPathContainsFolded(t *testing.T) {	idx := &Index{
+func TestCompactPathContainsFolded(t *testing.T) {
+	idx := &Index{
 		Compact: true,
 		Volume:  "E:",
 		Records: []CompactRecord{
@@ -589,7 +590,7 @@ func TestCompactPathContainsFolded(t *testing.T) {	idx := &Index{
 	}
 }
 
-func TestRegexMaskPrefilterSound(t *testing.T) {	// The mask prefilter may only skip MatchString, never change the verdict:
+func TestRegexMaskPrefilterSound(t *testing.T) { // The mask prefilter may only skip MatchString, never change the verdict:
 	// every true match must pass its disjunct masks, and RegexMasks must
 	// parallel Regexps.
 	paths := []string{

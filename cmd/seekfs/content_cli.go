@@ -3,7 +3,7 @@ package main
 // CLI surface for the offline content index:
 //
 //	seekfs content-index -root <dir> [-out file.gsx]
-//	seekfs content -db file.gsx [-n 100] [--json] <term>
+//	seekfs content -db file.gsx [-n 100] [--json] [--budget 150ms] <term>
 
 import (
 	"context"
@@ -229,8 +229,18 @@ func cmdContent(args []string) error {
 	n := fs.Int("n", 100, "maximum results")
 	asJSON := fs.Bool("json", false, "emit JSON")
 	withSnippet := fs.Bool("snippet", false, "append the matched-text snippet to each line")
+	budget := fs.Duration("budget", 0, "opt-in wall-clock time for content verification; omitted or 0 leaves time unbounded")
 	if err := fs.Parse(args); err != nil {
 		return err
+	}
+	budgetMS, budgetDisabled, err := contentBudgetFromFlagSet(fs, *budget)
+	if err != nil {
+		return err
+	}
+	if budgetDisabled {
+		budgetMS = 0
+	} else if budgetMS == 0 {
+		budgetMS = contentDefaultBudgetMS
 	}
 	if !contentSearchEnabled() {
 		return contentUnavailableError()
@@ -262,11 +272,11 @@ func cmdContent(args []string) error {
 	// v11 verifies from disk with the build's extraction policy (caps from
 	// CXPL, encoding from CXFL), so the query decodes exactly as the build
 	// did without extra flags.
-	hits, complete := r.search(term, *n)
+	hits, complete := r.searchWithBudget(term, *n, budgetMS)
 	if !complete {
-		// The scan stopped at the verification cap with records unvisited:
-		// the answer is a visible subset, never silent.
-		fmt.Fprintf(os.Stderr, "content: incomplete results (disk verification cap reached; narrow the term)\n")
+		// The scan stopped at its time or disk safety bound with records
+		// unvisited: the answer is a visible subset, never silent.
+		fmt.Fprintf(os.Stderr, "content: incomplete results (time/disk verification budget reached; narrow the term)\n")
 	}
 	fuzzy := ""
 	if len(hits) == 0 {

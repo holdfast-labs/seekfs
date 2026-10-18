@@ -241,6 +241,7 @@ func searchCompactWithCacheHidden(idx *Index, opts queryOptions, countOnly bool,
 	if err != nil {
 		return nil, err
 	}
+	pq.ensureDiskBudget()
 	if pq.Impossible {
 		pq.Trace.setPlannerMode("impossible-query")
 		pq.Trace.setSource("impossible-query", 0)
@@ -390,7 +391,7 @@ func searchCompactWithCacheHidden(idx *Index, opts queryOptions, countOnly bool,
 		// of burning the whole candidate set past an already-incomplete page.
 		// Results are identical (every later verify would miss); only wasted
 		// reads stop. A pre-verified page (skipEntryMatches) never gets here.
-		if contentMatcher != nil && pq.Trace != nil && (pq.Trace.DiskCapped || pq.Trace.BudgetExceeded) {
+		if contentMatcher != nil && pq.Trace != nil && pq.Trace.stopDiskVerify() {
 			break
 		}
 	}
@@ -543,6 +544,10 @@ func verifyCompactCandidateOrderParallel(idx *Index, pq parsedQuery, order []int
 func verifyCompactCandidateOrderRange(idx *Index, pq parsedQuery, order []int, pathCache map[int]string, limit int, skipEntryMatches bool, hidden hiddenBaseIDs, contentVol *serviceVolumeIndex, matcher *contentLeafMatcher) ([]Entry, error) {
 	out := make([]Entry, 0, min(limit, 1024))
 	for pos, recIndex := range order {
+		if pq.Trace != nil && pq.Trace.deadlineReached() {
+			pq.Trace.markBudgetExceeded()
+			return out, nil
+		}
 		if pos&1023 == 0 && queryCanceled(pq) {
 			return nil, errQueryCanceled
 		}
@@ -553,6 +558,9 @@ func verifyCompactCandidateOrderRange(idx *Index, pq parsedQuery, order []int, p
 		if entry, ok := compactCandidateEntryIfMatchIn(contentVol, idx, pq, recIndex, pathCache, true, skipEntryMatches, matcher); ok {
 			out = append(out, entry)
 			if len(out) >= limit {
+				if pq.Trace != nil && pq.Trace.deadlineReached() {
+					pq.Trace.markBudgetExceeded()
+				}
 				return out, nil
 			}
 		}
@@ -596,10 +604,15 @@ type contentVerifyJob struct {
 // contentVerifyResult is one verified candidate: ok=false is a miss, but
 // every job reports so the merger can advance past it.
 type contentVerifyResult struct {
-	seq   uint64
-	entry Entry
-	ok    bool
+	seq      uint64
+	entry    Entry
+	ok       bool
+	verified bool
 }
+
+// contentVerifyParallelTestHook is nil outside tests. It lets the cap-frontier
+// regression test coordinate worker completion deterministically.
+var contentVerifyParallelTestHook func(seq, candidateID int, phase string, used int64, matched, capped bool)
 
 // verifyCompactContentParallel verifies content candidates across workers
 // and merges matches in candidate order with the exact serial limit: the
@@ -613,6 +626,7 @@ func verifyCompactContentParallel(idx *Index, pq parsedQuery, order []int, pathC
 	if len(order) == 0 || limit <= 0 {
 		return nil, nil
 	}
+	pq.ensureDiskBudget()
 	workers := contentParallelWorkers()
 	if workers < 2 {
 		return verifyCompactCandidateOrderRange(idx, pq, order, pathCache, limit, skipEntryMatches, hidden, contentVol, matcher)
@@ -622,10 +636,16 @@ func verifyCompactContentParallel(idx *Index, pq parsedQuery, order []int, pathC
 	quit := make(chan struct{})
 	var quitOnce sync.Once
 	stop := func() { quitOnce.Do(func() { close(quit) }) }
-	defer stop()
 	work := make(chan contentVerifyJob, 64)
 	out := make(chan contentVerifyResult, 64)
 	var wg sync.WaitGroup
+	defer func() {
+		stop()
+		// Reads already inside contentDiskReadForVerify are non-interruptible.
+		// Join workers before publishing the per-query reservation so no disk
+		// read or accounting update escapes the completed request.
+		wg.Wait()
+	}()
 	// Feeder: the only goroutine that walks the candidate order.
 	wg.Add(1)
 	go func() {
@@ -667,15 +687,49 @@ func verifyCompactContentParallel(idx *Index, pq parsedQuery, order []int, pathC
 					}
 					var res contentVerifyResult
 					res.seq = job.seq
+					res.verified = true
 					if !hidden.contains(job.id) {
-						localCache = boundPathCache(localCache)
-						if entry, ok := compactCandidateEntryIfMatchIn(contentVol, idx, pq, job.id, localCache, true, skipEntryMatches, matcher); ok {
-							res.entry, res.ok = entry, true
+						if pq.Trace != nil && pq.Trace.deadlineReached() {
+							pq.Trace.markBudgetExceeded()
+							res.verified = false
+						}
+						if contentVerifyParallelTestHook != nil {
+							used := int64(0)
+							if pq.Trace != nil && pq.Trace.disk != nil {
+								used = pq.Trace.disk.used.Load()
+							}
+							contentVerifyParallelTestHook(int(job.seq), job.id, "merge-start", used, false, pq.Trace.stopDiskVerify())
+						}
+						if res.verified {
+							localCache = boundPathCache(localCache)
+							candidatePQ := pq
+							var candidateState atomic.Bool
+							candidatePQ.contentVerifyState = &candidateState
+							if entry, ok := compactCandidateEntryIfMatchIn(contentVol, idx, candidatePQ, job.id, localCache, true, skipEntryMatches, matcher); ok {
+								res.entry, res.ok = entry, true
+							}
+							if candidateState.Load() {
+								res.verified = false
+							}
+							if skipEntryMatches && pq.Trace != nil && pq.Trace.deadlineReached() {
+								pq.Trace.markBudgetExceeded()
+								res.verified = false
+							}
+						}
+						if contentVerifyParallelTestHook != nil {
+							used := int64(0)
+							if pq.Trace != nil && pq.Trace.disk != nil {
+								used = pq.Trace.disk.used.Load()
+							}
+							contentVerifyParallelTestHook(int(job.seq), job.id, "merge-done", used, res.ok, pq.Trace.stopDiskVerify())
 						}
 					}
 					select {
 					case out <- res:
 					case <-quit:
+						return
+					}
+					if !res.verified {
 						return
 					}
 				case <-quit:
@@ -704,6 +758,13 @@ func verifyCompactContentParallel(idx *Index, pq parsedQuery, order []int, pathC
 				return true
 			}
 			delete(pending, expect)
+			if !res.verified {
+				// A later worker may finish after an earlier rank hits the cap
+				// or deadline. Stop at this contiguous verified frontier rather
+				// than treating an unverified candidate as a nonmatch and
+				// admitting a later hit.
+				return false
+			}
 			expect++
 			if res.ok {
 				hits = append(hits, res.entry)
@@ -716,7 +777,14 @@ func verifyCompactContentParallel(idx *Index, pq parsedQuery, order []int, pathC
 		if !emit() {
 			return hits, nil
 		}
-		if pq.Trace != nil && (pq.Trace.DiskCapped || pq.Trace.BudgetExceeded) {
+		// A pre-verified page (skipEntryMatches) owns its results even if the
+		// earlier rank-ordered superset pass exhausted the disk cap; only the
+		// wall-clock deadline limits this no-disk reconstruction. Inline
+		// verification instead stops at the first per-candidate unverified
+		// frontier in emit, preserving earlier jobs already verified before a
+		// later worker exhausted the shared cap.
+		if skipEntryMatches && pq.Trace != nil && pq.Trace.deadlineReached() {
+			pq.Trace.markBudgetExceeded()
 			return hits, nil
 		}
 	}
@@ -734,6 +802,7 @@ func verifyCompactContentParallel(idx *Index, pq parsedQuery, order []int, pathC
 // path-free entry unless the query reads paths), so the total equals the
 // serial count by construction.
 func countCompactContentParallel(idx *Index, pq parsedQuery, order []int, hidden hiddenBaseIDs, contentVol *serviceVolumeIndex, matcher *contentLeafMatcher, count *int) error {
+	pq.ensureDiskBudget()
 	total := compactOrderLen(order, idx.compactRecordCount())
 	workers := contentParallelWorkers()
 	if workers > total {
@@ -846,16 +915,18 @@ func scanCandidateMatches(vol *serviceVolumeIndex, idx *Index, pq parsedQuery, r
 // verifyContentSupersetPage verifies candidates in result order until the
 // requested page is full. A full page is exact because all omitted candidates
 // rank later; a short page exhausts the available superset.
+
 func (vol *serviceVolumeIndex) verifyContentSupersetPage(pq parsedQuery, ranked []int) ([]int, bool) {
 	if vol == nil || vol.index == nil || pq.Limit <= 0 || len(ranked) == 0 {
 		return nil, false
 	}
+	pq.ensureDiskBudget()
 	matcher := newContentLeafMatcher(pq)
 	page := make([]int, 0, min(pq.Limit, len(ranked)))
 	stopped := func() bool {
 		// The verify cap / time budget already marked the trace incomplete;
 		// keep the hits found so far as a visible partial page.
-		return pq.Trace != nil && (pq.Trace.BudgetExceeded || pq.Trace.DiskCapped)
+		return pq.Trace != nil && pq.Trace.stopDiskVerify()
 	}
 	// Verify in small parallel batches (like verifyCompactContentParallel),
 	// then take hits in rank order: the page is identical to the serial walk
@@ -866,6 +937,7 @@ func (vol *serviceVolumeIndex) verifyContentSupersetPage(pq parsedQuery, ranked 
 	}
 	batch := 4 * workers
 	ok := make([]bool, batch)
+	verified := make([]bool, batch)
 	caches := make([]map[int]string, workers)
 	for w := range caches {
 		caches[w] = make(map[int]string)
@@ -877,10 +949,17 @@ func (vol *serviceVolumeIndex) verifyContentSupersetPage(pq parsedQuery, ranked 
 		end := min(start+batch, len(ranked))
 		n := end - start
 		clear(ok)
-		if workers == 1 || n == 1 {
+		clear(verified)
+		// A batch that could exhaust the exact per-candidate read cap is
+		// verified serially, in rank order; other batches stay parallel.
+		if workers == 1 || n == 1 || pq.Trace.capFiresWithin(n) {
 			for i := 0; i < n && !stopped(); i++ {
 				caches[0] = boundPathCache(caches[0])
-				ok[i] = scanCandidateMatches(vol, vol.index, pq, ranked[start+i], caches[0], matcher)
+				candidatePQ := pq
+				var candidateState atomic.Bool
+				candidatePQ.contentVerifyState = &candidateState
+				ok[i] = scanCandidateMatches(vol, vol.index, candidatePQ, ranked[start+i], caches[0], matcher)
+				verified[i] = !candidateState.Load()
 			}
 		} else {
 			var next atomic.Int64
@@ -895,20 +974,33 @@ func (vol *serviceVolumeIndex) verifyContentSupersetPage(pq parsedQuery, ranked 
 							return
 						}
 						caches[w] = boundPathCache(caches[w])
-						ok[i] = scanCandidateMatches(vol, vol.index, pq, ranked[start+i], caches[w], matcher)
+						candidatePQ := pq
+						var candidateState atomic.Bool
+						candidatePQ.contentVerifyState = &candidateState
+						ok[i] = scanCandidateMatches(vol, vol.index, candidatePQ, ranked[start+i], caches[w], matcher)
+						verified[i] = !candidateState.Load()
 					}
 				}(w)
 			}
 			wg.Wait()
 		}
 		for i := 0; i < n; i++ {
+			if !verified[i] {
+				return page, true
+			}
 			if ok[i] {
 				page = append(page, ranked[start+i])
 				if len(page) == pq.Limit {
+					if pq.Trace != nil && pq.Trace.deadlineReached() {
+						pq.Trace.markBudgetExceeded()
+					}
 					return page, true
 				}
 			}
 		}
+	}
+	if pq.Trace != nil && pq.Trace.deadlineReached() {
+		pq.Trace.markBudgetExceeded()
 	}
 	return page, true
 }

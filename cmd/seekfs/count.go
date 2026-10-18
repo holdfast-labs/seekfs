@@ -18,12 +18,27 @@ func isVolumeRoot(path string) bool {
 }
 
 func countServiceVolumes(volumes []*serviceVolumeIndex, opts queryOptions) (int, bool, error) {
+	if opts.Trace == nil {
+		opts.Trace = &searchTrace{}
+	}
+	defer opts.Trace.publishDiskBudget()
 	if opts.parsedOverride == nil {
 		opts, _ = contentFuzzyExpandQuery(volumes, opts)
 	}
 	pq, err := parseQuery(opts)
 	if err != nil {
 		return 0, true, err
+	}
+	if opts.Trace != nil {
+		opts.Trace.DiskVerifyBudget = contentDiskVerifyBudgetOf(pq)
+		opts.Trace.initDiskBudget()
+		// A count honors the wall-clock --budget too: like search it stops new
+		// disk reads past the deadline and refuses rather than returning a
+		// partial tally (see acquireDiskRead / errContentIncomplete). Armed
+		// only for content queries, since only disk verification reads it.
+		if queryHasAnyContentLeaf(pq) {
+			opts.Trace.armContentDeadline(opts.BudgetMS, opts.BudgetDisabled)
+		}
 	}
 	markCountDivergent(opts, pq)
 	if pq.Impossible {
@@ -73,11 +88,11 @@ func countServiceVolumes(volumes []*serviceVolumeIndex, opts queryOptions) (int,
 			}
 			// The same completeness refusal as the exact tail: a capped
 			// retry is not an exact count.
-			if opts.Trace != nil && opts.Trace.ContentIncomplete {
+			if opts.Trace != nil && opts.Trace.contentIncomplete() {
 				return 0, true, errContentIncomplete
 			}
 			opts.Trace.setPlannerMode("service-content")
-			opts.Trace.setComplete(opts.Trace == nil || (!opts.Trace.ContentPartial && !opts.Trace.ContentIncomplete))
+			opts.Trace.setComplete(opts.Trace == nil || (!opts.Trace.ContentPartial && !opts.Trace.contentIncomplete()))
 			return total, true, nil
 		}
 		total := 0
@@ -101,11 +116,11 @@ func countServiceVolumes(volumes []*serviceVolumeIndex, opts queryOptions) (int,
 		}
 		// A capped candidate superset means the count is not exact. Refuse it
 		// instead of returning a partial number that looks complete.
-		if opts.Trace != nil && opts.Trace.ContentIncomplete {
+		if opts.Trace != nil && opts.Trace.contentIncomplete() {
 			return 0, true, errContentIncomplete
 		}
 		opts.Trace.setPlannerMode("service-content")
-		opts.Trace.setComplete(opts.Trace == nil || (!opts.Trace.ContentPartial && !opts.Trace.ContentIncomplete))
+		opts.Trace.setComplete(opts.Trace == nil || (!opts.Trace.ContentPartial && !opts.Trace.contentIncomplete()))
 		return total, true, nil
 	}
 	snapshot := newGlobalQuerySnapshot(volumes, opts.Trace)

@@ -74,12 +74,18 @@ type serviceResponse struct {
 	Complete                 *bool               `json:"complete,omitempty"`
 	Results                  []string            `json:"results,omitempty"`
 	BudgetExceeded           bool                `json:"budget_exceeded,omitempty"`
-	Rows                     []jsonResult        `json:"rows,omitempty"`
-	DBs                      []dbInfo            `json:"dbs,omitempty"`
-	Runtime                  *runtimeMemoryInfo  `json:"runtime,omitempty"`
-	Health                   string              `json:"health,omitempty"`
-	HealthMessage            string              `json:"health_message,omitempty"`
-	Content                  *contentHealth      `json:"content,omitempty"`
+	// ContentBudgetDeadlineUnix and ContentDiskVerifyRemaining let the CLI's
+	// optional --lines enrichment share the query's absolute time deadline and
+	// exact remaining per-query read cap. A zero deadline means explicitly
+	// unbounded time; a non-nil remaining value of zero means no reads remain.
+	ContentBudgetDeadlineUnix  int64              `json:"content_budget_deadline_unix,omitempty"`
+	ContentDiskVerifyRemaining *int               `json:"content_disk_verify_remaining,omitempty"`
+	Rows                       []jsonResult       `json:"rows,omitempty"`
+	DBs                        []dbInfo           `json:"dbs,omitempty"`
+	Runtime                    *runtimeMemoryInfo `json:"runtime,omitempty"`
+	Health                     string             `json:"health,omitempty"`
+	HealthMessage              string             `json:"health_message,omitempty"`
+	Content                    *contentHealth     `json:"content,omitempty"`
 	// Recent carries the `recent` op rows (most recently opened files, newest
 	// first). Only set on the recent command.
 	Recent []recentFileJSON `json:"recent,omitempty"`

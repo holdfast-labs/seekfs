@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 	"unsafe"
@@ -895,10 +896,21 @@ func cmdSearch(args []string, countOnly bool) error {
 	modifiedAfter := fs.String("modified-after", "", "only return results modified after RFC3339 time or YYYY-MM-DD")
 	caseSensitive := fs.Bool("case", false, "case-sensitive query matching")
 	fuzzy := fs.Bool("fuzzy", false, "append close matches (edit distance) below exact results")
-	budget := fs.Duration("budget", 0, "maximum wall-clock time for content verification (for example 150ms)")
+	budget := fs.Duration("budget", 0, "opt-in wall-clock limit for content verification (for example 150ms); omitted or 0 leaves time unbounded")
+	contentVerifyBudget := fs.Int("content-verify-budget", 0, "override the per-query content disk-verification budget: 0 = default ("+strconv.Itoa(contentDiskVerifyBudget)+" reads), max "+strconv.Itoa(contentDiskVerifyBudgetMax)+"; --budget is an optional time bound")
 	cursor := fs.String("cursor", "", "continue a search page from an opaque cursor")
 	if err := fs.Parse(normalizeSearchArgs(args)); err != nil {
 		return err
+	}
+	budgetMS, budgetDisabled, berr := contentBudgetFromFlagSet(fs, *budget)
+	if berr != nil {
+		return berr
+	}
+	if *contentVerifyBudget < 0 {
+		return fmt.Errorf("--content-verify-budget must be >= 0 (0 = default), got %d", *contentVerifyBudget)
+	}
+	if *contentVerifyBudget > contentDiskVerifyBudgetMax {
+		return fmt.Errorf("--content-verify-budget exceeds the maximum %d, got %d", contentDiskVerifyBudgetMax, *contentVerifyBudget)
 	}
 	cfg, err := loadConfig(*configPath)
 	if err != nil {
@@ -933,20 +945,22 @@ func cmdSearch(args []string, countOnly bool) error {
 		return errors.New("query required")
 	}
 	opts := queryOptions{
-		Query:         query,
-		MatchPath:     *matchPath || queryLooksLoosePathScoped(query),
-		Limit:         *limit,
-		Under:         *under,
-		Exists:        *exists,
-		RootBias:      *rootBias,
-		Near:          *near,
-		Current:       *current,
-		Recent:        *recent,
-		ModifiedAfter: *modifiedAfter,
-		CaseSensitive: *caseSensitive,
-		Fuzzy:         *fuzzy,
-		BudgetMS:      int(budget.Milliseconds()),
-		Cursor:        *cursor,
+		Query:                   query,
+		MatchPath:               *matchPath || queryLooksLoosePathScoped(query),
+		Limit:                   *limit,
+		Under:                   *under,
+		Exists:                  *exists,
+		RootBias:                *rootBias,
+		Near:                    *near,
+		Current:                 *current,
+		Recent:                  *recent,
+		ModifiedAfter:           *modifiedAfter,
+		CaseSensitive:           *caseSensitive,
+		Fuzzy:                   *fuzzy,
+		BudgetMS:                budgetMS,
+		BudgetDisabled:          budgetDisabled,
+		ContentDiskVerifyBudget: *contentVerifyBudget,
+		Cursor:                  *cursor,
 	}
 	if *cwdBias {
 		cwd, err := os.Getwd()

@@ -285,6 +285,10 @@ func (s *goSearchService) serviceCommandSearch(w io.Writer, caps serviceCapabili
 	serviceNoteQueryActivity()
 	serviceActiveQueryEnter()
 	defer serviceActiveQueryLeave()
+	if req.BudgetMS < 0 || (req.BudgetDisabled && req.BudgetMS > 0) {
+		_ = json.NewEncoder(w).Encode(serviceResponse{OK: false, Message: "invalid content budget fields"})
+		return
+	}
 	if queryHasFeatureToken(req.Query) {
 		s.serviceCommandFeatureSearch(w, caps, req)
 		return
@@ -331,9 +335,15 @@ func (s *goSearchService) serviceCommandSearch(w io.Writer, caps serviceCapabili
 	if req.Cursor != "" && !req.CountOnly {
 		opts.Limit = cursorOffset + pageLimit
 	}
-	if opts.BudgetMS > 0 && !req.CountOnly {
-		// Budget starts once for the complete request, not once per volume.
-		opts.Trace = &searchTrace{BudgetDeadline: time.Now().Add(time.Duration(opts.BudgetMS) * time.Millisecond)}
+	// Start an explicitly requested wall-clock budget once for the complete
+	// content request, not once per volume. The historical omitted-budget default
+	// is unbounded; only a positive --budget arms a deadline. Parse to scope it
+	// to content queries so name-only searches do not pay for it.
+	if opts.Trace == nil {
+		opts.Trace = &searchTrace{}
+	}
+	if pq, parseErr := parseQuery(opts); parseErr == nil && queryHasAnyContentLeaf(pq) {
+		opts.Trace.armContentDeadline(opts.BudgetMS, opts.BudgetDisabled)
 	}
 	// Per-user ranking: the frecency/query-history store is keyed by the
 	// caller's SID so one LocalSystem service keeps each local user's
@@ -411,6 +421,10 @@ func (s *goSearchService) serviceCommandSearch(w io.Writer, caps serviceCapabili
 		matches, err = searchAll(s.indexes, opts, req.CountOnly)
 		s.indexMu.RUnlock()
 	}
+	// A post-query client may ask for raw --lines output. Publish the final
+	// content accounting after fuzzy top-up too, so the response can carry the
+	// exact remaining deadline and disk-read allowance for that optional pass.
+	trace.publishDiskBudget()
 	searchMS := float64(time.Since(searchStart).Nanoseconds()) / 1_000_000
 	if err != nil {
 		_ = json.NewEncoder(w).Encode(serviceResponse{OK: false, Message: err.Error()})
@@ -432,6 +446,11 @@ func (s *goSearchService) serviceCommandSearch(w io.Writer, caps serviceCapabili
 		serviceLog("search query=%q ms=%.1f planner=%s source=%s decline=%s filename_driver=%s candidates=%d results=%d", req.Query, searchMS, trace.PlannerMode, trace.Source, trace.Decline, trace.FilenameDriver, trace.Candidates, len(matches))
 	}
 	resp := serviceResponse{OK: true, Count: len(matches), SearchMS: searchMS, Fuzzy: fuzzyApplied, FuzzyCorrection: fuzzyCorrection, Source: trace.Source, Decline: trace.Decline, Candidates: trace.Candidates, PlannerMode: trace.PlannerMode, EligibleVolumes: trace.EligibleVolumes, BlocksDecoded: trace.BlocksDecoded, BlocksSkipped: trace.BlocksSkipped, ScalarDriver: trace.ScalarDriver, ScalarInterval: trace.ScalarInterval, RecordsVerified: trace.ScalarRecordsVerified, ComponentDriver: trace.ComponentDriver, ComponentRoots: trace.ComponentRoots, ComponentIntervals: trace.ComponentIntervals, ComponentCardinality: trace.ComponentCardinality, ComponentSelfHits: trace.ComponentSelfHits, ComponentBounds: trace.ComponentBounds, ComponentRecordsVerified: trace.ComponentRecordsVerified, FilenameDriver: trace.FilenameDriver, FilenameRequiredGrams: trace.FilenameRequiredGrams, FilenamePostingHint: trace.FilenamePostingHint, FilenameRecordsVerified: trace.FilenameRecordsVerified, OverlayBaseWindow: trace.OverlayBaseWindow, PostingPrefetchBytes: trace.PostingPrefetchBytes, PostingPrefetchRanges: trace.PostingPrefetchRanges, PostingPrefetchPages: trace.PostingPrefetchPages, Terms: trace.Terms, Declines: trace.Declines, Fallback: trace.Fallback, Complete: trace.completePtr(), BudgetExceeded: trace.BudgetExceeded}
+	if !trace.BudgetDeadline.IsZero() {
+		resp.ContentBudgetDeadlineUnix = trace.BudgetDeadline.UnixNano()
+	}
+	remaining := max(0, trace.DiskVerifyBudget-trace.DiskVerified)
+	resp.ContentDiskVerifyRemaining = &remaining
 	if !req.CountOnly && len(matches) == pageLimit {
 		resp.NextCursor = encodeSearchCursor(requestToOptionsFromService(*req), cursorOffset+pageLimit)
 	}
@@ -882,6 +901,13 @@ func searchService(pipeName string, opts queryOptions, countOnly bool, jsonOut b
 	}
 	if !resp.OK {
 		return serviceResponseError(resp)
+	}
+	if resp.ContentDiskVerifyRemaining != nil {
+		opts.lineBudgetMetadata = true
+		opts.lineDiskVerifyRemaining = resp.ContentDiskVerifyRemaining
+		if resp.ContentBudgetDeadlineUnix != 0 {
+			opts.lineBudgetDeadline = time.Unix(0, resp.ContentBudgetDeadlineUnix)
+		}
 	}
 	if jsonOut {
 		jsonResp := newJSONSearchResponse(resp, opts, countOnly)

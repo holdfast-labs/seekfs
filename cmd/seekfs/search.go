@@ -55,47 +55,51 @@ func decodeSearchCursor(token string, opts queryOptions) (int, error) {
 
 func serviceRequestFromOptions(opts queryOptions, countOnly bool) serviceRequest {
 	return serviceRequest{
-		Command:       "search",
-		Query:         opts.Query,
-		MatchPath:     opts.MatchPath || queryLooksLoosePathScoped(opts.Query),
-		Limit:         opts.Limit,
-		CountOnly:     countOnly,
-		Under:         opts.Under,
-		Exists:        opts.Exists,
-		CWDBias:       opts.CWDBias,
-		RootBias:      opts.RootBias,
-		Near:          opts.Near,
-		Current:       opts.Current,
-		Recent:        opts.Recent,
-		ModifiedAfter: opts.ModifiedAfter,
-		CaseSensitive: opts.CaseSensitive,
-		Fuzzy:         opts.Fuzzy,
-		DeadlineUnix:  opts.DeadlineUnix,
-		RequestSeq:    opts.RequestSeq,
-		BudgetMS:      opts.BudgetMS,
-		Cursor:        opts.Cursor,
+		Command:                 "search",
+		Query:                   opts.Query,
+		MatchPath:               opts.MatchPath || queryLooksLoosePathScoped(opts.Query),
+		Limit:                   opts.Limit,
+		CountOnly:               countOnly,
+		Under:                   opts.Under,
+		Exists:                  opts.Exists,
+		CWDBias:                 opts.CWDBias,
+		RootBias:                opts.RootBias,
+		Near:                    opts.Near,
+		Current:                 opts.Current,
+		Recent:                  opts.Recent,
+		ModifiedAfter:           opts.ModifiedAfter,
+		CaseSensitive:           opts.CaseSensitive,
+		Fuzzy:                   opts.Fuzzy,
+		DeadlineUnix:            opts.DeadlineUnix,
+		RequestSeq:              opts.RequestSeq,
+		BudgetMS:                opts.BudgetMS,
+		BudgetDisabled:          opts.BudgetDisabled,
+		ContentDiskVerifyBudget: opts.ContentDiskVerifyBudget,
+		Cursor:                  opts.Cursor,
 	}
 }
 
 func requestToOptionsFromService(req serviceRequest) queryOptions {
 	return queryOptions{
-		Query:         req.Query,
-		MatchPath:     req.MatchPath,
-		Limit:         req.Limit,
-		Under:         req.Under,
-		Exists:        req.Exists,
-		CWDBias:       req.CWDBias,
-		RootBias:      req.RootBias,
-		Near:          req.Near,
-		Current:       req.Current,
-		Recent:        req.Recent,
-		ModifiedAfter: req.ModifiedAfter,
-		CaseSensitive: req.CaseSensitive,
-		Fuzzy:         req.Fuzzy,
-		DeadlineUnix:  req.DeadlineUnix,
-		RequestSeq:    req.RequestSeq,
-		BudgetMS:      req.BudgetMS,
-		Cursor:        req.Cursor,
+		Query:                   req.Query,
+		MatchPath:               req.MatchPath,
+		Limit:                   req.Limit,
+		Under:                   req.Under,
+		Exists:                  req.Exists,
+		CWDBias:                 req.CWDBias,
+		RootBias:                req.RootBias,
+		Near:                    req.Near,
+		Current:                 req.Current,
+		Recent:                  req.Recent,
+		ModifiedAfter:           req.ModifiedAfter,
+		CaseSensitive:           req.CaseSensitive,
+		Fuzzy:                   req.Fuzzy,
+		DeadlineUnix:            req.DeadlineUnix,
+		RequestSeq:              req.RequestSeq,
+		BudgetMS:                req.BudgetMS,
+		BudgetDisabled:          req.BudgetDisabled,
+		ContentDiskVerifyBudget: req.ContentDiskVerifyBudget,
+		Cursor:                  req.Cursor,
 	}
 }
 
@@ -429,13 +433,16 @@ func entryTypeRank(entry Entry) int {
 }
 
 func searchServiceVolumes(volumes []*serviceVolumeIndex, opts queryOptions, countOnly bool) ([]Entry, error) {
+	if opts.Trace == nil {
+		opts.Trace = &searchTrace{}
+	}
 	if opts.parsedOverride == nil {
 		opts, _ = contentFuzzyExpandQuery(volumes, opts)
 	}
-	if opts.BudgetMS > 0 && !countOnly && opts.Trace != nil && opts.Trace.BudgetDeadline.IsZero() {
-		opts.Trace.BudgetDeadline = time.Now().Add(time.Duration(opts.BudgetMS) * time.Millisecond)
-	}
 	matches, err := searchServiceVolumesInner(volumes, opts, countOnly)
+	if opts.Trace != nil {
+		opts.Trace.publishDiskBudget()
+	}
 	if err != nil || countOnly || len(matches) < 2 {
 		return matches, err
 	}
@@ -455,6 +462,18 @@ func searchServiceVolumesInner(volumes []*serviceVolumeIndex, opts queryOptions,
 	pq, err := parseQuery(opts)
 	if err != nil {
 		return nil, err
+	}
+	if opts.Trace != nil {
+		opts.Trace.DiskVerifyBudget = contentDiskVerifyBudgetOf(pq)
+		// Resolve the per-query disk reservation now, before any verify worker
+		// starts: the exact cap is shared atomic state (see contentDiskBudget).
+		opts.Trace.initDiskBudget()
+		// The wall-clock bound is a content-only concern: the deadline is read
+		// solely by disk verification, so arm it only for content queries and
+		// leave name-only searches byte-identical to the unbounded path.
+		if queryHasAnyContentLeaf(pq) {
+			opts.Trace.armContentDeadline(opts.BudgetMS, opts.BudgetDisabled)
+		}
 	}
 	if countOnly {
 		markCountDivergent(opts, pq)

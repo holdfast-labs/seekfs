@@ -122,17 +122,60 @@ func contentLineText(b []byte) string {
 // contentFileLines reads path and returns its output lines. ok is false when
 // the file cannot be read or is not UTF-8 text (binary, or an extracted format
 // such as PDF/DOCX); callers then fall back to the result's snippet.
-func contentFileLines(path string, m *contentLeafMatcher, positive []contentLeaf, o contentLineOutput) ([]contentOutputLine, bool) {
+func contentFileLines(path string, m *contentLeafMatcher, positive []contentLeaf, o contentLineOutput, trace *searchTrace) ([]contentOutputLine, bool) {
+	if trace != nil && !trace.acquireDiskRead() {
+		return nil, false
+	}
+	if trace != nil && trace.deadlineReached() {
+		trace.markBudgetExceeded()
+		return nil, false
+	}
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, false
 	}
 	defer f.Close()
-	raw, err := io.ReadAll(io.LimitReader(f, contentExtractMaxTextBytes))
-	if err != nil || bytes.IndexByte(raw, 0) >= 0 || !utf8.Valid(raw) {
+	raw, ok := contentLineReadBounded(f, trace)
+	if !ok || bytes.IndexByte(raw, 0) >= 0 || !utf8.Valid(raw) {
 		return nil, false
 	}
 	return contentMatchingLinesAt(path, raw, m, positive, o.maxPerFile, o.before, o.after), true
+}
+
+// contentLineReadChunk is a test seam for the bounded raw line reader.
+var contentLineReadChunk = func(f *os.File, p []byte) (int, error) { return f.Read(p) }
+
+func contentLineReadBounded(f *os.File, trace *searchTrace) ([]byte, bool) {
+	const chunkBytes = 32 << 10
+	limit := int64(contentExtractMaxTextBytes)
+	raw := make([]byte, 0, min(contentExtractMaxTextBytes, chunkBytes))
+	buf := make([]byte, chunkBytes)
+	for int64(len(raw)) < limit {
+		if trace != nil && trace.deadlineReached() {
+			trace.markBudgetExceeded()
+			return nil, false
+		}
+		want := min(len(buf), int(limit-int64(len(raw))))
+		if trace != nil && trace.deadlineReached() {
+			trace.markBudgetExceeded()
+			return nil, false
+		}
+		n, err := contentLineReadChunk(f, buf[:want])
+		if n > 0 {
+			raw = append(raw, buf[:n]...)
+		}
+		if trace != nil && trace.deadlineReached() {
+			trace.markBudgetExceeded()
+			return nil, false
+		}
+		if err == io.EOF {
+			break
+		}
+		if err != nil || n == 0 {
+			return nil, false
+		}
+	}
+	return raw, true
 }
 
 // contentLinePrinter prints ripgrep-style lines for content hits:
@@ -142,6 +185,7 @@ type contentLinePrinter struct {
 	m        *contentLeafMatcher
 	positive []contentLeaf
 	o        contentLineOutput
+	trace    *searchTrace
 	printed  bool // a group was printed (for the `--` separator)
 }
 
@@ -172,11 +216,27 @@ func newContentLinePrinter(opts queryOptions, o contentLineOutput) *contentLineP
 	if len(positive) == 0 {
 		return nil
 	}
-	return &contentLinePrinter{m: newContentLeafMatcher(pq), positive: positive, o: o}
+	return &contentLinePrinter{m: newContentLeafMatcher(pq), positive: positive, o: o, trace: contentLineBudgetTrace(opts)}
 }
 
 func (p *contentLinePrinter) lines(path string) ([]contentOutputLine, bool) {
-	return contentFileLines(path, p.m, p.positive, p.o)
+	return contentFileLines(path, p.m, p.positive, p.o, p.trace)
+}
+
+func contentLineBudgetTrace(opts queryOptions) *searchTrace {
+	trace := &searchTrace{}
+	limit := clampContentDiskVerifyBudget(opts.ContentDiskVerifyBudget)
+	if opts.lineBudgetMetadata && opts.lineDiskVerifyRemaining != nil {
+		limit = max(0, *opts.lineDiskVerifyRemaining)
+		trace.BudgetDeadline = opts.lineBudgetDeadline
+	} else {
+		trace.armContentDeadline(opts.BudgetMS, opts.BudgetDisabled)
+	}
+	trace.DiskVerifyBudget = limit
+	// A zero remaining allowance returned by the service is an exhausted cap,
+	// not the initDiskBudget zero-means-default sentinel.
+	trace.disk = &contentDiskBudget{limit: int64(limit)}
+	return trace
 }
 
 func (p *contentLinePrinter) print(w io.Writer, path, snippet string) {

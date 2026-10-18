@@ -102,8 +102,9 @@ func TestContentRegexVerifyCountsBounded(t *testing.T) {
 				}
 			}
 		}
-		if trace.DiskVerified != wantVerifies {
-			t.Errorf("%s: DiskVerified=%d; want %d (gate-pass files)", q, trace.DiskVerified, wantVerifies)
+		wantTotalReads := wantVerifies + len(matches) // optional snippets share the exact query cap
+		if trace.DiskVerified != wantTotalReads {
+			t.Errorf("%s: DiskVerified=%d; want %d (%d gate-pass files + %d snippet reads)", q, trace.DiskVerified, wantTotalReads, wantVerifies, len(matches))
 		}
 		if trace.DiskCapped {
 			t.Errorf("%s: DiskCapped=true; want complete", q)

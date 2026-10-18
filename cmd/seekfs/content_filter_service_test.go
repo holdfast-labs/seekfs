@@ -1,11 +1,15 @@
 package main
 
 import (
+	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 )
 
 // contentFilterV11Fixture builds a USN service volume over real files with a
@@ -260,11 +264,148 @@ func TestContentDiskVerifyBudgetBoundsQuery(t *testing.T) {
 	if trace == nil || !trace.ContentIncomplete {
 		t.Fatalf("capped query did not mark incomplete (hits=%d)", len(matches))
 	}
-	if len(matches) > 3 {
-		t.Fatalf("capped query returned %d hits past a 3-verify budget", len(matches))
+	if len(matches) != 3 {
+		t.Fatalf("capped query returned %d hits; want exactly a 3-verify budget", len(matches))
 	}
 	if _, _, err := countServiceVolumes([]*serviceVolumeIndex{vol}, queryOptions{Query: "content:needle", Trace: &searchTrace{}}); err == nil {
 		t.Fatal("capped count was answered instead of refused")
+	}
+}
+
+// TestContentDiskVerifyBudgetOverride proves the opt-in per-query override
+// (--content-verify-budget / ContentDiskVerifyBudget) lifts the disk boundary
+// for that request only: with the built-in default pinned low the query is
+// incomplete and the count refused, while the same query with a larger
+// override returns every match, reports complete, and counts exactly.
+func TestContentDiskVerifyBudgetOverride(t *testing.T) {
+	bodies := map[string]string{}
+	for i := 0; i < 30; i++ {
+		bodies["f"+string(rune('a'+i/10))+string(rune('0'+i%10))+".txt"] = "common filler needle"
+	}
+	vol := contentFilterV11Fixture(t, bodies)
+	prev := contentDiskVerifyBudget
+	contentDiskVerifyBudget = 3
+	t.Cleanup(func() { contentDiskVerifyBudget = prev })
+
+	defaultTrace := &searchTrace{}
+	defaultMatches, err := searchServiceVolumes([]*serviceVolumeIndex{vol},
+		queryOptions{Query: "content:needle", Limit: 100, Trace: defaultTrace}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !defaultTrace.ContentIncomplete {
+		t.Fatalf("default-budget query not incomplete (hits=%d)", len(defaultMatches))
+	}
+
+	fullTrace := &searchTrace{}
+	full, err := searchServiceVolumes([]*serviceVolumeIndex{vol},
+		queryOptions{Query: "content:needle", Limit: 100, Trace: fullTrace, ContentDiskVerifyBudget: 100}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(full) != 30 {
+		t.Fatalf("override hits = %d; want 30", len(full))
+	}
+	if fullTrace.ContentIncomplete {
+		t.Fatal("override query wrongly reported incomplete")
+	}
+	n, ok, err := countServiceVolumes([]*serviceVolumeIndex{vol},
+		queryOptions{Query: "content:needle", Trace: &searchTrace{}, ContentDiskVerifyBudget: 100})
+	if err != nil || !ok || n != 30 {
+		t.Fatalf("override count = %d,%v,%v; want 30,true,nil", n, ok, err)
+	}
+}
+
+// TestContentLargePageVerifyCapKeepsPage is the regression for the large-page
+// anomaly: a default-order content query whose page exceeds the parallel-verify
+// threshold (contentParallelVerifyMinIDs) is served by verifyCompactContentParallel
+// from the page verifyContentSupersetPage already verified. When the disk cap
+// fires during that superset pass it latches the cap on the shared reservation;
+// the parallel merger used to re-check it and return immediately, discarding the
+// just-verified page and returning only the contiguous prefix that had arrived
+// (observed live as 0-1 hits out of the verified page, nondeterministic).
+// The page (the exact rank-ordered prefix verified before the cap) must survive.
+//
+// The cap is now an exact, race-free reservation (contentDiskBudget), so with
+// every candidate matching the page is EXACTLY the budget, identical across
+// repetitions, and a byte-for-byte prefix of the uncapped result.
+func TestContentLargePageVerifyCapKeepsPage(t *testing.T) {
+	const files = 400
+	bodies := map[string]string{}
+	want := map[string]bool{}
+	for i := 0; i < files; i++ {
+		name := "f" + fmt.Sprintf("%03d", i) + ".txt"
+		bodies[name] = "common filler needle"
+		want[name] = true
+	}
+	vol := contentFilterV11Fixture(t, bodies)
+	prev, prevMS := contentDiskVerifyBudget, contentDefaultBudgetMS
+	contentDiskVerifyBudget = 300
+	contentDefaultBudgetMS = 0
+	t.Cleanup(func() {
+		contentDiskVerifyBudget = prev
+		contentDefaultBudgetMS = prevMS
+	})
+
+	// The canonical full order with a budget covering every candidate.
+	fullTrace := &searchTrace{}
+	full, err := searchServiceVolumes([]*serviceVolumeIndex{vol},
+		queryOptions{Query: "content:needle", Limit: 1000, Trace: fullTrace, ContentDiskVerifyBudget: 2 * files}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(full) != files || fullTrace.ContentIncomplete {
+		t.Fatalf("uncapped hits=%d incomplete=%v; want %d, false", len(full), fullTrace.ContentIncomplete, files)
+	}
+
+	// Every candidate matches, so an exact cap of N reads yields exactly N
+	// hits, in rank order: the returned page must equal full[:N] in every rep.
+	prefix := make([]string, contentDiskVerifyBudget)
+	for i := range prefix {
+		prefix[i] = full[i].Name
+	}
+	for rep := 0; rep < 5; rep++ {
+		matches, trace, err := contentServiceSearchLimit(t, []*serviceVolumeIndex{vol}, "content:needle", 1000)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if trace == nil || !trace.DiskCapped || !trace.ContentIncomplete {
+			t.Fatalf("rep %d: cap not surfaced (capped=%v incomplete=%v hits=%d)",
+				rep, trace != nil && trace.DiskCapped, trace != nil && trace.ContentIncomplete, len(matches))
+		}
+		if len(matches) != contentDiskVerifyBudget {
+			t.Fatalf("rep %d: hits=%d; want exactly %d (exact cap, no overshoot/truncation)",
+				rep, len(matches), contentDiskVerifyBudget)
+		}
+		seen := map[string]bool{}
+		for i, m := range matches {
+			if !want[m.Name] {
+				t.Fatalf("rep %d: unexpected hit %q", rep, m.Name)
+			}
+			if seen[m.Name] {
+				t.Fatalf("rep %d: duplicate hit %q", rep, m.Name)
+			}
+			seen[m.Name] = true
+			if m.Name != prefix[i] {
+				t.Fatalf("rep %d: rank %d = %q; want %q (stable rank-prefix)", rep, i, m.Name, prefix[i])
+			}
+		}
+		if trace.DiskVerified != contentDiskVerifyBudget {
+			t.Fatalf("rep %d: DiskVerified=%d; want exactly %d", rep, trace.DiskVerified, contentDiskVerifyBudget)
+		}
+	}
+}
+
+// TestContentVerifyBudgetFlagRejectsOutOfRange proves the CLI rejects an
+// out-of-range --content-verify-budget instead of silently clamping or
+// expanding it: negative values and values past the hard maximum are errors.
+func TestContentVerifyBudgetFlagRejectsOutOfRange(t *testing.T) {
+	if err := cmdSearch([]string{"--content-verify-budget", "-1", "needle"}, false); err == nil || !strings.Contains(err.Error(), "must be >= 0") {
+		t.Fatalf("negative budget err = %v; want a >= 0 range error", err)
+	}
+	over := fmt.Sprintf("%d", contentDiskVerifyBudgetMax+1)
+	if err := cmdSearch([]string{"--content-verify-budget", over, "needle"}, false); err == nil || !strings.Contains(err.Error(), "exceeds the maximum") {
+		t.Fatalf("oversized budget err = %v; want a maximum error", err)
 	}
 }
 
@@ -404,5 +545,152 @@ func TestContentFilterHealthMerge(t *testing.T) {
 	mergeContentHealth(&a, b)
 	if a.Docs != 17 || a.ScopeDropped != 1 || a.ScopeDroppedBytes != 50 {
 		t.Fatalf("merged = %+v", a)
+	}
+}
+
+// matchingBodies builds n identical-content files so every candidate matches
+// and an exact disk cap of N reads yields exactly N hits.
+func matchingBodies(n int) map[string]string {
+	bodies := map[string]string{}
+	for i := 0; i < n; i++ {
+		bodies["f"+fmt.Sprintf("%04d", i)+".txt"] = "common filler needle"
+	}
+	return bodies
+}
+
+// TestContentDiskVerifyBudgetWireRoundtrip proves the override survives the
+// CLI -> service wire both ways (serviceRequest JSON), so a resident service
+// sees the caller's --content-verify-budget rather than silently using the
+// built-in default.
+func TestContentDiskVerifyBudgetWireRoundtrip(t *testing.T) {
+	opts := queryOptions{Query: "content:needle", Limit: 10, ContentDiskVerifyBudget: 1234, BudgetMS: 250}
+	req := serviceRequestFromOptions(opts, false)
+	if req.ContentDiskVerifyBudget != 1234 {
+		t.Fatalf("serviceRequestFromOptions dropped the budget: %d", req.ContentDiskVerifyBudget)
+	}
+	raw, err := json.Marshal(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), `"content_disk_verify_budget":1234`) {
+		t.Fatalf("budget missing from wire JSON: %s", raw)
+	}
+	var back serviceRequest
+	if err := json.Unmarshal(raw, &back); err != nil {
+		t.Fatal(err)
+	}
+	got := requestToOptionsFromService(back)
+	if got.ContentDiskVerifyBudget != 1234 || got.BudgetMS != 250 {
+		t.Fatalf("roundtrip = budget %d, budgetMS %d; want 1234, 250", got.ContentDiskVerifyBudget, got.BudgetMS)
+	}
+	// Zero keeps the service default and stays off the wire (omitempty).
+	zero, err := json.Marshal(serviceRequestFromOptions(queryOptions{Query: "needle"}, false))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(zero), "content_disk_verify_budget") {
+		t.Fatalf("zero budget should be omitted: %s", zero)
+	}
+}
+
+// TestContentStablePrefixAcrossBudgets proves the page is an exact, stable
+// rank-prefix: for every budget B the result equals the first B of the
+// uncapped full result, including the default budget when it covers the set.
+func TestContentStablePrefixAcrossBudgets(t *testing.T) {
+	const files = 120
+	vol := contentFilterV11Fixture(t, matchingBodies(files))
+
+	fullTrace := &searchTrace{}
+	full, err := searchServiceVolumes([]*serviceVolumeIndex{vol},
+		queryOptions{Query: "content:needle", Limit: 1000, Trace: fullTrace, ContentDiskVerifyBudget: contentDiskVerifyBudgetMax}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(full) != files || fullTrace.ContentIncomplete {
+		t.Fatalf("uncapped hits=%d incomplete=%v; want %d, false", len(full), fullTrace.ContentIncomplete, files)
+	}
+
+	for _, b := range []int{1, 10, 40, files} {
+		trace := &searchTrace{}
+		got, err := searchServiceVolumes([]*serviceVolumeIndex{vol},
+			queryOptions{Query: "content:needle", Limit: 1000, Trace: trace, ContentDiskVerifyBudget: b}, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(got) != b {
+			t.Fatalf("budget %d: hits=%d; want exactly %d", b, len(got), b)
+		}
+		for i := range got {
+			if got[i].Name != full[i].Name {
+				t.Fatalf("budget %d: rank %d = %q; want prefix %q", b, i, got[i].Name, full[i].Name)
+			}
+		}
+	}
+}
+
+// TestContentDiskVerifyBudgetConcurrentIsolation proves concurrent queries do
+// not share disk-budget state: each request carries its own reservation, so a
+// parallel burst yields exactly each request's own cap, never a merged count.
+func TestContentDiskVerifyBudgetConcurrentIsolation(t *testing.T) {
+	const files = 200
+	vol := contentFilterV11Fixture(t, matchingBodies(files))
+	budgets := []int{1, 2, 3, 5, 8, 13, 21, 34}
+	got := make([]int, len(budgets))
+	incomplete := make([]bool, len(budgets))
+	errs := make([]error, len(budgets))
+	var wg sync.WaitGroup
+	for i, b := range budgets {
+		wg.Add(1)
+		go func(i, b int) {
+			defer wg.Done()
+			trace := &searchTrace{}
+			matches, err := searchServiceVolumes([]*serviceVolumeIndex{vol},
+				queryOptions{Query: "content:needle", Limit: 1000, Trace: trace, ContentDiskVerifyBudget: b}, false)
+			got[i] = len(matches)
+			incomplete[i] = trace.ContentIncomplete
+			errs[i] = err
+		}(i, b)
+	}
+	wg.Wait()
+	for i, b := range budgets {
+		if errs[i] != nil {
+			t.Fatalf("budget %d: %v", b, errs[i])
+		}
+		if got[i] != b || !incomplete[i] {
+			t.Fatalf("budget %d: hits=%d incomplete=%v; want %d, true (isolated per-request cap)",
+				b, got[i], incomplete[i], b)
+		}
+	}
+}
+
+// TestContentBudgetDeadlineCancelsSearchAndCount proves the wall-clock --budget
+// is an independent cancellation bound for BOTH search and count (separate from
+// the disk cap): a passed deadline stops the search with a visible partial page
+// and refuses the count rather than returning a partial tally.
+func TestContentBudgetDeadlineCancelsSearchAndCount(t *testing.T) {
+	vol := contentFilterV11Fixture(t, matchingBodies(200))
+	past := time.Now().Add(-time.Second)
+
+	searchTr := &searchTrace{BudgetDeadline: past}
+	matches, err := searchServiceVolumes([]*serviceVolumeIndex{vol},
+		queryOptions{Query: "content:needle", Limit: 1000, Trace: searchTr}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !searchTr.BudgetExceeded || !searchTr.ContentIncomplete {
+		t.Fatalf("search: exceeded=%v incomplete=%v; want both true",
+			searchTr.BudgetExceeded, searchTr.ContentIncomplete)
+	}
+	if len(matches) != 0 {
+		t.Fatalf("search: hits=%d under an expired deadline; want 0", len(matches))
+	}
+
+	countTrace := &searchTrace{BudgetDeadline: past}
+	if _, ok, err := countServiceVolumes([]*serviceVolumeIndex{vol},
+		queryOptions{Query: "content:needle", Trace: countTrace}); err == nil || !strings.Contains(err.Error(), "incomplete") {
+		t.Fatalf("count: err=%v ok=%v; want a refused (incomplete) tally", err, ok)
+	}
+	if !countTrace.BudgetExceeded {
+		t.Fatal("count: BudgetExceeded not surfaced on the trace")
 	}
 }

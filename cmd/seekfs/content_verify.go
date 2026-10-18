@@ -15,9 +15,12 @@ package main
 import (
 	"bytes"
 	"errors"
+	"flag"
+	"fmt"
 	"os"
 	"regexp"
 	"sort"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 )
@@ -55,6 +58,71 @@ func contentScanVisitBudgetOf(pq parsedQuery) int {
 		return pq.ContentScanVisitBudget
 	}
 	return contentDefaultScanVisitBudget
+}
+
+// contentDiskVerifyBudgetMax is the hard ceiling for a per-query disk
+// verification budget (--content-verify-budget). The historical built-in
+// default remains contentDiskVerifyBudget (512); larger explicit values are
+// clamped here.
+const contentDiskVerifyBudgetMax = 100_000
+
+// contentDefaultBudgetMS is zero to preserve the existing no-implicit-deadline
+// behavior. An explicit positive --budget arms a wall-clock bound; omitted and
+// explicit zero both leave it unarmed. A var so tests can pin deadlines.
+var contentDefaultBudgetMS = 0
+
+// resolveContentBudget turns the CLI --budget duration into the wire selection
+// (budgetMS, disabled). It keeps the three cases distinct: an omitted flag
+// keeps the historical no-time-limit behavior; an explicit 0 disables the time
+// bound; a positive value is the bound. Negative durations and positive
+// sub-millisecond values are rejected rather than silently truncated to 0.
+func resolveContentBudget(d time.Duration, provided bool) (ms int, disabled bool, err error) {
+	if !provided {
+		return 0, false, nil
+	}
+	if d < 0 {
+		return 0, false, fmt.Errorf("--budget must be >= 0 (0 disables the time bound), got %s", d)
+	}
+	if d == 0 {
+		return 0, true, nil
+	}
+	if d < time.Millisecond {
+		return 0, false, fmt.Errorf("--budget must be 0 (disable) or at least 1ms, got %s", d)
+	}
+	return int(d.Milliseconds()), false, nil
+}
+
+// contentBudgetFromFlagSet preserves whether the CLI flag was explicitly set;
+// flag.Duration's value alone cannot distinguish omitted from explicit zero.
+func contentBudgetFromFlagSet(fs *flag.FlagSet, d time.Duration) (ms int, disabled bool, err error) {
+	provided := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "budget" {
+			provided = true
+		}
+	})
+	return resolveContentBudget(d, provided)
+}
+
+// clampContentDiskVerifyBudget returns the effective per-query disk
+// verification budget for an explicit request value. Values <= 0 keep the
+// built-in default; larger values are clamped to contentDiskVerifyBudgetMax so
+// an opt-in override can never read unboundedly.
+func clampContentDiskVerifyBudget(v int) int {
+	if v <= 0 {
+		return contentDiskVerifyBudget
+	}
+	if v > contentDiskVerifyBudgetMax {
+		return contentDiskVerifyBudgetMax
+	}
+	return v
+}
+
+// contentDiskVerifyBudgetOf returns the query's disk verification budget, or
+// the built-in default when unset (<= 0). It is used where a parsedQuery is in
+// hand; the verify path itself reads the pre-resolved value off the trace.
+func contentDiskVerifyBudgetOf(pq parsedQuery) int {
+	return clampContentDiskVerifyBudget(pq.ContentDiskVerifyBudget)
 }
 
 // boundPathCache resets a scan's path-reconstruction memo once it reaches
@@ -622,7 +690,7 @@ func entryMatchesWithContentMatcher(vol *serviceVolumeIndex, entry Entry, pq par
 		return entryMatchesContentAt(entry, pq, matchPath, make([]bool, m.size))
 	}
 	matched := make([]bool, m.size)
-	if text, ok := vol.contentTextForEntryTrace(&entry, pq.Trace); ok {
+	if text, ok := vol.contentTextForEntryVerification(&entry, pq); ok {
 		// Fold the document at most once for the whole entry, and only if a
 		// case-insensitive leaf actually needs it; case-sensitive leaves read
 		// the raw text. The fold lands in a pooled scratch buffer so each
@@ -736,7 +804,18 @@ func entryMatchesContentAt(entry Entry, pq parsedQuery, matchPath bool, matched 
 // (search) or a refused tally (count), never silent. A nil trace disables
 // the cap for bounded callers (snippet attach runs post-limit).
 func (vol *serviceVolumeIndex) contentTextForEntryTrace(entry *Entry, trace *searchTrace) ([]byte, bool) {
-	return vol.contentTextForEntryPath(entry, "", trace)
+	return vol.contentTextForEntryPath(entry, "", trace, false, nil)
+}
+
+func (vol *serviceVolumeIndex) contentTextForEntryVerification(entry *Entry, pq parsedQuery) ([]byte, bool) {
+	return vol.contentTextForEntryPath(entry, "", pq.Trace, false, pq.contentVerifyState)
+}
+
+// contentTextForEntryOptional is for presentation-only enrichment after the
+// match set is fixed. Its reads share the query deadline/cap, but a skipped
+// snippet never changes match completeness or removes the verified hit.
+func (vol *serviceVolumeIndex) contentTextForEntryOptional(entry *Entry, trace *searchTrace) ([]byte, bool) {
+	return vol.contentTextForEntryPath(entry, "", trace, true, nil)
 }
 
 // contentTextForEntry is contentTextForEntryTrace without a trace (uncapped,
@@ -748,7 +827,7 @@ func (vol *serviceVolumeIndex) contentTextForEntry(entry *Entry) ([]byte, bool) 
 // contentTextForEntryPath resolves an entry's text, verifying livePath
 // instead of the entry path when non-empty (callers that resolved a fresher
 // path than the entry carries).
-func (vol *serviceVolumeIndex) contentTextForEntryPath(entry *Entry, livePath string, trace *searchTrace) ([]byte, bool) {
+func (vol *serviceVolumeIndex) contentTextForEntryPath(entry *Entry, livePath string, trace *searchTrace, optional bool, verifyState *atomic.Bool) ([]byte, bool) {
 	if vol == nil || vol.content == nil {
 		return nil, false
 	}
@@ -778,29 +857,37 @@ func (vol *serviceVolumeIndex) contentTextForEntryPath(entry *Entry, livePath st
 		return nil, false
 	}
 	read := func(p string) ([]byte, bool) {
-		if trace != nil {
-			if trace.DiskCapped || trace.BudgetExceeded {
-				return nil, false
+		if trace != nil && optional && !trace.acquireOptionalDiskRead() {
+			return nil, false
+		}
+		if trace != nil && !optional && !trace.acquireDiskRead() {
+			if verifyState != nil {
+				verifyState.Store(true)
 			}
-			// The per-request time budget (--budget, budget_ms) stops new
-			// disk reads like the verify cap does: hits found so far stay,
-			// the result is marked incomplete.
-			if !trace.BudgetDeadline.IsZero() && !time.Now().Before(trace.BudgetDeadline) {
-				trace.BudgetExceeded = true
-				trace.setContentIncomplete()
-				return nil, false
+			// The wall-clock deadline (--budget) or the exact disk cap is
+			// spent: stop reading, keep the hits found so far as a visible
+			// partial page (or a refused tally). acquireDiskRead latched the
+			// shared reservation and marked the query incomplete.
+			return nil, false
+		}
+		if trace != nil && trace.deadlineReached() {
+			if optional {
+				trace.markOptionalEnrichmentSkipped()
+			} else {
+				trace.markBudgetExceeded()
+				if verifyState != nil {
+					verifyState.Store(true)
+				}
 			}
-			if trace.DiskVerified >= contentDiskVerifyBudget {
-				trace.DiskCapped = true
-				trace.setContentIncomplete()
-				return nil, false
-			}
-			trace.DiskVerified++
+			return nil, false
 		}
 		return contentDiskReadForVerify(p, contentServiceExtractSettings())
 	}
 	if text, ok := read(path); ok {
 		return text, true
+	}
+	if optional && trace != nil && trace.optionalEnrichmentSkipped() {
+		return nil, false
 	}
 	// The live path is missing: fall back to the doc table's stored path.
 	// This heals rename races where the record index lags the content index
@@ -812,6 +899,9 @@ func (vol *serviceVolumeIndex) contentTextForEntryPath(entry *Entry, livePath st
 		if docPath := vol.contentDocPathForKey(key); docPath != "" && docPath != path {
 			if text, ok := read(docPath); ok {
 				return text, true
+			}
+			if optional && trace != nil && trace.optionalEnrichmentSkipped() {
+				return nil, false
 			}
 		}
 	}
@@ -1027,7 +1117,7 @@ func contentSnippet(path string, raw, folded []byte, positive []contentLeaf, m *
 // attachContentSnippets fills Entry.Snippet for content-query results. It is
 // called after the result set is bounded by the limit, so the work is O(results).
 // The matcher and positive-leaf list are built once per query by the caller.
-func attachContentSnippets(entries []Entry, volByPath map[string]*serviceVolumeIndex, positive []contentLeaf, m *contentLeafMatcher) {
+func attachContentSnippets(entries []Entry, volByPath map[string]*serviceVolumeIndex, positive []contentLeaf, m *contentLeafMatcher, trace *searchTrace) {
 	if len(entries) == 0 || len(volByPath) == 0 || m == nil || len(positive) == 0 {
 		return
 	}
@@ -1036,7 +1126,7 @@ func attachContentSnippets(entries []Entry, volByPath map[string]*serviceVolumeI
 		if vol == nil {
 			continue
 		}
-		if text, ok := vol.contentTextForEntry(&entries[i]); ok {
+		if text, ok := vol.contentTextForEntryOptional(&entries[i], trace); ok {
 			var folded []byte
 			if !m.caseSensitive {
 				folded = contentFoldAccentAppend(contentFoldScratchGet()[:0], text)
@@ -1617,10 +1707,13 @@ func (vol *serviceVolumeIndex) countContentVolume(opts queryOptions) (int, error
 	if _, err := vol.searchContentVolume(opts, true); err != nil {
 		return 0, err
 	}
+	if opts.Trace != nil && opts.Trace.deadlineReached() {
+		opts.Trace.markBudgetExceeded()
+	}
 	// A disk verification cap hit during the tally means the count is
 	// partial: refuse it outright, like the candidate-budget overrun — never
 	// a silent partial number.
-	if opts.Trace != nil && opts.Trace.DiskCapped {
+	if opts.Trace != nil && opts.Trace.stopDiskVerify() {
 		return 0, errContentIncomplete
 	}
 	// The base scan counted base matches; add the overlay count here so a
@@ -1839,12 +1932,17 @@ func searchContentServiceVolumes(volumes []*serviceVolumeIndex, opts queryOption
 	if !countOnly && userLimit > 0 && len(results) > userLimit {
 		results = results[:userLimit]
 	}
+	// Deadline is checked before optional snippets: a timed-out enrichment must
+	// not make an otherwise complete verified match set incomplete.
+	if opts.Trace != nil && opts.Trace.deadlineReached() {
+		opts.Trace.markBudgetExceeded()
+	}
 	// Snippets are attached last so the work is bounded by the returned set.
 	if postVerify {
-		attachContentSnippets(results, volByPath, positive, contentMatcher)
+		attachContentSnippets(results, volByPath, positive, contentMatcher, opts.Trace)
 	}
 	opts.Trace.setPlannerMode("service-content")
-	opts.Trace.setComplete(opts.Trace == nil || (!opts.Trace.ContentPartial && !opts.Trace.ContentIncomplete))
+	opts.Trace.setComplete(opts.Trace == nil || (!opts.Trace.ContentPartial && !opts.Trace.contentIncomplete()))
 	return results, nil
 }
 

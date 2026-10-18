@@ -376,8 +376,8 @@ func TestContentLargePostingSupersetVerifiesPage(t *testing.T) {
 		t.Fatalf("large posting superset returned %d hits, incomplete=%v; want 20, true", len(matches), trace.ContentIncomplete)
 	}
 	// Verified in parallel batches: at most one batch past the page.
-	if limit := 20 + 4*contentParallelWorkers(); trace.DiskVerified > limit {
-		t.Fatalf("ranked page verified %d files, want at most %d", trace.DiskVerified, limit)
+	if limit := 20 + 4*contentParallelWorkers() + len(matches); trace.DiskVerified > limit {
+		t.Fatalf("ranked page and snippets verified %d files, want at most %d", trace.DiskVerified, limit)
 	}
 }
 

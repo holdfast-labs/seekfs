@@ -544,6 +544,7 @@ func searchServiceVolumesGlobalContentComponentsSnapshot(snapshot globalQuerySna
 	if countOnly || !contentGlobalLaneEnabled() {
 		return nil, false, nil
 	}
+	pq.ensureDiskBudget()
 	usable, skipped, ok := contentLaneScope(snapshot, pq, true)
 	if !ok {
 		return nil, false, nil
@@ -608,10 +609,13 @@ func searchServiceVolumesGlobalContentComponentsSnapshot(snapshot globalQuerySna
 	filtered = filterImplicitUnderExisting(filtered, opts, false)
 	markContentQueryDegraded(opts.Trace, skipped)
 	if opts.Trace != nil {
+		if opts.Trace.deadlineReached() {
+			opts.Trace.markBudgetExceeded()
+		}
 		opts.Trace.ComponentRecordsVerified += verified
 		opts.Trace.setPlannerMode("global-content-components")
 		opts.Trace.setSource("global:content-components", len(filtered))
-		opts.Trace.setComplete(opts.Trace == nil || !opts.Trace.ContentPartial)
+		opts.Trace.setComplete(opts.Trace == nil || (!opts.Trace.ContentPartial && !opts.Trace.contentIncomplete()))
 	}
 	if limit > 0 && len(filtered) > limit {
 		filtered = filtered[:limit]
@@ -623,7 +627,7 @@ func searchServiceVolumesGlobalContentComponentsSnapshot(snapshot globalQuerySna
 		for i := range filtered {
 			volByPath[filtered[i].Path] = usable[0]
 		}
-		attachContentSnippets(filtered, volByPath, contentPositiveLeaves(pq), matcher)
+		attachContentSnippets(filtered, volByPath, contentPositiveLeaves(pq), matcher, opts.Trace)
 	}
 	return filtered, true, nil
 }
@@ -636,6 +640,7 @@ func countServiceVolumesGlobalContentComponentsSnapshot(snapshot globalQuerySnap
 	if !contentGlobalLaneEnabled() {
 		return 0, false, nil
 	}
+	pq.ensureDiskBudget()
 	usable, skipped, ok := contentLaneScope(snapshot, pq, false)
 	if !ok {
 		return 0, false, nil
@@ -669,10 +674,16 @@ func countServiceVolumesGlobalContentComponentsSnapshot(snapshot globalQuerySnap
 		opts.Trace.ContentCountDivergent = true
 	}
 	if opts.Trace != nil {
+		if opts.Trace.deadlineReached() {
+			opts.Trace.markBudgetExceeded()
+		}
 		opts.Trace.ComponentRecordsVerified += verified
 		opts.Trace.setPlannerMode("global-content-components")
 		opts.Trace.setSource("global:content-components-count", count)
-		opts.Trace.setComplete(opts.Trace == nil || !opts.Trace.ContentPartial)
+		opts.Trace.setComplete(opts.Trace == nil || (!opts.Trace.ContentPartial && !opts.Trace.contentIncomplete()))
+		if opts.Trace.contentIncomplete() {
+			return 0, true, errContentIncomplete
+		}
 	}
 	return count, true, nil
 }

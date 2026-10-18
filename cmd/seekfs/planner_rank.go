@@ -201,12 +201,16 @@ type contentRelevance struct {
 	first int
 }
 
-func contentRelevanceOf(vol *serviceVolumeIndex, entry Entry, pq parsedQuery, m *contentLeafMatcher) contentRelevance {
+func contentRelevanceOf(vol *serviceVolumeIndex, entry Entry, pq parsedQuery, m *contentLeafMatcher, traces ...*searchTrace) contentRelevance {
 	rel := contentRelevance{first: contentRelevanceNoOffset}
 	if vol == nil || m == nil {
 		return rel
 	}
-	text, ok := vol.contentTextForEntry(&entry)
+	var trace *searchTrace
+	if len(traces) > 0 {
+		trace = traces[0]
+	}
+	text, ok := vol.contentTextForEntryTrace(&entry, trace)
 	if !ok {
 		return rel
 	}
@@ -279,8 +283,14 @@ func sortContentEntriesByRelevance(entries []Entry, volByPath map[string]*servic
 	rel := make([]contentRelevance, len(entries))
 	order := make([]int, len(entries))
 	for i := range entries {
-		rel[i] = contentRelevanceOf(volByPath[entries[i].Path], entries[i], pq, m)
+		rel[i] = contentRelevanceOf(volByPath[entries[i].Path], entries[i], pq, m, pq.Trace)
 		order[i] = i
+	}
+	// Relevance is optional ranking enrichment and may reread verified files.
+	// If the query budget stops that pass, keep the already-verified base order
+	// rather than sorting a mixture of complete and missing relevance keys.
+	if pq.Trace != nil && pq.Trace.contentIncomplete() {
+		return
 	}
 	defaultPQ := pq
 	defaultPQ.SortColumn = ""
