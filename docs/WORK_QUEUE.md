@@ -152,10 +152,13 @@ GOMAXPROCS=2, peak disk 0.56x extracted. Limit-20 warm/first: rare literal
   (3) tokenize+emit CPU (~5 s of 6), only matters warm or after (1).
 - **Fold cost under no stored text:** a fold re-reads every doc in the shard
   from disk (5.6 ms/doc). Keep shards small, or fold from postings only.
-- **Delta-varint spill runs:** the external section builder spills raw 8-byte
-  (key, docID) records: 1.02x of extracted text per shard on a blink subtree,
-  vs ~0.18x if delta+varint coded per key. Shrinks per-shard scratch (fixed
-  slack) and build IO about 5x (streampost NOTES.md, 2026-10-15).
+- **Delta-varint spill runs: DONE** (562fe42). Grouped per key with
+  delta-varint docIDs. blink/renderer/core (79.9 MB extracted, 2 shards): spill
+  run peak 77.1 -> 24.3 MB (-69%), total build disk peak 174.2 -> 121.4 MB
+  (2.18x -> 1.52x incl. the fixed 128 MiB scratch slack), final sections
+  byte-identical (sha256 34ee9a5d...). Next coverage lever: re-derive the
+  reserve model's per-extracted-byte peak floor from this, so the
+  reserve-governed default admits more of the drive.
 - **Host-sensitive reconcile tests:** `TestContentAttachReconciles{WorktreePolicyToMain,
   WorktreePolicyToAll,VanishedWorktree}` end `stale` when TEMP is on C:
   (nearly full) and pass with TEMP on E: (fails back to at least 878b6d2, so
