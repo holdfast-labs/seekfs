@@ -156,9 +156,11 @@ GOMAXPROCS=2, peak disk 0.56x extracted. Limit-20 warm/first: rare literal
   delta-varint docIDs. blink/renderer/core (79.9 MB extracted, 2 shards): spill
   run peak 77.1 -> 24.3 MB (-69%), total build disk peak 174.2 -> 121.4 MB
   (2.18x -> 1.52x incl. the fixed 128 MiB scratch slack), final sections
-  byte-identical (sha256 34ee9a5d...). Next coverage lever: re-derive the
-  reserve model's per-extracted-byte peak floor from this, so the
-  reserve-governed default admits more of the drive.
+  byte-identical (sha256 34ee9a5d...). Spill runs sit inside the fixed
+  per-shard scratch slack (2 x 64 MiB), not the 0.8x per-extracted-byte peak
+  multiplier, so this mainly cuts build IO/scratch; selection is unchanged.
+  The live E: auto-scope build (640,581 docs) drops nothing for budget, so E:
+  coverage is now bound by scope/inclusion rules, not disk.
 - **Host-sensitive reconcile tests:** `TestContentAttachReconciles{WorktreePolicyToMain,
   WorktreePolicyToAll,VanishedWorktree}` end `stale` when TEMP is on C:
   (nearly full) and pass with TEMP on E: (fails back to at least 878b6d2, so
