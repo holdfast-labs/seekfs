@@ -55,6 +55,14 @@ corruption, exact required sources, auto-fuzzy only on zero exact hits).
 |---|---|---|
 | `perf/static-ranking` | staticrank | **Parked** at WIP commit `761db7b` (OR-lane case unresolved, suite not green); resume only with a fresh, narrow brief (G13) |
 
+Merged 2026-10-17: `content/verify-frontier` (e271c17): parallel verifiers stop at
+the first unverified candidate when the disk cap runs out (no page gaps), exact
+concurrent read accounting, default 512 reads with no implicit deadline,
+snippets/`--lines` share the cap and deadline, large-page cap fix. Open:
+regex pages underfill (40 hits at limit 100/520 on the E: copy); incomplete
+overlay-merged pages are not guaranteed rank prefixes (`mergeOverlayMatches`);
+cursor v2 needs a candidate frontier plus content delta/source mutation identity.
+
 Merged 2026-10-16: `perf/footprint-shards` (b329cd3: lazy front-coded paths with a
 locked restart cache, one composite doc table; heap after content attach
 63.5 -> 45.3 MB on chrome/), `perf/query-transients` (231b7f0: pooled verify read
