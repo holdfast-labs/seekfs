@@ -29,6 +29,17 @@
   (<https://github.com/noahdunnagan/fsearch>), never the unrelated Linux GTK
   app cboxdoerfer/fsearch. "fff" means **dmtrKovalenko/fff**
   (<https://github.com/dmtrKovalenko/fff>, fff.nvim).
+- Noah's fsearch supports indexed content search (smart-case and line-based
+  content regex). Its content index is a trigram index plus a per-file filter
+  that narrows candidates; matching text is read **fresh from source files on
+  disk**, and files edited since the last index sync are read directly. Content
+  search is therefore **not index-only**: candidate-file disk verification is
+  consistent with the reference architecture, so evaluate candidate
+  selectivity, bounded-page/verification behavior, correctness, and latency
+  rather than assuming any source-file read violates the design goal. Check the
+  relevant source revision (e.g. `src/content.rs`, `src/query.rs`) before making
+  implementation-specific claims; do not attribute the GTK project's limits to
+  Noah's.
 - `docs/REFERENCE_TOOLS.md` summarizes how each one works and lists seekfs's
   current gaps against them. Read it before working on speed, ranking, typo
   tolerance, content coverage or index size, and update its gap list when you
