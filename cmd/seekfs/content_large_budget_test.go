@@ -69,14 +69,31 @@ func TestContentLargeBudgetVerifyBounded(t *testing.T) {
 		name  string
 		query string
 		recs  func(string, int) []contentVolRecord
+		hide  bool
 	}{
-		{"regex-unknown-probe", `content:/a.b/`, contentLargeBudgetRegexRecords},
-		{"literal-known-superset", "content:ababab", contentLargeBudgetLiteralRecords},
+		{"regex-unknown-probe", `content:/a.b/`, contentLargeBudgetRegexRecords, false},
+		{"literal-known-superset", "content:ababab", contentLargeBudgetLiteralRecords, false},
+		// A pending WAL overlay (hidden base IDs) disables the page-limit
+		// reduction, so the volume searches the completeness window and
+		// verifies until it has window matches or the disk cap is spent. Only
+		// non-matching files are hidden, so the page is unchanged.
+		{"regex-hidden-overlay", `content:/a.b/`, contentLargeBudgetRegexRecords, true},
+		{"literal-hidden-overlay", "content:ababab", contentLargeBudgetLiteralRecords, true},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			vol := newContentRecordVolume(t, "C:", tc.recs("C:", files))
+			if tc.hide {
+				changes := make([]usnChange, 0, 3)
+				for _, i := range []uint64{1, 2, 3} { // frn = i+2, all non-matching
+					changes = append(changes, usnChange{FRN: i + 2, USN: int64(i) + 7, Reason: usnReasonFileDelete})
+				}
+				vol.applyUSNChanges(changes)
+				if vol.snapshotHiddenBaseIDs().empty() {
+					t.Fatal("pending deletes did not hide base records")
+				}
+			}
 			vols := []*serviceVolumeIndex{vol}
 
 			prev := contentDiskReadForVerify

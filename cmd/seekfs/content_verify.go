@@ -1860,8 +1860,20 @@ func searchContentServiceVolumes(volumes []*serviceVolumeIndex, opts queryOption
 		// candidate fast path, so it must also disable the page reduction:
 		// otherwise the window probe below (len(matches) >= window) can never
 		// fire and a window-full query reports complete.
-		reduced := !opts.contentFullCandidates && defaultOrder && contentVolume &&
-			userLimit > 0 && userLimit < window && vol.snapshotHiddenBaseIDs().empty()
+		probeForPage := !opts.contentFullCandidates && defaultOrder && contentVolume &&
+			userLimit > 0 && userLimit < window
+		reduced := probeForPage && vol.snapshotHiddenBaseIDs().empty()
+		// A pending overlay forces the full completeness window, but the page
+		// only needs userLimit results: that window pass is a completeness probe
+		// for the page. Bound its disk reads at the default page-scaled valve so
+		// an explicit larger --content-verify-budget cannot make it verify the
+		// window's worth of files (or the whole volume, when fewer than window
+		// matches exist) for a page of userLimit. The bounded probe latches
+		// incomplete exactly as a default-budget query would.
+		if windowProbe := probeForPage && !reduced; windowProbe {
+			opts.Trace.capDiskBudgetForProbe(
+				contentDiskVerifyBudgetOf(parsedQuery{Limit: userLimit}))
+		}
 		if reduced {
 			volOpts.Limit = userLimit
 			volOpts.contentWindow = window
