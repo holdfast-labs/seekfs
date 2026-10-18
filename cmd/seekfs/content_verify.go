@@ -1878,7 +1878,13 @@ func searchContentServiceVolumes(volumes []*serviceVolumeIndex, opts queryOption
 			// Anything else (an unbounded source such as a regex, or a superset
 			// exactly at the window) must widen back to the window so the
 			// len(matches) >= window probe can decide, exactly as pre-PB8. A
-			// shared boundary name forces the widen for merge-tie parity.
+			// shared boundary name forces the widen for merge-tie parity, but
+			// only when more than one volume is searched: the cross-volume merge
+			// breaks name ties by path while a volume breaks them by record id,
+			// and with a single volume there is no merge, so the page order
+			// already matches the unbounded search and widening would only
+			// re-read the window (spending the shared disk-verify budget) for
+			// byte-identical output.
 			//
 			// Gate on the page being filled (len >= userLimit), not on an exact
 			// equality: a pending overlay addition is merged in after the base
@@ -1890,7 +1896,7 @@ func searchContentServiceVolumes(volumes []*serviceVolumeIndex, opts queryOption
 			// the merged tail, which an overlay addition can occupy.
 			widen := err == nil && reduced && len(matches) >= userLimit &&
 				((!probe.windowCapped && !probe.supersetBelowWindow) ||
-					vol.nameLowerNameShared(entryLowerName(matches[userLimit-1])))
+					(len(volumes) > 1 && vol.nameLowerNameShared(entryLowerName(matches[userLimit-1]))))
 			if widen {
 				volOpts.Limit = window
 				volOpts.contentWindow = 0
