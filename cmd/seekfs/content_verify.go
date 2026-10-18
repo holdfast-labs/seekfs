@@ -1894,14 +1894,28 @@ func searchContentServiceVolumes(volumes []*serviceVolumeIndex, opts queryOption
 			// never evaluated. The boundary is the last entry the global limit
 			// keeps (index userLimit-1 of the name/path-sorted merged set), not
 			// the merged tail, which an overlay addition can occupy.
+			unknownProbe := !probe.windowCapped && !probe.supersetBelowWindow
 			widen := err == nil && reduced && len(matches) >= userLimit &&
-				((!probe.windowCapped && !probe.supersetBelowWindow) ||
+				(unknownProbe ||
 					(len(volumes) > 1 && vol.nameLowerNameShared(entryLowerName(matches[userLimit-1]))))
 			if widen {
 				volOpts.Limit = window
 				volOpts.contentWindow = 0
 				probe = &contentCompletenessProbe{}
 				volOpts.contentProbe = probe
+				// An unknown probe means the candidate source could not prove
+				// anything about broadness (an unbounded source such as a
+				// regex with no provable literals), so the re-search must walk
+				// the volume again to decide completeness. Bound that
+				// completeness probe at the default page-scaled valve: an
+				// explicit larger --content-verify-budget grows the ranked
+				// page verify, but must not let the probe re-read the drive
+				// past it (see capDiskBudgetForProbe). The bounded probe
+				// latches incomplete exactly as a default-budget query would.
+				if unknownProbe {
+					opts.Trace.capDiskBudgetForProbe(
+						contentDiskVerifyBudgetOf(parsedQuery{Limit: userLimit}))
+				}
 				matches, err = vol.searchContentVolume(volOpts, countOnly)
 			}
 		} else if filenameOnly && vol != nil {

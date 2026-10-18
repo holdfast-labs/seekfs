@@ -826,6 +826,26 @@ func (b *contentDiskBudget) remaining() int64 {
 	return r
 }
 
+// capDiskBudgetForProbe lowers the query's disk reservation to at most limit
+// reads, never raising it. It bounds a completeness-probe re-search: the probe
+// runs after the reduced first pass has stopped and all its verify workers have
+// joined, so the single-threaded swap is race-free. The lowered reservation
+// stays in force for the rest of the query (including snippets and later
+// volumes), so once an unknown-probe widen is needed the whole query reads no
+// more than a default-budget query would; a probe that exhausts it latches
+// capped/incomplete on the shared reservation exactly as the default valve
+// would. A limit at or above the current one is left untouched, and a used count
+// already past the limit caps the probe at the used count (no reads remain).
+func (t *searchTrace) capDiskBudgetForProbe(limit int) {
+	if t == nil || t.disk == nil || limit <= 0 || int64(limit) >= t.disk.limit {
+		return
+	}
+	if used := t.disk.used.Load(); int64(limit) < used {
+		limit = int(used)
+	}
+	t.disk.limit = int64(limit)
+}
+
 // capFiresWithin reports whether a batch of n more reads could exhaust the
 // exact disk cap. Callers verify such a boundary batch serially, in rank order,
 // so the capped page is a deterministic rank-prefix rather than whichever
