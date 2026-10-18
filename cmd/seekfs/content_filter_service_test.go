@@ -256,6 +256,7 @@ func TestContentDiskVerifyBudgetBoundsQuery(t *testing.T) {
 	vol := contentFilterV11Fixture(t, bodies)
 	prev := contentDiskVerifyBudget
 	contentDiskVerifyBudget = 3
+	pinContentDiskVerifyPageScale(t, 1)
 	t.Cleanup(func() { contentDiskVerifyBudget = prev })
 	matches, trace, err := contentServiceSearchLimit(t, []*serviceVolumeIndex{vol}, "content:needle", 100)
 	if err != nil {
@@ -341,6 +342,7 @@ func TestContentLargePageVerifyCapKeepsPage(t *testing.T) {
 	vol := contentFilterV11Fixture(t, bodies)
 	prev, prevMS := contentDiskVerifyBudget, contentDefaultBudgetMS
 	contentDiskVerifyBudget = 300
+	pinContentDiskVerifyPageScale(t, 1)
 	contentDefaultBudgetMS = 0
 	t.Cleanup(func() {
 		contentDiskVerifyBudget = prev

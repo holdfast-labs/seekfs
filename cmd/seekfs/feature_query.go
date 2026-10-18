@@ -250,7 +250,7 @@ func (s *goSearchService) searchFeatureQuery(opts queryOptions, countOnly bool) 
 	// exact per-query disk reservation here, before any verification, and honor
 	// the wall-clock budget for the content part. See contentDiskBudget.
 	if opts.Trace != nil {
-		opts.Trace.DiskVerifyBudget = contentDiskVerifyBudgetOf(pq)
+		opts.Trace.DiskVerifyBudget = contentDiskVerifyBudgetForPage(pq, opts, countOnly)
 		opts.Trace.initDiskBudget()
 		if queryHasAnyContentLeaf(pq) {
 			opts.Trace.armContentDeadline(opts.BudgetMS, opts.BudgetDisabled)

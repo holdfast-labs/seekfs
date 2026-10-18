@@ -464,7 +464,7 @@ func searchServiceVolumesInner(volumes []*serviceVolumeIndex, opts queryOptions,
 		return nil, err
 	}
 	if opts.Trace != nil {
-		opts.Trace.DiskVerifyBudget = contentDiskVerifyBudgetOf(pq)
+		opts.Trace.DiskVerifyBudget = contentDiskVerifyBudgetForPage(pq, opts, countOnly)
 		// Resolve the per-query disk reservation now, before any verify worker
 		// starts: the exact cap is shared atomic state (see contentDiskBudget).
 		opts.Trace.initDiskBudget()

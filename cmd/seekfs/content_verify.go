@@ -122,7 +122,25 @@ func clampContentDiskVerifyBudget(v int) int {
 // the built-in default when unset (<= 0). It is used where a parsedQuery is in
 // hand; the verify path itself reads the pre-resolved value off the trace.
 func contentDiskVerifyBudgetOf(pq parsedQuery) int {
-	return clampContentDiskVerifyBudget(pq.ContentDiskVerifyBudget)
+	if pq.ContentDiskVerifyBudget > 0 {
+		return clampContentDiskVerifyBudget(pq.ContentDiskVerifyBudget)
+	}
+	scale := 1
+	if unit := contentDiskVerifyPageUnit; unit > 0 && pq.Limit > unit {
+		scale = min((pq.Limit+unit-1)/unit, max(contentDiskVerifyPageScaleMax, 1))
+	}
+	return min(contentDiskVerifyBudget*scale, contentDiskVerifyBudgetMax)
+}
+
+// contentDiskVerifyBudgetForPage is contentDiskVerifyBudgetOf for a request
+// whose parsed query does not carry the page limit yet (parseQuery leaves
+// pq.Limit unset). Counts verify no page, so they keep the plain valve.
+func contentDiskVerifyBudgetForPage(pq parsedQuery, opts queryOptions, countOnly bool) int {
+	pq.Limit = 0
+	if !countOnly {
+		pq.Limit = normalizedLimit(opts.Limit, false)
+	}
+	return contentDiskVerifyBudgetOf(pq)
 }
 
 // boundPathCache resets a scan's path-reconstruction memo once it reaches

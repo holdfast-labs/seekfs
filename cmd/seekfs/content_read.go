@@ -459,6 +459,17 @@ func (r *contentReader) verifyDiskContent(id uint32, needle []byte, grams []uint
 // Delta hits never count (memory, not disk). A var so tests pin it.
 var contentDiskVerifyBudget = 512
 
+// contentDiskVerifyPageUnit and contentDiskVerifyPageScaleMax size the default
+// valve to the requested page: one contentDiskVerifyBudget per started unit of
+// page slots, up to the scale max. A low-precision superset (regex with common
+// literals verifies ~1 hit per 10 reads on Chromium) otherwise fills about
+// 50 hits at any limit. Pages up to one unit keep the plain valve, and an
+// explicit --content-verify-budget is never scaled. Vars so tests pin them.
+var (
+	contentDiskVerifyPageUnit     = 32
+	contentDiskVerifyPageScaleMax = 16
+)
+
 // candidates returns the docIDs that could contain term: trigram intersection
 // when the term has at least three bytes, otherwise every document. The result
 // is always a superset; verification decides. At most budget docIDs are

@@ -242,6 +242,7 @@ func TestContentTruncatedPageResumesWithoutGaps(t *testing.T) {
 	prevMS, prevValve := contentDefaultBudgetMS, contentDiskVerifyBudget
 	contentDefaultBudgetMS = 0
 	contentDiskVerifyBudget = valve
+	pinContentDiskVerifyPageScale(t, 1)
 	t.Cleanup(func() {
 		contentDefaultBudgetMS = prevMS
 		contentDiskVerifyBudget = prevValve
@@ -287,4 +288,41 @@ func TestContentTruncatedPageResumesWithoutGaps(t *testing.T) {
 			t.Fatalf("resume rank %d = %q; want %q (gap-free prefix)", i, path, full[i].Path)
 		}
 	}
+}
+
+// TestContentDiskVerifyBudgetScalesWithPage pins the page-sized default valve:
+// pages up to one unit keep the plain valve, larger pages get one valve per
+// started unit up to the scale max, and an explicit override is never scaled.
+func TestContentDiskVerifyBudgetScalesWithPage(t *testing.T) {
+	prev, prevUnit, prevScale := contentDiskVerifyBudget, contentDiskVerifyPageUnit, contentDiskVerifyPageScaleMax
+	contentDiskVerifyBudget, contentDiskVerifyPageUnit, contentDiskVerifyPageScaleMax = 512, 32, 16
+	t.Cleanup(func() {
+		contentDiskVerifyBudget, contentDiskVerifyPageUnit, contentDiskVerifyPageScaleMax = prev, prevUnit, prevScale
+	})
+	cases := []struct{ limit, override, want int }{
+		{0, 0, 512},
+		{20, 0, 512},
+		{32, 0, 512},
+		{33, 0, 1024},
+		{100, 0, 2048},
+		{520, 0, 8192},
+		{100000, 0, 8192},
+		{520, 64, 64},
+		{20, 4096, 4096},
+	}
+	for _, c := range cases {
+		pq := parsedQuery{Limit: c.limit, ContentDiskVerifyBudget: c.override}
+		if got := contentDiskVerifyBudgetOf(pq); got != c.want {
+			t.Errorf("limit=%d override=%d: budget %d, want %d", c.limit, c.override, got, c.want)
+		}
+	}
+}
+
+// pinContentDiskVerifyPageScale pins the page-sized valve scale for a test that
+// asserts the plain contentDiskVerifyBudget at a page larger than one unit.
+func pinContentDiskVerifyPageScale(t *testing.T, scale int) {
+	t.Helper()
+	prev := contentDiskVerifyPageScaleMax
+	contentDiskVerifyPageScaleMax = scale
+	t.Cleanup(func() { contentDiskVerifyPageScaleMax = prev })
 }
