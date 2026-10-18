@@ -58,8 +58,12 @@ corruption, exact required sources, auto-fuzzy only on zero exact hits).
 Merged 2026-10-17: `content/verify-frontier` (e271c17): parallel verifiers stop at
 the first unverified candidate when the disk cap runs out (no page gaps), exact
 concurrent read accounting, default 512 reads with no implicit deadline,
-snippets/`--lines` share the cap and deadline, large-page cap fix. Open:
-regex pages underfill (40 hits at limit 100/520 on the E: copy); incomplete
+snippets/`--lines` share the cap and deadline, large-page cap fix. Regex
+underfill fixed in 2138aa8 (default valve scales with the page: 512 reads per
+32 slots, max 8,192; warm `-n 520` regex 684 ms, cold 9.7 s). Open: a widen pass
+(shared boundary name) re-runs the volume at the 10k window and spends the rest
+of a large explicit budget (`-content-verify-budget 20000` took 26 s for 100
+hits); `count` with a high budget hits the 30 s client timeout; incomplete
 overlay-merged pages are not guaranteed rank prefixes (`mergeOverlayMatches`);
 cursor v2 needs a candidate frontier plus content delta/source mutation identity.
 
