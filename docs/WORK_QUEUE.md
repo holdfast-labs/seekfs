@@ -61,8 +61,10 @@ concurrent read accounting, default 512 reads with no implicit deadline,
 snippets/`--lines` share the cap and deadline, large-page cap fix. Regex
 underfill fixed in 2138aa8 (default valve scales with the page: 512 reads per
 32 slots, max 8,192; warm `-n 520` regex 684 ms, cold 9.7 s). The shared-name widen
-(re-ran the volume at the 10k window, 26 s with `-content-verify-budget 20000`)
-is now multi-volume only (8283924). Open: `count` with a high budget hits the 30 s client timeout; incomplete
+is now multi-volume only (8283924; warm regex n=20 340 -> 131 ms). Open: an
+explicit large `-content-verify-budget` (20000) still takes ~26 s for a 100-hit
+regex page on the E: service (default budget: 0.3 s), so something reads past
+the filled page when the budget is large (not the widen); `count` with a high budget hits the 30 s client timeout; incomplete
 overlay-merged pages are not guaranteed rank prefixes (`mergeOverlayMatches`);
 cursor v2 needs a candidate frontier plus content delta/source mutation identity.
 
