@@ -265,9 +265,14 @@ GOMAXPROCS=2, peak disk 0.56x extracted. Limit-20 warm/first: rare literal
 - **Save-time peak:** the write guard checks free space before each shard save,
   but a save briefly holds both the section files and the output (§6x
   residual). Account for it, or stream the save.
-- **Dense-text spool:** the fastest zstd level stores high-entropy text
-  uncompressed (1.000x). The default level gets 0.637x, about 28% more
-  coverage on dense corpora for roughly +4 s of serial encode (§6x).
+- **Dense-text spool: CLOSED 2026-10-19** (`content/spool-level` NOTES.md, 9868e01).
+  Selection already charges the measured staged spool bytes
+  (`content_service_build.go` ~990, credited back in `content_space.go` ~166);
+  the ratio only moves the peak multiplier, whose 0.8 floor binds below r = 0.325.
+  Measured per-doc ratios on E:ench\chromium: code 0.244 (Fastest) vs 0.231
+  (Default, 2.2x slower encode); dense/minified/generated 0.260 vs 0.242. Default
+  would select the same docs. Only a corpus with aggregate r > 0.35 gains
+  (the earlier 1.000 -> 0.637 sample would gain 28%); rerun the benchmark if one shows up.
 - **JSON-lines stdio mode (G12):** optional and low priority. **No MCP
   server**: the owner ruled it out on 2026-10-13.
 - **Live restart validation:** the deferred USN catch-up (restart serves in
