@@ -111,10 +111,14 @@ tests stay out of the ProgramData service log). Then `feat/content-cursor-v2` (4
 v2 cursor carries the last emitted record ID plus name/sidecar/delta identity;
 resume rebuilds the candidate order and verifies about one page; identity change
 restarts with `cursor_restarted`. Only single volume, non-relevance sort, empty
-name overlay and content delta; other shapes keep v1. Running:
-`feat/content-cursor-v2-overlay` (cursorov: design for overlay/delta pages, which
-the live E: volume nearly always has) and `fix/content-regex-underfill`
-(regexfill: diagnose first). Owner action: relaunch
+name overlay and content delta; other shapes keep v1. Then `feat/content-cursor-v2-overlay` (6dff32f): content pages no longer re-sort
+by name/path whenever the name overlay is non-empty, which had discarded rank order
+and symbol-first promotion on the live service; overlay rows insert by rank and the
+incomplete-page frontier cut is promotion-aware. Then `fix/pipe-stop-handle-race`
+(9332502): service stop racing a client connect could hand a handler a closed pipe
+handle whose number was reused (stray writes into another file). Running:
+`feat/content-cursor-v2-live` (cursorlive: v2 paging with a populated overlay/delta)
+and `fix/content-regex-underfill` (regexfill: diagnose first). Owner action: relaunch
 the live service to see the 1,826 extract errors split by reason.
 
 Merged 2026-10-17: `content/verify-frontier` (e271c17): parallel verifiers stop at
