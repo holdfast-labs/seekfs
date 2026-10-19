@@ -55,6 +55,21 @@ corruption, exact required sources, auto-fuzzy only on zero exact hits).
 |---|---|---|
 | `perf/static-ranking` | staticrank | **Parked** at WIP commit `761db7b` (OR-lane case unresolved, suite not green); resume only with a fresh, narrow brief (G13) |
 
+Merged 2026-10-18: `fix/usn-frn-sequence` (66f4b78): journal records below the
+base watermark are skipped. Records are keyed by MFT record number without the
+sequence, so an old WAL replayed over a rescan after a journal wrap deleted a
+reused record (E:ench\wt) and cut its subtree off at the root (phantom
+`E:\.git` made content auto scope treat all of E: as one repo). The live E:
+index was rebuilt from the MFT (backup in E:encht\idx_bak_20261018).
+Follow-up: store the sequence per record (format change) so identity never
+depends on the watermark. `fix/overlay-incomplete-prefix` (a3c149a): incomplete
+overlay-merged pages are cut at the base frontier and stay a rank prefix.
+`content/auto-drive-root` (383df2c): auto scope adds the volume root as the
+last-priority root (repos > configured > known folders > drive), with
+outside-repo skips for dependency/venv trees, Cargo internals, browser profiles,
+game libraries, AppData and module caches, and more binary extensions. E:
+estimate: 647k -> 903k files (5.6 -> 11.2 GB text upper bound).
+
 Merged 2026-10-17: `content/verify-frontier` (e271c17): parallel verifiers stop at
 the first unverified candidate when the disk cap runs out (no page gaps), exact
 concurrent read accounting, default 512 reads with no implicit deadline,
