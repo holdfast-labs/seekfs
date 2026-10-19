@@ -1919,7 +1919,10 @@ func searchContentServiceVolumes(volumes []*serviceVolumeIndex, opts queryOption
 		// window's worth of files (or the whole volume, when fewer than window
 		// matches exist) for a page of userLimit. The bounded probe latches
 		// incomplete exactly as a default-budget query would.
-		if windowProbe := probeForPage && !reduced && !resumePage; windowProbe {
+		// An explicit --content-verify-budget is the caller's choice for this
+		// pass: the window pass is the page verify itself here, so capping it
+		// at the default valve would silently ignore the flag.
+		if windowProbe := probeForPage && !reduced && !resumePage && opts.ContentDiskVerifyBudget <= 0; windowProbe {
 			opts.Trace.capDiskBudgetForProbe(
 				contentDiskVerifyBudgetOf(parsedQuery{Limit: userLimit}))
 		}

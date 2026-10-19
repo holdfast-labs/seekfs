@@ -899,6 +899,9 @@ func (t *searchTrace) capDiskBudgetForProbe(limit int) {
 		limit = int(used)
 	}
 	t.disk.limit = int64(limit)
+	// Keep the reported cap in step with the reservation, so the response's
+	// remaining reads reflect the cap that actually applied.
+	t.DiskVerifyBudget = limit
 }
 
 // capFiresWithin reports whether a batch of n more reads could exhaust the
