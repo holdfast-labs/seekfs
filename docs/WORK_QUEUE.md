@@ -63,8 +63,15 @@ relaunch: 690,868 -> 939,321 docs, sidecar 1.10 -> 1.39 GB, E:\wisp-memory and
 other non-repo trees searchable. Selection version 7. Open: `loaded` inclusion
 stats are only rewritten by a full build, so after a reconcile they still show
 the old scope (root=400173, no dependency key); recompute or tag them stale.
-In progress: `fix/usn-frn-identity` (FRN sequence per record: index v10, WAL v2;
-step 2 enforces identity on apply and in the content join, content v13).
+Merged: `fix/usn-frn-identity` (7168a2c, 65253b4, a33885e). Records, WAL frames
+and content docs carry the NTFS sequence (index v10, WAL v2 with v1 still
+replayed, content v13). A known sequence that differs from an event's means
+another occupant: delete/rename-old/data/info events are ignored, and
+create/rename-new replaces the old occupant and its subtree; 0 = unknown keeps
+the old behavior. The baseCheckpoint floor stays as defense in depth. Owner
+action: relaunching the live E: service rebuilds content for v13 (~1 h or more
+cold, content unavailable meanwhile). Follow-up: the standalone `direct`
+builder does not capture sequences yet.
 
 Merged 2026-10-18: `fix/usn-frn-sequence` (66f4b78): journal records below the
 base watermark are skipped. Records are keyed by MFT record number without the
