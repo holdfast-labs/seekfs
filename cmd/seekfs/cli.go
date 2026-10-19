@@ -68,6 +68,8 @@ func run(args []string) error {
 		return cmdDoctor(args[1:])
 	case "config":
 		return cmdConfig(args[1:])
+	case "settings":
+		return cmdSettings(args[1:])
 	case "plugin", "plugins":
 		return cmdPlugin(args[1:])
 	case "defaults":

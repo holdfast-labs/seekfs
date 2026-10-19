@@ -97,8 +97,9 @@ type serviceResponse struct {
 	// CursorRestarted reports that a content cursor v2 could not resume
 	// (identity change, missing record, or delta change) and the request
 	// answered from offset zero instead. CursorRestartReason names why.
-	CursorRestarted     bool   `json:"cursor_restarted,omitempty"`
-	CursorRestartReason string `json:"cursor_restart_reason,omitempty"`
+	CursorRestarted     bool             `json:"cursor_restarted,omitempty"`
+	CursorRestartReason string           `json:"cursor_restart_reason,omitempty"`
+	Settings            *serviceSettings `json:"settings,omitempty"`
 }
 
 // redactContentText clears local-only matched content text (snippets) from the
@@ -442,6 +443,7 @@ type goSearchService struct {
 	// handler and servePrivileged never run the teardown twice.
 	shutdownOnce sync.Once
 	dbs          []string
+	configPath   string
 	indexes      []*Index
 	volumes      []*serviceVolumeIndex
 	loading      bool
@@ -470,16 +472,51 @@ type goSearchService struct {
 	contentLockWarned map[string]bool
 	// contentCfg is the resolved seekfs.toml, used to derive the per-volume
 	// content scope for the service-owned build.
-	contentCfg     appConfig
-	featuresOnce   sync.Once
-	features       atomic.Pointer[serviceFeatures]
-	pluginSettings atomic.Pointer[pluginSettings]
-	pluginUpdateMu sync.Mutex
-	pluginQueueMu  sync.Mutex
-	pluginPending  map[string]pluginDefinition
-	pluginApplying atomic.Bool
-	pluginErrorMu  sync.Mutex
-	pluginError    string
+	contentCfg   appConfig
+	featuresOnce sync.Once
+	features     atomic.Pointer[serviceFeatures]
+	// contentForceRestart makes the next plugin apply restart content even
+	// when the plugin definitions are unchanged (per-volume scope edits).
+	contentForceRestart atomic.Bool
+	pluginSettings      atomic.Pointer[pluginSettings]
+	pluginUpdateMu      sync.Mutex
+	pluginQueueMu       sync.Mutex
+	pluginPending       map[string]pluginDefinition
+	pluginApplying      atomic.Bool
+	pluginErrorMu       sync.Mutex
+	pluginError         string
+	// settingsVolumeMu guards the pending/error state of settings-driven
+	// volume builds. Builds run in the background so settings-set returns
+	// before a multi-minute USN index build completes.
+	settingsVolumeMu    sync.Mutex
+	settingsVolumeTasks map[string]*settingsVolumeTask
+	settingsVolumeErrs  map[string]string
+}
+
+type settingsVolumeTask struct {
+	volume   string
+	db       string
+	cancel   chan struct{}
+	finished chan struct{}
+	mu       sync.Mutex
+	canceled bool
+}
+
+func (t *settingsVolumeTask) cancelNow() {
+	t.mu.Lock()
+	t.canceled = true
+	t.mu.Unlock()
+	select {
+	case <-t.cancel:
+	default:
+		close(t.cancel)
+	}
+}
+
+func (t *settingsVolumeTask) stopped() bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.canceled
 }
 
 // signalServiceStop closes the stop channel exactly once.  It is safe to call

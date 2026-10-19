@@ -57,7 +57,7 @@ func cmdService(args []string) error {
 	if isService {
 		processMode = "windows-service"
 	}
-	handler := &goSearchService{pipeName: *pipeName, sddl: *sddl, processMode: processMode, stop: make(chan struct{}), dbs: dbs, remoteAddr: *remoteAddr, contentCfg: cfg}
+	handler := &goSearchService{pipeName: *pipeName, sddl: *sddl, processMode: processMode, stop: make(chan struct{}), dbs: dbs, configPath: *configPath, remoteAddr: *remoteAddr, contentCfg: cfg}
 	if isService {
 		return svc.Run(serviceName, handler)
 	}
@@ -678,7 +678,7 @@ func setConfigKey(path, key, value string) error {
 		lines = append(lines, key+" = "+formatted)
 	}
 	out := strings.TrimRight(strings.Join(lines, "\n"), "\n") + "\n"
-	return os.WriteFile(path, []byte(out), 0o644)
+	return writeFileAtomic(path, []byte(out))
 }
 
 func formatConfigValue(key, value string) string {

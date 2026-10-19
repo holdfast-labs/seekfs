@@ -3,6 +3,7 @@ package main
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -246,4 +247,6 @@ type serviceRequest struct {
 	// client timing out on work nobody reads. Zero keeps the historical
 	// behavior (no implicit client bound).
 	ClientTimeoutMS int `json:"client_timeout_ms,omitempty"`
+	// Settings carries the settings-set patch (or settings-get has none).
+	Settings json.RawMessage `json:"settings,omitempty"`
 }

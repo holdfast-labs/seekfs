@@ -103,7 +103,7 @@ func (s *goSearchService) applyPluginDefinitions(defs map[string]pluginDefinitio
 	configs := configuredFeatureMap(cfg, defs)
 	content := featureContentEnabled(cfg)
 	next := &serviceFeatures{content: content, configs: configs, companions: make(map[string]*companionFeature)}
-	restartContent := old.content && (!content || !reflect.DeepEqual(previous["content"].Content, defs["content"].Content))
+	restartContent := old.content && (!content || s.contentForceRestart.Swap(false) || !reflect.DeepEqual(previous["content"].Content, defs["content"].Content))
 	for name, f := range old.companions {
 		wanted, ok := configs[name]
 		if ok && wanted.Enabled && reflect.DeepEqual(old.configs[name], wanted) {
