@@ -55,6 +55,19 @@ corruption, exact required sources, auto-fuzzy only on zero exact hits).
 |---|---|---|
 | `perf/static-ranking` | staticrank | **Parked** at WIP commit `761db7b` (OR-lane case unresolved, suite not green); resume only with a fresh, narrow brief (G13) |
 
+Merged 2026-10-19: `fix/phantom-orphans` (79f5266, 156ce46): the persist swap
+carried post-snapshot overlay tombstone/shadow sets (base record IDs) into the
+folded replacement base's different ID space, hiding unrelated records; the
+next fold dropped them (the E:ench\wt worktrees), and the path builder
+re-rooted their orphaned children at the volume root (phantom `E:\.git`, which
+made content auto scope treat all of E: as one repo). Carried IDs are now
+remapped by FRN, and a record whose parent FRN is missing has no path instead
+of a fabricated root path (self-parented roots still end the walk). Live E:
+rebuilt from the MFT: content ready at 854,202 docs (junk under
+wispd-target/SteamLibrary gone; skips now dependency 179k, build_output 40k,
+gitignore 45k, root 20). `fix/content-inclusion-stats` (79a38a4): scope
+reconcile refreshes the reported inclusion stats.
+
 Merged 2026-10-19: `fix/content-drive-reconcile` (3f57280): reconcile charged
 new files their raw size and latched full at the first misfit (327,669 files,
 215 GB raw, left out of a ~19 GB reserve allowance); it now charges the
