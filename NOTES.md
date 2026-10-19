@@ -80,15 +80,19 @@ WAL magic `SWAL2`)
 - Known gap: the standalone `direct` builder (directRecord/direct spool) does
   not yet carry the sequence; the service path (`indexUSNVolume`) does.
 
-Brief 2 - enforce identity on apply; fix the content join.
-- `applyUSNChanges`/`recordOverlayChange`: compare sequences by INEQUALITY, not
-  ordering. NTFS sequences wrap at 16 bits, so a known record Seq != event Seq
-  means a different occupant. Treat an older-sequence event as stale (ignore);
-  a different sequence as an occupant replacement (tombstone the old subtree,
-  then apply). Skip only when the event Seq is 0 (unknown).
-- Add `FRNSeq` to `contentDoc`; compare in the content joins/catch-up; bump
-  `contentIndexVersion` to 13.
-- Tests: stale delete with a different sequence ignored even above the
-  watermark; new occupant with a different sequence replaces the old record;
-  an old index without sequences loads and works.
+Brief 2 - enforce identity on apply; fix the content join. (IMPLEMENTED)
+- `applyUSNChanges` compares the newest overlay slot (else base `recordSeq`)
+  against the event sequence by INEQUALITY (`seqDiffers`), not ordering. NTFS
+  sequences wrap at 16 bits, so a known record Seq != event Seq means a
+  different occupant. An older/different-sequence delete/rename-old/data/info
+  event is consumed and ignored; a create/rename-new is an occupant replacement
+  (`forgetReusedOccupant` tombstones the old subtree and cascades overlay-only
+  descendants, then applies). Seq 0 on either side is unknown (old behavior).
+- `contentDoc.FRNSeq` is written in the `.gsx` (content version 13);
+  `buildContentResolverSeq` refuses to join a doc whose FRNSeq differs from the
+  record's known Seq. The catch-up reconcile re-extracts (or drops) such docs,
+  and folds carry the sequence forward.
+- Tests: stale different-Seq delete above the watermark keeps the subtree; a
+  new-Seq create replaces the old occupant; Seq 0 behaves as before; a v9 index
+  + v1 WAL still replays; a mismatched content doc is not joined.
 - Follow-up brief: bump `feature.Version`, carry the sequence in the companion.

@@ -247,7 +247,7 @@ func (s *goSearchService) attachContentForVolume(vol *serviceVolumeIndex) {
 		vol.content.markStale(reason)
 		return
 	}
-	resolver := buildContentResolver(idx.Docs, frns, ids)
+	resolver := buildContentResolverSeq(idx.Docs, frns, ids, vol.index.seqColumn())
 	// A content index whose docs join none of the base's FRNs would serve every
 	// query as an empty result set while advertising `ready` (the candidate path
 	// drops unmapped docs and still returns ok). Refuse to publish it: a
@@ -729,6 +729,15 @@ func (s *goSearchService) contentDrainLoop(vol *serviceVolumeIndex) {
 			ignoreChanged := false
 			// Hand the tick's scope to extraction for the repo-aware caps.
 			vol.contentCoord.scopeHint = scope
+			// Stamp the record's current sequence on each extracted delta doc so
+			// a reused record's doc never joins its previous occupant's row.
+			vol.contentCoord.seqHint = func(frn uint64) uint16 {
+				s.indexMu.RLock()
+				defer s.indexMu.RUnlock()
+				vol.mu.Lock()
+				defer vol.mu.Unlock()
+				return vol.knownFRNSeq(frn)
+			}
 			vol.contentCoord.processQueue(func(frn uint64) (string, bool) {
 				var path string
 				var ok bool
@@ -908,7 +917,7 @@ func rebindContentAfterBaseSwap(vol *serviceVolumeIndex) {
 	if origin == contentOriginWalk {
 		keys, ids := buildContentWalkKeys(vol.index)
 		vol.walkKeys = &walkKeySet{idx: vol.index, keys: keys, ids: ids}
-		vol.content.rebuildResolver(keys, ids)
+		vol.content.rebuildResolver(keys, ids, nil)
 		// A base whose docs join nothing (e.g. the roots changed out from
 		// under the sidecar) must not serve empty as ready. The next
 		// ensureContentBuild (walk rebuild path, runtime swap) re-attaches
@@ -926,5 +935,5 @@ func rebindContentAfterBaseSwap(vol *serviceVolumeIndex) {
 	if !ok {
 		return
 	}
-	vol.content.rebuildResolver(frns, ids)
+	vol.content.rebuildResolver(frns, ids, vol.index.seqColumn())
 }

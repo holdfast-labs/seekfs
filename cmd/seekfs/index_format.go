@@ -912,6 +912,50 @@ func buildPersistenceSeqs(idx *Index) []uint16 {
 	return seqs
 }
 
+// recordSeq returns the NTFS sequence for a base record id. The persisted SEQN
+// column wins (it is the only copy in low-memory/mmapped mode); otherwise the
+// in-memory record carries it. 0 means unknown.
+func (idx *Index) recordSeq(id int) uint16 {
+	if idx == nil || id < 0 {
+		return 0
+	}
+	if id < len(idx.Derived.FRNSeq) {
+		if s := idx.Derived.FRNSeq[id]; s != 0 {
+			return s
+		}
+	}
+	if id < len(idx.Records) {
+		return idx.Records[id].Seq
+	}
+	return 0
+}
+
+// seqColumn returns the per-record-id sequence column for joins, or nil when no
+// record carries one (walk sources and v9-upgraded indexes).
+func (idx *Index) seqColumn() []uint16 {
+	if idx == nil {
+		return nil
+	}
+	if len(idx.Derived.FRNSeq) > 0 {
+		return idx.Derived.FRNSeq
+	}
+	if len(idx.Records) == 0 {
+		return nil
+	}
+	seqs := make([]uint16, len(idx.Records))
+	any := false
+	for i := range idx.Records {
+		if idx.Records[i].Seq != 0 {
+			seqs[i] = idx.Records[i].Seq
+			any = true
+		}
+	}
+	if !any {
+		return nil
+	}
+	return seqs
+}
+
 func buildDerivedSectionBlobs(idx *Index, nameTokens []string) []indexSectionBlob {
 	out := make([]indexSectionBlob, 0, 16)
 	_ = forEachDerivedSection(idx, nameTokens, func(section indexSectionBlob) error {

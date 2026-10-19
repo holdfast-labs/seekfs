@@ -281,13 +281,13 @@ func TestContentCoordinatorProcessQueue(t *testing.T) {
 func TestContentVolumeStateRebuildResolverAfterBaseSwap(t *testing.T) {
 	s := contentTestState()
 	// Initial base: FRN 100 -> record 0, 200 -> record 1.
-	s.rebuildResolver([]uint64{100, 200}, []uint32{0, 1})
+	s.rebuildResolver([]uint64{100, 200}, []uint32{0, 1}, nil)
 	if id, ok := s.resolver.recordID(0); !ok || id != 0 {
 		t.Fatalf("initial resolver doc 0 -> %d, %v", id, ok)
 	}
 
 	// A base swap renumbers records: FRN 100 -> 5, 200 dropped.
-	s.rebuildResolver([]uint64{100}, []uint32{5})
+	s.rebuildResolver([]uint64{100}, []uint32{5}, nil)
 	if id, ok := s.resolver.recordID(0); !ok || id != 5 {
 		t.Fatalf("post-swap resolver doc 0 -> %d, %v; want 5", id, ok)
 	}

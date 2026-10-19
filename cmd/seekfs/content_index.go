@@ -115,12 +115,14 @@ func contentSectionEagerVerify(tag uint32) bool {
 // Version 12 changes the persisted term, trigram, and filter normalization
 // from lowercase-only to accent-folded; v11 sidecars must rebuild. V12 writers
 // still emit no CXST/CXTD sections and use the same doc-table encoding.
+// Version 13 appends the record's NTFS sequence (FRNSeq) to each doc row so a
+// doc from a previous occupant of a reused record is never joined.
 // (05 is the sharded-manifest version, which carries no doc table;
-// manifests are unaffected by the 06/07/08/09/10/11/12 bumps: a manifest names
-// shard files, and each shard carries the doc-table version itself.)
+// manifests are unaffected by the 06/07/08/09/10/11/12/13 bumps: a manifest
+// names shard files, and each shard carries the doc-table version itself.)
 var contentIndexMagic = [8]byte{'G', 'O', 'S', 'C', 'X', '0', '0', '4'}
 
-const contentIndexVersion = 12
+const contentIndexVersion = 13
 
 // contentOrigin records what the doc keys are, so a `.gsx` can never be
 // attached to a key space it does not join.
@@ -271,6 +273,11 @@ type contentDoc struct {
 	// attach (version gate) and are rebuilt instead.
 	FileSize    int64
 	FileModNano int64
+	// FRNSeq is the NTFS file-reference sequence number of the record the doc
+	// was extracted from (v13). A doc whose FRNSeq differs from the current
+	// record's known Seq belongs to a previous occupant and must not be joined.
+	// 0 means unknown (walk volumes and pre-v13 sidecars).
+	FRNSeq uint16
 }
 
 // contentIndex is the in-memory form of a `.gsx`. Sections map tag -> payload.
@@ -484,13 +491,14 @@ func contentDocTableBytes(docs []contentDoc) []byte {
 		_ = binary.Write(&buf, binary.LittleEndian, d.TextLen)
 		_ = binary.Write(&buf, binary.LittleEndian, d.FileSize)
 		_ = binary.Write(&buf, binary.LittleEndian, d.FileModNano)
+		_ = binary.Write(&buf, binary.LittleEndian, d.FRNSeq)
 	}
 	return buf.Bytes()
 }
 
 // contentDocFixedSize is the encoded width of one doc record:
-// docID(4)+frn(8)+type(2)+extractor(2)+hash(16)+textLen(4)+fileSize(8)+fileModNano(8)
-const contentDocFixedSize = 52
+// docID(4)+frn(8)+type(2)+extractor(2)+hash(16)+textLen(4)+fileSize(8)+fileModNano(8)+frnSeq(2)
+const contentDocFixedSize = 54
 
 func contentDecodeDocTable(data []byte) ([]contentDoc, error) {
 	if len(data) < 4 {
@@ -516,6 +524,7 @@ func contentDecodeDocTable(data []byte) ([]contentDoc, error) {
 		d.TextLen = binary.LittleEndian.Uint32(data[p:])
 		d.FileSize = int64(binary.LittleEndian.Uint64(data[p+4:]))
 		d.FileModNano = int64(binary.LittleEndian.Uint64(data[p+12:]))
+		d.FRNSeq = binary.LittleEndian.Uint16(data[p+20:])
 		off += contentDocFixedSize
 	}
 	return docs, nil

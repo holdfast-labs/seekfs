@@ -140,6 +140,9 @@ type contentBuildDoc struct {
 	// extraction read.
 	fileSize    int64
 	fileModNano int64
+	// seq is the source record's NTFS sequence number, stamped into the doc row
+	// so a later join can reject a doc from a previous occupant. 0 = unknown.
+	seq uint16
 }
 
 // contentWalkDoc is one extracted file awaiting assembly: the spool offset of
@@ -181,7 +184,7 @@ func contentWalkSpool(f *os.File, spooled []contentWalkDoc, order []int) (conten
 		if err != nil {
 			return contentBuildDoc{}, false, err
 		}
-		return contentBuildDoc{path: s.item.path, frn: s.item.frn, text: text, modUnix: s.modUnix, class: s.class, version: s.version, fileSize: s.fileSize, fileModNano: s.fileModNano}, true, nil
+		return contentBuildDoc{path: s.item.path, frn: s.item.frn, text: text, modUnix: s.modUnix, class: s.class, version: s.version, fileSize: s.fileSize, fileModNano: s.fileModNano, seq: s.item.seq}, true, nil
 	}, nil
 }
 
@@ -757,6 +760,7 @@ func assembleContentIndexStreamed(source contentBuildSource, tmpDir string, filt
 					TextLen:          t.textLen,
 					FileSize:         d.fileSize,
 					FileModNano:      d.fileModNano,
+					FRNSeq:           d.seq,
 				})
 				// Documents arrive in ascending docID order, so each key's Adds arrive
 				// in ascending docID order as the builder requires. The per-doc
@@ -959,7 +963,7 @@ func buildContentIndexForIndex(ctx context.Context, idx *Index, opts contentBuil
 			}
 			continue
 		}
-		items = append(items, contentBuildItem{frn: rec.FRN, path: path, inRepo: inRepoOf(path)})
+		items = append(items, contentBuildItem{frn: rec.FRN, path: path, inRepo: inRepoOf(path), seq: idx.recordSeq(id)})
 	}
 	next, stop := contentPrefetchExtract(ctx, items, contentBuildWorkers, contentBuildDocSafe)
 	defer stop()
