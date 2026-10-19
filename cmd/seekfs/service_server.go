@@ -31,6 +31,15 @@ func (s *goSearchService) servePipeListener() {
 	}
 }
 
+// errServicePipeStopping reports that service stop closed a pipe instance
+// before it could be handed to a connection handler.
+var errServicePipeStopping = errors.New("service pipe stopping")
+
+// pipeConnectedTestHook, when set by a test, runs after ConnectNamedPipe
+// returns and before the stop watcher is released, to force the stop/connect
+// race deterministically. Always nil in production.
+var pipeConnectedTestHook func()
+
 func (s *goSearchService) createPipeInstance() (*os.File, error) {
 	ptr, err := windows.UTF16PtrFromString(s.pipeName)
 	if err != nil {
@@ -53,16 +62,32 @@ func (s *goSearchService) createPipeInstance() (*os.File, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Stop closes the handle to unblock ConnectNamedPipe. The watcher must be
+	// finished before the handle is used or closed here: when stop and a
+	// client connect race, select may pick stop after the connect succeeded,
+	// and returning that closed handle lets the handler read and write a
+	// handle number the process may already have reused for another file.
 	done := make(chan struct{})
+	watchDone := make(chan struct{})
+	closedByStop := false
 	go func() {
+		defer close(watchDone)
 		select {
 		case <-s.stop:
+			closedByStop = true
 			_ = windows.CloseHandle(handle)
 		case <-done:
 		}
 	}()
 	err = windows.ConnectNamedPipe(handle, nil)
+	if pipeConnectedTestHook != nil {
+		pipeConnectedTestHook()
+	}
 	close(done)
+	<-watchDone
+	if closedByStop {
+		return nil, errServicePipeStopping
+	}
 	if err == nil || err == windows.ERROR_PIPE_CONNECTED {
 		return os.NewFile(uintptr(handle), s.pipeName), nil
 	}
