@@ -825,7 +825,11 @@ func callServiceOnce(pipeName string, req serviceRequest) (serviceResponse, erro
 	}
 	file := os.NewFile(uintptr(handle), pipeName)
 	defer file.Close()
-	return exchangeServiceJSON(file, req, serviceCallTimeout(req))
+	timeout := serviceClientTimeoutHook(req)
+	if timeout > 0 && req.ClientTimeoutMS <= 0 {
+		req.ClientTimeoutMS = int((timeout + time.Millisecond - 1) / time.Millisecond)
+	}
+	return exchangeServiceJSON(file, req, timeout)
 }
 
 func isTransientPipeError(err error) bool {
@@ -853,6 +857,11 @@ func serviceCallTimeout(req serviceRequest) time.Duration {
 		return 0
 	}
 }
+
+// serviceClientTimeoutHook is the injectable service wait. Tests shorten it to
+// prove the service settles an incomplete content answer before the client
+// gives up. Production leaves it at serviceCallTimeout.
+var serviceClientTimeoutHook = serviceCallTimeout
 
 func exchangeServiceJSON(conn io.ReadWriteCloser, req serviceRequest, timeout time.Duration) (serviceResponse, error) {
 	if timeout <= 0 {
