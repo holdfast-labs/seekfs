@@ -55,12 +55,24 @@ corruption, exact required sources, auto-fuzzy only on zero exact hits).
 |---|---|---|
 | `perf/static-ranking` | staticrank | **Parked** at WIP commit `761db7b` (OR-lane case unresolved, suite not green); resume only with a fresh, narrow brief (G13) |
 
+Merged 2026-10-19: `fix/content-drive-reconcile` (3f57280): reconcile charged
+new files their raw size and latched full at the first misfit (327,669 files,
+215 GB raw, left out of a ~19 GB reserve allowance); it now charges the
+extracted-text cap like the build and keeps the reserve. Live E: content after
+relaunch: 690,868 -> 939,321 docs, sidecar 1.10 -> 1.39 GB, E:\wisp-memory and
+other non-repo trees searchable. Selection version 7. Open: `loaded` inclusion
+stats are only rewritten by a full build, so after a reconcile they still show
+the old scope (root=400173, no dependency key); recompute or tag them stale.
+In progress: `fix/usn-frn-identity` (FRN sequence per record: index v10, WAL v2;
+step 2 enforces identity on apply and in the content join, content v13).
+
 Merged 2026-10-18: `fix/usn-frn-sequence` (66f4b78): journal records below the
 base watermark are skipped. Records are keyed by MFT record number without the
 sequence, so an old WAL replayed over a rescan after a journal wrap deleted a
 reused record (E:ench\wt) and cut its subtree off at the root (phantom
 `E:\.git` made content auto scope treat all of E: as one repo). The live E:
-index was rebuilt from the MFT (backup in E:encht\idx_bak_20261018).
+index was rebuilt from the MFT (backup in E:ench
+t\idx_bak_20261018).
 Follow-up: store the sequence per record (format change) so identity never
 depends on the watermark. `fix/overlay-incomplete-prefix` (a3c149a): incomplete
 overlay-merged pages are cut at the base frontier and stay a rank prefix.
