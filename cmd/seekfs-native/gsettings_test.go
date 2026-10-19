@@ -89,22 +89,24 @@ func assertBlocksDoNotOverlap(t *testing.T, blocks []settingsBlock) {
 
 func TestSettingsPanelHeadlessRender(t *testing.T) {
 	for _, dark := range []bool{false, true} {
-		u, _ := settingsTestUI(t, dark)
-		want := uint8(0xF3)
-		if dark {
-			want = 0x20
-		}
-		img := renderHeadless(t, 1000, 720, func(gtx layout.Context) layout.Dimensions {
-			return u.layout(gtx)
-		})
-		// The backdrop is a dark scrim over the app background; the panel
-		// theme itself is proven by a distinctly non-uniform frame.
-		if n := countDistinct(img); n < 10 {
-			t.Fatalf("dark=%v settings panel rendered near-uniform (%d colors)", dark, n)
-		}
-		corner := img.RGBAAt(4, 4)
-		if dark && corner.R > want+10 {
-			t.Fatalf("dark scrim too light: %v", corner)
+		for _, tab := range []int{settingsTabDrives, settingsTabContent, settingsTabSearch} {
+			u, p := settingsTestUI(t, dark)
+			p.tab = tab
+			img := renderHeadless(t, 1000, 720, func(gtx layout.Context) layout.Dimensions {
+				return u.layout(gtx)
+			})
+			// The backdrop is a dark scrim over the app background; the
+			// panel theme itself is proven by a non-uniform frame.
+			if n := countDistinct(img); n < 10 {
+				t.Fatalf("tab %d dark=%v settings panel rendered near-uniform (%d colors)", tab, dark, n)
+			}
+			corner := img.RGBAAt(4, 4)
+			if dark && corner.R > 0x30 {
+				t.Fatalf("tab %d dark scrim too light: %v", tab, corner)
+			}
+			if !dark && corner.R < 0x40 {
+				t.Fatalf("tab %d light scrim too dark: %v", tab, corner)
+			}
 		}
 	}
 }
