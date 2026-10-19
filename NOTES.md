@@ -86,3 +86,11 @@ Tests:
 - `TestContentSaveShardBytesUnchanged` (b): pins the saved shard sha256 on a
   deterministic fixture with file-backed terms, grams and filter sections.
 - `TestContentSavePeakMeasure`: reports before/peak/after and the ratios.
+
+## Verification (2026-10-19)
+
+- `go vet ./cmd/seekfs/` clean.
+- `go test -p 1 -timeout 30m -run 'Shard|Save|Spool|ContentBuild|Reserve|Budget|Guard' ./cmd/seekfs/`
+  passed (17.3 s).
+- `TestContentSaveShardBytesUnchanged` and
+  `TestContentSavePeakWithinAccountedBound` passed with `-count=2`.
