@@ -240,4 +240,10 @@ type serviceRequest struct {
 	// the wire and is never set from client-supplied input.
 	CancelOverride func() bool `json:"-"`
 	Cursor         string      `json:"cursor,omitempty"`
+	// ClientTimeoutMS is the caller's own wait for this request. The service
+	// arms an implicit content deadline just before it, so a slow content
+	// count/search settles as an incomplete partial answer instead of the
+	// client timing out on work nobody reads. Zero keeps the historical
+	// behavior (no implicit client bound).
+	ClientTimeoutMS int `json:"client_timeout_ms,omitempty"`
 }
