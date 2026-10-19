@@ -1231,7 +1231,7 @@ func (s *goSearchService) persistVolumeIfDue(vol *serviceVolumeIndex, force bool
 	// idempotent per batch).
 	seeded := 0
 	if replacement.index.Compact && replacement.index.Source == "usn" && vol.overlay != nil {
-		replacement.overlay = carryOverlayDelta(vol.overlay, snapshotWatermark, foldOverlay)
+		replacement.overlay = carryOverlayDelta(vol.overlay, snapshotWatermark, foldOverlay, vol.index, replacement)
 		seeded = int(replacement.overlay.watermark.Load())
 		if replacement.checkpoint < vol.checkpoint {
 			replacement.checkpoint = vol.checkpoint
@@ -1491,7 +1491,14 @@ func copyOverlayBaseIDSet(set overlayBaseIDSet) overlayBaseIDSet {
 // Slot identity is preserved consistently within the rebased segment: byFRN
 // values shift by -from, and the per-call seen/path caches in overlayEntry
 // are always built against the same records slice.
-func carryOverlayDelta(live *overlaySegment, from int, foldOverlay *overlaySegment) *overlaySegment {
+//
+// Tombstone/shadow entries are BASE RECORD IDs against oldBase.  The fold
+// removes and reorders records, so the replacement base has a different ID
+// space; carrying the raw IDs would hide unrelated records there.  Each
+// surviving delta entry is remapped to the replacement base by FRN.  When
+// foldOverlay is nil no fold ran, so the live set is already in the current
+// ID space and is copied unchanged.
+func carryOverlayDelta(live *overlaySegment, from int, foldOverlay *overlaySegment, oldBase *Index, replacement *serviceVolumeIndex) *overlaySegment {
 	if live == nil {
 		return nil
 	}
@@ -1508,14 +1515,41 @@ func carryOverlayDelta(live *overlaySegment, from int, foldOverlay *overlaySegme
 			}
 		}
 		if foldOverlay != nil {
-			out.tombstone = overlayBaseIDSetDelta(live.tombstone, foldOverlay.tombstone)
-			out.shadowed = overlayBaseIDSetDelta(live.shadowed, foldOverlay.shadowed)
+			out.tombstone = remapOverlayDerivedIDs(oldBase, replacement,
+				overlayBaseIDSetDelta(live.tombstone, foldOverlay.tombstone))
+			out.shadowed = remapOverlayDerivedIDs(oldBase, replacement,
+				overlayBaseIDSetDelta(live.shadowed, foldOverlay.shadowed))
 		} else {
 			out.tombstone = copyOverlayBaseIDSet(live.tombstone)
 			out.shadowed = copyOverlayBaseIDSet(live.shadowed)
 		}
 	}
 	out.watermark.Store(int32(len(out.records)))
+	return out
+}
+
+// remapOverlayDerivedIDs translates base-record IDs in set from oldBase's ID
+// space to replacement's ID space by FRN.  An old ID whose record no longer
+// exists in the replacement base is dropped: there is no record left to hide,
+// and the raw numeric ID would name an unrelated record.
+func remapOverlayDerivedIDs(oldBase *Index, replacement *serviceVolumeIndex, set overlayBaseIDSet) overlayBaseIDSet {
+	if oldBase == nil || replacement == nil || set.len() == 0 {
+		return set
+	}
+	out := overlayBaseIDSet{}
+	for _, id32 := range set.ids {
+		id := int(id32)
+		if id < 0 || id >= oldBase.compactRecordCount() {
+			continue
+		}
+		frn := oldBase.compactRecord(id).FRN
+		if frn == 0 {
+			continue
+		}
+		if newID, ok := replacement.idForFRN(frn); ok {
+			out.add(int32(newID))
+		}
+	}
 	return out
 }
 

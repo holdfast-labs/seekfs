@@ -487,7 +487,7 @@ func TestPersistOverlayCarryKeepsPostSnapshotChanges(t *testing.T) {
 	// it is loaded from the staged index file), carrying only the post-snapshot
 	// overlay delta.
 	replacement := newServiceVolumeIndex(vol.dbPath, folded)
-	replacement.overlay = carryOverlayDelta(vol.overlay, len(foldOverlay.records), foldOverlay)
+	replacement.overlay = carryOverlayDelta(vol.overlay, len(foldOverlay.records), foldOverlay, vol.index, replacement)
 	replacement.publishSnapshot()
 	if replacement.checkpoint < vol.checkpoint {
 		replacement.checkpoint = vol.checkpoint

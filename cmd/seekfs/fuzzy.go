@@ -901,6 +901,9 @@ func appendFuzzyServiceMatches(volumes []*serviceVolumeIndex, opts queryOptions,
 				pathCaches[scored.vol] = make(map[int]string)
 			}
 			entry := compactEntryFromRecord(vol.index, scored.id, rec, pathCaches[scored.vol], true)
+			if entry.Path == "" {
+				continue
+			}
 			if _, dupPath := existing[entry.Path]; dupPath {
 				continue
 			}

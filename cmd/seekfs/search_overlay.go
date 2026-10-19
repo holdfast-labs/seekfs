@@ -526,6 +526,13 @@ func (vol *serviceVolumeIndex) overlayRecordPath(records []CompactRecord, latest
 			return joinOverlayPath(parentPath, name)
 		}
 	}
+	// The parent FRN is nonzero and is neither a live overlay slot nor a base
+	// record: the parent was dropped (or is itself an orphan). Report no path
+	// instead of fabricating a child of the volume root. Indexes without a
+	// persisted root anchor (in-memory fixtures) keep the old fallback.
+	if vol.index != nil && len(vol.index.Roots) > 0 {
+		return ""
+	}
 	if vol.volume != "" {
 		return vol.volume + `\` + name
 	}

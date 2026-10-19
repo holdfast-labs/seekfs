@@ -359,7 +359,11 @@ func searchCompactWithCacheHidden(idx *Index, opts queryOptions, countOnly bool,
 		// visited path (see boundPathCache).
 		pathCache = boundPathCache(pathCache)
 		if skipEntryMatches {
-			results = append(results, compactEntryFromRecord(idx, recIndex, rec, pathCache, false))
+			entry := compactEntryFromRecord(idx, recIndex, rec, pathCache, false)
+			if entry.Path == "" {
+				continue
+			}
+			results = append(results, entry)
 			if !countOnly && len(results) >= limit {
 				break
 			}
@@ -376,6 +380,9 @@ func searchCompactWithCacheHidden(idx *Index, opts queryOptions, countOnly bool,
 			withPath = queryNeedsEntryPath(pq) || queryHasAnyContentLeaf(pq) || contentVol.contentWalkOriginAttached()
 		}
 		entry := compactEntryFromRecordPath(idx, recIndex, rec, pathCache, true, withPath)
+		if withPath && entry.Path == "" {
+			continue
+		}
 		if entryMatchesWithContentMatcher(contentVol, entry, pq, pq.MatchPath, contentMatcher) {
 			if opts.contentCount != nil {
 				*opts.contentCount++
@@ -879,9 +886,16 @@ func compactCandidateEntryIfMatchIn(vol *serviceVolumeIndex, idx *Index, pq pars
 		return Entry{}, false
 	}
 	if skipEntryMatches {
-		return compactEntryFromRecord(idx, recIndex, rec, pathCache, false), true
+		entry := compactEntryFromRecord(idx, recIndex, rec, pathCache, false)
+		if entry.Path == "" {
+			return Entry{}, false
+		}
+		return entry, true
 	}
 	entry := compactEntryFromRecord(idx, recIndex, rec, pathCache, true)
+	if entry.Path == "" {
+		return Entry{}, false
+	}
 	if !entryMatchesWithContentMatcher(vol, entry, pq, pq.MatchPath, matcher) {
 		return Entry{}, false
 	}

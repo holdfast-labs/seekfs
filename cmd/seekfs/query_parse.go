@@ -1679,9 +1679,14 @@ func (idx *Index) reconstructCompactPathCached(i int, cache map[int]string) stri
 	}
 	parts := make([]string, 0, 16)
 	seen := make(map[int]struct{}, 16)
+	unresolved := false
 	cur := i
 	for depth := 0; depth < 1024; depth++ {
 		if path, ok := cache[cur]; ok {
+			if path == "" {
+				cache[i] = ""
+				return ""
+			}
 			for p := len(parts) - 1; p >= 0; p-- {
 				path += `\` + parts[p]
 			}
@@ -1689,9 +1694,11 @@ func (idx *Index) reconstructCompactPathCached(i int, cache map[int]string) stri
 			return path
 		}
 		if cur < 0 || cur >= idx.compactRecordCount() {
+			unresolved = true
 			break
 		}
 		if _, ok := seen[cur]; ok {
+			unresolved = true
 			break
 		}
 		seen[cur] = struct{}{}
@@ -1700,9 +1707,25 @@ func (idx *Index) reconstructCompactPathCached(i int, cache map[int]string) stri
 			parts = append(parts, name)
 		}
 		if parent < 0 {
+			// A record whose nonzero parent FRN is absent is an orphan (the
+			// parent was dropped by an earlier fold). Do not report it as a
+			// child of the volume root; that fabricated path made orphaned
+			// worktree children appear as E:\.git.
+			rec := idx.compactRecord(cur)
+			if len(idx.Roots) > 0 && rec.ParentFRN != 0 && rec.ParentFRN != rec.FRN {
+				unresolved = true
+			}
+			break
+		}
+		if int(parent) >= idx.compactRecordCount() {
+			unresolved = true
 			break
 		}
 		cur = int(parent)
+	}
+	if unresolved {
+		cache[i] = ""
+		return ""
 	}
 	root := idx.Volume
 	rootName := ""
@@ -1742,12 +1765,18 @@ func (idx *Index) reconstructLowerPathInto(i int, paths []string, computed []boo
 		return parts
 	}
 	cur := i
+	unresolved := false
 	for depth := 0; depth < 1024; depth++ {
 		if cur < 0 || cur >= len(paths) {
+			unresolved = true
 			break
 		}
 		if computed[cur] {
 			path := paths[cur]
+			if path == "" {
+				unresolved = true
+				break
+			}
 			for p := len(parts) - 1; p >= 0; p-- {
 				path += `\` + strings.ToLower(parts[p])
 			}
@@ -1756,6 +1785,7 @@ func (idx *Index) reconstructLowerPathInto(i int, paths []string, computed []boo
 			return parts
 		}
 		if seen[cur] == gen {
+			unresolved = true
 			break
 		}
 		seen[cur] = gen
@@ -1764,9 +1794,21 @@ func (idx *Index) reconstructLowerPathInto(i int, paths []string, computed []boo
 			parts = append(parts, rec.Name)
 		}
 		if rec.Parent < 0 {
+			if len(idx.Roots) > 0 && rec.ParentFRN != 0 && rec.ParentFRN != rec.FRN {
+				unresolved = true
+			}
+			break
+		}
+		if int(rec.Parent) >= len(paths) {
+			unresolved = true
 			break
 		}
 		cur = int(rec.Parent)
+	}
+	if unresolved {
+		paths[i] = ""
+		computed[i] = true
+		return parts
 	}
 	root := idx.Volume
 	rootName := ""
