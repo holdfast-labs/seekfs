@@ -75,9 +75,11 @@ const contentScopeEncodedMultiplier = 0.5
 // rides the separate contentScopeScratchSlack, single-file builds (at most
 // one shard of extracted text) absorb their fixed excess there too, and a
 // corpus past the spool cap takes the adaptive rule below instead of relying
-// on the write-time guard. Measured peak on the 599 MB Chromium sample:
-// 0.590 of extracted (was 1.521). This is the floor the adaptive rule never
-// goes below.
+// on the write-time guard. The save consumes each section file as it is copied
+// into the output (contentSaveAssembled), so it no longer holds all sections
+// plus a full encoded copy; only one section can overlap the growing output.
+// Measured peak on the 599 MB Chromium sample: 0.590 of extracted (was 1.521).
+// This is the floor the adaptive rule never goes below.
 const contentScopePeakMultiplier = 0.8
 
 // contentSpoolTrustBytes is the extracted text staged before the observed
@@ -129,8 +131,10 @@ func contentEffectivePeakMultiplier(prev float64, used, staged int64) float64 {
 }
 
 // contentScopeScratchSlack is the headroom kept for the shards being
-// assembled at once: their section files exist alongside the spool until
-// each shard is saved and its scratch removed.
+// assembled at once: their section files and spill runs exist alongside the
+// spool until each shard is saved and its scratch removed. Saving consumes
+// each section file as it is copied, so the save itself no longer needs a
+// full second copy of the shard inside this slack.
 func contentScopeScratchSlack() uint64 {
 	return uint64(contentShardBuildConcurrency) * uint64(contentShardTargetBytes)
 }

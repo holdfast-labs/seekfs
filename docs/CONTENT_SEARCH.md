@@ -2281,19 +2281,24 @@ build stages bytes, exactly like a real disk).
   kept 0.5, and the peak constant derives from the split spike, not the
   sum, so the output cap only bounds assembly.
 
-**Residual:** single-file builds (at most one shard of extracted text) skip
-the reframe and briefly hold spool + section files + output together; the
-fixed excess fits inside the scratch slack by construction (≤64 MB corpus).
-A corpus past the spool cap skips the reframe and peaks at spool + output;
-the adaptive allowance now budgets that peak, and the write-time guard fails
-it loudly rather than breaching the reserve. Guard-check spacing is
-pre-save: the sections+output doubling mid-save (~2x one shard's output)
-is never checked after the save starts; for target-sized shards it sits
-inside the slack and margins, but it is a hole a future change should close
-(a post-save check, or streaming the save without retaining the sections).
-Oversize shards (one folder unit past the target — indivisible docs) widen
-the same hole past the slack; sharding by size within a folder would fix it
-but changes grouping and therefore output bytes.
+**Save-time transient: CLOSED 2026-10-19** (`content/save-peak`). The
+residual was real: `contentSaveAssembled` copied every file-backed section
+into the temp output while the whole section set stayed on disk, so a save
+held `section scratch + encoded output` at once (measured 2.265x the encoded
+shard on a synthetic fixture). It now removes each section file as soon as
+its bytes are in the output, so only the section being copied can overlap the
+growing output. The same fixture measures 0.602x extracted / 1.275x encoded
+(was 1.070x / 2.265x). The output bytes are unchanged
+(`TestContentSaveShardBytesUnchanged`, pinned sha256) and the measured peak
+fits `contentScopePeakMultiplier * extracted + contentScopeScratchSlack`
+(`TestContentSavePeakWithinAccountedBound`, which failed before the change).
+The write-time guard still samples before a save, but the section/output
+doubling it never saw is gone, so it no longer needs a mid-save sample.
+Single-file builds and shards past the spool cap keep their spool + output
+peak, which the adaptive allowance budgets. Oversize shards (one folder unit
+past the target) still widen the assembly scratch above the slack during
+spill; sharding by size within a folder would change grouping and therefore
+output bytes, so that remains untouched.
 
 Tests: `TestContentSpoolRoundTrip`, `TestContentSpoolCorruptFailsClosed`,
 `TestContentSpoolSplitGroups(+CleansUp)`,
@@ -2302,6 +2307,8 @@ Tests: `TestContentSpoolRoundTrip`, `TestContentSpoolCorruptFailsClosed`,
 decrease across saves), `TestContentServiceBuildSkipsSplitPastSpoolCap`,
 `TestContentEffectivePeakMultiplier` (floor/pin/branch math),
 `TestContentSpoolWillSplit` (projection matches the save decision),
+`TestContentSavePeakWithinAccountedBound` (save transient inside the
+selection bound), `TestContentSaveShardBytesUnchanged` (pinned shard sha256),
 `TestContentServiceBuildAdaptsToIncompressibleSpool` (dense stops earlier,
 peak in budget, publishes; compressible control admits all; fails with the
 adaptation forced to the floor),

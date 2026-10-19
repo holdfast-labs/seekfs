@@ -981,10 +981,13 @@ func contentWritePayload(w io.Writer, h io.Writer, p contentSectionPayload) (uin
 
 // contentSaveAssembled streams one shard to path: the header placeholder, each
 // section payload from memory or its spool file (hashing the CRC32C as it
-// goes), then the section table with checksums, then the patched header. The
-// temp-then-rename atomicity, the contentGSXSizeError cap (checked before
-// anything is written), the deterministic section order and the byte-identical
-// output for the same input all match contentSaveFile.
+// goes), then the section table with checksums, then the patched header. Each
+// file-backed payload is removed once its bytes are in the output, so the save
+// transient is one encoded copy plus one section instead of the whole section
+// set plus the whole output. The temp-then-rename atomicity, the
+// contentGSXSizeError cap (checked before anything is written), the
+// deterministic section order and the byte-identical output for the same input
+// all match contentSaveFile.
 func contentSaveAssembled(path string, idx *contentIndex, files map[uint32]string) error {
 	payloads := contentCollectPayloads(idx, files)
 	if size := contentPayloadSize(payloads); contentGSXMaxBytes > 0 && size > contentGSXMaxBytes {
@@ -1015,6 +1018,14 @@ func contentSaveAssembled(path string, idx *contentIndex, files map[uint32]strin
 		crc, err := contentWritePayload(bw, io.Discard, p)
 		if err != nil {
 			return fail(err)
+		}
+		// Consume each spooled section as soon as it is in the output: the
+		// save must not hold the whole section set plus a second copy of it
+		// in the growing temp file. Only the section being copied can
+		// overlap the output now, so the save transient stays inside the
+		// selection's peak accounting instead of doubling the shard.
+		if p.file != "" {
+			_ = os.Remove(p.file)
 		}
 		entries = append(entries, contentSectionEntry{tag: p.tag, offset: off, length: p.size, flags: contentSectionFlagCRC, crc: crc, hasCRC: true})
 		off += p.size

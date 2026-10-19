@@ -262,9 +262,11 @@ GOMAXPROCS=2, peak disk 0.56x extracted. Limit-20 warm/first: rare literal
   the service treats the freshest report as the governor input signal and
   `loaded --json` names the source (`ui-heartbeat`/`wts`/`lastinput`/
   `unavailable`). See §6w.
-- **Save-time peak:** the write guard checks free space before each shard save,
-  but a save briefly holds both the section files and the output (§6x
-  residual). Account for it, or stream the save.
+- **Save-time peak: CLOSED 2026-10-19** (`content/save-peak`). The streaming
+  save now removes each file-backed section as it is copied into the output,
+  so the transient is one encoded copy plus one section, not all sections plus
+  the output. Measured 2.265x -> 1.275x encoded on a synthetic shard; pinned
+  output hash unchanged. See section 6x.
 - **Dense-text spool: CLOSED 2026-10-19** (`content/spool-level` NOTES.md, 9868e01).
   Selection already charges the measured staged spool bytes
   (`content_service_build.go` ~990, credited back in `content_space.go` ~166);

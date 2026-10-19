@@ -1,4 +1,4 @@
-﻿# Save-time peak (content/save-peak)
+# Save-time peak (content/save-peak)
 
 Branch `content/save-peak` from integ `2fbab97`. Work item: docs/WORK_QUEUE.md
 "Save-time peak", docs/CONTENT_SEARCH.md section 6x "Residual".
@@ -58,3 +58,31 @@ slack; the *sum* is not accounted. For target-sized shards the slack absorbs
 it. For an oversize shard (one folder unit past the target) or a tight
 reserve, the sum exceeds the accounted bound. This matches the documented
 residual in docs/CONTENT_SEARCH.md section 6x.
+
+## Phase 2: fix
+
+`contentSaveAssembled` (`cmd/seekfs/content_index.go`) now removes each
+file-backed section payload as soon as its bytes are in the temp output.
+Only the section currently being copied can overlap the growing output, so
+the transient is one encoded copy plus one section instead of the whole
+section set plus the whole output.
+
+Measured on the same fixture after the fix: peak 2,281,515 bytes = 0.602x
+extracted and 1.275x encoded (was 4,054,380 / 1.070x / 2.265x). The
+section files are gone by the time the save returns; the saved shard is
+byte-identical (pinned sha256 ce9f1b5517c751bd24100566046236644463cdaf038baf42f9263ac1cbdf8d46,
+captured before the change).
+
+Failing line before the fix:
+
+    content_save_peak_test.go:179: save peak 4054476 bytes (1.070x extracted, 2.265x encoded; scratch 2264625 + encoded 1789851) exceeds accounted bound 3555030 (0.800x extracted + 524288 slack)
+
+Tests:
+
+- `TestContentSavePeakWithinAccountedBound` (a): asserts the measured save
+  peak stays within `contentScopePeakMultiplier * extracted +
+  contentScopeScratchSlack()` for an oversize shard (512 KiB target, every
+  doc in one folder unit). Fails before, passes after.
+- `TestContentSaveShardBytesUnchanged` (b): pins the saved shard sha256 on a
+  deterministic fixture with file-backed terms, grams and filter sections.
+- `TestContentSavePeakMeasure`: reports before/peak/after and the ratios.

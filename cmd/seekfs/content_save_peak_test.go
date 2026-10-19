@@ -6,6 +6,7 @@ package main
 // what selection accounts for that shard.
 
 import (
+	"crypto/sha256"
 	"fmt"
 	"math/rand"
 	"os"
@@ -100,6 +101,16 @@ func contentMeasureSavePeak(t *testing.T, docs []contentBuildDoc) (extracted, be
 	hdr := contentShardHeader(&contentIndex{Origin: contentOriginUSN}, built)
 	hdr.Sections = map[uint32][]byte{contentSectionPaths: encodeContentPaths(built.paths)}
 	extracted = int64(built.textSize)
+	for _, f := range []struct {
+		name string
+		path string
+	}{{"terms", built.termPath}, {"grams", built.gramPath}, {"filter", built.filterPath}, {"prune", built.prunePath}} {
+		if f.path != "" {
+			if fi, err := os.Stat(f.path); err == nil {
+				t.Logf("section %s=%d", f.name, fi.Size())
+			}
+		}
+	}
 	before = contentDirBytes(t, scratch)
 	peak = before
 
@@ -149,4 +160,86 @@ func TestContentSavePeakMeasure(t *testing.T) {
 	t.Logf("peak/extracted=%.3f scratch/extracted=%.3f encoded/extracted=%.3f", float64(peak)/float64(extracted), float64(before)/float64(extracted), float64(encoded)/float64(extracted))
 	t.Logf("peak/encoded=%.3f scratch/encoded=%.3f", float64(peak)/float64(encoded), float64(before)/float64(encoded))
 	t.Logf("analytic upper bound scratch+encoded=%d (%.3fx extracted, %.3fx encoded)", before+encoded, float64(before+encoded)/float64(extracted), float64(before+encoded)/float64(encoded))
+}
+
+// TestContentSavePeakWithinAccountedBound is the regression guard: one
+// oversize shard (extracted well past the 512 KiB planning target, as an
+// indivisible folder unit can be) must save without its section files and
+// encoded output coexisting for the whole copy. The accounted peak is what
+// selection budgets: the peak multiplier times the shard's extracted bytes
+// plus the fixed scratch slack for in-flight shards.
+func TestContentSavePeakWithinAccountedBound(t *testing.T) {
+	restoreTarget, restoreConc := contentShardTargetBytes, contentShardBuildConcurrency
+	contentShardTargetBytes, contentShardBuildConcurrency = 512<<10, 1
+	t.Cleanup(func() { contentShardTargetBytes, contentShardBuildConcurrency = restoreTarget, restoreConc })
+
+	docs := contentSavePeakDocs(t, 240, 1800)
+	extracted, before, encoded, peak := contentMeasureSavePeak(t, docs)
+	bound := float64(extracted)*contentScopePeakMultiplier + float64(contentScopeScratchSlack())
+	if float64(peak) > bound {
+		t.Fatalf("save peak %d bytes (%.3fx extracted, %.3fx encoded; scratch %d + encoded %d) exceeds accounted bound %.0f (%.3fx extracted + %d slack)",
+			peak, float64(peak)/float64(extracted), float64(peak)/float64(encoded), before, encoded, bound, contentScopePeakMultiplier, contentScopeScratchSlack())
+	}
+}
+
+// contentSaveHashDocs is a stable fixture: fixed path strings, fixed text,
+// no on-disk files (assembly never re-reads the source). Its saved shard hash
+// is pinned so the streaming save can change how it consumes section files
+// without changing one output byte.
+func contentSaveHashDocs(n, wordsPerDoc int) []contentBuildDoc {
+	rng := rand.New(rand.NewSource(0xc0ffee))
+	vocab := make([]string, 4000)
+	for i := range vocab {
+		var b strings.Builder
+		for k := 0; k < 6+rng.Intn(6); k++ {
+			b.WriteByte(byte('a' + rng.Intn(26)))
+		}
+		vocab[i] = b.String()
+	}
+	docs := make([]contentBuildDoc, 0, n)
+	for i := 0; i < n; i++ {
+		var b strings.Builder
+		fmt.Fprintf(&b, "doc%05d ", i)
+		for k := 0; k < wordsPerDoc; k++ {
+			b.WriteString(vocab[rng.Intn(len(vocab))])
+			b.WriteByte(' ')
+		}
+		docs = append(docs, contentBuildDoc{
+			path:    fmt.Sprintf("C:/repo/d%02d/f%05d.txt", i%13, i),
+			frn:     uint64(1000 + i*3),
+			text:    []byte(b.String()),
+			modUnix: 1_700_000_000 + int64(i),
+			class:   1,
+			version: 2,
+		})
+	}
+	return docs
+}
+
+// TestContentSaveShardBytesUnchanged pins the saved shard hash. The fixture
+// exercises file-backed terms, grams and filter sections, so consuming those
+// files during the copy must not alter the bytes.
+func TestContentSaveShardBytesUnchanged(t *testing.T) {
+	docs := contentSaveHashDocs(60, 400)
+	tmp := t.TempDir()
+	built, err := assembleContentIndexStreamed(contentStreamTestSource(docs), tmp, contentFilterID{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	hdr := contentShardHeader(&contentIndex{Origin: contentOriginUSN}, built)
+	hdr.Sections = map[uint32][]byte{contentSectionPaths: encodeContentPaths(built.paths)}
+	dir := t.TempDir()
+	info, err := contentSaveShard(dir, hdr, contentBuildFiles(built), []string{""})
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(filepath.Join(dir, info.File))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := fmt.Sprintf("%x", sha256.Sum256(data))
+	const want = "ce9f1b5517c751bd24100566046236644463cdaf038baf42f9263ac1cbdf8d46"
+	if got != want {
+		t.Fatalf("saved shard sha256 = %s; want %s", got, want)
+	}
 }
