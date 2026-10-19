@@ -128,7 +128,7 @@ e16a345): low-hit-rate regexes spend the page-scaled valve and return a short pa
 marked incomplete; the cap scales 2,048 -> 8,192 reads from limit 100 to 520.
 Running: `fix/explicit-budget-overlay` (budgetfix: with hidden overlay rows the
 window pass replaced an explicit --content-verify-budget with the default valve;
-needs a two-step page fill) and `content/save-peak` (savepeak: measure first). Owner action: relaunch
+needs a two-step page fill) . `content/save-peak` merged (c25c755, see Save-time peak below). Owner action: relaunch
 the live service to see the 1,826 extract errors split by reason.
 
 Merged 2026-10-17: `content/verify-frontier` (e271c17): parallel verifiers stop at
