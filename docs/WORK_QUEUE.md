@@ -102,6 +102,16 @@ outside-repo skips for dependency/venv trees, Cargo internals, browser profiles,
 game libraries, AppData and module caches, and more binary extensions. E:
 estimate: 647k -> 903k files (5.6 -> 11.2 GB text upper bound).
 
+Merged 2026-10-19: `fix/direct-builder-seq` (3789143: direct builder persists FRN
+sequence numbers), `fix/count-client-timeout` (8b1438a/9f28b8f: service deadline 2 s
+inside the client wait, partial page marked incomplete; cancel only on pipe-disconnect
+errors), `fix/content-extract-errors` (8df7264: per-reason extraction error counts in
+`loaded --json`, vanished files not errors, files past MAX_PATH now open with the extended-length prefix,
+tests stay out of the ProgramData service log). Running: `feat/content-cursor-v2`
+(cursorv2: record-ID resume, single volume, empty delta) and
+`fix/content-regex-underfill` (regexfill: diagnose first). Owner action: relaunch
+the live service to see the 1,826 extract errors split by reason.
+
 Merged 2026-10-17: `content/verify-frontier` (e271c17): parallel verifiers stop at
 the first unverified candidate when the disk cap runs out (no page gaps), exact
 concurrent read accounting, default 512 reads with no implicit deadline,
