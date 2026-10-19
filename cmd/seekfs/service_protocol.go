@@ -666,13 +666,20 @@ type postingCacheEntry struct {
 // redirect it with SEEKFS_DIR instead of appending to the machine's real
 // %ProgramData%\seekfs\service.log. In production SEEKFS_DIR is unset and the
 // path is unchanged (%ProgramData%\seekfs\service.log).
-func serviceLog(format string, args ...any) {
+// serviceLogPath is the exact file serviceLog appends to. Tests assert this
+// path is not under the machine's ProgramData tree.
+func serviceLogPath() string {
 	dir := defaultSeekFSDir()
 	if dir == "" || dir == "seekfs" {
 		dir = filepath.Join(os.TempDir(), "seekfs")
 	}
-	_ = os.MkdirAll(dir, 0o755)
-	f, err := os.OpenFile(filepath.Join(dir, "service.log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	return filepath.Join(dir, "service.log")
+}
+
+func serviceLog(format string, args ...any) {
+	path := serviceLogPath()
+	_ = os.MkdirAll(filepath.Dir(path), 0o755)
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
 	if err != nil {
 		return
 	}

@@ -9,6 +9,8 @@ package main
 import (
 	"errors"
 	"os"
+	"path/filepath"
+	"strings"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
@@ -22,8 +24,35 @@ const contentFileFlagOpenNoRecall = 0x00100000
 // reserved for memory-manager paging; Low is the background level.)
 const contentIOPriorityHintLow = 1
 
+// contentLongPath prefixes an absolute path with the extended-length marker
+// when it can exceed MAX_PATH. go's os package does this internally, but a raw
+// windows.CreateFile call does not: without the prefix a valid file in a deep
+// tree fails to open (ERROR_PATH_NOT_FOUND) even though the walker indexed it.
+// Clean paths are required: the marker disables the normalizer, so "." and ".."
+// must not survive. UNC paths use the \\?\UNC\ form.
+func contentLongPath(path string) string {
+	if strings.HasPrefix(path, `\\?\`) || strings.HasPrefix(path, `\\.\`) {
+		return path
+	}
+	if len(path) < 248 {
+		return path
+	}
+	clean := filepath.Clean(path)
+	if !filepath.IsAbs(clean) {
+		abs, err := filepath.Abs(clean)
+		if err != nil {
+			return path
+		}
+		clean = abs
+	}
+	if strings.HasPrefix(clean, `\\`) {
+		return `\\?\UNC\` + clean[2:]
+	}
+	return `\\?\` + clean
+}
+
 func contentOpenNoRecall(path string) (*os.File, error) {
-	p, err := windows.UTF16PtrFromString(path)
+	p, err := windows.UTF16PtrFromString(contentLongPath(path))
 	if err != nil {
 		return nil, err
 	}

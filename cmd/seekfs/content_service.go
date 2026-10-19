@@ -17,10 +17,13 @@ package main
 import (
 	"context"
 	"crypto/sha256"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -40,6 +43,77 @@ const (
 	// persists the reconciled delta returns health to ready.
 	contentStateReconciling = "reconciling"
 )
+
+// Extraction error reason codes. The total extraction-error count stays as it
+// was; these codes split it into a small fixed set so `loaded` names what
+// failed instead of only how many. A file that vanished between selection and
+// extraction is an expected transient, so it goes to the vanished counter and
+// not to the error count.
+const (
+	contentExtractReasonNotFound         = "not_found"
+	contentExtractReasonAccessDenied     = "access_denied"
+	contentExtractReasonSharingViolation = "sharing_violation"
+	contentExtractReasonTimeout          = "timeout"
+	contentExtractReasonExtractor        = "extractor"
+	contentExtractReasonIO               = "io"
+	contentExtractReasonOther            = "other"
+)
+
+// contentExtractErrorLogPerReason caps how many error lines one reason writes
+// to service.log per process (and therefore per build). Diagnostics must never
+// cost one log line per file.
+const contentExtractErrorLogPerReason = 20
+
+// Windows errno values that classify a file open failure. Numeric constants
+// keep the classifier portable to the non-Windows test build.
+const (
+	contentErrnoFileNotFound     = syscall.Errno(2)
+	contentErrnoPathNotFound     = syscall.Errno(3)
+	contentErrnoAccessDenied     = syscall.Errno(5)
+	contentErrnoSharingViolation = syscall.Errno(32)
+	contentErrnoLockViolation    = syscall.Errno(33)
+)
+
+// contentExtractionErrorReason classifies one extraction failure into a fixed
+// reason code. Path errors are checked first (a vanished file must never look
+// like an extractor bug), then the extractor sentinel, and finally the generic
+// I/O fallback.
+func contentExtractionErrorReason(err error) string {
+	if err == nil {
+		return contentExtractReasonOther
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return contentExtractReasonTimeout
+	}
+	if errors.Is(err, context.Canceled) {
+		return contentExtractReasonOther
+	}
+	if errors.Is(err, os.ErrNotExist) {
+		return contentExtractReasonNotFound
+	}
+	if errors.Is(err, os.ErrPermission) {
+		return contentExtractReasonAccessDenied
+	}
+	var errno syscall.Errno
+	if errors.As(err, &errno) {
+		switch errno {
+		case contentErrnoFileNotFound, contentErrnoPathNotFound:
+			return contentExtractReasonNotFound
+		case contentErrnoAccessDenied:
+			return contentExtractReasonAccessDenied
+		case contentErrnoSharingViolation, contentErrnoLockViolation:
+			return contentExtractReasonSharingViolation
+		}
+	}
+	if errors.Is(err, contentExtractFailure) || errors.Is(err, contentExtractPanicError) {
+		return contentExtractReasonExtractor
+	}
+	var pathErr *os.PathError
+	if errors.As(err, &pathErr) || errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return contentExtractReasonIO
+	}
+	return contentExtractReasonOther
+}
 
 // Windows file attributes the content pipeline cares about.
 const (
@@ -186,6 +260,15 @@ type contentHealth struct {
 	// checksum pass. The base is dropped (stale) and a rebuild scheduled, so
 	// the field names the corruption instead of serving wrong results.
 	IntegrityError string `json:"integrity_error,omitempty"`
+	// ExtractErrorReasons splits ExtractionErrors into the fixed reason codes
+	// (not_found is reported separately as Vanished and is not an error, so it
+	// never appears here). A non-zero code names what to fix: an ACL, a
+	// sharing lock, an extractor bug, or the disk.
+	ExtractErrorReasons map[string]int `json:"extract_error_reasons,omitempty"`
+	// Vanished counts files that were selected but no longer existed when the
+	// drain opened them. This is an expected transient (delete/rename race),
+	// so it is not an extraction error and does not keep the volume degraded.
+	Vanished int `json:"extract_vanished,omitempty"`
 }
 
 // contentDeltaDoc is an extracted document for a file changed since the base,
@@ -510,6 +593,10 @@ type contentVolumeState struct {
 	// full build. scopeInclusionSet marks it valid (zero stats are meaningful).
 	scopeInclusion    contentInclusionStats
 	scopeInclusionSet bool
+	// extractErrLog counts log lines already written per extraction-error
+	// reason, so service.log gets the first 20 of each and no more. In-memory
+	// only; a restart re-arms the diagnostic sample.
+	extractErrLog map[string]int
 }
 
 // walkDeclinedNote records that key extracted to nothing at print. A later
@@ -610,6 +697,13 @@ func mergeContentHealth(dst *contentHealth, src contentHealth) {
 	dst.QueueDepth += src.QueueDepth
 	dst.Evictions += src.Evictions
 	dst.ExtractionErrors += src.ExtractionErrors
+	dst.Vanished += src.Vanished
+	for reason, n := range src.ExtractErrorReasons {
+		if dst.ExtractErrorReasons == nil {
+			dst.ExtractErrorReasons = make(map[string]int, len(src.ExtractErrorReasons))
+		}
+		dst.ExtractErrorReasons[reason] += n
+	}
 	dst.Skipped += src.Skipped
 	dst.Truncated += src.Truncated
 	dst.Binary += src.Binary
@@ -666,6 +760,20 @@ func mergeContentHealth(dst *contentHealth, src contentHealth) {
 	dst.LastDrain = newestContentTimestamp(dst.LastDrain, src.LastDrain)
 }
 
+// cloneContentExtractErrorReasons copies a per-reason map. Health snapshots
+// outlive the state lock (JSON encoding happens later), so a shared map would
+// race with the next drain failure.
+func cloneContentExtractErrorReasons(src map[string]int) map[string]int {
+	if len(src) == 0 {
+		return nil
+	}
+	out := make(map[string]int, len(src))
+	for reason, n := range src {
+		out[reason] = n
+	}
+	return out
+}
+
 func containsVolumeName(list []string, want string) bool {
 	for _, v := range list {
 		if v == want {
@@ -716,6 +824,9 @@ func newestContentTimestamp(a, b string) string {
 // documented on contentHealthSnapshot.
 func aggregateContentHealth(healths []contentHealth) contentHealth {
 	out := healths[0]
+	// The reason map is shared by the snapshot; clone it before merging so a
+	// per-volume state is never mutated by aggregation.
+	out.ExtractErrorReasons = cloneContentExtractErrorReasons(healths[0].ExtractErrorReasons)
 	// Build progress is only meaningful while a volume is indexing; a ready
 	// volume can carry a stale BuildTotal from its last build, so only indexing
 	// volumes contribute.
@@ -741,8 +852,9 @@ func aggregateContentHealth(healths []contentHealth) contentHealth {
 //   - State is the most severe state: ready/off < unavailable < indexing <
 //     degraded < stale (contentStateSeverity).
 //   - Docs, DeltaBytes, Deferred, QueueDepth, Evictions, ExtractionErrors,
-//     Skipped, Truncated, Binary, ScopeDropped, ScopeDroppedBytes, SidecarBytes
-//     and SidecarCap are summed; BudgetBytes takes the largest;
+//     Vanished, Skipped, Truncated, Binary, ScopeDropped, ScopeDroppedBytes,
+//     SidecarBytes and SidecarCap are summed; ExtractErrorReasons is summed per
+//     reason; BudgetBytes takes the largest;
 //     BuildDone/BuildTotal sum while indexing or reconciling; BuildPhase
 //     comes from an indexing or reconciling volume.
 //   - Partial, Incomplete and CountDivergent are OR-ed.
@@ -1406,6 +1518,7 @@ func (s *contentVolumeState) healthSnapshot(queueDepth int) contentHealth {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	h := s.health
+	h.ExtractErrorReasons = cloneContentExtractErrorReasons(h.ExtractErrorReasons)
 	h.QueueDepth = queueDepth
 	if h.State == "" {
 		h.State = s.state
@@ -1455,10 +1568,50 @@ func (s *contentVolumeState) markDrained() {
 	s.health.LastDrain = time.Now().UTC().Format(time.RFC3339)
 }
 
-func (s *contentVolumeState) noteExtractionError() {
+// noteExtractionError records one failed extraction with its path and reason.
+// The first contentExtractErrorLogPerReason failures of a reason write a log
+// line with the path and error; later ones only move the counters, so a huge
+// broken directory never produces one log line per file. A vanished file is an
+// expected delete/rename race: it moves Vanished instead of ExtractionErrors.
+func (s *contentVolumeState) noteExtractionError(path string, err error) {
+	if s == nil {
+		return
+	}
+	reason := contentExtractionErrorReason(err)
+	volume := s.volume
+	logNow := false
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	if reason == contentExtractReasonNotFound {
+		s.health.Vanished++
+		if s.extractErrLog == nil {
+			s.extractErrLog = make(map[string]int)
+		}
+		if s.extractErrLog[reason] < contentExtractErrorLogPerReason {
+			s.extractErrLog[reason]++
+			logNow = true
+		}
+		s.mu.Unlock()
+		if logNow {
+			serviceLog("content extract vanished volume=%s path=%q err=%v", volume, path, err)
+		}
+		return
+	}
 	s.health.ExtractionErrors++
+	if s.health.ExtractErrorReasons == nil {
+		s.health.ExtractErrorReasons = make(map[string]int)
+	}
+	s.health.ExtractErrorReasons[reason]++
+	if s.extractErrLog == nil {
+		s.extractErrLog = make(map[string]int)
+	}
+	if s.extractErrLog[reason] < contentExtractErrorLogPerReason {
+		s.extractErrLog[reason]++
+		logNow = true
+	}
+	s.mu.Unlock()
+	if logNow {
+		serviceLog("content extract error volume=%s reason=%s path=%q err=%v", volume, reason, path, err)
+	}
 }
 
 // markCatchUpIncomplete flags that restart catch-up stopped before reaching
@@ -2031,8 +2184,13 @@ func contentExtractDeltaDocReason(baseCtx context.Context, frn uint64, path stri
 		return contentDeltaDoc{}, false, "binary", size, nil
 	}
 	res, err := contentExtractSafely(fctx, e, s.reader(), size)
-	if err != nil || res.Skipped || len(res.Text) == 0 {
-		return contentDeltaDoc{}, false, "", size, err
+	if err != nil {
+		// Tag the error as an extractor failure so the caller's reason
+		// classifier does not mistake it for an open/read failure.
+		return contentDeltaDoc{}, false, "", size, fmt.Errorf("%w: %w", contentExtractFailure, err)
+	}
+	if res.Skipped || len(res.Text) == 0 {
+		return contentDeltaDoc{}, false, "", size, nil
 	}
 	if res.Class == contentClassText && contentLooksMinified(res.Text) {
 		return contentDeltaDoc{}, false, contentSkipMinified, size, nil
@@ -2103,7 +2261,7 @@ func (c *contentCoordinator) processQueue(resolvePath func(frn uint64) (string, 
 		}
 		doc, didChange, reason, size, err := contentExtractDeltaDocReason(fctx, frn, path, prior, havePrior)
 		if err != nil {
-			c.state.noteExtractionError()
+			c.state.noteExtractionError(path, err)
 			continue
 		}
 		if reason != "" {
