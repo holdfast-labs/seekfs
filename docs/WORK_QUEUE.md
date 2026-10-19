@@ -107,9 +107,14 @@ sequence numbers), `fix/count-client-timeout` (8b1438a/9f28b8f: service deadline
 inside the client wait, partial page marked incomplete; cancel only on pipe-disconnect
 errors), `fix/content-extract-errors` (8df7264: per-reason extraction error counts in
 `loaded --json`, vanished files not errors, files past MAX_PATH now open with the extended-length prefix,
-tests stay out of the ProgramData service log). Running: `feat/content-cursor-v2`
-(cursorv2: record-ID resume, single volume, empty delta) and
-`fix/content-regex-underfill` (regexfill: diagnose first). Owner action: relaunch
+tests stay out of the ProgramData service log). Then `feat/content-cursor-v2` (4e12172):
+v2 cursor carries the last emitted record ID plus name/sidecar/delta identity;
+resume rebuilds the candidate order and verifies about one page; identity change
+restarts with `cursor_restarted`. Only single volume, non-relevance sort, empty
+name overlay and content delta; other shapes keep v1. Running:
+`feat/content-cursor-v2-overlay` (cursorov: design for overlay/delta pages, which
+the live E: volume nearly always has) and `fix/content-regex-underfill`
+(regexfill: diagnose first). Owner action: relaunch
 the live service to see the 1,826 extract errors split by reason.
 
 Merged 2026-10-17: `content/verify-frontier` (e271c17): parallel verifiers stop at
@@ -123,9 +128,9 @@ is now multi-volume only (8283924; warm regex n=20 340 -> 131 ms). A large expli
 window probes (unknown-probe widen; the full window forced by a pending WAL
 overlay) are capped at the default page-scaled valve. Live E: regex n=100 with
 budget 20000: 26 s -> 0.21 s. Open: cold first runs after a relaunch are slow
-(regex n=100 6.9 s, n=520 10.6 s; Defender first-open cost); `count` with a high budget hits the 30 s client timeout; incomplete
-overlay-merged pages are not guaranteed rank prefixes (`mergeOverlayMatches`);
-cursor v2 needs a candidate frontier plus content delta/source mutation identity.
+(regex n=100 6.9 s, n=520 10.6 s; Defender first-open cost); `count` past the client timeout now returns a partial page (8b1438a); incomplete
+overlay-merged pages keep a rank prefix (fixed earlier, a3c149a);
+cursor v2 merged 2026-10-19 (4e12172), overlay/delta pages still v1.
 
 Merged 2026-10-16: `perf/footprint-shards` (b329cd3: lazy front-coded paths with a
 locked restart cache, one composite doc table; heap after content attach
