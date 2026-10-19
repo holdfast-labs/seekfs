@@ -131,8 +131,12 @@ pass had replaced an explicit --content-verify-budget with the default valve; a
 short capped page now refills from the verify frontier under the caller budget
 (zero first-pass hits included, no candidate read twice), and the reported cap
 matches the applied one. Single volume only. `content/save-peak` merged (c25c755, see Save-time peak below).
-Running: `content/fold-postings` (foldpost: posting-level fold, only changed docs
-re-extracted; full re-extract fallback past 25% changed docs or 32 folds per shard).
+Then `content/fold-postings` (73ecc75): a fold re-extracts only changed/added docs
+and carries unchanged doc table, paths, filter rows, aliases and gram postings
+(byte-identical to a rebuild except pruned grams); per-shard CXFC counters force a
+full re-extract past 25% changed docs or 32 posting folds, restoring exact term df
+(fuzzy ordering) and pruning. A posting fold no longer repairs out-of-band edits
+that never reached the delta. Nothing running.
 Owner action: relaunch
 the live service to see the 1,826 extract errors split by reason.
 
@@ -231,8 +235,9 @@ GOMAXPROCS=2, peak disk 0.56x extracted. Limit-20 warm/first: rare literal
   I/O concurrency from CPU workers: TRIED (`perf/build-io-concurrency` 871319b,
   not merged): 175 vs 179 files/s cold, the scan rate is the ceiling;
   (3) tokenize+emit CPU (~5 s of 6), only matters warm or after (1).
-- **Fold cost under no stored text:** a fold re-reads every doc in the shard
-  from disk (5.6 ms/doc). Keep shards small, or fold from postings only.
+- **Fold cost under no stored text: DONE 2026-10-19** (`content/fold-postings`,
+  73ecc75). Follow-up option: a smaller shard target (e.g. 16 MiB) for the
+  full-fold fallback and reshards.
 - **Delta-varint spill runs: DONE** (562fe42). Grouped per key with
   delta-varint docIDs. blink/renderer/core (79.9 MB extracted, 2 shards): spill
   run peak 77.1 -> 24.3 MB (-69%), total build disk peak 174.2 -> 121.4 MB
