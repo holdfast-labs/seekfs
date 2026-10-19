@@ -110,3 +110,16 @@ func TestContentFeatureConfigOptIn(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// TestContentFeatureDefaultOn pins the v1.12.0 default: with no plugin entry
+// and no [features.content] section, content search is on; an explicit
+// section turns it off.
+func TestContentFeatureDefaultOn(t *testing.T) {
+	if !featureContentEnabled(appConfig{}) {
+		t.Fatal("content search is off with no configuration; want on by default")
+	}
+	off := appConfig{Features: map[string]featureConfig{"content": {Enabled: false}}}
+	if featureContentEnabled(off) {
+		t.Fatal("[features.content] enabled = false did not opt out")
+	}
+}
