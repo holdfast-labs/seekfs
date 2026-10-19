@@ -477,6 +477,7 @@ func (s *goSearchService) serviceCommandSearch(w io.Writer, caps serviceCapabili
 	v2Resume := false
 	v2Restarted := false
 	v2RestartReason := ""
+	resumeBaseFRN := uint64(0)
 	var cursorCtx *contentCursorContext
 	if !req.CountOnly {
 		if pq, parseErr := parseQuery(opts); parseErr == nil {
@@ -485,7 +486,17 @@ func (s *goSearchService) serviceCommandSearch(w io.Writer, caps serviceCapabili
 				if v2Cursor != nil {
 					if ok, reason := v2Cursor.check(*ctx); ok {
 						v2Resume = true
-						opts.contentAfter = &contentCursorResume{FRN: v2Cursor.ID}
+						resumeBaseFRN = v2Cursor.BK
+						if v2Cursor.K == nil {
+							// A pre-overlay token carried only the last row's
+							// FRN, and that row was always a base row.
+							resumeBaseFRN = v2Cursor.ID
+						}
+						opts.contentAfter = &contentCursorResume{
+							FRN:   resumeBaseFRN,
+							Found: resumeBaseFRN == 0,
+							Key:   v2Cursor.K,
+						}
 						opts.Limit = pageLimit
 					} else {
 						v2Restarted = true
@@ -571,6 +582,7 @@ func (s *goSearchService) serviceCommandSearch(w io.Writer, caps serviceCapabili
 		v2Resume = false
 		v2Restarted = true
 		v2RestartReason = "content cursor position not found"
+		resumeBaseFRN = 0
 	}
 	rowsBefore := 0
 	if v2Resume && v2Cursor != nil {
@@ -606,7 +618,29 @@ func (s *goSearchService) serviceCommandSearch(w io.Writer, caps serviceCapabili
 			if pq, parseErr := parseQuery(opts); parseErr == nil {
 				if now, ok := s.contentCursorContextFor(pq, opts); ok && *now == *cursorCtx {
 					if lastID := matches[len(matches)-1].FRN; lastID != 0 {
-						v2Token = encodeSearchCursorV2(opts, *cursorCtx, lastID, emitted)
+						bk := uint64(0)
+						if v2Resume {
+							bk = resumeBaseFRN
+						}
+						var key *contentCursorKey
+						if vol := s.volumes[0]; vol != nil {
+							for i := range matches {
+								entry := matches[i]
+								var rowKey contentCursorKey
+								if vol.contentCursorEntryIsOverlay(entry) {
+									rowKey = vol.contentCursorOverlayKey(
+										rankedOverlayEntry{entry: entry, rank: vol.overlayEntryRank(entry, pq)}, pq)
+								} else {
+									rowKey = vol.contentCursorBaseKey(entry, pq)
+									bk = entry.FRN
+								}
+								if i == len(matches)-1 {
+									k := rowKey
+									key = &k
+								}
+							}
+						}
+						v2Token = encodeSearchCursorV2(opts, *cursorCtx, lastID, emitted, bk, key)
 					}
 				}
 			}

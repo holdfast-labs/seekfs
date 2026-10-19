@@ -596,6 +596,9 @@ type contentCursorResume struct {
 	FRN   uint64
 	Found bool
 	skip  int
+	// Key is the page key of the last emitted row. Overlay rows at or before
+	// it are already emitted and stay out of the resumed page.
+	Key *contentCursorKey
 }
 
 // contentCompletenessProbe carries the reduced default-order path's

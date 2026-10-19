@@ -796,6 +796,21 @@ func (vol *serviceVolumeIndex) overlayRankedMatches(snap *volumeSnapshot, pq par
 		}
 		return overlay[i].rank < overlay[j].rank
 	})
+	// A v2 resume re-evaluates the overlay against the current snapshot. Rows
+	// whose page key is at or before the last emitted row are already on an
+	// earlier page and must not be emitted again. A row published between
+	// pages that sorts before the cursor is therefore skipped for the rest of
+	// the walk; a file renamed across the cursor can be missed. The divergence
+	// is bounded and never duplicates a path within the returned pages.
+	if resume := pq.contentAfter; resume != nil && resume.Key != nil {
+		kept := overlay[:0]
+		for _, item := range overlay {
+			if vol.contentCursorOverlayKey(item, pq).compare(*resume.Key) > 0 {
+				kept = append(kept, item)
+			}
+		}
+		overlay = kept
+	}
 	return overlay
 }
 
