@@ -169,6 +169,11 @@ const (
 	contentSectionScope    uint32 = 'C'<<24 | 'X'<<16 | 'S'<<8 | 'C'
 	contentSectionPruned   uint32 = 'C'<<24 | 'X'<<16 | 'G'<<8 | 'P'
 	contentSectionFilter   uint32 = 'C'<<24 | 'X'<<16 | 'F'<<8 | 'L'
+	// contentSectionFoldCounters carries the per-shard posting-fold counters in
+	// a manifest: how many posting-level folds a shard has taken and how many
+	// of its docs were changed or removed since the last full re-extract. It is
+	// small, so it verifies eagerly; older binaries ignore the unknown section.
+	contentSectionFoldCounters uint32 = 'C'<<24 | 'X'<<16 | 'F'<<8 | 'C'
 )
 
 // contentBuildPolicy is the extraction policy a `.gsx` was built with and the

@@ -52,7 +52,7 @@ Cold-cache (Defender first open) multiplies today's fold several times; A pays o
 
 ## 7. Recommendation
 - Short term: lower the shard target (for example 16 MiB) for new/resharded volumes. Low risk, about 4x faster folds, lower peaks. Do not re-plan live volumes just for this.
-- Medium term: Option A for stable-shape shards. It removes the O(shard docs) disk extraction and keeps one canonical format, the existing atomic publish, and the unchanged query path. Ship exact `CXDT`/`CXPT`/`CXFL`/`CXAL`/`CXGR` reconstruction with a documented `CXTR`/prune approximation; make fuzzy ordering `df`-independent if fuzzy parity is required.
+- Medium term: Option A for stable-shape shards. Implemented on `content/fold-postings`; see section 10. It removes the O(shard docs) disk extraction and keeps one canonical format, the existing atomic publish, and the unchanged query path. Exact `CXDT`/`CXPT`/`CXFL`/`CXAL`/`CXGR` reconstruction with a documented `CXTR`/prune approximation; fuzzy ordering stays `df`-dependent until the fallback resets it.
 - Option B only if durable deltas or exact base immutability are required. It fits query-time freshness and compaction scheduling, but touches manifest, attach, cursor, count, and fuzzy paths. Keep the re-extract reshard fallback for rare growth (`:278-282`).
 
 ## 8. Test plan
@@ -67,3 +67,32 @@ Cold-cache (Defender first open) multiplies today's fold several times; A pays o
 - `CXTR` exactness vs fuzzy behavior is the main decision; without a format addition, fuzzy correction ordering can differ. Pruned-gram un-pruning is not recoverable, so keep the conservative behavior.
 - Option B needs a durable-delta budget so scope selection still bounds disk.
 - A must not advance the checkpoint or publish before durability; keep the temp+fsync+rename ordering (`content_index.go:991-1073`, `:1075-1100`; `content_shards.go:447-458`).
+
+## 10. Implementation on `content/fold-postings`
+- `content_fold_postings.go`: posting fold for a stable-shape shard and for a
+  stable single-file sidecar (the latter stores its counter in the sidecar).
+  Unchanged docs carry `CXDT`/`CXPT`/`CXFL` rows; removed/changed DocIDs are
+  dropped; changed/added docs are re-extracted once (delta text is the
+  unreadable-file fallback); `CXAL` is recomputed from doc-table hashes; a
+  promoted alias copies the old primary's posting row.
+- Counters live in the manifest's `CXFC` section, keyed by shard file name
+  (single-file key `""`). `contentPostingFoldMaxFolds = 32` and
+  `contentPostingFoldMaxChangedPercent = 25` trigger the full re-extract path,
+  which resets the counters and restores exact `CXTR` `df` and un-pruned grams.
+  The pending fold's changed/removed docs count toward the 25% share, so a
+  single large fold falls back immediately.
+  A reshard/build omits `CXFC`, so it also resets them. No format-version bump:
+  older binaries ignore the unknown section.
+- `contentShardPostingFold` applies only when the shard has filter/path
+  sections and no unexpected alias shape; otherwise the existing re-extract
+  path runs. The shard save stays temp+fsync+rename, and the manifest is still
+  the commit point.
+- Tests are in `content_fold_postings_test.go`: section/query equivalence vs a
+  from-disk rebuild across three shards; delete first/middle/last and dedupe
+  promotion; pruned-gram no-false-negatives; failed-manifest restart and
+  per-section CRC corruption; 25% and 32-fold fallback with exact `CXTR`; one
+  changed doc reads exactly one file (sharded and single-file).
+- Residual: `CXTR` `df` and the pruned set are stale until the full fallback.
+  An out-of-band edit not present in the delta is not repaired by a posting
+  fold (unchanged docs are not re-read); a fold whose changed share crosses 25%
+  still falls back to the full re-read.
