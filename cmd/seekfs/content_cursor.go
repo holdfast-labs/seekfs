@@ -306,6 +306,9 @@ func (vol *serviceVolumeIndex) contentAfterCandidateStart(ids []int, resume *con
 	for i, id := range ids {
 		if vol.index.compactRecord(id).FRN == resume.FRN {
 			resume.Found = true
+			if resume.Inclusive {
+				return i
+			}
 			return i + 1
 		}
 	}
@@ -325,6 +328,9 @@ func (vol *serviceVolumeIndex) contentAfterScanStart(order []uint32, recordCount
 		id := compactUint32OrderAt(order, pos)
 		if vol.index.compactRecord(id).FRN == resume.FRN {
 			resume.Found = true
+			if resume.Inclusive {
+				return pos
+			}
 			return pos + 1
 		}
 	}
@@ -351,6 +357,21 @@ func (vol *serviceVolumeIndex) contentResumeNextBaseKey(idx *Index, order []int,
 	rec := idx.compactRecord(recIndex)
 	entry := compactEntryFromRecordPath(idx, recIndex, rec, pathCache, true, false)
 	return vol.contentCursorBaseKey(entry, pq), true
+}
+
+// contentResumeFromFrontier builds an inclusive resume at the first candidate
+// the capped pass did not verify. It skips every candidate the first pass
+// already verified, including when that pass emitted no hit at all.
+func (vol *serviceVolumeIndex) contentResumeFromFrontier(trace *searchTrace, pq parsedQuery) *contentCursorResume {
+	if vol == nil || trace == nil || !trace.contentFrontierSet {
+		return nil
+	}
+	frontier := trace.contentFrontier
+	if frontier.FRN == 0 {
+		return nil
+	}
+	k := vol.contentCursorBaseKey(frontier, pq)
+	return &contentCursorResume{FRN: frontier.FRN, Found: true, Key: &k, Inclusive: true}
 }
 
 // contentResumeFromMatches builds a v2 resume after the last emitted row. A

@@ -609,6 +609,12 @@ type contentCursorResume struct {
 	// the post-search merge reuses them instead of evaluating the overlay
 	// twice. Local-only; nil on every other path.
 	overlay []rankedOverlayEntry
+	// Inclusive starts the base side AT FRN instead of after it, and keeps
+	// overlay rows whose key equals Key. The explicit-budget refill resumes at
+	// the first unverified candidate (the verify frontier), not after the last
+	// emitted row, so a zero-hit page can resume and verified misses are not
+	// read again. False for v2 cursor pages, which resume after a row.
+	Inclusive bool
 }
 
 // contentCompletenessProbe carries the reduced default-order path's

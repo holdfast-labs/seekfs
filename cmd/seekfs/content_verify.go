@@ -1954,20 +1954,26 @@ func searchContentServiceVolumes(volumes []*serviceVolumeIndex, opts queryOption
 			// caps this pass at the default page valve even when the caller
 			// chose a larger --content-verify-budget. When that valve (not the
 			// candidate set) stopped a still-short page, restore the caller's
-			// reservation and verify only the rest of the page, resuming after
-			// the last emitted row so earlier rows are not re-emitted.
-			if err == nil && !countOnly && len(volumes) == 1 && len(matches) > 0 &&
+			// reservation and verify only the rest of the page, resuming at the
+			// first unverified candidate so verified misses are not re-read.
+			if err == nil && !countOnly && len(volumes) == 1 &&
 				len(matches) < userLimit && opts.ContentDiskVerifyBudget > 0 {
 				explicit := clampContentDiskVerifyBudget(opts.ContentDiskVerifyBudget)
 				disk := opts.Trace.disk
 				if disk != nil && disk.capped.Load() && !disk.exceeded.Load() &&
 					int64(explicit) > disk.limit && disk.used.Load() >= disk.limit {
 					if opts.Trace.raiseDiskBudget(explicit) {
+						// Resume at the first candidate the capped pass did not
+						// verify. Fall back to the last emitted row when no
+						// frontier was recorded (e.g. a serial verify path).
+						resume := vol.contentResumeFromFrontier(opts.Trace, pq)
+						if resume == nil {
+							resume = vol.contentResumeFromMatches(matches, pq)
+						}
 						// The first-pass frontier is stale once verification
 						// resumes past it. Clear it so the continuation merge
 						// does not cut rows the second pass verifies.
 						opts.Trace.contentFrontierSet = false
-						resume := vol.contentResumeFromMatches(matches, pq)
 						if resume != nil {
 							resume.pageLimit = userLimit - len(matches)
 							vol.prepareContentResumeOverlay(pq, resume)
