@@ -678,7 +678,7 @@ func setConfigKey(path, key, value string) error {
 		lines = append(lines, key+" = "+formatted)
 	}
 	out := strings.TrimRight(strings.Join(lines, "\n"), "\n") + "\n"
-	return os.WriteFile(path, []byte(out), 0o644)
+	return writeFileAtomic(path, []byte(out))
 }
 
 func formatConfigValue(key, value string) string {

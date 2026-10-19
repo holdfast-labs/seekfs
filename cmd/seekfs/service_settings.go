@@ -10,6 +10,8 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+
+	"golang.org/x/sys/windows"
 )
 
 // serviceSettings is the settings payload shared by settings-get and
@@ -29,6 +31,7 @@ type settingsVolume struct {
 	FreeBytes  uint64 `json:"free_bytes"`
 	Entries    int    `json:"entries"`
 	State      string `json:"state"`
+	Error      string `json:"error,omitempty"`
 }
 
 type settingsContentInfo struct {
@@ -81,12 +84,10 @@ type settingsContentPatch struct {
 // with synthetic volumes so no real disk is touched.
 var settingsVolumeEnumeration = enumerateSettingsVolumes
 
-// settingsIndexVolume runs the index-usn path for a volume added through
-// settings-set. Tests replace it to avoid a real USN build and to assert the
-// path was invoked with the volume.
-var settingsIndexVolume = func(s *goSearchService, volume, db string) (*Index, error) {
-	return s.buildIndexUSNVolume(volume, db)
-}
+// serviceIndexUSNVolume is the low-level index build seam shared by the
+// index-usn path. Tests replace it with a small synthetic Index instead of
+// touching a real USN journal.
+var serviceIndexUSNVolume = indexUSNVolume
 
 func (s *goSearchService) settingsConfigPath() string {
 	if s != nil && s.configPath != "" {
@@ -148,13 +149,35 @@ func (s *goSearchService) currentServiceSettings(caps serviceCapabilities) servi
 	cfg := s.contentConfig()
 	settings := serviceSettings{
 		CanWrite: caps.Mutate,
-		Volumes:  settingsVolumeList(settingsVolumeEnumeration(), volumes, loading),
+		Volumes:  settingsVolumeList(settingsVolumeEnumeration(), volumes, loading, s.settingsVolumeStateOverrides()),
 		Content:  settingsContentFromConfig(cfg),
 	}
 	return settings
 }
 
-func settingsVolumeList(infos []settingsVolumeInfo, volumes []*serviceVolumeIndex, loading bool) []settingsVolume {
+type settingsVolumeStateOverride struct {
+	indexed bool
+	state   string
+	err     string
+}
+
+func (s *goSearchService) settingsVolumeStateOverrides() map[string]settingsVolumeStateOverride {
+	s.settingsVolumeMu.Lock()
+	defer s.settingsVolumeMu.Unlock()
+	out := make(map[string]settingsVolumeStateOverride, len(s.settingsVolumeTasks)+len(s.settingsVolumeErrs))
+	for volume := range s.settingsVolumeTasks {
+		out[volume] = settingsVolumeStateOverride{indexed: true, state: "indexing"}
+	}
+	for volume, message := range s.settingsVolumeErrs {
+		if _, pending := out[volume]; pending {
+			continue
+		}
+		out[volume] = settingsVolumeStateOverride{state: "error", err: message}
+	}
+	return out
+}
+
+func settingsVolumeList(infos []settingsVolumeInfo, volumes []*serviceVolumeIndex, loading bool, overrides map[string]settingsVolumeStateOverride) []settingsVolume {
 	byVolume := make(map[string]*settingsVolume, len(infos)+len(volumes))
 	for _, info := range infos {
 		volume := normalizeSettingsVolume(info.Volume)
@@ -189,6 +212,19 @@ func settingsVolumeList(infos []settingsVolumeInfo, volumes []*serviceVolumeInde
 			entry.Entries = vol.index.entryCount()
 		}
 		entry.State = settingsVolumeState(vol, loading)
+	}
+	for volume, override := range overrides {
+		entry := byVolume[volume]
+		if entry == nil {
+			entry = &settingsVolume{Volume: volume}
+			byVolume[volume] = entry
+		}
+		entry.Indexed = override.indexed
+		entry.State = override.state
+		entry.Error = override.err
+		if override.state != "ready" {
+			entry.Entries = 0
+		}
 	}
 	out := make([]settingsVolume, 0, len(byVolume))
 	for _, entry := range byVolume {
@@ -457,21 +493,106 @@ func (s *goSearchService) addSettingsVolume(volume string) error {
 	db := s.settingsDBForVolumeLocked(volume)
 	s.indexMu.RUnlock()
 	if loaded {
+		s.settingsVolumeMu.Lock()
+		delete(s.settingsVolumeErrs, volume)
+		s.settingsVolumeMu.Unlock()
 		return nil
 	}
-	idx, err := settingsIndexVolume(s, volume, db)
+
+	s.settingsVolumeMu.Lock()
+	if s.settingsVolumeTasks == nil {
+		s.settingsVolumeTasks = make(map[string]*settingsVolumeTask)
+	}
+	if _, pending := s.settingsVolumeTasks[volume]; pending {
+		s.settingsVolumeMu.Unlock()
+		return nil
+	}
+	task := &settingsVolumeTask{
+		volume:   volume,
+		db:       db,
+		cancel:   make(chan struct{}),
+		finished: make(chan struct{}),
+	}
+	s.settingsVolumeTasks[volume] = task
+	delete(s.settingsVolumeErrs, volume)
+	s.settingsVolumeMu.Unlock()
+
+	go s.runSettingsVolumeBuild(task)
+	go func() {
+		if s.stop == nil {
+			return
+		}
+		select {
+		case <-s.stop:
+			s.cancelSettingsVolumeBuild(task)
+		case <-task.finished:
+		}
+	}()
+	return nil
+}
+
+func (s *goSearchService) runSettingsVolumeBuild(task *settingsVolumeTask) {
+	select {
+	case <-task.cancel:
+		s.finishSettingsVolumeTask(task)
+		return
+	default:
+	}
+
+	idx, err := s.buildIndexUSNVolume(task.volume, task.db)
+
+	s.settingsVolumeMu.Lock()
+	current := s.settingsVolumeTasks[task.volume] == task
+	canceled := task.stopped()
+	if !current || canceled {
+		delete(s.settingsVolumeTasks, task.volume)
+		s.settingsVolumeMu.Unlock()
+		if idx != nil {
+			// The build installed the volume after the remove; drop it.
+			s.removeSettingsVolumeMemory(task.volume)
+		}
+		s.finishSettingsVolumeTask(task)
+		return
+	}
+	delete(s.settingsVolumeTasks, task.volume)
 	if err != nil {
-		return err
+		if s.settingsVolumeErrs == nil {
+			s.settingsVolumeErrs = make(map[string]string)
+		}
+		s.settingsVolumeErrs[task.volume] = err.Error()
+		s.settingsVolumeMu.Unlock()
+		s.finishSettingsVolumeTask(task)
+		return
 	}
+	s.settingsVolumeMu.Unlock()
+
 	s.indexMu.Lock()
-	if idx != nil {
-		s.replaceLoadedVolumeLocked(db, idx)
-	}
-	if !settingsContainsDB(s.dbs, db) {
-		s.dbs = append(s.dbs, db)
+	if !settingsContainsDB(s.dbs, task.db) {
+		s.dbs = append(s.dbs, task.db)
 	}
 	s.indexMu.Unlock()
-	return s.writeSettingsVolumeConfig([]string{volume}, nil, nil)
+	if writeErr := s.writeSettingsVolumeConfig([]string{task.volume}, nil, nil); writeErr != nil {
+		serviceLog("settings volume config volume=%s err=%v", task.volume, writeErr)
+	}
+	s.finishSettingsVolumeTask(task)
+}
+
+// finishSettingsVolumeTask releases the service-stop watcher.
+func (s *goSearchService) finishSettingsVolumeTask(task *settingsVolumeTask) {
+	select {
+	case <-task.finished:
+	default:
+		close(task.finished)
+	}
+}
+
+func (s *goSearchService) cancelSettingsVolumeBuild(task *settingsVolumeTask) {
+	s.settingsVolumeMu.Lock()
+	if s.settingsVolumeTasks[task.volume] == task {
+		delete(s.settingsVolumeTasks, task.volume)
+	}
+	s.settingsVolumeMu.Unlock()
+	task.cancelNow()
 }
 
 func (s *goSearchService) settingsDBForVolumeLocked(volume string) string {
@@ -493,7 +614,25 @@ func settingsContainsDB(dbs []string, db string) bool {
 }
 
 func (s *goSearchService) removeSettingsVolume(volume string) error {
+	s.settingsVolumeMu.Lock()
+	if task := s.settingsVolumeTasks[volume]; task != nil {
+		delete(s.settingsVolumeTasks, volume)
+		task.cancelNow()
+	}
+	delete(s.settingsVolumeErrs, volume)
+	s.settingsVolumeMu.Unlock()
+
+	dbPath, removed := s.removeSettingsVolumeMemory(volume)
+	if !removed {
+		// A pending build was only canceled: its config was never written.
+		return nil
+	}
+	return s.writeSettingsVolumeConfig(nil, []string{volume}, []string{dbPath})
+}
+
+func (s *goSearchService) removeSettingsVolumeMemory(volume string) (string, bool) {
 	s.indexMu.Lock()
+	defer s.indexMu.Unlock()
 	removeAt := -1
 	dbPath := ""
 	for i, vol := range s.volumes {
@@ -510,8 +649,7 @@ func (s *goSearchService) removeSettingsVolume(volume string) error {
 		}
 	}
 	if removeAt < 0 {
-		s.indexMu.Unlock()
-		return nil
+		return "", false
 	}
 	s.volumes = append(s.volumes[:removeAt], s.volumes[removeAt+1:]...)
 	if removeAt < len(s.indexes) {
@@ -525,8 +663,7 @@ func (s *goSearchService) removeSettingsVolume(volume string) error {
 			}
 		}
 	}
-	s.indexMu.Unlock()
-	return s.writeSettingsVolumeConfig(nil, []string{volume}, []string{dbPath})
+	return dbPath, true
 }
 
 func (s *goSearchService) writeSettingsVolumeConfig(add, remove, removeDBs []string) error {
@@ -688,10 +825,7 @@ func (s *goSearchService) writeSettingsContentEnabled(enabled bool) error {
 	}
 	replacement := fmt.Sprintf("[features.content]\nenabled = %t\n", enabled)
 	text := replaceSettingsSection(string(data), "[features.content]", replacement)
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return err
-	}
-	if err := os.WriteFile(path, []byte(text), 0o644); err != nil {
+	if err := writeFileAtomic(path, []byte(text)); err != nil {
 		return err
 	}
 	if s.contentCfg.Features == nil {
@@ -721,10 +855,50 @@ func (s *goSearchService) writeSettingsContentOverrides(overrides map[string]set
 		header := `[content."` + normalized + `"]`
 		text = replaceSettingsSection(text, header, formatSettingsContentSection(header, merged))
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+	return writeFileAtomic(path, []byte(text))
+}
+
+// writeFileAtomic writes data to a temp file in the target directory, fsyncs
+// it, then replaces the target with a write-through rename.
+func writeFileAtomic(path string, data []byte) error {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
-	return os.WriteFile(path, []byte(text), 0o644)
+	tmp, err := os.CreateTemp(dir, "."+filepath.Base(path)+".*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmpName)
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmpName)
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(tmpName)
+		return err
+	}
+	from, err := windows.UTF16PtrFromString(tmpName)
+	if err != nil {
+		_ = os.Remove(tmpName)
+		return err
+	}
+	to, err := windows.UTF16PtrFromString(path)
+	if err != nil {
+		_ = os.Remove(tmpName)
+		return err
+	}
+	if err := windows.MoveFileEx(from, to, windows.MOVEFILE_REPLACE_EXISTING|windows.MOVEFILE_WRITE_THROUGH); err != nil {
+		_ = os.Remove(tmpName)
+		return err
+	}
+	return nil
 }
 
 func applySettingsContentOverride(sc *contentScopeConfig, override settingsContentOverride) {
@@ -788,27 +962,66 @@ func formatSettingsContentSection(header string, sc contentScopeConfig) string {
 }
 
 // replaceSettingsSection replaces one TOML table (by exact header line) or
-// appends it when absent, preserving every other line.
+// appends it when absent. It splices the original text, so every unrelated
+// byte (other keys, comments, line endings) stays unchanged.
 func replaceSettingsSection(text, header, replacement string) string {
-	lines := strings.Split(strings.ReplaceAll(text, "\r\n", "\n"), "\n")
-	start, end := -1, len(lines)
-	for i, line := range lines {
-		trimmed := strings.TrimSpace(line)
-		if strings.HasPrefix(trimmed, "[") && strings.HasSuffix(trimmed, "]") {
+	newline := "\n"
+	if strings.Contains(text, "\r\n") {
+		newline = "\r\n"
+	}
+	middle := strings.TrimRight(strings.ReplaceAll(replacement, "\r\n", "\n"), "\n")
+	if newline != "\n" {
+		middle = strings.ReplaceAll(middle, "\n", newline)
+	}
+	middle += newline
+
+	start, end, lastContentEnd := -1, -1, -1
+	for offset := 0; offset <= len(text); {
+		lineEnd := strings.IndexByte(text[offset:], '\n')
+		next := len(text)
+		line := text[offset:]
+		if lineEnd >= 0 {
+			line = text[offset : offset+lineEnd]
+			next = offset + lineEnd + 1
+		}
+		trimmed := strings.TrimSpace(strings.TrimSuffix(line, "\r"))
+		isHeader := strings.HasPrefix(trimmed, "[") && strings.HasSuffix(trimmed, "]")
+		if isHeader {
 			if start >= 0 {
-				end = i
+				end = lastContentEnd
 				break
 			}
 			if trimmed == header {
-				start = i
+				start = offset
+				lastContentEnd = next
+			}
+		} else if start >= 0 && trimmed != "" && !strings.HasPrefix(trimmed, "#") {
+			lastContentEnd = next
+		}
+		if lineEnd < 0 {
+			break
+		}
+		offset = next
+	}
+	if start < 0 {
+		base := text
+		if base != "" {
+			if !strings.HasSuffix(base, "\n") {
+				base += newline
+			}
+			if !strings.HasSuffix(base, newline+newline) {
+				base += newline
 			}
 		}
+		return base + middle
 	}
-	middle := strings.TrimRight(replacement, "\n")
-	if start < 0 {
-		return strings.TrimRight(text, "\r\n") + "\n\n" + middle + "\n"
+	if end < 0 {
+		end = lastContentEnd
+		if end < start {
+			end = len(text)
+		}
 	}
-	return strings.TrimRight(strings.Join(append(append(lines[:start], middle), lines[end:]...), "\n"), "\n") + "\n"
+	return text[:start] + middle + text[end:]
 }
 
 func (s *goSearchService) queueSettingsPluginReload(defs map[string]pluginDefinition) error {

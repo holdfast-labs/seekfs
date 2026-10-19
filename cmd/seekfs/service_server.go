@@ -844,7 +844,7 @@ func (s *goSearchService) serviceCommandIndexUSN(w io.Writer, req *serviceReques
 // an operator adds a volume.
 func (s *goSearchService) buildIndexUSNVolume(volume, db string) (*Index, error) {
 	serviceLog("index-usn start volume=%s db=%s", volume, db)
-	idx, err := indexUSNVolume(volume)
+	idx, err := serviceIndexUSNVolume(volume)
 	if err != nil {
 		serviceLog("index-usn error volume=%s err=%v", volume, err)
 		return nil, err

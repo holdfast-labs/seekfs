@@ -3,10 +3,12 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -309,7 +311,56 @@ func TestSettingsSetRequiresElevationAndRemoteIsDenied(t *testing.T) {
 	}
 }
 
-func TestSettingsSetAddsAndRemovesVolume(t *testing.T) {
+func useSettingsIndexStub(t *testing.T, stub func(string) (*Index, error)) {
+	t.Helper()
+	previous := serviceIndexUSNVolume
+	serviceIndexUSNVolume = stub
+	t.Cleanup(func() { serviceIndexUSNVolume = previous })
+}
+
+func settingsTestBuildIndex(volume string) *Index {
+	return &Index{
+		Source:  "usn",
+		Volume:  volume,
+		Compact: true,
+		Records: []CompactRecord{
+			{FRN: 1, ParentFRN: 1, Parent: -1, Name: "."},
+			{FRN: 2, ParentFRN: 1, Parent: 0, Name: "needle.txt"},
+		},
+	}
+}
+
+func settingsVolumeEntry(t *testing.T, s *goSearchService, volume string) settingsVolume {
+	t.Helper()
+	resp := callSettingsCommand(t, s, serviceCapabilities{ReadOnly: true}, serviceRequest{Command: "settings-get"})
+	if !resp.OK || resp.Settings == nil {
+		t.Fatalf("settings-get = %+v", resp)
+	}
+	for _, entry := range resp.Settings.Volumes {
+		if entry.Volume == volume {
+			return entry
+		}
+	}
+	t.Fatalf("volume %s missing from %+v", volume, resp.Settings.Volumes)
+	return settingsVolume{}
+}
+
+func waitSettingsVolumeState(t *testing.T, s *goSearchService, volume, state string) settingsVolume {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		entry := settingsVolumeEntry(t, s, volume)
+		if entry.State == state {
+			return entry
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("volume %s state = %q (error %q), want %q", volume, entry.State, entry.Error, state)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+func TestSettingsAddVolumeReturnsBeforeBuildAndServesAfter(t *testing.T) {
 	preservePluginSelection(t)
 	t.Setenv("SEEKFS_CONTENT_SEARCH", "0")
 	useSyntheticSettingsVolumes(t)
@@ -319,33 +370,71 @@ func TestSettingsSetAddsAndRemovesVolume(t *testing.T) {
 	volC.dbPath = dbC
 	s := settingsTestService(t, configPath, []*serviceVolumeIndex{volC})
 
-	var indexed []string
-	previous := settingsIndexVolume
-	settingsIndexVolume = func(s *goSearchService, volume, db string) (*Index, error) {
-		indexed = append(indexed, volume)
-		return &Index{Source: "usn", Volume: volume, Compact: true, Records: []CompactRecord{{FRN: 1, ParentFRN: 1, Parent: -1, Name: "."}}}, nil
-	}
-	t.Cleanup(func() { settingsIndexVolume = previous })
+	release := make(chan struct{})
+	started := make(chan struct{}, 1)
+	var calls atomic.Int32
+	useSettingsIndexStub(t, func(volume string) (*Index, error) {
+		calls.Add(1)
+		started <- struct{}{}
+		<-release
+		return settingsTestBuildIndex(volume), nil
+	})
 
+	start := time.Now()
 	add := callSettingsCommand(t, s, serviceCapabilities{ReadOnly: true, Mutate: true}, settingsPatchRequest(t, map[string]any{"volumes": []map[string]any{{"volume": "F:", "indexed": true}}}))
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("settings-set add took %s; want an immediate return", elapsed)
+	}
 	if !add.OK || add.Settings == nil {
 		t.Fatalf("add volume = %+v", add)
 	}
-	if len(indexed) != 1 || indexed[0] != "F:" {
-		t.Fatalf("index-usn path volumes = %v, want F:", indexed)
+	pending := settingsVolumeEntry(t, s, "F:")
+	if pending.State != "indexing" || !pending.Indexed {
+		t.Fatalf("pending F: = %+v, want indexing", pending)
 	}
-	if !settingsVolumeIndexed(add.Settings.Volumes, "F:") {
-		t.Fatalf("F: not indexed after add: %+v", add.Settings.Volumes)
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("background build did not start")
+	}
+
+	second := callSettingsCommand(t, s, serviceCapabilities{ReadOnly: true, Mutate: true}, settingsPatchRequest(t, map[string]any{"volumes": []map[string]any{{"volume": "F:", "indexed": true}}}))
+	if !second.OK {
+		t.Fatalf("second add = %+v", second)
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("index builds = %d, want 1 (pending add must be a no-op)", calls.Load())
+	}
+
+	close(release)
+	ready := waitSettingsVolumeState(t, s, "F:", "ready")
+	if ready.Entries != 2 || !ready.Indexed {
+		t.Fatalf("ready F: = %+v", ready)
 	}
 	if !settingsHasVolume(s, "F:") {
 		t.Fatal("service volume list missing F:")
 	}
-	cfg, err := loadConfig(configPath)
-	if err != nil {
-		t.Fatal(err)
+	s.indexMu.RLock()
+	volumes := snapshotServiceVolumesForSearch(s.volumes)
+	s.indexMu.RUnlock()
+	matches, err := searchServiceVolumes(volumes, queryOptions{Query: "needle", Limit: 10}, false)
+	if err != nil || len(matches) == 0 {
+		t.Fatalf("search after settings volume add = %v, %v; want needle.txt", matches, err)
 	}
-	if !settingsContainsVolume(cfg.Volumes, "F:") || len(cfg.DBs) != 2 {
-		t.Fatalf("config after add = volumes %v dbs %v", cfg.Volumes, cfg.DBs)
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		cfg, err := loadConfig(configPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if settingsContainsVolume(cfg.Volumes, "F:") && len(cfg.DBs) == 2 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("config after add = volumes %v dbs %v", cfg.Volumes, cfg.DBs)
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 
 	remove := callSettingsCommand(t, s, serviceCapabilities{ReadOnly: true, Mutate: true}, settingsPatchRequest(t, map[string]any{"volumes": []map[string]any{{"volume": "F:", "indexed": false}}}))
@@ -358,12 +447,84 @@ func TestSettingsSetAddsAndRemovesVolume(t *testing.T) {
 	if settingsHasVolume(s, "F:") {
 		t.Fatal("service volume list still has F:")
 	}
-	cfg, err = loadConfig(configPath)
+	cfg, err := loadConfig(configPath)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if settingsContainsVolume(cfg.Volumes, "F:") || len(cfg.DBs) != 1 {
 		t.Fatalf("config after remove = volumes %v dbs %v", cfg.Volumes, cfg.DBs)
+	}
+}
+
+func TestSettingsAddVolumeFailureReportsError(t *testing.T) {
+	preservePluginSelection(t)
+	t.Setenv("SEEKFS_CONTENT_SEARCH", "0")
+	useSyntheticSettingsVolumes(t)
+	configPath := settingsTestConfig(t, "default_limit = 10\n")
+	s := settingsTestService(t, configPath, nil)
+
+	release := make(chan struct{})
+	useSettingsIndexStub(t, func(string) (*Index, error) {
+		<-release
+		return nil, errors.New("journal unavailable")
+	})
+	add := callSettingsCommand(t, s, serviceCapabilities{ReadOnly: true, Mutate: true}, settingsPatchRequest(t, map[string]any{"volumes": []map[string]any{{"volume": "F:", "indexed": true}}}))
+	if !add.OK {
+		t.Fatalf("add volume = %+v", add)
+	}
+	if state := settingsVolumeEntry(t, s, "F:").State; state != "indexing" {
+		t.Fatalf("state while building = %q, want indexing", state)
+	}
+	close(release)
+	failed := waitSettingsVolumeState(t, s, "F:", "error")
+	if failed.Indexed || !strings.Contains(failed.Error, "journal unavailable") {
+		t.Fatalf("failed F: = %+v", failed)
+	}
+}
+
+func TestSettingsRemovePendingVolumeCancelsBuild(t *testing.T) {
+	preservePluginSelection(t)
+	t.Setenv("SEEKFS_CONTENT_SEARCH", "0")
+	useSyntheticSettingsVolumes(t)
+	configPath := settingsTestConfig(t, "default_limit = 10\n")
+	s := settingsTestService(t, configPath, nil)
+
+	release := make(chan struct{})
+	useSettingsIndexStub(t, func(volume string) (*Index, error) {
+		<-release
+		return settingsTestBuildIndex(volume), nil
+	})
+	add := callSettingsCommand(t, s, serviceCapabilities{ReadOnly: true, Mutate: true}, settingsPatchRequest(t, map[string]any{"volumes": []map[string]any{{"volume": "F:", "indexed": true}}}))
+	if !add.OK {
+		t.Fatalf("add volume = %+v", add)
+	}
+	remove := callSettingsCommand(t, s, serviceCapabilities{ReadOnly: true, Mutate: true}, settingsPatchRequest(t, map[string]any{"volumes": []map[string]any{{"volume": "F:", "indexed": false}}}))
+	if !remove.OK {
+		t.Fatalf("remove pending = %+v", remove)
+	}
+	if state := settingsVolumeEntry(t, s, "F:").State; state != "not_indexed" {
+		t.Fatalf("pending remove state = %q, want not_indexed", state)
+	}
+	close(release)
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		s.settingsVolumeMu.Lock()
+		pending := len(s.settingsVolumeTasks)
+		s.settingsVolumeMu.Unlock()
+		if pending == 0 && !settingsHasVolume(s, "F:") {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("pending build was not ignored: tasks=%d volume=%v", pending, settingsHasVolume(s, "F:"))
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	cfg, err := loadConfig(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if settingsContainsVolume(cfg.Volumes, "F:") {
+		t.Fatalf("canceled pending add wrote config: %v", cfg.Volumes)
 	}
 }
 
@@ -411,5 +572,89 @@ roots = ["C:\work"]
 	}
 	if !strings.Contains(out, `"volumes"`) || !strings.Contains(out, `"content"`) {
 		t.Fatalf("CLI output = %s", out)
+	}
+}
+
+func TestSettingsSetPreservesUnrelatedConfig(t *testing.T) {
+	preservePluginSelection(t)
+	useSyntheticSettingsVolumes(t)
+	configBody := `# top comment
+default_limit = 10
+# keep me
+service_pipe = "\\\\.\\pipe\\seekfs-test"
+
+[content."C:"]
+mode = "auto"
+roots = ["C:\work"]
+
+# trailing unrelated
+[features.content]
+enabled = true
+`
+	configPath := settingsTestConfig(t, configBody)
+	pluginPath := filepath.Join(filepath.Dir(configPath), "plugin.toml")
+	pluginBody := `# plugin header
+[plugins.content]
+installed = true
+enabled = true
+scope = "auto"
+# content comment
+[plugins.other]
+installed = true
+enabled = false
+command = "C:\\Tools\\other.exe"
+# other comment
+`
+	if err := os.WriteFile(pluginPath, []byte(pluginBody), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s := settingsTestService(t, configPath, nil)
+	patch := map[string]any{"content": map[string]any{
+		"mode":            "explicit",
+		"roots":           []string{`C:\src`},
+		"volumes":         map[string]any{"C:": map[string]any{"mode": "explicit", "roots": []string{`C:\src`}}},
+		"system_excludes": false,
+	}}
+	resp := callSettingsCommand(t, s, serviceCapabilities{ReadOnly: true, Mutate: true}, settingsPatchRequest(t, patch))
+	if !resp.OK {
+		t.Fatalf("settings-set = %+v", resp)
+	}
+	waitSettingsPluginApplied(t, s)
+
+	afterConfig, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	configText := string(afterConfig)
+	for _, want := range []string{
+		"# top comment\ndefault_limit = 10\n# keep me\n",
+		"# trailing unrelated\n[features.content]\nenabled = true\n",
+	} {
+		if !strings.Contains(configText, want) {
+			t.Fatalf("unrelated config changed, missing %q in:\n%s", want, configText)
+		}
+	}
+	afterPlugin, err := os.ReadFile(pluginPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pluginText := string(afterPlugin)
+	for _, want := range []string{
+		"# plugin header\n",
+		"# other comment\n",
+		"[plugins.other]\ninstalled = true\nenabled = false\ncommand = \"C:\\\\Tools\\\\other.exe\"\n",
+	} {
+		if !strings.Contains(pluginText, want) {
+			t.Fatalf("unrelated plugin config changed, missing %q in:\n%s", want, pluginText)
+		}
+	}
+	for _, pattern := range []string{".seekfs.toml.*.tmp", ".plugin-*.tmp"} {
+		leftovers, err := filepath.Glob(filepath.Join(filepath.Dir(configPath), pattern))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(leftovers) != 0 {
+			t.Fatalf("atomic write left temp files: %v", leftovers)
+		}
 	}
 }

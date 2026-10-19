@@ -43,7 +43,8 @@ Response (`serviceResponse` with a new `settings` field):
 
 - `volumes` lists every local fixed NTFS volume (so the app can offer drives
   that are not indexed yet), plus any indexed volume that is not fixed/NTFS.
-  `state` is one of `ready`, `indexing`, `not_indexed`, `error`.
+  `state` is one of `ready`, `indexing`, `not_indexed`, `error`. `error`, when
+  present, is the last background build failure for that volume.
 - `content` mirrors the `[content]` keys in docs/CONFIG.md, with
   `[plugins.content]` values from `plugin.toml` merged in; `volumes` holds the
   per-volume `[content."X:"]` overrides from `seekfs.toml` (only keys that are
@@ -59,9 +60,14 @@ Request: `{"command":"settings-set","settings":{...}}` with the same shape as
 `settings-get`'s `settings`. Every field is optional; only present fields
 change. `volumes` entries need only `volume` and `indexed`.
 
-- Adding a volume (`indexed: true`) starts a USN index build for it (the same
-  path as `index-usn`) and adds it to the service's volume list; removing one
-  unloads it and drops it from the list (its index file is kept on disk).
+- Adding a volume (`indexed: true`) starts a USN index build for it in the
+  background (the same path as `index-usn`) and returns immediately. The
+  volume reports `state: "indexing"` while the build runs; a second add of the
+  same volume is a no-op. On success the volume joins the service's volume
+  list and the volume config is written; on failure it keeps `state: "error"`
+  and `error` carries the build message. Removing a volume unloads it and drops
+  it from the list (its index file is kept on disk); removing one whose build
+  is still pending cancels and ignores that result.
 - Content changes are validated (absolute roots on known volumes, mode in
   `auto|explicit|off`, `budget_bytes >= 0`). Global scope keys are written to
   `plugin.toml`; per-volume overrides are written to `[content."X:"]` in
