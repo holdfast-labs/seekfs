@@ -1698,7 +1698,8 @@ func (idx *Index) reconstructCompactPathCached(i int, cache map[int]string) stri
 			break
 		}
 		if _, ok := seen[cur]; ok {
-			unresolved = true
+			// A self-parented root record (or a cycle) ends the walk at the
+			// root, as before: it is not an orphan.
 			break
 		}
 		seen[cur] = struct{}{}
@@ -1785,7 +1786,7 @@ func (idx *Index) reconstructLowerPathInto(i int, paths []string, computed []boo
 			return parts
 		}
 		if seen[cur] == gen {
-			unresolved = true
+			// Self-parented root or cycle: ends at the root, not an orphan.
 			break
 		}
 		seen[cur] = gen
