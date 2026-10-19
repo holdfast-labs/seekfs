@@ -1950,6 +1950,43 @@ func searchContentServiceVolumes(volumes []*serviceVolumeIndex, opts queryOption
 		var err error
 		if contentVolume {
 			matches, err = vol.searchContentVolume(volOpts, countOnly)
+			// Two-step explicit-budget refill. The hidden-overlay window probe
+			// caps this pass at the default page valve even when the caller
+			// chose a larger --content-verify-budget. When that valve (not the
+			// candidate set) stopped a still-short page, restore the caller's
+			// reservation and verify only the rest of the page, resuming after
+			// the last emitted row so earlier rows are not re-emitted.
+			if err == nil && !countOnly && len(volumes) == 1 && len(matches) > 0 &&
+				len(matches) < userLimit && opts.ContentDiskVerifyBudget > 0 {
+				explicit := clampContentDiskVerifyBudget(opts.ContentDiskVerifyBudget)
+				disk := opts.Trace.disk
+				if disk != nil && disk.capped.Load() && !disk.exceeded.Load() &&
+					int64(explicit) > disk.limit && disk.used.Load() >= disk.limit {
+					if opts.Trace.raiseDiskBudget(explicit) {
+						// The first-pass frontier is stale once verification
+						// resumes past it. Clear it so the continuation merge
+						// does not cut rows the second pass verifies.
+						opts.Trace.contentFrontierSet = false
+						resume := vol.contentResumeFromMatches(matches, pq)
+						if resume != nil {
+							resume.pageLimit = userLimit - len(matches)
+							vol.prepareContentResumeOverlay(pq, resume)
+							second := volOpts
+							second.Limit = userLimit
+							second.contentWindow = 0
+							second.contentAfter = resume
+							extra, secondErr := vol.searchContentVolume(second, countOnly)
+							if secondErr != nil {
+								return nil, secondErr
+							}
+							matches = append(matches, extra...)
+							if len(matches) > userLimit {
+								matches = matches[:userLimit]
+							}
+						}
+					}
+				}
+			}
 			// The page-limit reduction is safe only when the completeness signal
 			// survives it: a capped superset (window-capped, page full) carries
 			// it here, and a provably-under-window superset is already complete.

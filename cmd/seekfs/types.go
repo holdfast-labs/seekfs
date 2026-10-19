@@ -904,6 +904,20 @@ func (t *searchTrace) capDiskBudgetForProbe(limit int) {
 	t.DiskVerifyBudget = limit
 }
 
+// raiseDiskBudget restores the query's disk reservation to limit and clears a
+// cap latch, keeping the reported cap in step. It never lowers the reservation
+// and never clears a wall-clock deadline latch: a deadline stop is not a cap
+// that a larger explicit budget can undo.
+func (t *searchTrace) raiseDiskBudget(limit int) bool {
+	if t == nil || t.disk == nil || limit <= 0 || int64(limit) <= t.disk.limit {
+		return false
+	}
+	t.disk.limit = int64(limit)
+	t.disk.capped.Store(false)
+	t.DiskVerifyBudget = limit
+	return true
+}
+
 // capFiresWithin reports whether a batch of n more reads could exhaust the
 // exact disk cap. Callers verify such a boundary batch serially, in rank order,
 // so the capped page is a deterministic rank-prefix rather than whichever
