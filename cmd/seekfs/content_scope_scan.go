@@ -69,8 +69,8 @@ type contentParentDecision struct {
 	excluded bool   // under an exclude prefix (whole subtree out)
 	segHit   bool   // an excluded segment on the dir path (non-final for children)
 	// segKind names the segment class that set segHit ("build_output",
-	// "cache" or "system", by inclusion-policy priority), so a pruned
-	// subtree tallies the same reason allowsReason reports per file.
+	// "dependency", "cache" or "system", by inclusion-policy priority), so a
+	// pruned subtree tallies the same reason allowsReason reports per file.
 	segKind  string
 	ignored  bool   // git-ignored (whole subtree dead)
 	unit     string // matched include root, "" if none
@@ -484,6 +484,8 @@ func (w *contentScanWorker) admitRecord(id int, rec CompactRecord) (contentScope
 			rootMiss = true
 		} else if _, isExplicit := w.scope.explicitSet[unit]; isExplicit {
 			priority = 1
+		} else if w.scope.DriveRoot != "" && unit == w.scope.DriveRoot {
+			priority = 3
 		} else {
 			priority = 2
 		}
@@ -823,17 +825,21 @@ func (w *contentScanWorker) volumeRootDecision() contentParentDecision {
 	return out
 }
 
-// repositories first, configured roots next, other roots last — the same
-// rule as contentScopeResolved.priority.
+// repositories first, configured roots next, other roots (known folders)
+// then the drive root, no match last — the same rule as
+// contentScopeResolved.priority.
 func (w *contentScanWorker) priorityFor(d contentParentDecision) int {
 	if d.repo != "" {
 		return 0
 	}
 	if d.unit == "" {
-		return 3
+		return 4
 	}
 	if _, ok := w.scope.explicitSet[d.unit]; ok {
 		return 1
+	}
+	if w.scope.DriveRoot != "" && d.unit == w.scope.DriveRoot {
+		return 3
 	}
 	return 2
 }
@@ -842,22 +848,25 @@ func (w *contentScanWorker) priorityFor(d contentParentDecision) int {
 // excluded segment. The name folds like the normalized path components
 // contentPathHasExcludedSegment tests, so `Build` excludes exactly like
 // `build` does through allows(). The set is the union of the legacy
-// system segments and the inclusion-policy build-output/cache segments:
-// pruning covers every class allowsReason rejects outside repos, and the
-// kind (below) keeps the tallied reason exact.
+// system segments and the inclusion-policy build-output/dependency/cache
+// segments: pruning covers every class allowsReason rejects outside repos,
+// and the kind (below) keeps the tallied reason exact.
 func contentSegmentExcluded(name string) bool {
 	return contentSegmentKind(name) != ""
 }
 
 // contentSegmentKind names one lowercase directory segment's exclusion
-// class ("build_output", "cache" or "system", by allowsReason priority),
-// or "" when the segment excludes nothing.
+// class ("build_output", "dependency", "cache" or "system", by allowsReason
+// priority), or "" when the segment excludes nothing.
 func contentSegmentKind(name string) string {
 	// Fold like the normalized path components allowsReason tests, so
 	// `Build` prunes exactly like `build` does through allows().
 	name = strings.ToLower(name)
 	if contentBuildOutputSegment(name) {
 		return contentSkipBuildOutput
+	}
+	if contentDependencySegment(name) {
+		return contentSkipDependency
 	}
 	if contentCacheSegment(name) {
 		return contentSkipCache
@@ -871,11 +880,11 @@ func contentSegmentKind(name string) string {
 }
 
 // combineSegmentKind folds one more segment's class into an accumulated
-// kind by allowsReason priority: build_output beats cache beats system,
-// independent of depth (contentInclusionSkip scans every non-final
-// segment in the same class order).
+// kind by allowsReason priority: build_output beats dependency beats cache
+// beats system, independent of depth (contentInclusionSkip scans every
+// non-final segment in the same class order).
 func combineSegmentKind(acc, kind string) string {
-	rank := map[string]int{contentSkipBuildOutput: 3, contentSkipCache: 2, "system": 1}
+	rank := map[string]int{contentSkipBuildOutput: 4, contentSkipDependency: 3, contentSkipCache: 2, "system": 1}
 	if rank[kind] > rank[acc] {
 		return kind
 	}

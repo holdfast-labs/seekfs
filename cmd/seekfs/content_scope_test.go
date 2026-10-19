@@ -156,7 +156,9 @@ func TestContentScopeResolvedAllows(t *testing.T) {
 		{`C:\proj\Makefile`, true, "repo"}, // extensionless: admitted, sniffed at build
 		{`C:\proj\notes.xyz`, true, "repo"},
 		{`C:\proj\OWNERS`, true, "repo"},
-		{`C:\other\readme.md`, false, ""},
+		// Auto mode adds the volume root as its lowest-priority include,
+		// so a text file outside repos/known folders is now in scope.
+		{`C:\other\readme.md`, true, "root"},
 		{`C:\Windows\a.txt`, false, ""},
 	}
 	for _, c := range cases {
@@ -259,17 +261,19 @@ func TestContentScopeEstimateAndDetect(t *testing.T) {
 	}
 	// Inside a worktree git ignore rules replace the name-based excludes;
 	// C:\proj has no ignore files, so node_modules and build are indexed.
-	if est.Files != 4 || est.Bytes != 210 {
-		t.Fatalf("estimate files=%d bytes=%d; want 4/210 (everything under proj)", est.Files, est.Bytes)
+	// Auto mode also adds the volume root, so C:\readme.md is now in scope
+	// as a lowest-priority "root" unit.
+	if est.Files != 5 || est.Bytes != 220 {
+		t.Fatalf("estimate files=%d bytes=%d; want 5/220 (proj files + C:\\readme.md at the drive root)", est.Files, est.Bytes)
 	}
-	if len(est.ByUnit) != 1 || est.ByUnit[0].Kind != "repo" || est.ByUnit[0].Files != 4 {
+	if len(est.ByUnit) != 2 || est.ByUnit[0].Kind != "repo" || est.ByUnit[0].Files != 4 {
 		t.Fatalf("by-unit = %+v", est.ByUnit)
 	}
-	if est.Excluded["root"] != 1 || est.Excluded["ext"] != 0 {
-		t.Fatalf("excluded = %+v; want root=1 (readme.md), ext=0", est.Excluded)
+	if est.Excluded["root"] != 0 || est.Excluded["ext"] != 0 {
+		t.Fatalf("excluded = %+v; want root=0 (drive root admits readme.md), ext=0", est.Excluded)
 	}
-	if est.ExcludedBytes["root"] != 10 {
-		t.Fatalf("excluded bytes = %+v; want root=10B (readme.md)", est.ExcludedBytes)
+	if est.ExcludedBytes["root"] != 0 {
+		t.Fatalf("excluded bytes = %+v; want root=0B (drive root admits readme.md)", est.ExcludedBytes)
 	}
 	// The projection scales extracted bytes by the compact-encoding
 	// multiplier (< 1), so it sits below the raw byte count.
@@ -286,8 +290,8 @@ func TestContentScopeEstimateAndDetect(t *testing.T) {
 	budgeted.BudgetExplicit = true
 	if capped := scanContentScope(idx, budgeted, "C:", 0, 0, false); !capped.BudgetHit || capped.Files != 1 || capped.Bytes != 20 {
 		t.Fatalf("budget=110 => files=%d bytes=%d hit=%v; want 1/20/true (build/out.txt sorts first)", capped.Files, capped.Bytes, capped.BudgetHit)
-	} else if capped.BudgetBytes != 110 || capped.EligibleFiles != 4 || capped.EligibleBytes != 210 {
-		t.Fatalf("budget=110 => budget=%d eligible=%d/%d; want 110, 4 files, 210 bytes", capped.BudgetBytes, capped.EligibleFiles, capped.EligibleBytes)
+	} else if capped.BudgetBytes != 110 || capped.EligibleFiles != 5 || capped.EligibleBytes != 220 {
+		t.Fatalf("budget=110 => budget=%d eligible=%d/%d; want 110, 5 files, 220 bytes", capped.BudgetBytes, capped.EligibleFiles, capped.EligibleBytes)
 	} else if capped.TextCandidates != 0 || capped.BinaryCandidates != 0 {
 		t.Fatalf("budget=110 => text/binary candidates = %d/%d; want 0/0 (all extensions known)", capped.TextCandidates, capped.BinaryCandidates)
 	}
