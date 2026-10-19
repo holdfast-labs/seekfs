@@ -636,6 +636,9 @@ func (vol *serviceVolumeIndex) mergeOverlayMatches(base []Entry, opts queryOptio
 	}
 	overlay := vol.overlayRankedMatches(snap, pq, pathCache)
 	if !countOnly {
+		if queryHasAnyContentLeaf(pq) {
+			return vol.mergeContentOverlayMatches(base, overlay, pq, opts.Trace)
+		}
 		merged := make([]Entry, 0, len(base)+len(overlay))
 		merged = append(merged, base...)
 		for _, item := range overlay {
@@ -668,6 +671,60 @@ func (vol *serviceVolumeIndex) mergeOverlayMatches(base []Entry, opts queryOptio
 	}
 	out := vol.mergeRankedOverlayEntries(base, overlay, limit, countOnly, pq)
 	return out
+}
+
+// mergeContentOverlayMatches merges a verified base page with the matching
+// overlay rows without leaving the base's rank order. Base rows are already a
+// verified prefix in rank order (symbol-promoted for the default sort), so a
+// name/path re-sort would both lose the promotion and compare base rows against
+// a frontier they never had to pass.
+func (vol *serviceVolumeIndex) mergeContentOverlayMatches(base []Entry, overlay []rankedOverlayEntry, pq parsedQuery, trace *searchTrace) []Entry {
+	if len(overlay) == 0 {
+		// Nothing from the overlay matched: the base page is already the exact
+		// rank-ordered prefix. Keep it verbatim (no re-sort, no frontier cut).
+		return base
+	}
+	if pq.SortColumn == "relevance" {
+		// Relevance is re-sorted over the whole result set in content_verify.go;
+		// preserve the historical intermediate order.
+		merged := make([]Entry, 0, len(base)+len(overlay))
+		merged = append(merged, base...)
+		for _, item := range overlay {
+			merged = append(merged, item.entry)
+		}
+		sort.SliceStable(merged, func(i, j int) bool {
+			return compareSearchAllEntries(merged[i], merged[j], pq) < 0
+		})
+		return merged
+	}
+	if trace != nil && trace.contentFrontierSet && trace.contentIncomplete() {
+		// Base rows are already verified up to the frontier. Only overlay rows
+		// ranking at or after it must be dropped to keep the partial page a
+		// rank prefix.
+		frontierRank := vol.baseEntryRank(trace.contentFrontier, pq)
+		kept := overlay[:0]
+		for _, item := range overlay {
+			if item.rank < frontierRank {
+				kept = append(kept, item)
+			}
+		}
+		overlay = kept
+	}
+	rankedBase := base
+	if pq.SortColumn == "" && len(base) > 1 {
+		// The default content candidates were symbol-promoted before
+		// verification. Restore the plain rank order for the merge; promotion
+		// is re-applied to the merged page below.
+		rankedBase = append([]Entry(nil), base...)
+		sort.SliceStable(rankedBase, func(i, j int) bool {
+			return vol.baseEntryRank(rankedBase[i], pq) < vol.baseEntryRank(rankedBase[j], pq)
+		})
+	}
+	merged := vol.mergeRankedOverlayEntries(rankedBase, overlay, 0, false, pq)
+	if pq.SortColumn == "" {
+		promoteSymbolNamedEntries(merged, contentSymbolQueryKey(pq))
+	}
+	return merged
 }
 
 func (vol *serviceVolumeIndex) overlayRankedMatches(snap *volumeSnapshot, pq parsedQuery, pathCache map[int]string) []rankedOverlayEntry {
