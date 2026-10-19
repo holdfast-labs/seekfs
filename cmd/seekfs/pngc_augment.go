@@ -358,8 +358,8 @@ func readRawSectionTable(path string, size int64) (rawSectionTable, error) {
 	if err := binary.Read(f, binary.LittleEndian, &header); err != nil {
 		return rawSectionTable{}, err
 	}
-	if header.Magic != indexMagic || header.Version != indexVersion {
-		return rawSectionTable{}, errors.New("source is not a v9 index")
+	if header.Magic != indexMagic || !indexVersionSupported(int(header.Version)) {
+		return rawSectionTable{}, errors.New("source is not a v9/v10 index")
 	}
 	var ptr [8]byte
 	if _, err := io.ReadFull(f, ptr[:]); err != nil {

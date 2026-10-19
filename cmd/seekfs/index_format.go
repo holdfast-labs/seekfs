@@ -25,13 +25,13 @@ func readIndexWithReaderAt(r io.Reader, ra io.ReaderAt, size int64) (*Index, err
 	}
 	sectionTableOffset := uint64(0)
 	if header.Magic != indexMagic {
-		return nil, errors.New("unsupported index format: only the v9 index format is supported")
+		return nil, errors.New("unsupported index format: only the v9/v10 index formats are supported")
 	}
 	if err := binary.Read(r, binary.LittleEndian, &sectionTableOffset); err != nil {
 		return nil, err
 	}
-	if header.Version != indexVersion {
-		return nil, fmt.Errorf("unsupported index version %d: only v9 indexes are supported", header.Version)
+	if !indexVersionSupported(int(header.Version)) {
+		return nil, fmt.Errorf("unsupported index version %d: only v9/v10 indexes are supported", header.Version)
 	}
 	if header.EntryCount > uint64(^uint(0)>>1) || header.RootCount > uint64(^uint(0)>>1) {
 		return nil, errors.New("index too large")
@@ -132,6 +132,13 @@ func readIndexWithReaderAt(r io.Reader, ra io.ReaderAt, size int64) (*Index, err
 		}
 		if sectionTableOffset != 0 {
 			idx.Derived = readDerivedSectionsFromReaderAt(ra, size, sectionTableOffset, int(header.EntryCount))
+		}
+		// A v10 index persists the NTFS sequence per record in the SEQN
+		// section; a v9 index has none and every record's Seq stays 0.
+		if seqs := idx.Derived.FRNSeq; len(seqs) == len(idx.Records) {
+			for i := range seqs {
+				idx.Records[i].Seq = seqs[i]
+			}
 		}
 		return idx, nil
 	}
@@ -871,6 +878,40 @@ func populatePersistenceFRNs(vol *serviceVolumeIndex, idx *Index) {
 	sortFRNIndexEntries(vol.frns, vol.frnRecordIDs)
 }
 
+// buildPersistenceSeqs returns the per-record-id NTFS sequence column, or nil
+// when no record carries a sequence (walk sources and v9-upgraded indexes), so
+// the SEQN section is never written empty. A persisted FRNSeq column is
+// authoritative; otherwise the in-memory records are scanned.
+func buildPersistenceSeqs(idx *Index) []uint16 {
+	if idx == nil || !idx.Compact {
+		return nil
+	}
+	recordCount := idx.compactRecordCount()
+	if recordCount == 0 {
+		return nil
+	}
+	if seqs := idx.Derived.FRNSeq; len(seqs) == recordCount {
+		for _, s := range seqs {
+			if s != 0 {
+				return seqs
+			}
+		}
+		return nil
+	}
+	seqs := make([]uint16, recordCount)
+	any := false
+	for id := 0; id < recordCount; id++ {
+		if s := idx.compactRecord(id).Seq; s != 0 {
+			seqs[id] = s
+			any = true
+		}
+	}
+	if !any {
+		return nil
+	}
+	return seqs
+}
+
 func buildDerivedSectionBlobs(idx *Index, nameTokens []string) []indexSectionBlob {
 	out := make([]indexSectionBlob, 0, 16)
 	_ = forEachDerivedSection(idx, nameTokens, func(section indexSectionBlob) error {
@@ -1065,6 +1106,11 @@ func forEachDerivedSection(idx *Index, nameTokens []string, emit func(indexSecti
 		return err
 	}
 	vol.frns, vol.frnRecordIDs = nil, nil
+	if seqs := buildPersistenceSeqs(idx); len(seqs) > 0 {
+		if err := emitSection(indexSectionSEQN, encodeSeqSection(seqs)); err != nil {
+			return err
+		}
+	}
 	if err := emitSection(indexSectionLOWR, encodeLowerSection(nameTokens)); err != nil {
 		return err
 	}
@@ -1212,6 +1258,10 @@ func derivedSectionInfo(derived indexDerivedSections) ([]string, int) {
 		sections = append(sections, "FRNS")
 		bytes += 8*len(derived.FRNs) + 4*len(derived.FRNRecordIDs)
 	}
+	if len(derived.FRNSeq) > 0 {
+		sections = append(sections, "SEQN")
+		bytes += 2 * len(derived.FRNSeq)
+	}
 	if len(derived.LowerOffs) > 0 || len(derived.LowerBlob) > 0 {
 		sections = append(sections, "LOWR")
 		bytes += 6*len(derived.LowerOffs) + len(derived.LowerBlob)
@@ -1280,6 +1330,18 @@ func encodeFRNSection(frns []uint64, ids []uint32) []byte {
 	_ = binary.Write(&buf, binary.LittleEndian, frns)
 	_ = binary.Write(&buf, binary.LittleEndian, uint32(len(ids)))
 	_ = binary.Write(&buf, binary.LittleEndian, ids)
+	return buf.Bytes()
+}
+
+// encodeSeqSection writes the per-record-id NTFS sequence column: a uint32
+// count followed by that many little-endian uint16 values.
+func encodeSeqSection(seqs []uint16) []byte {
+	if len(seqs) == 0 {
+		return nil
+	}
+	var buf bytes.Buffer
+	_ = binary.Write(&buf, binary.LittleEndian, uint32(len(seqs)))
+	_ = binary.Write(&buf, binary.LittleEndian, seqs)
 	return buf.Bytes()
 }
 

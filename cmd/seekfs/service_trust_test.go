@@ -439,7 +439,7 @@ func TestWALTruncatedBatchClaimsAppliedCheckpoint(t *testing.T) {
 	if err != nil {
 		t.Fatalf("encodeBinaryWALBatch: %v", err)
 	}
-	batch, err := decodeBinaryWALBatch(payload)
+	batch, err := decodeBinaryWALBatch(payload, true)
 	if err != nil {
 		t.Fatalf("decodeBinaryWALBatch: %v", err)
 	}

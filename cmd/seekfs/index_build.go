@@ -326,6 +326,7 @@ func indexUSNVolume(volume string) (*Index, error) {
 			Parent:    parent,
 			Name:      node.name,
 			Mode:      modeFromAttrs(node.attr),
+			Seq:       node.seq,
 		})
 	}
 	serviceLog("compact records complete volume=%s entries=%d source=usn", vol, len(idx.Records))
@@ -351,6 +352,8 @@ func mergeUSNNodesIntoMFT(entries map[uint64]mftEntry, nodes map[uint64]usnNode)
 			attr:      node.attr,
 			isDir:     node.attr&fileAttributeDir != 0,
 			inUse:     true,
+			seq:       node.seq,
+			parentSeq: node.parentSeq,
 		}
 		added++
 	}
@@ -385,6 +388,7 @@ func buildRecordsFromMFT(idx *Index, entries map[uint64]mftEntry) {
 			Mode:      modeFromAttrs(e.attr),
 			Size:      e.size,
 			ModUnix:   e.modUnix,
+			Seq:       e.seq,
 		})
 	}
 }
@@ -461,7 +465,7 @@ func enumUSN(handle windows.Handle, highUSN int64) (map[uint64]usnNode, error) {
 			}
 			major := binary.LittleEndian.Uint16(record[4:6])
 			if major == 2 || major == 3 {
-				frn, parent, attr, nameLen, nameOff, ok := parseUSNRecordFields(record, major)
+				frn, parent, attr, nameLen, nameOff, frnSeq, parentSeq, ok := parseUSNRecordFields(record, major)
 				if !ok {
 					pos += recordLen
 					continue
@@ -470,7 +474,7 @@ func enumUSN(handle windows.Handle, highUSN int64) (map[uint64]usnNode, error) {
 					nameBytes := record[nameOff : uint32(nameOff)+uint32(nameLen)]
 					name := windows.UTF16ToString(bytesToUTF16(nameBytes))
 					if name != "" {
-						nodes[frn] = usnNode{frn: frn, parentFRN: parent, name: name, attr: attr}
+						nodes[frn] = usnNode{frn: frn, parentFRN: parent, name: name, attr: attr, seq: frnSeq, parentSeq: parentSeq}
 					}
 				}
 			}
@@ -656,7 +660,7 @@ func parseUSNRecords(buffer []byte) ([]usnChange, error) {
 		}
 		major := binary.LittleEndian.Uint16(record[4:6])
 		if major == 2 || major == 3 {
-			frn, parent, attr, nameLen, nameOff, ok := parseUSNRecordFields(record, major)
+			frn, parent, attr, nameLen, nameOff, frnSeq, _, ok := parseUSNRecordFields(record, major)
 			if !ok {
 				pos += recordLen
 				continue
@@ -672,6 +676,7 @@ func parseUSNRecords(buffer []byte) ([]usnChange, error) {
 				Reason:    parseUSNRecordReason(record, major),
 				Attr:      attr,
 				Name:      windows.UTF16ToString(bytesToUTF16(nameBytes)),
+				Seq:       frnSeq,
 			})
 		}
 		pos += recordLen
@@ -679,30 +684,38 @@ func parseUSNRecords(buffer []byte) ([]usnChange, error) {
 	return changes, nil
 }
 
-func parseUSNRecordFields(record []byte, major uint16) (frn, parent uint64, attr uint32, nameLen, nameOff uint16, ok bool) {
+func parseUSNRecordFields(record []byte, major uint16) (frn, parent uint64, attr uint32, nameLen, nameOff, frnSeq, parentSeq uint16, ok bool) {
 	switch major {
 	case 2:
 		if len(record) < 60 {
-			return 0, 0, 0, 0, 0, false
+			return 0, 0, 0, 0, 0, 0, 0, false
 		}
-		return fileReferenceRecordNumber(binary.LittleEndian.Uint64(record[8:16])),
-			fileReferenceRecordNumber(binary.LittleEndian.Uint64(record[16:24])),
+		fileRef := binary.LittleEndian.Uint64(record[8:16])
+		parentRef := binary.LittleEndian.Uint64(record[16:24])
+		return fileReferenceRecordNumber(fileRef),
+			fileReferenceRecordNumber(parentRef),
 			binary.LittleEndian.Uint32(record[52:56]),
 			binary.LittleEndian.Uint16(record[56:58]),
 			binary.LittleEndian.Uint16(record[58:60]),
+			uint16(fileRef >> 48),
+			uint16(parentRef >> 48),
 			true
 	case 3:
 		if len(record) < 76 {
-			return 0, 0, 0, 0, 0, false
+			return 0, 0, 0, 0, 0, 0, 0, false
 		}
-		return fileReferenceRecordNumber(binary.LittleEndian.Uint64(record[8:16])),
-			fileReferenceRecordNumber(binary.LittleEndian.Uint64(record[24:32])),
+		fileRef := binary.LittleEndian.Uint64(record[8:16])
+		parentRef := binary.LittleEndian.Uint64(record[24:32])
+		return fileReferenceRecordNumber(fileRef),
+			fileReferenceRecordNumber(parentRef),
 			binary.LittleEndian.Uint32(record[68:72]),
 			binary.LittleEndian.Uint16(record[72:74]),
 			binary.LittleEndian.Uint16(record[74:76]),
+			uint16(fileRef >> 48),
+			uint16(parentRef >> 48),
 			true
 	default:
-		return 0, 0, 0, 0, 0, false
+		return 0, 0, 0, 0, 0, 0, 0, false
 	}
 }
 

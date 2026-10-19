@@ -34,7 +34,12 @@ func (vol *serviceVolumeIndex) replayWALWithLimit(maxBytes int64) error {
 		}
 		return err
 	}
-	defer f.Close()
+	closed := false
+	defer func() {
+		if !closed {
+			_ = f.Close()
+		}
+	}()
 	if maxBytes > 0 {
 		if info, err := f.Stat(); err == nil && info.Size() > maxBytes {
 			return staleIndexError{
@@ -45,9 +50,23 @@ func (vol *serviceVolumeIndex) replayWALWithLimit(maxBytes int64) error {
 	}
 	br := bufio.NewReaderSize(f, 1024*1024)
 	prefix, err := br.Peek(len(walMagicV1))
-	if err == nil && bytes.Equal(prefix, walMagicV1) {
-		_, _ = br.Discard(len(walMagicV1))
-		return vol.replayBinaryWAL(br)
+	if err == nil && (bytes.Equal(prefix, walMagicV1) || bytes.Equal(prefix, walMagicV2)) {
+		withSeq := bytes.Equal(prefix, walMagicV2)
+		_, _ = br.Discard(len(prefix))
+		frames, replayErr := vol.replayBinaryWAL(br, withSeq)
+		if replayErr != nil {
+			return replayErr
+		}
+		if !withSeq {
+			// Legacy v1 frames carry no sequence. Keep them (Seq reads back as
+			// 0 = unknown) and rewrite the file as v2 so later appends to this
+			// WAL stay one version. The rewrite renames over the WAL, so close
+			// the read handle first (Windows refuses a rename over an open file).
+			_ = f.Close()
+			closed = true
+			return rewriteWAL(vol.dbPath, frames)
+		}
+		return nil
 	}
 	dec := json.NewDecoder(br)
 	applied := 0
@@ -74,34 +93,35 @@ func (vol *serviceVolumeIndex) replayWALWithLimit(maxBytes int64) error {
 	return nil
 }
 
-func (vol *serviceVolumeIndex) replayBinaryWAL(r io.Reader) error {
+func (vol *serviceVolumeIndex) replayBinaryWAL(r io.Reader, withSeq bool) ([]walBatch, error) {
+	var kept []walBatch
 	applied := 0
 	for {
 		var header [8]byte
 		if _, err := io.ReadFull(r, header[:]); err != nil {
 			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) && applied == 0 {
-				return nil
+				return kept, nil
 			}
 			if errors.Is(err, io.ErrUnexpectedEOF) {
-				return err
+				return kept, err
 			}
-			return err
+			return kept, err
 		}
 		length := binary.LittleEndian.Uint32(header[0:4])
 		wantCRC := binary.LittleEndian.Uint32(header[4:8])
 		if length == 0 || length > 64*1024*1024 {
-			return fmt.Errorf("invalid wal frame length %d", length)
+			return kept, fmt.Errorf("invalid wal frame length %d", length)
 		}
 		payload := make([]byte, length)
 		if _, err := io.ReadFull(r, payload); err != nil {
-			return err
+			return kept, err
 		}
 		if got := crc32.ChecksumIEEE(payload); got != wantCRC {
-			return fmt.Errorf("wal frame crc mismatch got=%08x want=%08x", got, wantCRC)
+			return kept, fmt.Errorf("wal frame crc mismatch got=%08x want=%08x", got, wantCRC)
 		}
-		batch, err := decodeBinaryWALBatch(payload)
+		batch, err := decodeBinaryWALBatch(payload, withSeq)
 		if err != nil {
-			return err
+			return kept, err
 		}
 		if batch.NextUSN <= vol.checkpoint {
 			continue
@@ -111,6 +131,7 @@ func (vol *serviceVolumeIndex) replayBinaryWAL(r io.Reader) error {
 		vol.index.Checkpoint = batch.NextUSN
 		vol.dirty = true
 		applied++
+		kept = append(kept, batch)
 	}
 }
 
@@ -131,11 +152,12 @@ func readWALFramesAfter(dbPath string, checkpoint int64) ([]walBatch, error) {
 	defer f.Close()
 	br := bufio.NewReaderSize(f, 1024*1024)
 	prefix, err := br.Peek(len(walMagicV1))
-	if err != nil || !bytes.Equal(prefix, walMagicV1) {
+	if err != nil || !(bytes.Equal(prefix, walMagicV1) || bytes.Equal(prefix, walMagicV2)) {
 		// Legacy JSON WAL (or empty/invalid magic): nothing to rewrite safely.
 		return nil, nil
 	}
-	_, _ = br.Discard(len(walMagicV1))
+	withSeq := bytes.Equal(prefix, walMagicV2)
+	_, _ = br.Discard(len(prefix))
 	var frames []walBatch
 	for {
 		var header [8]byte
@@ -157,7 +179,7 @@ func readWALFramesAfter(dbPath string, checkpoint int64) ([]walBatch, error) {
 		if got := crc32.ChecksumIEEE(payload); got != wantCRC {
 			return frames, fmt.Errorf("wal frame crc mismatch got=%08x want=%08x", got, wantCRC)
 		}
-		batch, err := decodeBinaryWALBatch(payload)
+		batch, err := decodeBinaryWALBatch(payload, withSeq)
 		if err != nil {
 			return frames, err
 		}
@@ -186,7 +208,7 @@ func rewriteWAL(dbPath string, frames []walBatch) error {
 	}
 	tmpName := tmp.Name()
 	writeErr := func() error {
-		if _, err := tmp.Write(walMagicV1); err != nil {
+		if _, err := tmp.Write(walMagicV2); err != nil {
 			return err
 		}
 		for _, frame := range frames {
@@ -238,7 +260,7 @@ func appendBinaryWALFrame(f *os.File, nextUSN int64, changes []usnChange) error 
 		return err
 	}
 	if info.Size() == 0 {
-		if _, err := f.Write(walMagicV1); err != nil {
+		if _, err := f.Write(walMagicV2); err != nil {
 			return err
 		}
 	}
@@ -269,16 +291,24 @@ func encodeBinaryWALBatch(nextUSN int64, changes []usnChange) ([]byte, error) {
 		_ = binary.Write(&buf, binary.LittleEndian, change.USN)
 		_ = binary.Write(&buf, binary.LittleEndian, change.Reason)
 		_ = binary.Write(&buf, binary.LittleEndian, change.Attr)
+		_ = binary.Write(&buf, binary.LittleEndian, change.Seq)
 		_ = binary.Write(&buf, binary.LittleEndian, uint16(len(change.Name)))
 		_, _ = buf.WriteString(change.Name)
 	}
 	return buf.Bytes(), nil
 }
 
-func decodeBinaryWALBatch(payload []byte) (walBatch, error) {
+// decodeBinaryWALBatch decodes one WAL frame payload. withSeq selects the v2
+// layout (a uint16 sequence after the attributes); v1 frames have no sequence
+// and decode with Seq = 0 (unknown).
+func decodeBinaryWALBatch(payload []byte, withSeq bool) (walBatch, error) {
 	var batch walBatch
 	if len(payload) < 12 {
 		return batch, errors.New("wal frame too small")
+	}
+	fixedChange := 34
+	if withSeq {
+		fixedChange = 36
 	}
 	off := 0
 	batch.NextUSN = int64(binary.LittleEndian.Uint64(payload[off:]))
@@ -290,7 +320,7 @@ func decodeBinaryWALBatch(payload []byte) (walBatch, error) {
 	}
 	batch.Changes = make([]usnChange, 0, count)
 	for i := 0; i < count; i++ {
-		if off+34 > len(payload) {
+		if off+fixedChange > len(payload) {
 			return batch, errors.New("truncated wal change")
 		}
 		change := usnChange{}
@@ -304,6 +334,10 @@ func decodeBinaryWALBatch(payload []byte) (walBatch, error) {
 		off += 4
 		change.Attr = binary.LittleEndian.Uint32(payload[off:])
 		off += 4
+		if withSeq {
+			change.Seq = binary.LittleEndian.Uint16(payload[off:])
+			off += 2
+		}
 		nameLen := int(binary.LittleEndian.Uint16(payload[off:]))
 		off += 2
 		if off+nameLen < off || off+nameLen > len(payload) {

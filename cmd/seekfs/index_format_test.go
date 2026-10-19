@@ -2049,8 +2049,8 @@ func TestServiceVolumeIndexReplaysBinaryWAL(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read wal: %v", err)
 	}
-	if !bytes.HasPrefix(data, walMagicV1) {
-		t.Fatalf("wal prefix = %q, want %q", data[:min(len(data), len(walMagicV1))], walMagicV1)
+	if !bytes.HasPrefix(data, walMagicV2) {
+		t.Fatalf("wal prefix = %q, want %q", data[:min(len(data), len(walMagicV2))], walMagicV2)
 	}
 	reloaded := newServiceVolumeIndex(db, &Index{
 		Source:     "usn",

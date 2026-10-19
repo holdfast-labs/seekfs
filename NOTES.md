@@ -66,22 +66,29 @@ leaves every 48-bit-keyed structure unchanged. Cost is one uint16 per record
 plus one WAL field. Keep the 66f4b78 floor as defense in depth. (a) is a later
 consolidation if the full reference is wanted elsewhere.
 
-Brief 1 - capture and persist the sequence.
+Brief 1 - capture and persist the sequence. (IMPLEMENTED, indexVersion 10,
+WAL magic `SWAL2`)
 - Add `Seq uint16` to `CompactRecord`/`usnChange`; `mftEntry.seq` from
   `record[16:18]`; `parseUSNRecordFields` returns the file-ref sequence.
 - New `indexSectionSEQN` + encode/decode + `Index.Derived.FRNSeq`; bump
   `indexVersion` to 10. Add `Seq` to the binary WAL frame; bump the magic.
-- Tests: SEQN round-trip; WAL `Seq` round-trip; old-magic frame dropped;
-  `parseUSNRecordFields` returns the sequence.
+- Backward compatible: a v9 index (no SEQN) loads with Seq 0, and a v1 WAL
+  frame still decodes and replays (Seq 0); a v1 WAL is upgraded to v2 in place
+  so later appends stay one version. 0 means unknown.
+- Tests: SEQN round-trip; v9 index loads with Seq 0; WAL `Seq` round-trip;
+  v1-magic frame replays as Seq 0; `parseUSNRecordFields` returns the sequence.
+- Known gap: the standalone `direct` builder (directRecord/direct spool) does
+  not yet carry the sequence; the service path (`indexUSNVolume`) does.
 
 Brief 2 - enforce identity on apply; fix the content join.
-- `applyUSNChanges`/`recordOverlayChange`: ignore an event whose sequence is
-  below the record's known sequence (base or newest overlay slot) even above
-  the floor; a higher sequence is an occupant replacement (tombstone the old
-  subtree, then apply).
+- `applyUSNChanges`/`recordOverlayChange`: compare sequences by INEQUALITY, not
+  ordering. NTFS sequences wrap at 16 bits, so a known record Seq != event Seq
+  means a different occupant. Treat an older-sequence event as stale (ignore);
+  a different sequence as an occupant replacement (tombstone the old subtree,
+  then apply). Skip only when the event Seq is 0 (unknown).
 - Add `FRNSeq` to `contentDoc`; compare in the content joins/catch-up; bump
   `contentIndexVersion` to 13.
-- Tests: stale delete with an older sequence ignored even above the watermark;
-  new occupant with a newer sequence replaces the old record; an old index
-  without sequences loads and works.
+- Tests: stale delete with a different sequence ignored even above the
+  watermark; new occupant with a different sequence replaces the old record;
+  an old index without sequences loads and works.
 - Follow-up brief: bump `feature.Version`, carry the sequence in the companion.
