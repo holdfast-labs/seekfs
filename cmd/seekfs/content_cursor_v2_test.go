@@ -223,3 +223,59 @@ func TestContentCursorV2RejectsBadTokens(t *testing.T) {
 		t.Fatalf("wrong-query token = ok:%v message:%q", r.OK, r.Message)
 	}
 }
+
+// TestContentCursorV2ValveCappedPagesResumeWithoutGaps walks a v2 cursor
+// under a per-request disk valve smaller than the result set. Each resume
+// prices one page, so paging reaches every hit, and the concatenated pages
+// equal the uncapped rank order with no duplicates or gaps.
+func TestContentCursorV2ValveCappedPagesResumeWithoutGaps(t *testing.T) {
+	const files = 400
+	const valve = 150
+	vol := contentFilterV11Fixture(t, matchingBodies(files))
+	prevMS, prevValve := contentDefaultBudgetMS, contentDiskVerifyBudget
+	contentDefaultBudgetMS = 0
+	contentDiskVerifyBudget = valve
+	pinContentDiskVerifyPageScale(t, 1)
+	t.Cleanup(func() {
+		contentDefaultBudgetMS = prevMS
+		contentDiskVerifyBudget = prevValve
+	})
+
+	full, err := searchServiceVolumes([]*serviceVolumeIndex{vol},
+		queryOptions{Query: "content:needle", Limit: files, Trace: &searchTrace{}, ContentDiskVerifyBudget: 2 * files}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(full) != files {
+		t.Fatalf("uncapped hits=%d; want %d", len(full), files)
+	}
+
+	s := &goSearchService{volumes: []*serviceVolumeIndex{vol}, indexes: []*Index{vol.index}}
+	var got []string
+	cursor := ""
+	for page := 0; page < 10; page++ {
+		resp := callTestServiceCommand(t, s, serviceRequest{Command: "search", Query: "content:needle", Limit: 100, Cursor: cursor})
+		if !resp.OK {
+			t.Fatalf("page %d: %s", page, resp.Message)
+		}
+		if resp.CursorRestarted {
+			t.Fatalf("page %d restarted: %s", page, resp.CursorRestartReason)
+		}
+		got = append(got, resp.Results...)
+		if resp.NextCursor == "" {
+			break
+		}
+		if page > 0 && !strings.HasPrefix(resp.NextCursor, "eyJ2IjoyL") {
+			t.Fatalf("page %d emitted a non-v2 cursor", page)
+		}
+		cursor = resp.NextCursor
+	}
+	if len(got) != files {
+		t.Fatalf("paged rows=%d; want all %d (each v2 resume prices one page)", len(got), files)
+	}
+	for i, e := range full {
+		if got[i] != e.Path {
+			t.Fatalf("row %d = %q; want %q (pages must concatenate to the uncapped order)", i, got[i], e.Path)
+		}
+	}
+}
