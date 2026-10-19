@@ -120,9 +120,11 @@ handle whose number was reused (stray writes into another file). Then `feat/cont
 (78ccdd9): v2 pages through a populated name overlay and content delta; the cursor
 carries the last base FRN and the last row key (tier, rank, tiebreak); overlay rows
 at or before the key are skipped; snapshotGen/delta changes no longer restart. A file
-renamed across the cursor may be missed (bounded, never duplicated). Running:
-`perf/cursor-overlay-page-price` (cursorprice: overlay resumes still verify the
-window, not one page) and `fix/content-regex-underfill` (regexfill: diagnose first). Owner action: relaunch
+renamed across the cursor may be missed (bounded, never duplicated). Then
+`perf/cursor-overlay-page-price` (cd0956c): a v2 resume with hidden base rows stops
+base verification once base hits plus earlier overlay rows fill the page (page 2 of
+a 200-file fixture: 198 -> 18 disk reads). Running: `fix/content-regex-underfill`
+(regexfill: diagnose first; no standalone services, read-only live queries). Owner action: relaunch
 the live service to see the 1,826 extract errors split by reason.
 
 Merged 2026-10-17: `content/verify-frontier` (e271c17): parallel verifiers stop at
