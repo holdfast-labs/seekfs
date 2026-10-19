@@ -69,6 +69,18 @@ func TestApplyUSNStaleDeleteForReusedRecordKeepsLiveSubtree(t *testing.T) {
 	if !found {
 		t.Fatalf("stale delete removed the directory: widen paths = %v, want to contain E:\\wt\\widen", searchPathsFor(t, vol, "widen"))
 	}
+
+	// The record at the watermark is the first post-scan change
+	// (Checkpoint = journal.NextUsn) and must apply.
+	vol.applyUSNChanges([]usnChange{{
+		FRN:    fileFRN,
+		USN:    snapshotUSN,
+		Reason: usnReasonFileDelete,
+		Name:   "WORK_QUEUE.md",
+	}})
+	if got := searchPathsFor(t, vol, "WORK_QUEUE.md"); len(got) != 0 {
+		t.Fatalf("first post-scan delete (USN == watermark) was dropped: paths = %v", got)
+	}
 }
 
 func searchPathsFor(t *testing.T, vol *serviceVolumeIndex, query string) []string {

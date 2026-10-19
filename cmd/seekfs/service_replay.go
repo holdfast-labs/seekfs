@@ -450,20 +450,22 @@ func (vol *serviceVolumeIndex) applyUSNChanges(changes []usnChange) {
 		applied = make([]usnChange, 0, len(changes))
 	}
 	// Snapshot watermark floor: a fresh scan (MFT or USN enum) records
-	// idx.Checkpoint = journal.NextUsn, so baseCheckpoint is the USN the base
-	// records are complete through. Any journal record at or below it is
-	// already reflected in the base. The index keys records by the 48-bit MFT
+	// idx.Checkpoint = journal.NextUsn, so every journal record below
+	// baseCheckpoint is already reflected in the base. The record AT it is the
+	// first post-scan change (NextUsn is the next record's USN) and must apply;
+	// after a fold the checkpoint is the last applied USN, so re-applying that
+	// one is the historical, harmless behavior. The index keys records by the 48-bit MFT
 	// record number only (fileReferenceRecordNumber), so a DELETE or RENAME_OLD
 	// for a *previous occupant* of a reused record number is indistinguishable
 	// from one for the current occupant; re-applying it after a rescan would
 	// tombstone the live record and cascade its whole subtree. Refuse changes
-	// at or below the floor instead of relying on the batch/head USN alone.
+	// below the floor instead of relying on the batch/head USN alone.
 	floor := vol.baseCheckpoint
 	for i, change := range changes {
 		if change.FRN == 0 {
 			continue
 		}
-		if change.USN > 0 && floor > 0 && change.USN <= floor {
+		if change.USN > 0 && floor > 0 && change.USN < floor {
 			continue
 		}
 		// Changes inside directories that hold seekfs's own artifacts (the
