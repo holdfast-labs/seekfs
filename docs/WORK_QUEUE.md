@@ -126,9 +126,14 @@ base verification once base hits plus earlier overlay rows fill the page (page 2
 a 200-file fixture: 198 -> 18 disk reads). Regex underfill diagnosed as expected (`fix/content-regex-underfill` NOTES.md,
 e16a345): low-hit-rate regexes spend the page-scaled valve and return a short page
 marked incomplete; the cap scales 2,048 -> 8,192 reads from limit 100 to 520.
-Running: `fix/explicit-budget-overlay` (budgetfix: with hidden overlay rows the
-window pass replaced an explicit --content-verify-budget with the default valve;
-needs a two-step page fill) . `content/save-peak` merged (c25c755, see Save-time peak below). Owner action: relaunch
+Then `fix/explicit-budget-overlay` (bd167e4): with hidden overlay rows the window
+pass had replaced an explicit --content-verify-budget with the default valve; a
+short capped page now refills from the verify frontier under the caller budget
+(zero first-pass hits included, no candidate read twice), and the reported cap
+matches the applied one. Single volume only. `content/save-peak` merged (c25c755, see Save-time peak below).
+Running: `content/fold-postings` (foldpost: posting-level fold, only changed docs
+re-extracted; full re-extract fallback past 25% changed docs or 32 folds per shard).
+Owner action: relaunch
 the live service to see the 1,826 extract errors split by reason.
 
 Merged 2026-10-17: `content/verify-frontier` (e271c17): parallel verifiers stop at
