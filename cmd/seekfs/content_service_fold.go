@@ -254,8 +254,6 @@ func (s *goSearchService) runContentFold(vol *serviceVolumeIndex) {
 	var rewritten int
 	var saveErr error
 	if base.shards == nil {
-		src := newContentFoldDiskSource(vol, base.Docs, basePaths, snap, settings, fctx, livePath)
-		defer src.stop()
 		// Growth is projected up front from metadata (no text reads): base
 		// extracted bytes, minus tombstoned/replaced docs, plus delta docs.
 		// Past twice the shard target the fold shards directly instead of
@@ -287,25 +285,62 @@ func (s *goSearchService) runContentFold(vol *serviceVolumeIndex) {
 			}
 			rewritten = len(items)
 		} else {
-			built, shard, err := foldShard(src.next)
-			if err != nil {
-				serviceLog("content fold assemble failed volume=%s err=%v", vol.volume, err)
-				vol.contentCoord.foldFailed(contentFoldRetryBackoff)
-				return
+			drop := make(map[uint64]struct{}, len(snap))
+			incoming := make([]contentDeltaDoc, 0, len(snap))
+			for _, d := range snap {
+				drop[d.FRN] = struct{}{}
+				if !d.Deleted {
+					incoming = append(incoming, d)
+				}
 			}
-			if !s.contentBuildCurrent(vol, gen, base.JournalID) {
-				// A rebuild/journal reset moved under the fold; keep the delta for
-				// the next fold against the new generation rather than publish
-				// stale.
-				vol.contentCoord.foldFailed(contentFoldRetryBackoff)
-				return
+			counter := decodeContentFoldCounters(base.Sections[contentSectionFoldCounters])[""]
+			sh := &contentShard{info: contentShardInfo{File: gsx}, idx: base, reader: reader, base: 0}
+			pending := contentShardDroppedDocs(sh, drop)
+			posted := false
+			if !contentPostingFoldStale(counter, len(base.Docs), pending) {
+				if res, ok := contentShardPostingFold(sh, incoming, drop, header, settings, fctx, livePath); ok {
+					counter = contentFoldCounter{
+						Folds:   counter.Folds + 1,
+						Changed: counter.Changed + uint32(pending),
+					}
+					res.idx.Inclusion.DedupeFiles = res.dedupeFiles
+					res.idx.Inclusion.DedupeBytes = res.dedupeBytes
+					if res.idx.Sections == nil {
+						res.idx.Sections = make(map[uint32][]byte)
+					}
+					res.idx.Sections[contentSectionFoldCounters] = encodeContentFoldCounters(map[string]contentFoldCounter{"": counter})
+					if !s.contentBuildCurrent(vol, gen, base.JournalID) {
+						vol.contentCoord.foldFailed(contentFoldRetryBackoff)
+						return
+					}
+					saveErr = contentFoldSave(gsx, res.idx, nil)
+					if saveErr == nil {
+						rewritten = res.rewritten
+						posted = true
+					}
+				}
 			}
-			rewritten = len(built.docs)
-			// Stamp the shard save, not the header: foldShard already
-			// snapshotted header into shard above.
-			shard.Inclusion.DedupeFiles = built.dedupeFiles
-			shard.Inclusion.DedupeBytes = built.dedupeBytes
-			saveErr = contentFoldSave(gsx, shard, contentBuildFiles(built))
+			if !posted && saveErr == nil {
+				// Full re-extract: also resets the posting-fold counter (a
+				// full fold writes no CXFC section).
+				src := newContentFoldDiskSource(vol, base.Docs, basePaths, snap, settings, fctx, livePath)
+				defer src.stop()
+				built, shard, err := foldShard(src.next)
+				if err != nil {
+					serviceLog("content fold assemble failed volume=%s err=%v", vol.volume, err)
+					vol.contentCoord.foldFailed(contentFoldRetryBackoff)
+					return
+				}
+				rewritten = len(built.docs)
+				// Stamp the shard save, not the header: foldShard already
+				// snapshotted header into shard above.
+				shard.Inclusion.DedupeFiles = built.dedupeFiles
+				shard.Inclusion.DedupeBytes = built.dedupeBytes
+				saveErr = contentFoldSave(gsx, shard, contentBuildFiles(built))
+			}
+			if contentPostingFoldChoiceHook != nil {
+				contentPostingFoldChoiceHook("", posted)
+			}
 		}
 	} else {
 		// Sharded: rewrite only the shards the delta touches; the others are
@@ -313,6 +348,8 @@ func (s *goSearchService) runContentFold(vol *serviceVolumeIndex) {
 		// surviving base docs from disk (v11: no stored text) merged with its
 		// incoming delta docs.
 		plan := planContentShardedFold(reader, resolver, snap)
+		counters := decodeContentFoldCounters(base.Sections[contentSectionFoldCounters])
+		nextCounters := make(map[string]contentFoldCounter, len(base.shards))
 		infos := make([]contentShardInfo, len(base.shards))
 		var foldBuilt []*contentStreamedBuild
 		var stops []func()
@@ -323,20 +360,52 @@ func (s *goSearchService) runContentFold(vol *serviceVolumeIndex) {
 		}()
 		for i, sh := range base.shards {
 			infos[i] = sh.info
+			prev := counters[sh.info.File]
+			nextCounters[sh.info.File] = prev
 			if !plan.dirty[i] || saveErr != nil {
 				continue
 			}
-			src := contentShardFoldDiskSource(vol, sh, plan.incoming[i], plan.drop, settings, fctx, livePath)
-			stops = append(stops, src.stop)
-			built, shard, err := foldShard(src.next)
-			if err != nil {
-				serviceLog("content fold assemble failed volume=%s shard=%s err=%v", vol.volume, sh.info.File, err)
-				vol.contentCoord.foldFailed(contentFoldRetryBackoff)
-				return
+			pending := contentShardDroppedDocs(sh, plan.drop)
+			posted := false
+			if !contentPostingFoldStale(prev, len(sh.idx.Docs), pending) {
+				if res, ok := contentShardPostingFold(sh, plan.incoming[i], plan.drop, header, settings, fctx, livePath); ok {
+					infos[i], saveErr = contentSaveShard(contentShardDir(gsx), res.idx, nil, sh.info.Prefixes)
+					if saveErr == nil {
+						rewritten += res.rewritten
+						foldBuilt = append(foldBuilt, &contentStreamedBuild{dedupeFiles: res.dedupeFiles, dedupeBytes: res.dedupeBytes})
+						// The rewritten shard has a new file name; move its
+						// counters with it so the next manifest can find them.
+						delete(nextCounters, sh.info.File)
+						nextCounters[infos[i].File] = contentFoldCounter{
+							Folds:   prev.Folds + 1,
+							Changed: prev.Changed + uint32(pending),
+						}
+						posted = true
+					}
+				}
 			}
-			rewritten += len(built.docs)
-			foldBuilt = append(foldBuilt, built)
-			infos[i], saveErr = contentSaveShard(contentShardDir(gsx), shard, contentBuildFiles(built), sh.info.Prefixes)
+			if !posted && saveErr == nil {
+				src := contentShardFoldDiskSource(vol, sh, plan.incoming[i], plan.drop, settings, fctx, livePath)
+				stops = append(stops, src.stop)
+				built, shard, err := foldShard(src.next)
+				if err != nil {
+					serviceLog("content fold assemble failed volume=%s shard=%s err=%v", vol.volume, sh.info.File, err)
+					vol.contentCoord.foldFailed(contentFoldRetryBackoff)
+					return
+				}
+				rewritten += len(built.docs)
+				foldBuilt = append(foldBuilt, built)
+				infos[i], saveErr = contentSaveShard(contentShardDir(gsx), shard, contentBuildFiles(built), sh.info.Prefixes)
+				if saveErr == nil {
+					// A full re-extract restores exact term df and un-prunes
+					// dense grams; start its staleness counters over.
+					delete(nextCounters, sh.info.File)
+					nextCounters[infos[i].File] = contentFoldCounter{}
+				}
+			}
+			if contentPostingFoldChoiceHook != nil {
+				contentPostingFoldChoiceHook(sh.info.File, posted)
+			}
 		}
 		if saveErr == nil {
 			// Restamp the dedupe totals over the new corpus: rewritten
@@ -357,6 +426,10 @@ func (s *goSearchService) runContentFold(vol *serviceVolumeIndex) {
 			}
 			header.Inclusion.DedupeFiles = df
 			header.Inclusion.DedupeBytes = db
+			if header.Sections == nil {
+				header.Sections = make(map[uint32][]byte)
+			}
+			header.Sections[contentSectionFoldCounters] = encodeContentFoldCounters(nextCounters)
 			if !s.contentBuildCurrent(vol, gen, base.JournalID) {
 				vol.contentCoord.foldFailed(contentFoldRetryBackoff)
 				contentSweepShards(gsx)

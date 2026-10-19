@@ -453,6 +453,11 @@ func contentSaveManifest(gsx string, header *contentIndex, shards []contentShard
 	m.Policy = header.Policy
 	m.ScopeHash = header.ScopeHash
 	m.Inclusion = header.Inclusion
+	if header.Sections != nil {
+		if sec, ok := header.Sections[contentSectionFoldCounters]; ok && len(sec) > 0 {
+			m.Sections[contentSectionFoldCounters] = sec
+		}
+	}
 	m.Sections[contentSectionShards] = encodeContentShards(shards)
 	return contentSaveFile(gsx, m)
 }
@@ -634,5 +639,10 @@ func contentReshardAndSave(gsx string, items []contentFoldItem, readDoc func(con
 	}
 	header.Inclusion.DedupeFiles = df
 	header.Inclusion.DedupeBytes = db
+	// A reshard is a from-scratch rebuild of every shard: drop any posting-fold
+	// counters the caller carried, so the new layout starts clean.
+	if header.Sections != nil {
+		delete(header.Sections, contentSectionFoldCounters)
+	}
 	return len(infos), contentSaveManifest(gsx, header, infos)
 }
