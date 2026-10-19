@@ -77,6 +77,9 @@ Copy-Item README.md,LICENSE,NOTICE.md -Destination $Target
 # data, and other untracked docs cannot leak into release artifacts.
 $DocFiles = git ls-files docs
 Assert-LastExit "git ls-files docs"
+# Internal coordination notes (local paths, agent setup) are not release docs.
+$InternalDocs = @("docs/WORK_QUEUE.md")
+$DocFiles = $DocFiles | Where-Object { $InternalDocs -notcontains $_ }
 foreach ($doc in $DocFiles) {
     $dest = Join-Path $Target $doc
     $destDir = Split-Path -Parent $dest
