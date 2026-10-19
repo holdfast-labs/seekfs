@@ -86,7 +86,24 @@ go build -ldflags=-H=windowsgui -o seekfs-native.exe ./cmd/seekfs-native
 
 `SEEKFS_NATIVE_PRESENTER=dxgi` switches from the default GDI presentation path
 (GPU render, then a GDI copy, which works on every display setup) to Gio's
-swapchain. Settings live in `%APPDATA%\seekfs\native.json`.
+swapchain. Local UI preferences live in `%APPDATA%\seekfs\native.json`.
+
+The gear button (or `Ctrl+,`) opens Settings. It has three sections:
+
+- **Drives** lists every local volume with its file system, used/free space,
+  entry count and state, and stages an "Index this drive" change per volume.
+- **Content search** edits the master switch, mode (Automatic / Only chosen
+  folders / Off), roots and exclusions (native folder picker), `.gitignore`
+  and system-folder toggles, the size budget and an optional extension
+  allowlist. A drive selector at the top edits per-drive overrides.
+- **Search** sets the local defaults: Contents mode, preview pane, view mode
+  and sort order.
+
+Apply sends only changed fields over the service pipe. If the service refuses
+the write as non-elevated, the app runs `seekfs.exe settings set --json
+<file>` with a UAC prompt and then reloads the settings. Validation errors
+appear next to the named field. A drive that starts indexing shows a
+non-blocking notice while it builds.
 
 ## Search your way
 

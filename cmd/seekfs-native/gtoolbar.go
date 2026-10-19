@@ -34,6 +34,9 @@ func (u *UI) layoutToolbar(gtx layout.Context) layout.Dimensions {
 		u.searchEd.SetText("")
 		u.typedQuery("")
 	}
+	if u.settingsBtn.Clicked(gtx) {
+		u.openSettings()
+	}
 	for i := range u.viewBtns {
 		if u.viewBtns[i].Clicked(gtx) {
 			u.setView(ViewMode(i))
@@ -66,8 +69,13 @@ func (u *UI) layoutToolbar(gtx layout.Context) layout.Dimensions {
 				})
 			}),
 			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-				return layout.Inset{Right: Dp(12)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+				return layout.Inset{Right: Dp(8)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
 					return u.layoutViewSwitcher(gtx, view)
+				})
+			}),
+			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+				return layout.Inset{Right: Dp(12)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+					return fluentBtn(gtx, th, s, &u.settingsBtn, iconSettings, true, u.settingsOpen, Dp(32))
 				})
 			}),
 		)

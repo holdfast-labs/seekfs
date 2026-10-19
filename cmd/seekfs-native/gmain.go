@@ -368,8 +368,9 @@ func (u *UI) layout(gtx layout.Context) layout.Dimensions {
 	}
 	u.handleEditorEvents(gtx)
 	u.handleGlobalKeys(gtx)
+	u.consumeSettingsPending()
 	u.paintBG(gtx)
-	return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
+	body := layout.Flex{Axis: layout.Vertical}.Layout(gtx,
 		layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 			return u.layoutToolbar(gtx)
 		}),
@@ -378,6 +379,15 @@ func (u *UI) layout(gtx layout.Context) layout.Dimensions {
 		}),
 		layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 			return u.layoutStatus(gtx)
+		}),
+	)
+	if !u.settingsOpen {
+		return body
+	}
+	return layout.Stack{}.Layout(gtx,
+		layout.Stacked(func(gtx layout.Context) layout.Dimensions { return body }),
+		layout.Stacked(func(gtx layout.Context) layout.Dimensions {
+			return u.layoutSettingsOverlay(gtx)
 		}),
 	)
 }

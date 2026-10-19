@@ -40,6 +40,9 @@ type shellBridge interface {
 	Icon(path string, isDir bool, size int) image.Image
 	// TypeName returns the shell type name ("Text Document", "File folder").
 	TypeName(path string, isDir bool) string
+	// PickFolder shows the native folder picker and returns the chosen path.
+	// An error (including a cancelled dialog) leaves the list unchanged.
+	PickFolder(title string) (string, error)
 }
 
 // newShellBridge builds the platform bridge.

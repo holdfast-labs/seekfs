@@ -77,7 +77,18 @@ func (u *UI) handleGlobalKeys(gtx layout.Context) {
 		}
 		name := e.Name
 		mods := e.Modifiers
+		if u.settingsOpen {
+			switch {
+			case name == key.NameEscape:
+				u.closeSettings()
+			case name == key.NameReturn:
+				u.applySettings()
+			}
+			continue
+		}
 		switch {
+		case name == "," && mods.Contain(key.ModCtrl):
+			u.openSettings()
 		case name == key.NameReturn && mods.Contain(key.ModCtrl):
 			u.revealSelected()
 		case name == key.NameReturn:

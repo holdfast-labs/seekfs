@@ -58,6 +58,12 @@ type UI struct {
 	dark   bool
 	accent color.NRGBA
 
+	// Settings overlay (gsettings.go).
+	settingsOpen    bool
+	gsettings       *settingsPanelState
+	settingsPending settingsPendingResult
+	settingsBtn     widget.Clickable
+
 	// Widgets.
 	searchEd    widget.Editor
 	scopeEd     widget.Editor

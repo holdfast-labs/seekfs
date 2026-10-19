@@ -64,6 +64,7 @@ func (b *fakeBridge) TypeName(path string, isDir bool) string {
 	}
 	return "Text Document"
 }
+func (b *fakeBridge) PickFolder(title string) (string, error) { return "", nil }
 
 func testUI(t *testing.T, dark bool) *UI {
 	t.Helper()
