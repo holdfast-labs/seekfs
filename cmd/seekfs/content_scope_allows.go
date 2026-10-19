@@ -106,8 +106,14 @@ type contentScopeResolved struct {
 	Roots         []string // effective include roots (normalized)
 	Repos         []string // detected git worktree roots (normalized)
 	ExplicitRoots []string // configured roots, before known folders are added
-	Excludes      []string // normalized exclude prefixes
-	ExtSet        map[string]struct{}
+	// DriveRoot is the normalized volume root (auto mode only), added as the
+	// final, lowest-priority include root so text files outside repos and
+	// known folders are still in scope (parity with Noah's fsearch, which
+	// indexes text drive-wide and only skips junk). "" when the volume names
+	// no drive root or the scope is explicit.
+	DriveRoot string
+	Excludes  []string // normalized exclude prefixes
+	ExtSet    map[string]struct{}
 	// SniffText selects ripgrep-style selection: any file not cheaply rejected
 	// (the binary skip list) is admitted and its 512-byte head sniffed at
 	// build time (NUL in the first 8 KiB means binary). It is on unless the
@@ -144,6 +150,9 @@ type contentScopeResolved struct {
 	rootPrefix     []string
 	excludePrefix  []string
 	explicitPrefix []string
+	// driveRootPrefix is the separator-terminated form of DriveRoot ("" when
+	// unset), so the lowest-priority match is one HasPrefix.
+	driveRootPrefix string
 	// rootExact maps a normalized path that exactly equals a root to it, for
 	// the corner where a root names the file itself while its parent matches
 	// no root (the only way a file joins without its parent joining).
@@ -198,6 +207,11 @@ func (r *contentScopeResolved) buildScopePrefixes() {
 	r.explicitSet = make(map[string]struct{}, len(r.ExplicitRoots))
 	for _, root := range r.ExplicitRoots {
 		r.explicitSet[root] = struct{}{}
+	}
+	if r.DriveRoot != "" {
+		r.driveRootPrefix = contentScopePrefix(r.DriveRoot)
+	} else {
+		r.driveRootPrefix = ""
 	}
 }
 
@@ -282,6 +296,16 @@ func (s contentScope) resolve(volume string, repoRoots []string) contentScopeRes
 	r.ExplicitRoots = dedupeContentPaths(append([]string(nil), s.Roots...))
 	if s.Mode == contentScopeAuto {
 		r.Roots = append(r.Roots, contentKnownFolders(volume)...)
+		// The volume root is the final, lowest-priority root: it admits
+		// text files outside repos and known folders (drive-wide coverage,
+		// like the reference indexer) while priority() keeps the budget
+		// filling repos, configured roots and known folders first. All
+		// excludes stay in force, and the inclusion skips below drop
+		// dependency/cache trees.
+		r.DriveRoot = contentVolumeRoot(volume)
+		if r.DriveRoot != "" {
+			r.Roots = append(r.Roots, r.DriveRoot)
+		}
 	}
 	r.Roots = dedupeContentPaths(r.Roots)
 
@@ -304,7 +328,10 @@ func (s contentScope) resolve(volume string, repoRoots []string) contentScopeRes
 }
 
 // priority orders budget candidates by user intent: repositories first,
-// configured roots next, then automatically detected known folders.
+// configured roots next, then automatically detected known folders, then the
+// whole-volume drive root (auto mode) last. A path matching no root at all
+// ranks below every include (4); in auto mode the drive root makes that
+// unreachable.
 func (r contentScopeResolved) priority(path string) int {
 	p := contentNormPath(path)
 	for i, repo := range r.Repos {
@@ -318,11 +345,26 @@ func (r contentScopeResolved) priority(path string) int {
 		}
 	}
 	for i, root := range r.Roots {
+		if r.DriveRoot != "" && root == r.DriveRoot {
+			continue
+		}
 		if contentPrefixUnder(p, root, r.rootPrefixAt(i)) {
 			return 2
 		}
 	}
-	return 3
+	if r.DriveRoot != "" && contentPrefixUnder(p, r.DriveRoot, r.driveRootPrefixAt()) {
+		return 3
+	}
+	return 4
+}
+
+// driveRootPrefixAt is DriveRoot's precomputed separator-terminated form,
+// falling back to computing it for hand-built test scopes.
+func (r contentScopeResolved) driveRootPrefixAt() string {
+	if r.driveRootPrefix != "" {
+		return r.driveRootPrefix
+	}
+	return contentScopePrefix(r.DriveRoot)
 }
 
 // repoPrefixAt returns the precomputed separator-terminated form of
@@ -417,6 +459,25 @@ func (r contentScopeResolved) allowsReason(path string, size int64) (unit, kind,
 		return "", "", "root", false
 	}
 	return unit, kind, "", true
+}
+
+// contentVolumeRoot returns the normalized drive-root include for volume
+// ("C:" -> "c:\"), or "" when the volume names no drive root (auto mode's
+// whole-volume coverage). Only a bare drive ("C:") or its root form qualifies;
+// a deeper path volume is left alone so a scoped path never silently widens to
+// the whole drive.
+func contentVolumeRoot(volume string) string {
+	v := strings.TrimSpace(volume)
+	if len(v) < 2 || v[1] != ':' {
+		return ""
+	}
+	if len(v) > 2 {
+		rest := v[2:]
+		if rest != string(filepath.Separator) && rest != "/" {
+			return ""
+		}
+	}
+	return contentNormPath(v[:2] + string(filepath.Separator))
 }
 
 // contentKnownFolders returns the user's Documents/Desktop/Downloads when the

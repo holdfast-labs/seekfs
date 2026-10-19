@@ -22,8 +22,8 @@ import (
 type contentScopeMode string
 
 const (
-	// contentScopeAuto detects roots (git worktrees, known folders) and applies
-	// the built-in excludes and the budget.
+	// contentScopeAuto detects roots (git worktrees, known folders, then the
+	// whole volume root) and applies the built-in excludes and the budget.
 	contentScopeAuto contentScopeMode = "auto"
 	// contentScopeOff disables content entirely for the volume (no build).
 	contentScopeOff contentScopeMode = "off"

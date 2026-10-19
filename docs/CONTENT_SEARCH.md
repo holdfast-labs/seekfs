@@ -148,7 +148,18 @@ reconciles the selection difference under the new rules (§6p) instead of
 rebuilding the sidecar.
 
 The service selects Git repositories before configured roots, then known
-folders. It spools accepted extracted text to temporary disk before assembling
+folders, then the volume root. In `auto` mode the volume root joins as the
+final, lowest-priority include, so text files outside every repo and known
+folder are in scope — parity with the reference indexer, which indexes text
+drive-wide and only skips junk. The budget still fills repos, configured
+roots and known folders first; the drive-root files are dropped only once the
+higher priorities are exhausted. Explicit mode is unchanged. All existing
+excludes stay in force, and outside repos the dependency/cache skips
+additionally drop `site-packages`, `node_modules`, `__pycache__`, `.venv`,
+`venv`, `.tox`, `.mypy_cache`, `.pytest_cache` and `.ruff_cache` trees (plus
+`target`/`dist`/`build`/... via the build-output rule); inside a repo git's
+ignore rules still decide.
+It spools accepted extracted text to temporary disk before assembling
 the FRN-sorted sidecar, so a large scoped build needs temporary disk space up
 to its extracted-text budget. Assembly itself is fully streamed: the text
 store is spooled to a temp file as docs arrive, the term/gram posting sections

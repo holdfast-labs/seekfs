@@ -24,7 +24,14 @@ package main
 //     text whose average line length looks generated.
 //  7. build_output — dist/build/out/target/… segments, only outside repos
 //     (inside a repo git's ignore rules own directories).
-//  8. cache — well-known cache trees (Go/npm/pip/uv/Cargo/Gradle/NuGet,
+//  8. dependency — Python venv / site-packages, JS node_modules, and other
+//     dependency or tool-cache trees (`.venv`, `venv`, `site-packages`,
+//     `node_modules`, `__pycache__`, `.tox`, `.mypy_cache`, `.pytest_cache`,
+//     `.ruff_cache`), only outside repos: inside a repo git's ignore rules
+//     decide, so a tracked/un-ignored tree stays indexable. Rust `target`
+//     dirs are covered by build_output outside repos; CACHEDIR.TAG is not
+//     consulted (a name-based rule is enough and cheaper).
+//  9. cache — well-known cache trees (Go/npm/pip/uv/Cargo/Gradle/NuGet,
 //     browser caches), inside or outside repos.
 //
 // Size caps are per file, not per build: the default text cap is ~1 MiB
@@ -49,6 +56,7 @@ const (
 	contentSkipLargeJSON   = "large_json"
 	contentSkipMinified    = "minified"
 	contentSkipBuildOutput = "build_output"
+	contentSkipDependency  = "dependency"
 	contentSkipCache       = "cache"
 	contentSkipUserSkip    = "user_skip"
 )
@@ -67,8 +75,8 @@ const contentSkipSizeCap = "size_cap"
 func contentInclusionReason(reason string) bool {
 	switch reason {
 	case contentSkipLockfile, contentSkipLargeJSON, contentSkipMinified,
-		contentSkipBuildOutput, contentSkipCache, contentSkipUserSkip,
-		contentSkipWorktree, contentSkipSizeCap:
+		contentSkipBuildOutput, contentSkipDependency, contentSkipCache,
+		contentSkipUserSkip, contentSkipWorktree, contentSkipSizeCap:
 		return true
 	}
 	return false
@@ -137,6 +145,16 @@ var contentCacheSegments = []string{
 	".yarn", "yarn-cache", ".cargo", ".gradle", ".nuget", ".cache",
 }
 
+// contentDependencySegments are directory names marking dependency / virtualenv
+// trees, applied OUTSIDE git repos only: inside a repo gitignore decides, so a
+// tracked or deliberately-un-ignored tree stays indexable (e.g. a vendored
+// node_modules). Rust `target` directories, with or without a CACHEDIR.TAG,
+// are already covered by contentBuildOutputSegments outside repos.
+var contentDependencySegments = []string{
+	"site-packages", "node_modules", "__pycache__", ".venv", "venv",
+	".tox", ".mypy_cache", ".pytest_cache", ".ruff_cache",
+}
+
 // contentCachePathSubs are lowercase `/`-separated path substrings marking
 // cache trees whose directory names alone are too generic to match
 // (e.g. `CacheStorage` under a browser profile, `registry` under cargo).
@@ -202,6 +220,18 @@ func contentCacheSegment(seg string) bool {
 	return false
 }
 
+// contentDependencySegment reports whether a single lowercase path segment
+// names a dependency/virtualenv tree (outside repos only; see
+// contentDependencySegments).
+func contentDependencySegment(seg string) bool {
+	for _, s := range contentDependencySegments {
+		if seg == s {
+			return true
+		}
+	}
+	return false
+}
+
 // contentCachePath reports whether the lowercase `/`-joined path matches a
 // cache-tree substring.
 func contentCachePath(slashPath string) bool {
@@ -252,6 +282,11 @@ func contentInclusionSkip(normPath, base, ext string, size int64, inRepo bool, s
 		for i := 0; i < last; i++ {
 			if contentBuildOutputSegment(segs[i]) {
 				return contentSkipBuildOutput, true
+			}
+		}
+		for i := 0; i < last; i++ {
+			if contentDependencySegment(segs[i]) {
+				return contentSkipDependency, true
 			}
 		}
 	}
@@ -514,7 +549,8 @@ func contentFilterLinkedWorktrees(repos []string, keepAll bool) (kept []string, 
 func contentInclusionReasonOrder(s contentInclusionStats) []string {
 	order := []string{"exclude", "gitignore", contentSkipUserSkip,
 		contentSkipLockfile, contentSkipLargeJSON, contentSkipMinified,
-		contentSkipBuildOutput, contentSkipCache, "system", "binary", "ext", "root", "path",
+		contentSkipBuildOutput, contentSkipDependency, contentSkipCache,
+		"system", "binary", "ext", "root", "path",
 		contentSkipSizeCap, contentSkipWorktree}
 	var out []string
 	seen := make(map[string]bool)
