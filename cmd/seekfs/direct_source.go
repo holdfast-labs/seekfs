@@ -23,7 +23,7 @@ import (
 const (
 	directDefaultRunRecords = 64 * 1024
 	directDefaultRunBytes   = 64 * 1024 * 1024
-	directSpoolHeaderBytes  = 8 + 8 + 4 + 8 + 8 + 4 + 4
+	directSpoolHeaderBytes  = 8 + 8 + 4 + 8 + 8 + 4 + 4 + 2
 
 	// directDefaultMaxInaccessible allows a handful of transient permission
 	// or race failures during a large filesystem walk without discarding hours
@@ -48,6 +48,9 @@ type directRecord struct {
 	// missing path is deliberate for the elevation-free MFT/USN adapters; the
 	// path rank then uses the folded name as its conservative fallback.
 	Path string
+	// Seq is the NTFS file-reference sequence number when the source knows it.
+	// 0 means unknown (walk and synthetic sources).
+	Seq uint16
 }
 
 type directRecordSource interface {
@@ -262,6 +265,7 @@ func (s *directMFTSource) Next(ctx context.Context) (directRecord, error) {
 		Size:      e.size,
 		ModUnix:   e.modUnix,
 		Name:      e.name,
+		Seq:       e.seq,
 	}, nil
 }
 
@@ -291,7 +295,7 @@ func (s *directUSNSource) Next(ctx context.Context) (directRecord, error) {
 	}
 	n := s.nodes[s.frns[s.pos]]
 	s.pos++
-	return directRecord{FRN: n.frn, ParentFRN: n.parentFRN, Mode: modeFromAttrs(n.attr), Name: n.name}, nil
+	return directRecord{FRN: n.frn, ParentFRN: n.parentFRN, Mode: modeFromAttrs(n.attr), Name: n.name, Seq: n.seq}, nil
 }
 
 func (s *directSyntheticSource) Next(ctx context.Context) (directRecord, error) {

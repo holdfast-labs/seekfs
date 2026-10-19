@@ -390,6 +390,55 @@ func TestDirectMFTSourceNormalizesRootSelfParent(t *testing.T) {
 	}
 }
 
+func TestDirectMFTSourcePersistsSequenceNumbers(t *testing.T) {
+	entries := map[uint64]mftEntry{
+		5:  {frn: 5, parentFRN: 5, name: "root", attr: fileAttributeDir, isDir: true, inUse: true, seq: 17},
+		10: {frn: 10, parentFRN: 5, name: "alpha.txt", size: 3, inUse: true, seq: 23},
+		20: {frn: 20, parentFRN: 5, name: "beta.bin", size: 4, inUse: true, seq: 31},
+		30: {frn: 30, parentFRN: 5, name: "unknown-seq.txt", size: 5, inUse: true},
+	}
+	dir := t.TempDir()
+	out := filepath.Join(dir, "mft-seq.gsi")
+	if _, err := buildDirect(context.Background(), directBuildOptions{
+		OutputPath: out,
+		SpoolDir:   filepath.Join(dir, "spool"),
+		Roots:      []string{`X:\`},
+		Volume:     "X:",
+		Source:     "usn",
+		BuiltAt:    time.Unix(123, 0),
+		Records:    newDirectMFTSource(entries),
+		RunRecords: 1,
+		RunBytes:   4096,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	idx, err := loadIndexMMap(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = idx.MMapRecords.file.close() })
+	if len(directTestSectionData(t, out, indexSectionSEQN)) == 0 {
+		t.Fatal("direct MFT build did not publish the SEQN section")
+	}
+	want := map[uint64]uint16{5: 17, 10: 23, 20: 31, 30: 0}
+	if len(idx.Derived.FRNSeq) != len(want) {
+		t.Fatalf("derived FRNSeq = %v, want %d entries", idx.Derived.FRNSeq, len(want))
+	}
+	for id := 0; id < idx.compactRecordCount(); id++ {
+		rec := idx.compactRecord(id)
+		expected, ok := want[rec.FRN]
+		if !ok {
+			t.Fatalf("record %d unexpected FRN %d", id, rec.FRN)
+		}
+		if got := idx.recordSeq(id); got != expected {
+			t.Fatalf("record %d FRN %d Seq=%d, want %d", id, rec.FRN, got, expected)
+		}
+		if got := idx.Derived.FRNSeq[id]; got != expected {
+			t.Fatalf("record %d FRN %d derived Seq=%d, want %d", id, rec.FRN, got, expected)
+		}
+	}
+}
+
 func TestDirectUSNAdapterIsElevationFree(t *testing.T) {
 	usn := newDirectUSNSource(map[uint64]usnNode{
 		2: {frn: 2, parentFRN: 1, name: "child.bin"},
@@ -680,14 +729,14 @@ func TestDirectCanonicalDerivedParity(t *testing.T) {
 	t.Setenv("SEEKFS_LOW_MEMORY_TRIGRAM_MAX_POSTING", "2")
 	t.Setenv("SEEKFS_SELF_NAME_GRAMS", "1")
 	records := []directRecord{
-		{FRN: 1, Name: ".", Path: `X:\`, Mode: uint32(os.ModeDir)},
-		{FRN: 2, ParentFRN: 1, Name: "common", Path: `X:\common`, Mode: uint32(os.ModeDir)},
-		{FRN: 3, ParentFRN: 1, Name: "rare", Path: `X:\rare`, Mode: uint32(os.ModeDir)},
-		{FRN: 4, ParentFRN: 2, Name: "common-alpha-nrrd.txt", Path: `X:\common\common-alpha-nrrd.txt`, Size: 30, ModUnix: 300},
-		{FRN: 5, ParentFRN: 2, Name: "common-beta.txt", Path: `X:\common\common-beta.txt`, Size: 10, ModUnix: 100},
-		{FRN: 6, ParentFRN: 2, Name: "common-gamma.go", Path: `X:\common\common-gamma.go`, Size: 20, ModUnix: 200},
-		{FRN: 7, ParentFRN: 3, Name: "zqx-rare-nrrd.bin", Path: `X:\rare\zqx-rare-nrrd.bin`, Size: 40, ModUnix: 400},
-		{FRN: 8, ParentFRN: 3, Name: "neutral.txt", Path: `X:\rare\neutral.txt`, Size: 50, ModUnix: 500},
+		{FRN: 1, Name: ".", Path: `X:\`, Mode: uint32(os.ModeDir), Seq: 101},
+		{FRN: 2, ParentFRN: 1, Name: "common", Path: `X:\common`, Mode: uint32(os.ModeDir), Seq: 102},
+		{FRN: 3, ParentFRN: 1, Name: "rare", Path: `X:\rare`, Mode: uint32(os.ModeDir), Seq: 103},
+		{FRN: 4, ParentFRN: 2, Name: "common-alpha-nrrd.txt", Path: `X:\common\common-alpha-nrrd.txt`, Size: 30, ModUnix: 300, Seq: 104},
+		{FRN: 5, ParentFRN: 2, Name: "common-beta.txt", Path: `X:\common\common-beta.txt`, Size: 10, ModUnix: 100, Seq: 105},
+		{FRN: 6, ParentFRN: 2, Name: "common-gamma.go", Path: `X:\common\common-gamma.go`, Size: 20, ModUnix: 200, Seq: 106},
+		{FRN: 7, ParentFRN: 3, Name: "zqx-rare-nrrd.bin", Path: `X:\rare\zqx-rare-nrrd.bin`, Size: 40, ModUnix: 400, Seq: 107},
+		{FRN: 8, ParentFRN: 3, Name: "neutral.txt", Path: `X:\rare\neutral.txt`, Size: 50, ModUnix: 500, Seq: 108},
 	}
 	dir := t.TempDir()
 	out := filepath.Join(dir, "canonical-parity.gsi")
@@ -709,6 +758,55 @@ func TestDirectCanonicalDerivedParity(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = idx.MMapRecords.file.close() })
+	if len(directTestSectionData(t, out, indexSectionSEQN)) == 0 {
+		t.Fatal("direct index did not publish the SEQN section")
+	}
+	entries := make(map[uint64]mftEntry, len(records))
+	for _, rec := range records {
+		attr := uint32(fileAttributeArchive)
+		if rec.Mode&uint32(os.ModeDir) != 0 {
+			attr = fileAttributeDir
+		}
+		entries[rec.FRN] = mftEntry{
+			frn:       rec.FRN,
+			parentFRN: rec.ParentFRN,
+			name:      rec.Name,
+			attr:      attr,
+			size:      rec.Size,
+			modUnix:   rec.ModUnix,
+			isDir:     attr&fileAttributeDir != 0,
+			inUse:     true,
+			seq:       rec.Seq,
+		}
+	}
+	normalPath := filepath.Join(dir, "canonical-normal.gsi")
+	normal := &Index{
+		Version:      indexVersion,
+		Roots:        []string{`X:\`},
+		BuiltAt:      time.Unix(123, 0),
+		Source:       "usn",
+		Volume:       "X:",
+		Compact:      true,
+		CompactAttrs: true,
+	}
+	buildRecordsFromMFT(normal, entries)
+	if err := saveIndex(normalPath, normal); err != nil {
+		t.Fatalf("saveIndex: %v", err)
+	}
+	normalIdx, err := loadIndexMMap(normalPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = normalIdx.MMapRecords.file.close() })
+	for id := 0; id < idx.compactRecordCount(); id++ {
+		want := records[id].Seq
+		if got := idx.recordSeq(id); got != want {
+			t.Fatalf("direct record %d Seq=%d, want %d", id, got, want)
+		}
+		if got, normalSeq := idx.recordSeq(id), normalIdx.recordSeq(id); got != normalSeq {
+			t.Fatalf("record %d Seq direct=%d normal=%d", id, got, normalSeq)
+		}
+	}
 	sizeRank := append([]uint32(nil), idx.Derived.SizeRank...)
 	modRank := append([]uint32(nil), idx.Derived.ModRank...)
 	extRank := append([]uint32(nil), idx.Derived.ExtRank...)

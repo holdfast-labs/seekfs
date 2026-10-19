@@ -248,7 +248,70 @@ func directWriteTopologySections(ctx context.Context, cw *countingWriter, finalP
 	if err != nil {
 		return nil, nil, err
 	}
-	return []indexSectionTableEntry{chldEntry, frnsEntry}, []directSectionReport{chldReport, frnsReport}, nil
+	entries := []indexSectionTableEntry{chldEntry, frnsEntry}
+	reports := []directSectionReport{chldReport, frnsReport}
+	seqEntry, seqReport, seqPresent, err := directWriteSEQNSectionFromSpool(ctx, cw, finalPath, recordCount)
+	if err != nil {
+		return nil, nil, err
+	}
+	if seqPresent {
+		entries = append(entries, seqEntry)
+		reports = append(reports, seqReport)
+	}
+	return entries, reports, nil
+}
+
+// directWriteSEQNSectionFromSpool writes the SEQN section from the canonical
+// record spool. It reuses the shared encoder so direct builds persist the
+// per-record NTFS sequence column in exactly the normal save format. Records
+// whose source has no sequence (walk and synthetic) stay 0; the section is
+// omitted when every sequence is unknown, matching the normal save path.
+func directWriteSEQNSectionFromSpool(ctx context.Context, cw *countingWriter, finalPath string, recordCount int) (indexSectionTableEntry, directSectionReport, bool, error) {
+	if recordCount <= 0 {
+		return indexSectionTableEntry{}, directSectionReport{}, false, nil
+	}
+	f, err := os.Open(finalPath)
+	if err != nil {
+		return indexSectionTableEntry{}, directSectionReport{}, false, err
+	}
+	seqs := make([]uint16, recordCount)
+	r := bufio.NewReaderSize(f, 256*1024)
+	any := false
+	for id := 0; id < recordCount; id++ {
+		select {
+		case <-ctx.Done():
+			_ = f.Close()
+			return indexSectionTableEntry{}, directSectionReport{}, false, ctx.Err()
+		default:
+		}
+		rec, readErr := readDirectSpoolRecord(r)
+		if readErr != nil {
+			_ = f.Close()
+			return indexSectionTableEntry{}, directSectionReport{}, false, readErr
+		}
+		seqs[id] = rec.Seq
+		if rec.Seq != 0 {
+			any = true
+		}
+	}
+	_ = f.Close()
+	if !any {
+		return indexSectionTableEntry{}, directSectionReport{}, false, nil
+	}
+	data := encodeSeqSection(seqs)
+	if data == nil {
+		return indexSectionTableEntry{}, directSectionReport{}, false, errors.New("direct SEQN encoder returned no data")
+	}
+	if err := writeAlignment(cw, 8); err != nil {
+		return indexSectionTableEntry{}, directSectionReport{}, false, err
+	}
+	offset := uint64(cw.n)
+	if _, err := cw.Write(data); err != nil {
+		return indexSectionTableEntry{}, directSectionReport{}, false, err
+	}
+	entry := indexSectionTableEntry{tag: indexSectionSEQN, offset: offset, length: uint64(cw.n) - offset}
+	report := directSectionReport{Name: "SEQN", Tag: indexSectionSEQN, Bytes: int64(entry.length), ScratchBytes: int64(recordCount) * 2}
+	return entry, report, true, nil
 }
 
 // directTopologyScan holds the per-record parent/root/size sidecars produced by
