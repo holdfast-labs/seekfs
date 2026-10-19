@@ -767,6 +767,12 @@ func (vol *serviceVolumeIndex) boundedScanCandidatesParallel(pq parsedQuery, ord
 			if !res.verified {
 				// A later worker may finish after an earlier rank reached the
 				// disk cap/deadline. Emit only the contiguous verified frontier.
+				// Record it so an overlay merge keeps the partial page a prefix
+				// (see mergeOverlayMatches).
+				if pq.Trace != nil && vol.index != nil {
+					rec := vol.index.compactRecord(res.id)
+					pq.Trace.recordContentFrontier(compactEntryFromRecord(vol.index, res.id, rec, make(map[int]string), true), pq)
+				}
 				return false
 			}
 			expect++

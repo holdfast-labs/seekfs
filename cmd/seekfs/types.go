@@ -777,6 +777,13 @@ type searchTrace struct {
 	// pointer so a searchTrace stays copyable (go vet copylocks); every copy
 	// shares one accounting. nil means uncapped (bounded callers).
 	disk *contentDiskBudget `json:"-"`
+	// contentFrontier is the first (lowest-ranked) unverified base candidate an
+	// incomplete content page stopped at, recorded by the verify paths'
+	// single-threaded mergers. mergeOverlayMatches drops any merged entry that
+	// sorts at or after it, so a partial overlay-merged page stays a rank
+	// prefix of the complete result. Local-only plumbing.
+	contentFrontier    Entry
+	contentFrontierSet bool
 }
 
 // contentDiskBudget is the per-query disk-verification reservation shared by
@@ -1016,6 +1023,20 @@ func (t *searchTrace) publishDiskBudget() {
 	t.BudgetExceeded = t.disk.exceeded.Load()
 	if t.disk.incomplete.Load() {
 		t.ContentIncomplete = true
+	}
+}
+
+// recordContentFrontier remembers the lowest-ranked unverified base candidate
+// that stopped an incomplete content page. Each verify path calls it from its
+// single-threaded merger; a later, higher-ranked frontier never replaces an
+// earlier one, so a multi-volume query keeps the earliest cutoff.
+func (t *searchTrace) recordContentFrontier(entry Entry, pq parsedQuery) {
+	if t == nil {
+		return
+	}
+	if !t.contentFrontierSet || compareSearchAllEntries(entry, t.contentFrontier, pq) < 0 {
+		t.contentFrontier = entry
+		t.contentFrontierSet = true
 	}
 }
 

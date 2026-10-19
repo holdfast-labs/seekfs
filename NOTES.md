@@ -1,6 +1,10 @@
 # Overlay incomplete-page rank-prefix gap (design only)
 
-Status: analysis only; no product code changed. Branch `fix/overlay-incomplete-prefix`.
+Status: implemented (option (a)) on `fix/overlay-incomplete-prefix`. The base
+verify paths record the first unverified candidate as a frontier
+(`searchTrace.contentFrontier`); `mergeOverlayMatches` drops merged entries
+sorting at or after it when the query is incomplete. Tests:
+`cmd/seekfs/content_overlay_prefix_test.go`.
 
 ## 1. Code path (incomplete default-order content page with an overlay)
 
