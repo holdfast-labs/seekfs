@@ -32,21 +32,12 @@ const contentReconcileUnlimited = int64(^uint64(0) >> 1)
 
 // contentReconcileNewLimits returns the limits for files a reconcile may add
 // to base on vol: the reserve allowance on the sidecar's volume, and the
-// explicit budget minus the base's projected index bytes.
-//
-// The reserve allowance applies ONLY when the base was itself reserve-truncated
-// (Policy.ReserveBytes > 0, stamped by the build that hit the reserve). The
-// gate exists so such a base does not read its own drops as drift and loop
-// through a rebuild that truncates the same way (see the file header). A base
-// that fit its selection must not drop newly admitted in-scope files just
-// because the disk filled between the build and the reconcile: the drain adds
-// docs without the build's whole-corpus spool peak, and the fold keeps
-// contentCheckDiskReserve as the write-time guard. Recomputing the live
-// allowance for a non-truncated base would silently trim every drive-root file
-// the auto scope admits (real E: index, 2026-10-18: 327,669 files left out).
+// explicit budget minus the base's projected index bytes. Candidates are
+// charged their capped extracted size (contentReconcileCharge), not their raw
+// file size.
 func contentReconcileNewLimits(vol *serviceVolumeIndex, base *contentIndex, scope *contentScopeResolved) contentReconcileLimits {
 	lim := contentReconcileLimits{text: contentReconcileUnlimited, index: contentReconcileUnlimited}
-	if vol != nil && vol.dbPath != "" && base != nil && base.Policy.ReserveBytes > 0 {
+	if vol != nil && vol.dbPath != "" {
 		lim.text = contentScopeAllowance(contentIndexPathForDB(vol.dbPath), 0)
 	}
 	if scope != nil && scope.BudgetExplicit && scope.BudgetBytes > 0 {
@@ -75,6 +66,21 @@ func contentReconcileTrimNew(newKeys []uint64, rank map[uint64]contentScopeMembe
 // extracted-text estimate. rank reports a key's build ordering and size; keys
 // it does not know sort last and are admitted only while room remains. It
 // returns the admitted keys (ascending) and the files and bytes left out.
+// contentReconcileCharge is the extracted-text bytes a reconcile-new file can
+// add, the unit the build charges (it charges each doc's extracted text):
+// extraction truncates text at the file's text cap (1 MiB outside repos, 10
+// MiB inside), so the raw size over-charges large files. Charging raw sizes
+// let one multi-GB file early in priority order latch the allowance full and
+// drop every file after it (real E: index, 2026-10-18: 327,669 files, 215 GB
+// raw, left out of a ~19 GB allowance after the whole-volume auto root).
+func contentReconcileCharge(m contentScopeMember) int64 {
+	_, maxText := contentInclusionCapsForFile(m.inRepo, 0, 0)
+	if maxText > 0 && m.size > maxText {
+		return maxText
+	}
+	return m.size
+}
+
 func contentReconcileTrimNewLimits(newKeys []uint64, rank map[uint64]contentScopeMember, lim contentReconcileLimits) (admitted []uint64, droppedFiles int, droppedBytes int64) {
 	if lim.text == contentReconcileUnlimited && lim.index == contentReconcileUnlimited {
 		return newKeys, 0, 0
@@ -90,7 +96,7 @@ func contentReconcileTrimNewLimits(newKeys []uint64, rank map[uint64]contentScop
 			cands = append(cands, cand{item: contentBuildItem{frn: key, priority: int(^uint(0) >> 1)}})
 			continue
 		}
-		cands = append(cands, cand{item: contentBuildItem{frn: key, path: m.path, priority: m.priority}, size: m.size})
+		cands = append(cands, cand{item: contentBuildItem{frn: key, path: m.path, priority: m.priority}, size: contentReconcileCharge(m)})
 	}
 	sort.Slice(cands, func(i, j int) bool { return contentBuildItemLess(cands[i].item, cands[j].item) })
 	var used, indexUsed int64

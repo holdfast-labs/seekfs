@@ -69,6 +69,13 @@ func newDriveReconFixture(t *testing.T) *driveReconFixture {
 		{FRN: 6, Parent: 0, ParentFRN: 1, Mode: d, Name: "wisp-memory"},
 		{FRN: 7, Parent: 5, ParentFRN: 6, Name: "note.txt", Size: 20},
 	}
+	// Hermetic disk: a 500 GiB volume with the 10 GiB reserve plus 1 GiB free,
+	// so the reserve allowance is ~1 GiB (minus the shard scratch slack), not
+	// whatever the host disk happens to hold.
+	oldFree, oldTotal := contentFreeBytesFn, contentTotalBytesFn
+	t.Cleanup(func() { contentFreeBytesFn, contentTotalBytesFn = oldFree, oldTotal })
+	contentTotalBytesFn = func(string) (uint64, error) { return 500 << 30, nil }
+	contentFreeBytesFn = func(string) (uint64, error) { return contentScopeReserveMaxBytes + 1<<30, nil }
 	stubContentCatchUpJournal(t, usnJournalDataV0{UsnJournalID: 7, FirstUsn: 1, LowestValidUsn: 1, NextUsn: 100})
 	stubContentCatchUpRead(t, func(string, uint64, int64, []byte) (int64, []usnChange, error) {
 		return 0, nil, nil

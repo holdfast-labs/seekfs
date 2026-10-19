@@ -184,3 +184,28 @@ func TestContentReconcileTrimNewIndexLimit(t *testing.T) {
 		t.Fatalf("text-limited trim = %v (%d out); want [1] with 2 out", got, out)
 	}
 }
+
+// TestContentReconcileChargesCappedText pins the reconcile charge to the
+// extracted-text cap: a multi-GB file early in priority order costs at most
+// its text cap, so it can no longer latch the allowance full and drop every
+// smaller in-scope file after it (real E: index after the whole-volume auto
+// root: 327,669 files, 215 GB raw, left out of a ~19 GB allowance).
+func TestContentReconcileChargesCappedText(t *testing.T) {
+	_, outsideCap := contentInclusionCapsForFile(false, 0, 0)
+	rank := map[uint64]contentScopeMember{
+		1: {frn: 1, path: `E:\a\huge.dat`, size: 50 << 30, priority: 3},
+		2: {frn: 2, path: `E:\b\note.txt`, size: 4 << 10, priority: 3},
+		3: {frn: 3, path: `E:\c\todo.md`, size: 8 << 10, priority: 3},
+	}
+	lim := contentReconcileLimits{text: outsideCap + 64<<10, index: contentReconcileUnlimited}
+	admitted, dropped, _ := contentReconcileTrimNewLimits([]uint64{1, 2, 3}, rank, lim)
+	if !reflect.DeepEqual(admitted, []uint64{1, 2, 3}) || dropped != 0 {
+		t.Fatalf("admitted=%v dropped=%d; want all three (huge.dat charged its %d-byte text cap)", admitted, dropped, outsideCap)
+	}
+	if got := contentReconcileCharge(rank[1]); got != outsideCap {
+		t.Fatalf("charge(huge.dat) = %d; want the outside-repo text cap %d", got, outsideCap)
+	}
+	if got := contentReconcileCharge(rank[2]); got != 4<<10 {
+		t.Fatalf("charge(note.txt) = %d; want its size", got)
+	}
+}
