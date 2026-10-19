@@ -123,8 +123,12 @@ at or before the key are skipped; snapshotGen/delta changes no longer restart. A
 renamed across the cursor may be missed (bounded, never duplicated). Then
 `perf/cursor-overlay-page-price` (cd0956c): a v2 resume with hidden base rows stops
 base verification once base hits plus earlier overlay rows fill the page (page 2 of
-a 200-file fixture: 198 -> 18 disk reads). Running: `fix/content-regex-underfill`
-(regexfill: diagnose first; no standalone services, read-only live queries). Owner action: relaunch
+a 200-file fixture: 198 -> 18 disk reads). Regex underfill diagnosed as expected (`fix/content-regex-underfill` NOTES.md,
+e16a345): low-hit-rate regexes spend the page-scaled valve and return a short page
+marked incomplete; the cap scales 2,048 -> 8,192 reads from limit 100 to 520.
+Running: `fix/explicit-budget-overlay` (budgetfix: with hidden overlay rows the
+window pass replaced an explicit --content-verify-budget with the default valve;
+needs a two-step page fill) and `content/save-peak` (savepeak: measure first). Owner action: relaunch
 the live service to see the 1,826 extract errors split by reason.
 
 Merged 2026-10-17: `content/verify-frontier` (e271c17): parallel verifiers stop at
