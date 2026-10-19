@@ -167,6 +167,7 @@ var contentCachePathSubs = []string{
 	"/cachestorage/", "/gpucache/", "/code cache/", "/dawncache/",
 	"/mozilla/firefox/", "/google/chrome/", "/microsoft/edge/",
 	"/chromium/user data/", "/node_modules/.cache/",
+	"/go/pkg/mod/", "/.rustup/", "/.m2/repository/",
 }
 
 // contentLockfileBase reports whether the lowercase basename is a lockfile.

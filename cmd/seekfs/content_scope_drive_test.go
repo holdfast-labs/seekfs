@@ -85,6 +85,18 @@ func TestContentScopeDriveSkipsDependenciesOutsideRepos(t *testing.T) {
 			t.Errorf("outside-repo skip(%q) = (%q,%v); want dependency", p, reason, skip)
 		}
 	}
+	// Module/toolchain caches outside repos are cache trees.
+	for _, p := range []string{
+		`C:\Users\u\go\pkg\mod\github.com\x\y@v1\a.go`,
+		`C:\Users\u\.rustup\toolchains\std\lib.rs`,
+		`C:\Users\u\.m2\repository\org\x\A.java`,
+	} {
+		norm := contentNormPath(p)
+		base := strings.ToLower(filepath.Base(p))
+		if reason, skip := contentInclusionSkip(norm, base, contentPathExtension(norm), 100, false, true, nil); !skip {
+			t.Errorf("outside-repo skip(%q) = (%q,%v); want a cache skip", p, reason, skip)
+		}
+	}
 	// Inside a repo gitignore keeps deciding: with no ignore files an
 	// un-ignored (or tracked) node_modules file stays admitted, unchanged.
 	scope := contentScope{Mode: contentScopeAuto, IncludeGit: true, SystemExcludes: true}

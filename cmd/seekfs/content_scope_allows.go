@@ -320,6 +320,12 @@ func (s contentScope) resolve(volume string, repoRoots []string) contentScopeRes
 		}
 		if home := contentHomeOnVolume(volume); home != "" {
 			r.Excludes = append(r.Excludes, contentNormPath(filepath.Join(home, "AppData", "Local", "Temp")))
+			// With the drive root in scope, the rest of AppData (application
+			// state, extension and package caches) would come in too; it is
+			// not user text, so it stays out like the system dirs.
+			if r.DriveRoot != "" {
+				r.Excludes = append(r.Excludes, contentNormPath(filepath.Join(home, "AppData")))
+			}
 		}
 	}
 	r.Excludes = dedupeContentPaths(r.Excludes)
