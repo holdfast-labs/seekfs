@@ -701,10 +701,22 @@ func (vol *serviceVolumeIndex) mergeContentOverlayMatches(base []Entry, overlay 
 		// Base rows are already verified up to the frontier. Only overlay rows
 		// ranking at or after it must be dropped to keep the partial page a
 		// rank prefix.
+		// A default-order frontier inside the symbol-promoted group ranks
+		// before every unpromoted row, so only promoted overlay rows can
+		// precede it.
 		frontierRank := vol.baseEntryRank(trace.contentFrontier, pq)
+		symKey := ""
+		if pq.SortColumn == "" {
+			symKey = contentSymbolQueryKey(pq)
+		}
+		frontierPromoted := contentEntrySymbolNamed(trace.contentFrontier, symKey)
 		kept := overlay[:0]
 		for _, item := range overlay {
-			if item.rank < frontierRank {
+			promoted := contentEntrySymbolNamed(item.entry, symKey)
+			switch {
+			case promoted && !frontierPromoted:
+				kept = append(kept, item)
+			case promoted == frontierPromoted && item.rank < frontierRank:
 				kept = append(kept, item)
 			}
 		}

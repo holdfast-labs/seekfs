@@ -101,3 +101,29 @@ func TestContentOverlayFrontierDropsLaterOverlayRow(t *testing.T) {
 		t.Fatalf("capped page = %v; want %v", got, want)
 	}
 }
+
+// TestContentOverlayFrontierInsidePromotedGroup pins the frontier cut when the
+// page stops inside the symbol-promoted group: every unpromoted overlay row
+// ranks after the unverified promoted frontier, even one whose name sorts
+// before it, so it must drop instead of filling the page past a gap.
+func TestContentOverlayFrontierInsidePromotedGroup(t *testing.T) {
+	overlayPrefixSetup(t)
+	vol := newContentRecordVolume(t, "C:", []contentVolRecord{
+		{frn: 10, parent: -1, parentFRN: 1, name: "needle.h", content: "needle"},
+		{frn: 30, parent: -1, parentFRN: 1, name: "needle.go", content: "needle"},
+		{frn: 50, parent: -1, parentFRN: 1, name: "m50.txt", content: "needle"},
+	})
+	addContentOverlay(t, vol, 1, "a20.txt")
+
+	full, _ := overlayPrefixSearch(t, vol, 10, 100)
+	if want := []string{"needle.h", "needle.go", "a20.txt", "m50.txt"}; !reflect.DeepEqual(full, want) {
+		t.Fatalf("uncapped page = %v; want %v", full, want)
+	}
+	got, trace := overlayPrefixSearch(t, vol, 10, 1)
+	if !trace.contentIncomplete() {
+		t.Fatalf("capped query not incomplete: got=%v", got)
+	}
+	if !isNamePrefix(got, full) {
+		t.Fatalf("capped page = %v; want a prefix of %v", got, full)
+	}
+}
