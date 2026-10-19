@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -128,5 +129,26 @@ func TestServiceCanceledCountStopsDiskReads(t *testing.T) {
 	}
 	if got := reads.Load(); got >= files {
 		t.Fatalf("canceled count read %d/%d files; want verification to stop early", got, files)
+	}
+}
+
+// TestServicePipeDisconnectErrOnlyDisconnects pins the cancel trigger: only
+// the pipe-disconnect errors cancel a request; any other PeekNamedPipe failure
+// keeps a live client's query running.
+func TestServicePipeDisconnectErrOnlyDisconnects(t *testing.T) {
+	for _, c := range []struct {
+		err  error
+		want bool
+	}{
+		{syscall.Errno(109), true},
+		{syscall.Errno(232), true},
+		{syscall.Errno(233), true},
+		{syscall.Errno(5), false},
+		{syscall.Errno(6), false},
+		{nil, false},
+	} {
+		if got := servicePipeDisconnectErr(c.err); got != c.want {
+			t.Errorf("servicePipeDisconnectErr(%v) = %v; want %v", c.err, got, c.want)
+		}
 	}
 }

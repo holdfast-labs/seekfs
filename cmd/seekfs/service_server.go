@@ -150,12 +150,30 @@ func handleServiceConn(conn *os.File, s *goSearchService) {
 var procPeekNamedPipe = syscall.NewLazyDLL("kernel32.dll").NewProc("PeekNamedPipe")
 
 // servicePipeClientGone reports whether the other end of the pipe has closed.
-// PeekNamedPipe is non-blocking and does not consume bytes; a failed call means
-// the client disconnected.
+// PeekNamedPipe is non-blocking and does not consume bytes. Only the
+// disconnect errors count as gone; any other failure keeps the request alive,
+// because canceling a live client's query would be worse than finishing it.
 func servicePipeClientGone(handle uintptr) bool {
 	var available uint32
-	r1, _, _ := procPeekNamedPipe.Call(handle, 0, 0, 0, uintptr(unsafe.Pointer(&available)), 0)
-	return r1 == 0
+	r1, _, err := procPeekNamedPipe.Call(handle, 0, 0, 0, uintptr(unsafe.Pointer(&available)), 0)
+	if r1 != 0 {
+		return false
+	}
+	return servicePipeDisconnectErr(err)
+}
+
+// servicePipeDisconnectErr reports whether a pipe call failed because the
+// other end is gone.
+func servicePipeDisconnectErr(err error) bool {
+	errno, ok := err.(syscall.Errno)
+	if !ok {
+		return false
+	}
+	switch errno {
+	case 109, 232, 233: // ERROR_BROKEN_PIPE, ERROR_NO_DATA, ERROR_PIPE_NOT_CONNECTED
+		return true
+	}
+	return false
 }
 
 // serviceCommandClass classifies a service command for capability gating.
