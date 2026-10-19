@@ -599,6 +599,16 @@ type contentCursorResume struct {
 	// Key is the page key of the last emitted row. Overlay rows at or before
 	// it are already emitted and stay out of the resumed page.
 	Key *contentCursorKey
+	// pageLimit is the user page size for a v2 resume whose base still has
+	// hidden rows. overlayKeys are the matching overlay page keys after the
+	// cursor, in ascending order. Together they let the base verify walk stop
+	// once the merged page is provably full. Zero/nil on every other path.
+	pageLimit   int
+	overlayKeys []contentCursorKey
+	// overlay caches the ranked overlay matches computed for the page stop so
+	// the post-search merge reuses them instead of evaluating the overlay
+	// twice. Local-only; nil on every other path.
+	overlay []rankedOverlayEntry
 }
 
 // contentCompletenessProbe carries the reduced default-order path's

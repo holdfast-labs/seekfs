@@ -338,3 +338,35 @@ func (vol *serviceVolumeIndex) contentAfterSlice(ids []int, resume *contentCurso
 	}
 	return ids
 }
+
+// contentResumeNextBaseKey returns the page key of the candidate at pos. It is
+// used only by the hidden-overlay v2 resume stop, so it skips path
+// reconstruction: the default content order ranks and promotes on the name.
+func (vol *serviceVolumeIndex) contentResumeNextBaseKey(idx *Index, order []int, pos int, pq parsedQuery, pathCache map[int]string) (contentCursorKey, bool) {
+	if idx == nil || pos < 0 || pos >= compactOrderLen(order, idx.compactRecordCount()) {
+		return contentCursorKey{}, false
+	}
+	recIndex := compactOrderAt(order, pos)
+	rec := idx.compactRecord(recIndex)
+	entry := compactEntryFromRecordPath(idx, recIndex, rec, pathCache, true, false)
+	return vol.contentCursorBaseKey(entry, pq), true
+}
+
+// pageProvablyFull reports whether the base hits found so far, plus the
+// matching overlay rows that rank before the next unverified base candidate,
+// already fill the page. Verification can then stop: every later base
+// candidate ranks after the page. Hidden base rows are skipped and never
+// count.
+func (r *contentCursorResume) pageProvablyFull(baseHits int, next contentCursorKey) bool {
+	if r == nil || r.pageLimit <= 0 {
+		return false
+	}
+	before := 0
+	for _, key := range r.overlayKeys {
+		if key.compare(next) >= 0 {
+			break
+		}
+		before++
+	}
+	return baseHits+before >= r.pageLimit
+}

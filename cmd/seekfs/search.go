@@ -635,6 +635,11 @@ func (vol *serviceVolumeIndex) mergeOverlayMatches(base []Entry, opts queryOptio
 		limit = 0
 	}
 	overlay := vol.overlayRankedMatches(snap, pq, pathCache)
+	if resume := pq.contentAfter; resume != nil && resume.pageLimit > 0 && resume.overlay != nil {
+		// The hidden-overlay v2 resume computed the same ranked overlay list
+		// before base verification so it could stop at the provable page.
+		overlay = resume.overlay
+	}
 	if !countOnly {
 		if queryHasAnyContentLeaf(pq) {
 			return vol.mergeContentOverlayMatches(base, overlay, pq, opts.Trace)

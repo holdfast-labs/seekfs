@@ -1903,7 +1903,15 @@ func searchContentServiceVolumes(volumes []*serviceVolumeIndex, opts queryOption
 		// fire and a window-full query reports complete.
 		probeForPage := !opts.contentFullCandidates && defaultOrder && contentVolume &&
 			userLimit > 0 && userLimit < window
-		reduced := probeForPage && vol.snapshotHiddenBaseIDs().empty()
+		hidden := vol.snapshotHiddenBaseIDs()
+		reduced := probeForPage && hidden.empty()
+		// A v2 resume that still has hidden base rows cannot use the plain
+		// reduced lane (its candidate source declines truncation with hidden
+		// rows) and must not fall back to the completeness window: that
+		// verifies every remaining base candidate for one page. Price the
+		// resume page directly instead, counting matching overlay rows that
+		// rank before the next base candidate.
+		resumePage := probeForPage && !reduced && opts.contentAfter != nil
 		// A pending overlay forces the full completeness window, but the page
 		// only needs userLimit results: that window pass is a completeness probe
 		// for the page. Bound its disk reads at the default page-scaled valve so
@@ -1911,13 +1919,30 @@ func searchContentServiceVolumes(volumes []*serviceVolumeIndex, opts queryOption
 		// window's worth of files (or the whole volume, when fewer than window
 		// matches exist) for a page of userLimit. The bounded probe latches
 		// incomplete exactly as a default-budget query would.
-		if windowProbe := probeForPage && !reduced; windowProbe {
+		if windowProbe := probeForPage && !reduced && !resumePage; windowProbe {
 			opts.Trace.capDiskBudgetForProbe(
 				contentDiskVerifyBudgetOf(parsedQuery{Limit: userLimit}))
 		}
-		if reduced {
+		if reduced || resumePage {
 			volOpts.Limit = userLimit
 			volOpts.contentWindow = window
+		}
+		if resumePage {
+			// Re-evaluate the overlay once, before base verification, so the
+			// verify walk knows how many overlay rows precede its next base
+			// candidate and the merge reuses the same ranked list.
+			overlay := vol.overlayRankedMatches(vol.snap.Load(), pq, make(map[int]string))
+			overlayKeys := make([]contentCursorKey, 0, len(overlay))
+			for _, item := range overlay {
+				overlayKeys = append(overlayKeys, vol.contentCursorOverlayKey(item, pq))
+			}
+			sort.Slice(overlayKeys, func(i, j int) bool {
+				return overlayKeys[i].compare(overlayKeys[j]) < 0
+			})
+			resume := opts.contentAfter
+			resume.pageLimit = userLimit
+			resume.overlayKeys = overlayKeys
+			resume.overlay = overlay
 		}
 		probe := &contentCompletenessProbe{}
 		volOpts.contentProbe = probe
