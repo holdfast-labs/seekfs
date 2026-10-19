@@ -240,7 +240,7 @@ func appendWAL(dbPath string, nextUSN int64, changes []usnChange) error {
 	if err := os.MkdirAll(filepath.Dir(dbPath), 0o755); err != nil {
 		return err
 	}
-	f, err := os.OpenFile(walPath(dbPath), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	f, err := os.OpenFile(walPath(dbPath), os.O_CREATE|os.O_RDWR|os.O_APPEND, 0o644)
 	if err != nil {
 		return err
 	}
@@ -259,12 +259,21 @@ func appendBinaryWALFrame(f *os.File, nextUSN int64, changes []usnChange) error 
 	if err != nil {
 		return err
 	}
+	withSeq := true
 	if info.Size() == 0 {
 		if _, err := f.Write(walMagicV2); err != nil {
 			return err
 		}
+	} else {
+		// Append in the layout of the file's own magic. Replay upgrades a v1
+		// WAL to v2, but if that rewrite failed (disk full, rename refused) a
+		// v2 frame appended under a v1 magic would decode with the wrong layout.
+		prefix := make([]byte, len(walMagicV1))
+		if n, err := f.ReadAt(prefix, 0); err == nil && n == len(prefix) && bytes.Equal(prefix, walMagicV1) {
+			withSeq = false
+		}
 	}
-	payload, err := encodeBinaryWALBatch(nextUSN, changes)
+	payload, err := encodeBinaryWALBatchLayout(nextUSN, changes, withSeq)
 	if err != nil {
 		return err
 	}
@@ -279,6 +288,13 @@ func appendBinaryWALFrame(f *os.File, nextUSN int64, changes []usnChange) error 
 }
 
 func encodeBinaryWALBatch(nextUSN int64, changes []usnChange) ([]byte, error) {
+	return encodeBinaryWALBatchLayout(nextUSN, changes, true)
+}
+
+// encodeBinaryWALBatchLayout encodes one frame payload in the v2 layout
+// (withSeq) or the legacy v1 layout, so an append always matches the magic of
+// the file it lands in.
+func encodeBinaryWALBatchLayout(nextUSN int64, changes []usnChange, withSeq bool) ([]byte, error) {
 	var buf bytes.Buffer
 	_ = binary.Write(&buf, binary.LittleEndian, nextUSN)
 	_ = binary.Write(&buf, binary.LittleEndian, uint32(len(changes)))
@@ -291,7 +307,9 @@ func encodeBinaryWALBatch(nextUSN int64, changes []usnChange) ([]byte, error) {
 		_ = binary.Write(&buf, binary.LittleEndian, change.USN)
 		_ = binary.Write(&buf, binary.LittleEndian, change.Reason)
 		_ = binary.Write(&buf, binary.LittleEndian, change.Attr)
-		_ = binary.Write(&buf, binary.LittleEndian, change.Seq)
+		if withSeq {
+			_ = binary.Write(&buf, binary.LittleEndian, change.Seq)
+		}
 		_ = binary.Write(&buf, binary.LittleEndian, uint16(len(change.Name)))
 		_, _ = buf.WriteString(change.Name)
 	}

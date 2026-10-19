@@ -219,3 +219,36 @@ func TestParseUSNRecordFieldsReturnsSequence(t *testing.T) {
 		t.Fatalf("v3 seq = (%#x,%#x), want (0xd,0x1)", frnSeq3, parentSeq3)
 	}
 }
+
+// TestWALAppendToUnupgradedV1KeepsLayout pins the append fallback: if replay
+// could not upgrade a v1 WAL (the rewrite failed), a later append must use the
+// v1 layout of the file's own magic, so every frame still decodes.
+func TestWALAppendToUnupgradedV1KeepsLayout(t *testing.T) {
+	db := filepath.Join(t.TempDir(), "legacy.gsi")
+	writeLegacyV1WAL(t, db, 12, []usnChange{{FRN: 102, ParentFRN: 100, USN: 12, Reason: usnReasonFileCreate, Name: "first.txt"}})
+	if err := appendWAL(db, 14, []usnChange{{FRN: 103, ParentFRN: 100, USN: 14, Reason: usnReasonFileCreate, Name: "second.txt", Seq: 9}}); err != nil {
+		t.Fatalf("append to v1 wal: %v", err)
+	}
+	data, err := os.ReadFile(walPath(db))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.HasPrefix(data, walMagicV1) {
+		t.Fatalf("append rewrote the magic: prefix %q", data[:min(len(data), len(walMagicV1))])
+	}
+	vol := newServiceVolumeIndex(db, &Index{
+		Source: "usn", Volume: "F:", Compact: true, Checkpoint: 10,
+		Records: []CompactRecord{{FRN: 100, ParentFRN: 100, Parent: -1, Name: "."}},
+	})
+	if err := vol.replayWAL(); err != nil {
+		t.Fatalf("replay mixed-append wal: %v", err)
+	}
+	if vol.checkpoint != 14 || vol.overlay == nil || len(vol.overlay.records) != 2 {
+		t.Fatalf("checkpoint=%d overlay=%+v; want both frames replayed", vol.checkpoint, vol.overlay)
+	}
+	for _, r := range vol.overlay.records {
+		if r.Name != "first.txt" && r.Name != "second.txt" {
+			t.Fatalf("frame decoded with the wrong layout: name %q", r.Name)
+		}
+	}
+}
