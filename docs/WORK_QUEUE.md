@@ -58,7 +58,7 @@ corruption, exact required sources, auto-fuzzy only on zero exact hits).
 Merged 2026-10-19: `fix/phantom-orphans` (79f5266, 156ce46): the persist swap
 carried post-snapshot overlay tombstone/shadow sets (base record IDs) into the
 folded replacement base's different ID space, hiding unrelated records; the
-next fold dropped them (the E:ench\wt worktrees), and the path builder
+next fold dropped them (the E:\bench\wt worktrees), and the path builder
 re-rooted their orphaned children at the volume root (phantom `E:\.git`, which
 made content auto scope treat all of E: as one repo). Carried IDs are now
 remapped by FRN, and a record whose parent FRN is missing has no path instead
@@ -89,9 +89,9 @@ builder does not capture sequences yet.
 Merged 2026-10-18: `fix/usn-frn-sequence` (66f4b78): journal records below the
 base watermark are skipped. Records are keyed by MFT record number without the
 sequence, so an old WAL replayed over a rescan after a journal wrap deleted a
-reused record (E:ench\wt) and cut its subtree off at the root (phantom
+reused record (E:\bench\wt) and cut its subtree off at the root (phantom
 `E:\.git` made content auto scope treat all of E: as one repo). The live E:
-index was rebuilt from the MFT (backup in E:ench
+index was rebuilt from the MFT (backup in E:\bench
 t\idx_bak_20261018).
 Follow-up: store the sequence per record (format change) so identity never
 depends on the watermark. `fix/overlay-incomplete-prefix` (a3c149a): incomplete
@@ -237,7 +237,7 @@ GOMAXPROCS=2, peak disk 0.56x extracted. Limit-20 warm/first: rare literal
   WorktreePolicyToAll,VanishedWorktree}` end `stale` when TEMP is on C:
   (nearly full) and pass with TEMP on E: (fails back to at least 878b6d2, so
   environmental). Free space/reserve is not the cause (reserve is 0 in tests).
-  Run suites with TMP/TEMP=E:ench\scratch	mp until found.
+  Run suites with TMP/TEMP=E:\bench\scratch\tmp until found.
 - **Typo fallback scope:** DONE (`content/typo-scope`, da7def5).
 - **Single-line JSON:** an 11.4 MB single-line `tokenizer.json` makes every
   broad query 4–5× slower. Covered by item 1's caps; verify after.
@@ -269,7 +269,7 @@ GOMAXPROCS=2, peak disk 0.56x extracted. Limit-20 warm/first: rare literal
   Selection already charges the measured staged spool bytes
   (`content_service_build.go` ~990, credited back in `content_space.go` ~166);
   the ratio only moves the peak multiplier, whose 0.8 floor binds below r = 0.325.
-  Measured per-doc ratios on E:ench\chromium: code 0.244 (Fastest) vs 0.231
+  Measured per-doc ratios on E:\bench\chromium: code 0.244 (Fastest) vs 0.231
   (Default, 2.2x slower encode); dense/minified/generated 0.260 vs 0.242. Default
   would select the same docs. Only a corpus with aggregate r > 0.35 gains
   (the earlier 1.000 -> 0.637 sample would gain 28%); rerun the benchmark if one shows up.
