@@ -122,6 +122,7 @@ func contentSearchEnabled() bool {
 		return *cfg
 	}
 	defaultContentSelection.Do(func() {
+		defaultContentSelected = featureContentEnabled(appConfig{})
 		cfg, err := loadConfig("")
 		if err == nil {
 			defaultContentSelected = featureContentEnabled(cfg)

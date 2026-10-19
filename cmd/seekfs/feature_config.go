@@ -36,7 +36,12 @@ func featureContentEnabled(cfg appConfig) bool {
 	if value, ok := os.LookupEnv("SEEKFS_CONTENT_SEARCH"); ok {
 		return value == "1"
 	}
-	return cfg.Features["content"].Enabled
+	if f, ok := cfg.Features["content"]; ok {
+		return f.Enabled
+	}
+	// Content search is on by default (v1.12.0); an explicit plugin entry,
+	// SEEKFS_CONTENT_SEARCH, or [features.content] enabled = false opts out.
+	return true
 }
 
 func applyFeatureConfig(cfg *appConfig, name, key, value string) error {
