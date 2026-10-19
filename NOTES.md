@@ -1,6 +1,6 @@
-# Content cursor v2 (design)
+﻿# Content cursor v2 (design)
 
-Status: design only. v1 is `content/cursor` (607d38b, G10).
+Status: implemented on `feat/content-cursor-v2` (v2) with v1 kept for out-of-scope shapes. v1 is `content/cursor` (607d38b, G10).
 
 ## 1. v1 code path
 
@@ -24,10 +24,12 @@ Status: design only. v1 is `content/cursor` (607d38b, G10).
 
 - Use opaque base64url JSON with short keys: `v:2`, `q` (query hash), `vol`
   (one volume), `off` (emitted rows; fallback).
-- `front`: last emitted rank key, mirroring `compareSearchAllEntries`
-  (`search.go:331`): lower name, lower path, path, name, plus the active sort
-  value (`size`, `mod`, `ext`, `type`, `path`). Path is unique in a volume.
-- `name`: `JournalID`, base `Checkpoint`, record count, base `BuiltAt`, and
+- `id`: the last emitted RECORD (FRN). A single-volume content result is
+  emitted in candidate order (rank/symbol promotion is not expressible by the
+  name/path comparator), so resume rebuilds that deterministic candidate
+  list, locates this record, and verifies from the next candidate. A missing
+  record restarts at offset zero.
+- `name`: `JournalID`, base `Checkpoint`, record count, and
   `snapshotGen` (`service_protocol.go:607`), which advances on overlay publish
   (`service_runtime.go:452`).
 - `side`: `Version`, `Origin`, `JournalID`, `CheckpointUSN`, `ScopeHash`,
@@ -43,11 +45,13 @@ per-start instance ID rejects a generation that reset to zero.
 
 ## 3. Correctness rules
 
-- Static state: resume at the first candidate whose rank key is strictly
-  greater than `front`. Earlier candidates were verified or emitted; a filled
-  page stopped at the last emitted hit, so pages have no duplicates or gaps.
-- Overlay: filter base candidates and `overlayRankedMatches` by the same key.
-  Keep the `contentFrontier` cut; the tighter frontier applies.
+- Static state: rebuild the same ordered candidate list (identity is
+  unchanged) and verify from the candidate after the last emitted record.
+  Earlier candidates were verified or emitted, so pages have no duplicates or
+  gaps. CPU re-sorting is allowed; disk verification stays one page.
+- Overlay: v2 is refused while a content delta or filename overlay is
+  present. Those shapes keep the v1 offset cursor and the existing
+  `contentFrontier` cut.
 - Incomplete pages and valve: keep `ContentIncomplete`, `BudgetExceeded`, and
   partial-page semantics. Emit `next_cursor` only for a full page. A full page
   that hit the valve can advance: every unverified candidate ranks after the
@@ -79,3 +83,5 @@ per-start instance ID rejects a generation that reset to zero.
   a delta or name-index mutation sets `cursor_restarted`; a low valve or
   deadline gives a partial page that resumes without duplicates, and a short
   page emits no cursor; multi-volume and relevance emit no v2; bad tokens fail.
+
+
