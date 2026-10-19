@@ -53,13 +53,23 @@ var contentBinaryExtensions = map[string]struct{}{
 	".o": {}, ".obj": {}, ".so": {}, ".dylib": {}, ".dll": {}, ".exe": {},
 	".lib": {}, ".a": {}, ".pyc": {}, ".pyo": {}, ".class": {}, ".pdb": {},
 	".ilk": {}, ".exp": {}, ".pch": {}, ".gch": {}, ".ko": {}, ".sys": {},
-	".drv": {},
+	".drv": {}, ".node": {}, ".rlib": {}, ".rmeta": {},
 	// Fonts.
 	".ttf": {}, ".otf": {}, ".woff": {}, ".woff2": {}, ".eot": {},
 	// Legacy document formats with no registered extractor (OLE2; see §7).
 	".doc": {}, ".xls": {}, ".ppt": {},
 	// Misc certainly-binary stores.
 	".bin": {}, ".db": {}, ".sqlite": {}, ".sqlite3": {},
+	".sqlite-wal": {}, ".sqlite-shm": {}, ".db-wal": {}, ".db-shm": {}, ".ldb": {},
+	// VM and disk images (whole-volume scope reaches them).
+	".vhd": {}, ".vhdx": {}, ".vmdk": {}, ".qcow2": {}, ".img": {},
+	// Model weights and array dumps.
+	".safetensors": {}, ".pth": {}, ".pt": {}, ".ckpt": {}, ".gguf": {},
+	".onnx": {}, ".npy": {}, ".npz": {}, ".h5": {}, ".pkl": {}, ".tflite": {},
+	// Game packs and engine assets.
+	".pak": {}, ".assets": {}, ".resource": {}, ".ress": {}, ".bundle": {},
+	// seekfs's own index files.
+	".gsi": {}, ".gsx": {}, ".wgi": {},
 }
 
 // contentBinaryExtension reports whether ext is a known-binary extension:
