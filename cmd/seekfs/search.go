@@ -644,6 +644,23 @@ func (vol *serviceVolumeIndex) mergeOverlayMatches(base []Entry, opts queryOptio
 		sort.SliceStable(merged, func(i, j int) bool {
 			return compareSearchAllEntries(merged[i], merged[j], pq) < 0
 		})
+		// When the base pass stopped at an unverified candidate, the union is
+		// only a prefix up to that candidate's rank. Drop every merged entry
+		// (base or overlay) sorting at or after the recorded frontier so the
+		// partial page stays a rank prefix of the complete result. A complete
+		// query, a base-only query (no overlay merge), and relevance ordering
+		// are unchanged.
+		if opts.Trace != nil && opts.Trace.contentFrontierSet &&
+			opts.Trace.contentIncomplete() && pq.SortColumn != "relevance" {
+			frontier := opts.Trace.contentFrontier
+			kept := merged[:0]
+			for _, e := range merged {
+				if compareSearchAllEntries(e, frontier, pq) < 0 {
+					kept = append(kept, e)
+				}
+			}
+			merged = kept
+		}
 		if limit > 0 && len(merged) > limit {
 			merged = merged[:limit]
 		}

@@ -762,7 +762,13 @@ func verifyCompactContentParallel(idx *Index, pq parsedQuery, order []int, pathC
 				// A later worker may finish after an earlier rank hits the cap
 				// or deadline. Stop at this contiguous verified frontier rather
 				// than treating an unverified candidate as a nonmatch and
-				// admitting a later hit.
+				// admitting a later hit. Record the frontier so an overlay merge
+				// keeps the partial page a prefix (see mergeOverlayMatches).
+				if pq.Trace != nil && int(expect) < len(order) {
+					recIndex := order[expect]
+					rec := idx.compactRecord(recIndex)
+					pq.Trace.recordContentFrontier(compactEntryFromRecord(idx, recIndex, rec, pathCache, true), pq)
+				}
 				return false
 			}
 			expect++
@@ -986,6 +992,14 @@ func (vol *serviceVolumeIndex) verifyContentSupersetPage(pq parsedQuery, ranked 
 		}
 		for i := 0; i < n; i++ {
 			if !verified[i] {
+				// This candidate's read was denied by the exact cap or the
+				// deadline. Record it as the rank frontier so an overlay merge
+				// keeps the partial page a prefix (see mergeOverlayMatches).
+				if pq.Trace != nil {
+					recIndex := ranked[start+i]
+					rec := vol.index.compactRecord(recIndex)
+					pq.Trace.recordContentFrontier(compactEntryFromRecord(vol.index, recIndex, rec, caches[0], true), pq)
+				}
 				return page, true
 			}
 			if ok[i] {
