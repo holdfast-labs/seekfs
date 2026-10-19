@@ -28,6 +28,15 @@ type contentResolver struct {
 // baseFRNs must be sorted ascending with baseIDs parallel to it (this is the
 // shape of the persisted FRNS section). The join is O(len(docs)+len(baseFRNs)).
 func buildContentResolver(docs []contentDoc, baseFRNs []uint64, baseIDs []uint32) *contentResolver {
+	return buildContentResolverSeq(docs, baseFRNs, baseIDs, nil)
+}
+
+// buildContentResolverSeq is buildContentResolver with the per-record-id NTFS
+// sequence column (indexed by base record ID). When a doc's FRNSeq and the
+// record's sequence are both known and differ, the doc belongs to a previous
+// occupant of a reused record and is not joined. A 0 on either side is unknown
+// and joins as before.
+func buildContentResolverSeq(docs []contentDoc, baseFRNs []uint64, baseIDs []uint32, baseSeq []uint16) *contentResolver {
 	r := &contentResolver{
 		docs:        docs,
 		docRecordID: make([]uint32, len(docs)),
@@ -47,12 +56,25 @@ func buildContentResolver(docs []contentDoc, baseFRNs []uint64, baseIDs []uint32
 			j++
 		}
 		if j < len(baseFRNs) && baseFRNs[j] == frn && j < len(baseIDs) {
-			r.docRecordID[i] = baseIDs[j]
+			id := baseIDs[j]
+			if seqDiffers(docs[i].FRNSeq, seqAt(baseSeq, id)) {
+				r.docRecordID[i] = contentNoRecordID
+			} else {
+				r.docRecordID[i] = id
+			}
 		} else {
 			r.docRecordID[i] = contentNoRecordID
 		}
 	}
 	return r
+}
+
+// seqAt returns the sequence for a record id, or 0 when the column is absent.
+func seqAt(col []uint16, id uint32) uint16 {
+	if int(id) < len(col) {
+		return col[id]
+	}
+	return 0
 }
 
 // recordID returns the live base record ID for a doc, and whether it is live.

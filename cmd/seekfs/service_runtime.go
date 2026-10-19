@@ -1387,6 +1387,7 @@ func compactOverlayIndexLocked(vol *serviceVolumeIndex, foldOverlay *overlaySegm
 			rec := base.compactRecord(id)
 			if !rec.Deleted {
 				rec.Parent = -1
+				rec.Seq = base.recordSeq(id)
 				rec.Name = strings.Clone(rec.Name)
 				records = append(records, rec)
 			}
@@ -1405,6 +1406,7 @@ func compactOverlayIndexLocked(vol *serviceVolumeIndex, foldOverlay *overlaySegm
 				continue
 			}
 			rec.Parent = -1
+			rec.Seq = base.recordSeq(id)
 			rec.Name = strings.Clone(rec.Name)
 			records = append(records, rec)
 		}

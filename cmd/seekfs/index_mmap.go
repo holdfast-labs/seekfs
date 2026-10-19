@@ -51,15 +51,15 @@ func readIndexMMap(mapped *mappedIndexFile) (*Index, error) {
 	}
 	sectionTableOffset := uint64(0)
 	if header.Magic != indexMagic {
-		return nil, errors.New("unsupported index format: only the v9 index format is supported")
+		return nil, errors.New("unsupported index format: only the v9/v10 index format is supported")
 	}
 	if len(data) < headerSize+8 {
 		return nil, errors.New("invalid mapped v9 index")
 	}
 	sectionTableOffset = binary.LittleEndian.Uint64(data[headerSize:])
 	headerSize += 8
-	if header.Version != indexVersion {
-		return nil, fmt.Errorf("unsupported index version %d: only v9 indexes are supported", header.Version)
+	if !indexVersionSupported(int(header.Version)) {
+		return nil, fmt.Errorf("unsupported index version %d: only v9/v10 indexes are supported", header.Version)
 	}
 	if header.Compact == 0 {
 		return nil, errors.New("mmap low-memory mode requires compact index")
@@ -255,6 +255,8 @@ func decodeDerivedSection(out *indexDerivedSections, tag uint32, section []byte,
 	case indexSectionFRNS:
 		frns, ids := decodeFRNSection(section)
 		out.FRNs, out.FRNRecordIDs = frns, ids
+	case indexSectionSEQN:
+		out.FRNSeq = decodeSeqSection(section)
 	case indexSectionLOWR:
 		out.LowerBlob, out.LowerOffs, out.LowerLens = decodeLowerSection(section)
 	case indexSectionPATR:
@@ -393,6 +395,21 @@ func decodeFRNSection(data []byte) ([]uint64, []uint32) {
 	}
 	ids := mappedUint32Slice(data[off : off+idBytes])
 	return frns, ids
+}
+
+// decodeSeqSection decodes the SEQN section: a uint32 count then that many
+// little-endian uint16 sequence values (one per record id). A framing failure
+// yields nil, so a corrupt column reads back as "unknown" instead of garbage.
+func decodeSeqSection(data []byte) []uint16 {
+	if len(data) < 4 {
+		return nil
+	}
+	count := int(binary.LittleEndian.Uint32(data[:4]))
+	bytesLen := count * 2
+	if count < 0 || bytesLen/2 != count || 4+bytesLen != len(data) {
+		return nil
+	}
+	return mappedUint16Slice(data[4:])
 }
 
 func decodeLowerSection(data []byte) ([]byte, []uint32, []uint16) {

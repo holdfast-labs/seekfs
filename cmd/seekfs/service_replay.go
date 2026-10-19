@@ -482,7 +482,26 @@ func (vol *serviceVolumeIndex) applyUSNChanges(changes []usnChange) {
 			}
 			continue
 		}
-		vol.recordOverlayChange(change, i == lastChange[change.FRN] && change.Reason&usnReasonNeedsInfoRefresh != 0)
+		// Identity check, independent of the watermark: a nonzero known sequence
+		// that differs from the event's means a different occupant of the reused
+		// MFT record. Compare by inequality because NTFS sequences wrap at 16
+		// bits. A delayed delete/rename-old/data/info event for the old occupant
+		// is consumed and ignored; a create/rename-new is the replacement, so
+		// forget the old record and its subtree before applying the new one.
+		// Either sequence being 0 means unknown, which keeps today's behavior.
+		replaced := false
+		if seqDiffers(vol.knownFRNSeq(change.FRN), change.Seq) {
+			if !seqReplacementReason(change.Reason) {
+				if change.USN > vol.checkpoint {
+					vol.checkpoint = change.USN
+				}
+				continue
+			}
+			vol.forgetReusedOccupant(change.FRN)
+			replaced = true
+		}
+		refresh := i == lastChange[change.FRN] && change.Reason&usnReasonNeedsInfoRefresh != 0
+		vol.recordOverlayChange(change, refresh || replaced, replaced)
 		if vol.contentCoord != nil || vol.featureFeed != nil {
 			applied = append(applied, change)
 		}
@@ -605,7 +624,56 @@ func (vol *serviceVolumeIndex) retireOwnedDir(frn uint64) {
 	vol.ownedDirMu.Unlock()
 }
 
-func (vol *serviceVolumeIndex) recordOverlayChange(change usnChange, refreshInfo bool) {
+// seqDiffers reports whether two known NTFS sequence values identify different
+// occupants. A 0 on either side means unknown and never counts as a mismatch.
+// The comparison is inequality, not ordering: the 16-bit sequence wraps.
+func seqDiffers(a, b uint16) bool {
+	return a != 0 && b != 0 && a != b
+}
+
+// seqReplacementReason reports whether an event installs a new occupant of a
+// record rather than referring to the current one.
+func seqReplacementReason(reason uint32) bool {
+	return reason&(usnReasonFileCreate|usnReasonRenameNew) != 0
+}
+
+// knownFRNSeq returns the current sequence for a file reference: the newest
+// overlay slot wins over the base record. 0 means unknown.
+func (vol *serviceVolumeIndex) knownFRNSeq(frn uint64) uint16 {
+	if vol == nil || frn == 0 {
+		return 0
+	}
+	if vol.overlay != nil {
+		if slot, ok := vol.overlay.byFRN[frn]; ok && slot >= 0 && int(slot) < len(vol.overlay.records) {
+			if s := vol.overlay.records[slot].Seq; s != 0 {
+				return s
+			}
+		}
+	}
+	if id, ok := vol.idForFRN(frn); ok {
+		return vol.index.recordSeq(id)
+	}
+	return 0
+}
+
+// forgetReusedOccupant removes the previous occupant's whole identity before a
+// replacement is applied: its base subtree is tombstoned and overlay-only
+// descendants are cascade-deleted. The live overlay slot for frn itself is left
+// alone; the replacement appends a newer one.
+func (vol *serviceVolumeIndex) forgetReusedOccupant(frn uint64) {
+	if vol == nil || frn == 0 {
+		return
+	}
+	if vol.overlay == nil {
+		vol.overlay = newOverlaySegment()
+	}
+	if baseID, ok := vol.idForFRN(frn); ok {
+		vol.tombstoneBaseSubtree(baseID)
+	}
+	vol.cascadeOverlayDelete(frn)
+}
+
+func (vol *serviceVolumeIndex) recordOverlayChange(change usnChange, refreshInfo bool, replaced bool) {
 	if vol == nil {
 		return
 	}
@@ -621,7 +689,7 @@ func (vol *serviceVolumeIndex) recordOverlayChange(change usnChange, refreshInfo
 	beforeSize := vol.effectiveAccountingSize(change.FRN)
 	oldParent := vol.effectiveParentFRN(change.FRN)
 	if change.Reason&usnReasonFileDelete != 0 {
-		rec := CompactRecord{FRN: change.FRN, ParentFRN: change.ParentFRN, Name: change.Name, Deleted: true}
+		rec := CompactRecord{FRN: change.FRN, ParentFRN: change.ParentFRN, Name: change.Name, Deleted: true, Seq: change.Seq}
 		// Only directories can have descendants, so the O(overlay) cascade
 		// below is skipped when the deleted FRN is PROVABLY a plain file:
 		// some record for it exists (base or prior live overlay slot) and
@@ -673,22 +741,28 @@ func (vol *serviceVolumeIndex) recordOverlayChange(change usnChange, refreshInfo
 		Parent:    -1,
 		Name:      change.Name,
 		Mode:      modeFromAttrs(change.Attr),
+		Seq:       change.Seq,
 	}
 	vol.index.CompactAttrs = true
 	if baseID, ok := vol.idForFRN(change.FRN); ok {
 		overlay.shadowed.add(int32(baseID))
-		base := vol.index.compactRecord(baseID)
-		if rec.Name == "" {
-			rec.Name = base.Name
+		// A replacement must not inherit the previous occupant's name, parent,
+		// size, or timestamp. Only fall back to base metadata for an in-place
+		// update of the same occupant.
+		if !replaced {
+			base := vol.index.compactRecord(baseID)
+			if rec.Name == "" {
+				rec.Name = base.Name
+			}
+			if rec.ParentFRN == 0 {
+				rec.ParentFRN = base.ParentFRN
+			}
+			// A USN record carries neither size nor timestamp.  Preserve the base
+			// values so a rename or modify does not report a zero size; the live
+			// refresh below replaces them when the change affects file data.
+			rec.Size = base.Size
+			rec.ModUnix = base.ModUnix
 		}
-		if rec.ParentFRN == 0 {
-			rec.ParentFRN = base.ParentFRN
-		}
-		// A USN record carries neither size nor timestamp.  Preserve the base
-		// values so a rename or modify does not report a zero size; the live
-		// refresh below replaces them when the change affects file data.
-		rec.Size = base.Size
-		rec.ModUnix = base.ModUnix
 	}
 	slot := int32(len(overlay.records))
 	overlay.byFRN[change.FRN] = slot

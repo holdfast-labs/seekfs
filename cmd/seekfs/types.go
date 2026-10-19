@@ -10,7 +10,16 @@ import (
 	"time"
 )
 
-const indexVersion = 9
+const indexVersion = 10
+
+// legacyIndexVersion predates the SEQN section. A v9 index loads without it;
+// every record's NTFS sequence reads back as 0, which means "unknown".
+const legacyIndexVersion = 9
+
+func indexVersionSupported(v int) bool {
+	return v == legacyIndexVersion || v == indexVersion
+}
+
 const servicePathCacheLimit = 25_000
 const serviceStartupDefaultWorkers = 2
 const serviceResidentNameOrderMaxRecords = 2_000_000
@@ -52,6 +61,7 @@ const (
 
 var indexMagic = [8]byte{'G', 'O', 'S', 'R', 'C', 'H', '0', '9'}
 var walMagicV1 = []byte{'S', 'W', 'A', 'L', '1'}
+var walMagicV2 = []byte{'S', 'W', 'A', 'L', '2'}
 
 const (
 	indexSectionRANK uint32 = 'R'<<24 | 'A'<<16 | 'N'<<8 | 'K'
@@ -66,6 +76,10 @@ const (
 	indexSectionSUBS uint32 = 'S'<<24 | 'U'<<16 | 'B'<<8 | 'S'
 	indexSectionCHLD uint32 = 'C'<<24 | 'H'<<16 | 'L'<<8 | 'D'
 	indexSectionFRNS uint32 = 'F'<<24 | 'R'<<16 | 'N'<<8 | 'S'
+	// SEQN is the per-record NTFS file-reference sequence number (uint16 per
+	// record id). It disambiguates a reused MFT record from its previous
+	// occupant. Absent on v9 indexes, where every sequence reads back as 0.
+	indexSectionSEQN uint32 = 'S'<<24 | 'E'<<16 | 'Q'<<8 | 'N'
 	indexSectionLOWR uint32 = 'L'<<24 | 'O'<<16 | 'W'<<8 | 'R'
 	indexSectionPATR uint32 = 'P'<<24 | 'A'<<16 | 'T'<<8 | 'R'
 	indexSectionPEXT uint32 = 'P'<<24 | 'E'<<16 | 'X'<<8 | 'T'
@@ -418,6 +432,9 @@ type indexDerivedSections struct {
 	PostingBounds    map[uint32]postingRankBounds
 	NameTrigrams     *compressedTrigramIndex
 	SelfNameTrigrams *compressedTrigramIndex
+	// FRNSeq is the NTFS sequence number per record id (parallel to the record
+	// table), persisted in the SEQN section. Nil on legacy v9 indexes.
+	FRNSeq []uint16
 }
 
 type mappedPostingSection struct {
@@ -1246,6 +1263,10 @@ type CompactRecord struct {
 	Size      int64
 	ModUnix   int64
 	Deleted   bool
+	// Seq is the NTFS file-reference sequence number of this record (the high
+	// 16 bits of the 64-bit reference). 0 means unknown (legacy or walk). It
+	// lets replay tell a reused record from its previous occupant.
+	Seq uint16
 }
 
 type PackedRecords struct {
@@ -1306,6 +1327,8 @@ type usnNode struct {
 	parentFRN uint64
 	name      string
 	attr      uint32
+	seq       uint16
+	parentSeq uint16
 }
 
 type usnChange struct {
@@ -1315,6 +1338,9 @@ type usnChange struct {
 	Reason    uint32
 	Attr      uint32
 	Name      string
+	// Seq is the file reference's NTFS sequence number. It is omitted from
+	// legacy (v1) WAL/JSON frames and reads back as 0 (unknown).
+	Seq uint16 `json:"seq,omitempty"`
 }
 
 type walBatch struct {

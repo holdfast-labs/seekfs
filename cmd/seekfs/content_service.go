@@ -206,6 +206,9 @@ type contentDeltaDoc struct {
 	// the same change-detection identity the base would have (walk volumes).
 	FileSize    int64
 	FileModNano int64
+	// FRNSeq is the NTFS sequence the doc was extracted under (0 = unknown),
+	// so a reused record's previous doc is never joined or folded silently.
+	FRNSeq uint16
 }
 
 // contentDelta is the in-memory overlay of changed documents. Its own mutex
@@ -879,13 +882,13 @@ func (s *contentVolumeState) setReady(idx *contentIndex, reader *contentReader, 
 
 // rebuildResolver replaces the docID -> recordID map after a base swap. The
 // content index and delta are untouched: content is generation-independent.
-func (s *contentVolumeState) rebuildResolver(baseFRNs []uint64, baseIDs []uint32) {
+func (s *contentVolumeState) rebuildResolver(baseFRNs []uint64, baseIDs []uint32, baseSeq []uint16) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.idx == nil {
 		return
 	}
-	s.resolver = buildContentResolver(s.idx.Docs, baseFRNs, baseIDs)
+	s.resolver = buildContentResolverSeq(s.idx.Docs, baseFRNs, baseIDs, baseSeq)
 }
 
 // markIntegrityFailed drops a checksum-failed base so it is never served and
@@ -1581,6 +1584,10 @@ type contentCoordinator struct {
 	// (per-reason files/bytes) since the last fold, which merges them
 	// into the published sidecar's CXIS section and resets this.
 	inclusion contentInclusionStats
+	// seqHint returns the current NTFS sequence for a key when the drain can
+	// see the record layer; nil leaves delta docs at 0 (unknown). Set around
+	// processQueue by the wiring, which owns the needed locks.
+	seqHint func(frn uint64) uint16
 }
 
 func newContentCoordinator(state *contentVolumeState) *contentCoordinator {
@@ -2066,6 +2073,9 @@ func (c *contentCoordinator) processQueue(resolvePath func(frn uint64) (string, 
 				}
 			}
 			continue
+		}
+		if c.seqHint != nil {
+			doc.FRNSeq = c.seqHint(frn)
 		}
 		delta.upsert(doc)
 		changed++

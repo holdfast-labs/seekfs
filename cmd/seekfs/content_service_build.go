@@ -291,6 +291,9 @@ type contentBuildItem struct {
 	// inclusion-policy size caps are ~10 MiB of text inside repos and
 	// ~1 MiB outside. Comparisons ignore it.
 	inRepo bool
+	// seq is the source record's NTFS sequence number (0 = unknown), carried
+	// through extraction into the doc row.
+	seq uint16
 }
 
 func contentBuildItemLess(a, b contentBuildItem) bool {
@@ -559,7 +562,7 @@ func (s *goSearchService) snapshotContentBuildItemsLegacy(vol *serviceVolumeInde
 					continue
 				}
 			}
-			item := contentBuildItem{frn: frn, path: path}
+			item := contentBuildItem{frn: frn, path: path, seq: idx.recordSeq(id)}
 			if opts.Scope != nil {
 				_, item.inRepo = opts.Scope.Ignore.repoFor(contentNormPath(path))
 			}
@@ -633,7 +636,7 @@ func contentBuildDocSafe(ctx context.Context, item contentBuildItem) (doc conten
 	if res.Class == contentClassText && contentLooksMinified(res.Text) {
 		return contentBuildDoc{}, contentExtractResult{Skipped: true, Reason: contentSkipMinified, Size: s.size}, false
 	}
-	return contentBuildDoc{path: item.path, frn: item.frn, text: res.Text, modUnix: s.modUnix, class: res.Class, version: e.Version(), fileSize: s.size, fileModNano: s.modNano}, res, true
+	return contentBuildDoc{path: item.path, frn: item.frn, text: res.Text, modUnix: s.modUnix, class: res.Class, version: e.Version(), fileSize: s.size, fileModNano: s.modNano, seq: item.seq}, res, true
 }
 
 // contentExtractionSkip enforces the size-gated inclusion skips at

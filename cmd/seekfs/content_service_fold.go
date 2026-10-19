@@ -463,7 +463,7 @@ func (s *goSearchService) publishFoldedContent(vol *serviceVolumeIndex, gen uint
 	if !ok {
 		return false
 	}
-	if old := vol.content.setReady(idx, reader, buildContentResolver(idx.Docs, frns, ids)); old != nil {
+	if old := vol.content.setReady(idx, reader, buildContentResolverSeq(idx.Docs, frns, ids, vol.index.seqColumn())); old != nil {
 		// Replace the previous base's mapping while holding indexMu for writing:
 		// no query can be reading it (queries hold indexMu.RLock throughout), so
 		// the unmap cannot race a read.
@@ -496,6 +496,9 @@ type contentFoldItem struct {
 	frn  uint64
 	path string
 	size int64
+	// seq carries the doc's NTFS sequence through a re-extract so a fold never
+	// downgrades a known sequence back to unknown.
+	seq uint16
 }
 
 // contentFoldMergeItems merges the base doc table (FRN-sorted, with parallel
@@ -524,7 +527,7 @@ func contentFoldMergeItems(base []contentDoc, paths []string, snap []contentDelt
 		switch {
 		case haveDelta && (!haveBase || deltaFRN < baseFRN):
 			if !delta[j].Deleted {
-				out = append(out, contentFoldItem{frn: delta[j].FRN, path: delta[j].Path, size: int64(len(delta[j].Text))})
+				out = append(out, contentFoldItem{frn: delta[j].FRN, path: delta[j].Path, size: int64(len(delta[j].Text)), seq: delta[j].FRNSeq})
 			}
 			j++
 		case haveBase && (!haveDelta || baseFRN < deltaFRN):
@@ -532,7 +535,7 @@ func contentFoldMergeItems(base []contentDoc, paths []string, snap []contentDelt
 			if i < len(paths) {
 				p = paths[i]
 			}
-			out = append(out, contentFoldItem{frn: base[i].FRN, path: p, size: int64(base[i].TextLen)})
+			out = append(out, contentFoldItem{frn: base[i].FRN, path: p, size: int64(base[i].TextLen), seq: base[i].FRNSeq})
 			i++
 		case haveBase && haveDelta:
 			d := delta[j]
@@ -541,7 +544,7 @@ func contentFoldMergeItems(base []contentDoc, paths []string, snap []contentDelt
 			if d.Deleted {
 				continue
 			}
-			out = append(out, contentFoldItem{frn: d.FRN, path: d.Path, size: int64(len(d.Text))})
+			out = append(out, contentFoldItem{frn: d.FRN, path: d.Path, size: int64(len(d.Text)), seq: d.FRNSeq})
 		}
 	}
 	return out
@@ -562,12 +565,12 @@ func foldReadDoc(vol *serviceVolumeIndex, settings contentExtractSettings, ctx c
 		// Fail open to the in-repo caps (the drain's precedent): the fold
 		// carries no scope matcher, and outside-repo caps would truncate
 		// in-repo files the build indexed whole.
-		if doc, _, ok := contentBuildDocSafe(cctx, contentBuildItem{frn: it.frn, path: it.path, inRepo: true}); ok {
+		if doc, _, ok := contentBuildDocSafe(cctx, contentBuildItem{frn: it.frn, path: it.path, inRepo: true, seq: it.seq}); ok {
 			return doc, true
 		}
 		if livePath != nil {
 			if lp := livePath(it.frn); lp != "" && lp != it.path {
-				doc, _, ok := contentBuildDocSafe(cctx, contentBuildItem{frn: it.frn, path: lp, inRepo: true})
+				doc, _, ok := contentBuildDocSafe(cctx, contentBuildItem{frn: it.frn, path: lp, inRepo: true, seq: it.seq})
 				return doc, ok
 			}
 		}
@@ -623,14 +626,14 @@ func newContentFoldDiskSource(vol *serviceVolumeIndex, base []contentDoc, paths 
 			// doc until its next change re-adds it through the delta.
 			continue
 		}
-		items = append(items, contentFoldItem{frn: base[i].FRN, path: p, size: int64(base[i].TextLen)})
+		items = append(items, contentFoldItem{frn: base[i].FRN, path: p, size: int64(base[i].TextLen), seq: base[i].FRNSeq})
 	}
 	bitems := make([]contentBuildItem, 0, len(items))
 	for _, it := range items {
 		// Fail open to the in-repo caps (see foldReadDoc): the fold has
 		// no scope matcher, and outside-repo caps would truncate in-repo
 		// files the build indexed whole.
-		bitems = append(bitems, contentBuildItem{frn: it.frn, path: it.path, inRepo: true})
+		bitems = append(bitems, contentBuildItem{frn: it.frn, path: it.path, inRepo: true, seq: it.seq})
 	}
 	cctx := contentWithExtractSettings(ctx, settings)
 	next, stop := contentPrefetchExtract(cctx, bitems, contentBuildWorkerCount(), contentBuildDocSafe)
@@ -663,7 +666,7 @@ func (m *contentFoldDiskSource) next() (contentBuildDoc, bool, error) {
 			if d.Deleted {
 				continue
 			}
-			return contentBuildDoc{frn: d.FRN, path: d.Path, text: d.Text, class: d.ContentType, version: d.ExtractorVersion, fileSize: d.FileSize, fileModNano: d.FileModNano}, true, nil
+			return contentBuildDoc{frn: d.FRN, path: d.Path, text: d.Text, class: d.ContentType, version: d.ExtractorVersion, fileSize: d.FileSize, fileModNano: d.FileModNano, seq: d.FRNSeq}, true, nil
 		}
 		if m.j < len(m.delta) && (m.i >= len(m.items) || m.delta[m.j].FRN == m.items[m.i].frn) {
 			// Same FRN: the delta replaces the base doc; consume both sides.
@@ -678,7 +681,7 @@ func (m *contentFoldDiskSource) next() (contentBuildDoc, bool, error) {
 			if d.Deleted {
 				continue
 			}
-			return contentBuildDoc{frn: d.FRN, path: d.Path, text: d.Text, class: d.ContentType, version: d.ExtractorVersion, fileSize: d.FileSize, fileModNano: d.FileModNano}, true, nil
+			return contentBuildDoc{frn: d.FRN, path: d.Path, text: d.Text, class: d.ContentType, version: d.ExtractorVersion, fileSize: d.FileSize, fileModNano: d.FileModNano, seq: d.FRNSeq}, true, nil
 		}
 		if m.i >= len(m.items) {
 			// Drain any remaining delta-only tail.
@@ -688,7 +691,7 @@ func (m *contentFoldDiskSource) next() (contentBuildDoc, bool, error) {
 				if d.Deleted {
 					continue
 				}
-				return contentBuildDoc{frn: d.FRN, path: d.Path, text: d.Text, class: d.ContentType, version: d.ExtractorVersion, fileSize: d.FileSize, fileModNano: d.FileModNano}, true, nil
+				return contentBuildDoc{frn: d.FRN, path: d.Path, text: d.Text, class: d.ContentType, version: d.ExtractorVersion, fileSize: d.FileSize, fileModNano: d.FileModNano, seq: d.FRNSeq}, true, nil
 			}
 			return contentBuildDoc{}, false, nil
 		}

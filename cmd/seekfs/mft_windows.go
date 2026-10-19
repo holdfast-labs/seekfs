@@ -76,6 +76,8 @@ type mftEntry struct {
 	modUnix   int64 // unix nanoseconds, 0 if unknown
 	isDir     bool
 	inUse     bool
+	seq       uint16 // this record's NTFS file-reference sequence number
+	parentSeq uint16 // the parent reference's sequence number, when known
 }
 
 // filetimeToUnixNano converts a Windows FILETIME (100ns ticks since 1601) to
@@ -145,12 +147,14 @@ func parseMFTRecord(record []byte, recordNumber uint64, bytesPerSector int) (mft
 
 	// The MFT record's own number forms the FRN (low 48 bits); the sequence
 	// number occupies the high 16, but USN/journal FRNs the rest of seekfs uses
-	// are the 48-bit base record number, so we key on recordNumber.
+	// are the 48-bit base record number, so we key on recordNumber while
+	// retaining the sequence separately to disambiguate record reuse.
 	entry := mftEntry{
 		frn:   recordNumber,
 		isDir: isDir,
 		inUse: true,
 		attr:  fileAttributeFromDir(isDir),
+		seq:   binary.LittleEndian.Uint16(record[16:18]),
 	}
 
 	firstAttrOff := int(binary.LittleEndian.Uint16(record[20:22]))
@@ -226,6 +230,7 @@ func parseFileName(attr []byte, entry *mftEntry, bestNameSpace *int) {
 	c := attr[contentOff:]
 	parentRef := binary.LittleEndian.Uint64(c[0:8])
 	parentFRN := parentRef & 0x0000FFFFFFFFFFFF // low 48 bits
+	parentSeq := uint16(parentRef >> 48)        // high 16 bits: parent reference generation
 	nameLen := int(c[64])
 	namespace := int(c[65])
 	nameStart := 66
@@ -238,6 +243,7 @@ func parseFileName(attr []byte, entry *mftEntry, bestNameSpace *int) {
 		// Still record the parent even if we keep an existing better name.
 		if entry.parentFRN == 0 {
 			entry.parentFRN = parentFRN
+			entry.parentSeq = parentSeq
 		}
 		return
 	}
@@ -247,6 +253,7 @@ func parseFileName(attr []byte, entry *mftEntry, bestNameSpace *int) {
 	}
 	entry.name = windows.UTF16ToString(u16)
 	entry.parentFRN = parentFRN
+	entry.parentSeq = parentSeq
 	*bestNameSpace = pref
 }
 

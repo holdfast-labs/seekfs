@@ -193,6 +193,7 @@ func (s *goSearchService) reconcileMetadataPass(vol *serviceVolumeIndex, idx *co
 		return false
 	}
 	vol.mu.Lock()
+	liveSeq := make(map[uint64]uint16, len(live))
 	if vol.overlay != nil {
 		latest := latestOverlaySlotsByFRN(vol.overlay.records)
 		for frn, slot := range latest {
@@ -212,6 +213,9 @@ func (s *goSearchService) reconcileMetadataPass(vol *serviceVolumeIndex, idx *co
 				continue
 			}
 			live[frn] = contentFilePrint{size: rec.Size, mod: rec.ModUnix}
+			if rec.Seq != 0 {
+				liveSeq[frn] = rec.Seq
+			}
 			if m, ok := ranks[frn]; ok {
 				m.size = rec.Size
 				ranks[frn] = m
@@ -220,6 +224,14 @@ func (s *goSearchService) reconcileMetadataPass(vol *serviceVolumeIndex, idx *co
 				// after every scanned file for the reconcile budget.
 				ranks[frn] = contentScopeMember{frn: frn, size: rec.Size, priority: int(^uint(0) >> 1)}
 			}
+		}
+	}
+	for frn := range live {
+		if _, ok := liveSeq[frn]; ok {
+			continue
+		}
+		if id, ok := vol.idForFRN(frn); ok {
+			liveSeq[frn] = vol.index.recordSeq(id)
 		}
 	}
 	target := vol.checkpoint
@@ -234,15 +246,20 @@ func (s *goSearchService) reconcileMetadataPass(vol *serviceVolumeIndex, idx *co
 	// anything publishes below.
 	delta := vol.content.deltaView()
 	basePrints := make(map[uint64]contentFilePrint, len(idx.Docs))
+	baseSeq := make(map[uint64]uint16, len(idx.Docs))
 	for i := range idx.Docs {
 		if idx.Docs[i].FRN != 0 {
 			basePrints[idx.Docs[i].FRN] = contentFilePrint{size: idx.Docs[i].FileSize, mod: idx.Docs[i].FileModNano}
+			if idx.Docs[i].FRNSeq != 0 {
+				baseSeq[idx.Docs[i].FRN] = idx.Docs[i].FRNSeq
+			}
 		}
 	}
 	var enqueue, fresh, drop []uint64
 	for key, want := range live {
 		if doc, ok := delta.docFor(key); ok && !doc.Deleted &&
-			doc.FileSize == want.size && doc.FileModNano == want.mod {
+			doc.FileSize == want.size && doc.FileModNano == want.mod &&
+			!seqDiffers(doc.FRNSeq, liveSeq[key]) {
 			continue
 		}
 		if vol.content.walkDeclinedSkipped(key, want) {
@@ -255,7 +272,10 @@ func (s *goSearchService) reconcileMetadataPass(vol *serviceVolumeIndex, idx *co
 			}
 			continue
 		}
-		if got != want {
+		// A doc from a previous occupant of a reused record is stale even when
+		// its fingerprint matches: re-extract it so the doc carries the new
+		// sequence (or drops if the file no longer resolves).
+		if seqDiffers(baseSeq[key], liveSeq[key]) || got != want {
 			enqueue = append(enqueue, key)
 		}
 	}
