@@ -298,7 +298,7 @@ func (s *goSearchService) runContentFold(vol *serviceVolumeIndex) {
 			pending := contentShardDroppedDocs(sh, drop)
 			posted := false
 			if !contentPostingFoldStale(counter, len(base.Docs), pending) {
-				if res, ok := contentShardPostingFold(vol, sh, incoming, drop, header, settings, fctx, livePath); ok {
+				if res, ok := contentShardPostingFold(sh, incoming, drop, header, settings, fctx, livePath); ok {
 					counter = contentFoldCounter{
 						Folds:   counter.Folds + 1,
 						Changed: counter.Changed + uint32(pending),
@@ -368,7 +368,7 @@ func (s *goSearchService) runContentFold(vol *serviceVolumeIndex) {
 			pending := contentShardDroppedDocs(sh, plan.drop)
 			posted := false
 			if !contentPostingFoldStale(prev, len(sh.idx.Docs), pending) {
-				if res, ok := contentShardPostingFold(vol, sh, plan.incoming[i], plan.drop, header, settings, fctx, livePath); ok {
+				if res, ok := contentShardPostingFold(sh, plan.incoming[i], plan.drop, header, settings, fctx, livePath); ok {
 					infos[i], saveErr = contentSaveShard(contentShardDir(gsx), res.idx, nil, sh.info.Prefixes)
 					if saveErr == nil {
 						rewritten += res.rewritten

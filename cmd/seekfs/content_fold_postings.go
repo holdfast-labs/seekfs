@@ -139,7 +139,6 @@ func contentShardDroppedDocs(sh *contentShard, drop map[uint64]struct{}) int {
 type contentPostingFoldResult struct {
 	idx         *contentIndex
 	rewritten   int
-	changed     int
 	dedupeFiles int64
 	dedupeBytes int64
 }
@@ -149,7 +148,6 @@ type contentPostingFoldResult struct {
 // re-extract path (missing sections, an unexpected alias shape, or a base that
 // cannot be merged safely).
 func contentShardPostingFold(
-	vol *serviceVolumeIndex,
 	sh *contentShard,
 	incoming []contentDeltaDoc,
 	drop map[uint64]struct{},
@@ -197,11 +195,9 @@ func contentShardPostingFold(
 	for i := range remap {
 		remap[i] = -1
 	}
-	changed := 0
 	for i := range baseDocs {
 		d := baseDocs[i]
 		if _, gone := drop[d.FRN]; gone {
-			changed++
 			continue
 		}
 		p := sh.reader.docPath(uint32(i))
@@ -480,11 +476,9 @@ func contentShardPostingFold(
 	if len(filterSec) > 0 {
 		idx.Sections[contentSectionFilter] = filterSec
 	}
-	_ = vol
 	return &contentPostingFoldResult{
 		idx:         idx,
 		rewritten:   len(outDocs),
-		changed:     changed,
 		dedupeFiles: dedupeFiles,
 		dedupeBytes: dedupeBytes,
 	}, true
