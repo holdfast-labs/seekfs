@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 )
@@ -305,6 +306,9 @@ func (vol *serviceVolumeIndex) contentAfterCandidateStart(ids []int, resume *con
 	for i, id := range ids {
 		if vol.index.compactRecord(id).FRN == resume.FRN {
 			resume.Found = true
+			if resume.Inclusive {
+				return i
+			}
 			return i + 1
 		}
 	}
@@ -324,6 +328,9 @@ func (vol *serviceVolumeIndex) contentAfterScanStart(order []uint32, recordCount
 		id := compactUint32OrderAt(order, pos)
 		if vol.index.compactRecord(id).FRN == resume.FRN {
 			resume.Found = true
+			if resume.Inclusive {
+				return pos
+			}
 			return pos + 1
 		}
 	}
@@ -350,6 +357,71 @@ func (vol *serviceVolumeIndex) contentResumeNextBaseKey(idx *Index, order []int,
 	rec := idx.compactRecord(recIndex)
 	entry := compactEntryFromRecordPath(idx, recIndex, rec, pathCache, true, false)
 	return vol.contentCursorBaseKey(entry, pq), true
+}
+
+// contentResumeFromFrontier builds an inclusive resume at the first candidate
+// the capped pass did not verify. It skips every candidate the first pass
+// already verified, including when that pass emitted no hit at all.
+func (vol *serviceVolumeIndex) contentResumeFromFrontier(trace *searchTrace, pq parsedQuery) *contentCursorResume {
+	if vol == nil || trace == nil || !trace.contentFrontierSet {
+		return nil
+	}
+	frontier := trace.contentFrontier
+	if frontier.FRN == 0 {
+		return nil
+	}
+	k := vol.contentCursorBaseKey(frontier, pq)
+	return &contentCursorResume{FRN: frontier.FRN, Found: true, Key: &k, Inclusive: true}
+}
+
+// contentResumeFromMatches builds a v2 resume after the last emitted row. A
+// base row resumes the base scan after its FRN; an overlay row keeps the last
+// emitted base FRN and filters the overlay side by the last row's page key.
+func (vol *serviceVolumeIndex) contentResumeFromMatches(matches []Entry, pq parsedQuery) *contentCursorResume {
+	if vol == nil || len(matches) == 0 {
+		return nil
+	}
+	last := matches[len(matches)-1]
+	resume := &contentCursorResume{Found: true}
+	if vol.contentCursorEntryIsOverlay(last) {
+		k := vol.contentCursorOverlayKey(
+			rankedOverlayEntry{entry: last, rank: vol.overlayEntryRank(last, pq)}, pq)
+		resume.Key = &k
+	} else {
+		k := vol.contentCursorBaseKey(last, pq)
+		resume.Key = &k
+		resume.FRN = last.FRN
+	}
+	if resume.FRN == 0 {
+		for i := len(matches) - 1; i >= 0; i-- {
+			if !vol.contentCursorEntryIsOverlay(matches[i]) {
+				resume.FRN = matches[i].FRN
+				break
+			}
+		}
+	}
+	return resume
+}
+
+// prepareContentResumeOverlay fills resume.overlayKeys and resume.overlay with
+// the matching overlay rows that rank after resume.Key. The hidden-overlay
+// resume stop uses those keys to prove the page is full before verifying past
+// it, and the merge reuses the same list.
+func (vol *serviceVolumeIndex) prepareContentResumeOverlay(pq parsedQuery, resume *contentCursorResume) {
+	if vol == nil || resume == nil {
+		return
+	}
+	pq.contentAfter = resume
+	overlay := vol.overlayRankedMatches(vol.snap.Load(), pq, make(map[int]string))
+	keys := make([]contentCursorKey, 0, len(overlay))
+	for _, item := range overlay {
+		keys = append(keys, vol.contentCursorOverlayKey(item, pq))
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		return keys[i].compare(keys[j]) < 0
+	})
+	resume.overlayKeys = keys
+	resume.overlay = overlay
 }
 
 // pageProvablyFull reports whether the base hits found so far, plus the

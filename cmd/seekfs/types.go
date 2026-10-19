@@ -609,6 +609,12 @@ type contentCursorResume struct {
 	// the post-search merge reuses them instead of evaluating the overlay
 	// twice. Local-only; nil on every other path.
 	overlay []rankedOverlayEntry
+	// Inclusive starts the base side AT FRN instead of after it, and keeps
+	// overlay rows whose key equals Key. The explicit-budget refill resumes at
+	// the first unverified candidate (the verify frontier), not after the last
+	// emitted row, so a zero-hit page can resume and verified misses are not
+	// read again. False for v2 cursor pages, which resume after a row.
+	Inclusive bool
 }
 
 // contentCompletenessProbe carries the reduced default-order path's
@@ -899,6 +905,23 @@ func (t *searchTrace) capDiskBudgetForProbe(limit int) {
 		limit = int(used)
 	}
 	t.disk.limit = int64(limit)
+	// Keep the reported cap in step with the reservation, so the response's
+	// remaining reads reflect the cap that actually applied.
+	t.DiskVerifyBudget = limit
+}
+
+// raiseDiskBudget restores the query's disk reservation to limit and clears a
+// cap latch, keeping the reported cap in step. It never lowers the reservation
+// and never clears a wall-clock deadline latch: a deadline stop is not a cap
+// that a larger explicit budget can undo.
+func (t *searchTrace) raiseDiskBudget(limit int) bool {
+	if t == nil || t.disk == nil || limit <= 0 || int64(limit) <= t.disk.limit {
+		return false
+	}
+	t.disk.limit = int64(limit)
+	t.disk.capped.Store(false)
+	t.DiskVerifyBudget = limit
+	return true
 }
 
 // capFiresWithin reports whether a batch of n more reads could exhaust the

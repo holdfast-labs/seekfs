@@ -810,7 +810,8 @@ func (vol *serviceVolumeIndex) overlayRankedMatches(snap *volumeSnapshot, pq par
 	if resume := pq.contentAfter; resume != nil && resume.Key != nil {
 		kept := overlay[:0]
 		for _, item := range overlay {
-			if vol.contentCursorOverlayKey(item, pq).compare(*resume.Key) > 0 {
+			cmp := vol.contentCursorOverlayKey(item, pq).compare(*resume.Key)
+			if cmp > 0 || (resume.Inclusive && cmp == 0) {
 				kept = append(kept, item)
 			}
 		}
