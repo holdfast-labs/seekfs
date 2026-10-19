@@ -7,6 +7,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -15,10 +17,9 @@ import (
 const searchCursorMaxBytes = 16 << 10
 
 type searchCursorName struct {
-	JournalID   uint64 `json:"j"`
-	Checkpoint  int64  `json:"c"`
-	Records     int    `json:"n"`
-	SnapshotGen uint64 `json:"g"`
+	JournalID  uint64 `json:"j"`
+	Checkpoint int64  `json:"c"`
+	Records    int    `json:"n"`
 }
 
 type searchCursorSide struct {
@@ -42,15 +43,112 @@ type searchCursorV2 struct {
 	Side     searchCursorSide `json:"s"`
 	Delta    uint64           `json:"d"`
 	Instance string           `json:"i"`
+	// BK is the last emitted base row (FRN), or 0 when no base row has been
+	// emitted yet. The base side resumes after it.
+	BK uint64 `json:"bk,omitempty"`
+	// K is the page key of the last emitted row (base or overlay). The overlay
+	// side keeps only rows whose key is greater.
+	K *contentCursorKey `json:"k,omitempty"`
+}
+
+// contentCursorKey is a row's page position: (tier, rank, tiebreak).
+//
+// tier is the default-sort promotion tier (0 = symbol-named header, 1 =
+// symbol-named other, 2 = rest); explicit sorts use 0. rank is the same value
+// mergeContentOverlayMatches uses (baseEntryRank / overlayEntryRank). tiebreak
+// orders equal ranks: base rows sort first, then overlay rows in their ranked
+// overlay order (name/path). Sorting rows by key reproduces the merged page
+// order.
+type contentCursorKey struct {
+	Tier     int    `json:"t"`
+	Rank     int    `json:"r"`
+	Tiebreak string `json:"x,omitempty"`
+}
+
+func (k contentCursorKey) compare(other contentCursorKey) int {
+	if k.Tier != other.Tier {
+		return k.Tier - other.Tier
+	}
+	if k.Rank != other.Rank {
+		return k.Rank - other.Rank
+	}
+	return strings.Compare(k.Tiebreak, other.Tiebreak)
+}
+
+// contentCursorTier is the promotion tier a row occupies. Promotion only runs
+// for the default sort; every explicit sort is a single tier.
+func contentCursorTier(entry Entry, pq parsedQuery) int {
+	if pq.SortColumn != "" {
+		return 0
+	}
+	key := contentSymbolQueryKey(pq)
+	if key == "" || !contentEntrySymbolNamed(entry, key) {
+		return 2
+	}
+	name := entry.Name
+	if name == "" {
+		name = filepath.Base(entry.Path)
+	}
+	if contentIsHeaderName(name) {
+		return 0
+	}
+	return 1
+}
+
+// contentCursorOverlayTiebreak mirrors the final tie-break
+// overlayRankedMatches applies inside one rank.
+func contentCursorOverlayTiebreak(entry Entry, pq parsedQuery) string {
+	if pq.SortColumn == "path" {
+		return entryLowerPath(entry) + "\x00" + entry.Path
+	}
+	return entryLowerName(entry) + "\x00" + entry.Path
+}
+
+func (vol *serviceVolumeIndex) contentCursorOverlayKey(item rankedOverlayEntry, pq parsedQuery) contentCursorKey {
+	return contentCursorKey{
+		Tier:     contentCursorTier(item.entry, pq),
+		Rank:     item.rank,
+		Tiebreak: contentCursorOverlayTiebreak(item.entry, pq),
+	}
+}
+
+func (vol *serviceVolumeIndex) contentCursorBaseKey(entry Entry, pq parsedQuery) contentCursorKey {
+	return contentCursorKey{
+		Tier: contentCursorTier(entry, pq),
+		Rank: vol.baseEntryRank(entry, pq),
+	}
+}
+
+// contentCursorEntryIsOverlay reports whether an emitted row came from the
+// overlay side. Any overlay record for a base FRN shadows that base record, so
+// a base FRN is either hidden (overlay row) or the row itself. A FRN absent
+// from the base index can only be an overlay creation.
+func (vol *serviceVolumeIndex) contentCursorEntryIsOverlay(entry Entry) bool {
+	if vol == nil || vol.index == nil {
+		return false
+	}
+	snap := vol.snap.Load()
+	if snap == nil || len(snap.records) == 0 {
+		return false
+	}
+	id, ok := vol.idForFRN(entry.FRN)
+	if !ok {
+		return true
+	}
+	return hiddenBaseIDs{
+		tombstone: snap.tombstoneIDs,
+		shadowed:  snap.shadowedIDs,
+	}.contains(id)
 }
 
 // contentCursorContext is the identity captured for one request. It is
 // comparable so a pre-search capture can be compared with a post-search read.
+// Overlay names and content-delta generation are intentionally absent: they
+// change between pages and the resume re-evaluates them on each page.
 type contentCursorContext struct {
 	Volume   string
 	Name     searchCursorName
 	Side     searchCursorSide
-	Delta    uint64
 	Instance string
 }
 
@@ -64,7 +162,7 @@ func newContentCursorInstanceID() string {
 	return hex.EncodeToString(b[:])
 }
 
-func encodeSearchCursorV2(opts queryOptions, ctx contentCursorContext, id uint64, offset int) string {
+func encodeSearchCursorV2(opts queryOptions, ctx contentCursorContext, id uint64, offset int, bk uint64, key *contentCursorKey) string {
 	c := searchCursorV2{
 		Version:  2,
 		Query:    queryOptionsHash(opts),
@@ -73,8 +171,9 @@ func encodeSearchCursorV2(opts queryOptions, ctx contentCursorContext, id uint64
 		Offset:   offset,
 		Name:     ctx.Name,
 		Side:     ctx.Side,
-		Delta:    ctx.Delta,
 		Instance: ctx.Instance,
+		BK:       bk,
+		K:        key,
 	}
 	b, _ := json.Marshal(c)
 	return base64.RawURLEncoding.EncodeToString(b)
@@ -128,8 +227,6 @@ func (c *searchCursorV2) check(ctx contentCursorContext) (bool, string) {
 		return false, "name index changed"
 	case c.Side != ctx.Side:
 		return false, "content index changed"
-	case c.Delta != ctx.Delta:
-		return false, "content delta changed"
 	case c.Instance != ctx.Instance:
 		return false, "service instance changed"
 	}
@@ -158,8 +255,9 @@ func (s *contentVolumeState) cursorSideIdentity() (searchCursorSide, bool) {
 
 // contentCursorContextFor captures the eligible v2 cursor identity for one
 // content request. It refuses every shape outside the v2 scope: more than one
-// volume, relevance sort, non-content queries, and any content delta or
-// filename overlay state.
+// volume, relevance sort, and non-content queries. A populated filename
+// overlay and content delta stay in scope: the resume re-evaluates both on
+// every page (see overlayRankedMatches) instead of restarting.
 func (s *goSearchService) contentCursorContextFor(pq parsedQuery, opts queryOptions) (*contentCursorContext, bool) {
 	if s == nil || len(s.volumes) != 1 || len(s.indexes) != len(s.volumes) {
 		return nil, false
@@ -174,12 +272,6 @@ func (s *goSearchService) contentCursorContextFor(pq parsedQuery, opts queryOpti
 	if !vol.contentUsableForQuery() {
 		return nil, false
 	}
-	if delta := vol.content.deltaView(); delta != nil && delta.len() > 0 {
-		return nil, false
-	}
-	if snap := vol.snap.Load(); snap != nil && len(snap.records) > 0 {
-		return nil, false
-	}
 	side, ok := vol.content.cursorSideIdentity()
 	if !ok {
 		return nil, false
@@ -187,13 +279,11 @@ func (s *goSearchService) contentCursorContextFor(pq parsedQuery, opts queryOpti
 	return &contentCursorContext{
 		Volume: contentVolumeName(vol),
 		Name: searchCursorName{
-			JournalID:   vol.journalID,
-			Checkpoint:  vol.baseCheckpoint,
-			Records:     vol.index.compactRecordCount(),
-			SnapshotGen: vol.snapshotGen.Load(),
+			JournalID:  vol.journalID,
+			Checkpoint: vol.baseCheckpoint,
+			Records:    vol.index.compactRecordCount(),
 		},
 		Side:     side,
-		Delta:    vol.content.deltaGen.Load(),
 		Instance: contentCursorInstanceID,
 	}, true
 }
@@ -203,6 +293,13 @@ func (s *goSearchService) contentCursorContextFor(pq parsedQuery, opts queryOpti
 // start at zero (restart) and reports Found=false through the shared state.
 func (vol *serviceVolumeIndex) contentAfterCandidateStart(ids []int, resume *contentCursorResume) int {
 	if resume == nil {
+		return 0
+	}
+	if resume.FRN == 0 {
+		// No base row has been emitted yet: the base side starts at the
+		// beginning. Still report Found so a valid resume is not mistaken
+		// for a missing record.
+		resume.Found = true
 		return 0
 	}
 	for i, id := range ids {
@@ -217,6 +314,10 @@ func (vol *serviceVolumeIndex) contentAfterCandidateStart(ids []int, resume *con
 // contentAfterScanStart is contentAfterCandidateStart for a compact scan order.
 func (vol *serviceVolumeIndex) contentAfterScanStart(order []uint32, recordCount int, resume *contentCursorResume) int {
 	if resume == nil {
+		return 0
+	}
+	if resume.FRN == 0 {
+		resume.Found = true
 		return 0
 	}
 	for pos := 0; pos < compactUint32OrderLen(order, recordCount); pos++ {

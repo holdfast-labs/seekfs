@@ -128,14 +128,23 @@ func entryPaths(entries []Entry) []string {
 }
 
 func TestContentCursorV2RestartsOnMutation(t *testing.T) {
-	t.Run("delta", func(t *testing.T) {
+	t.Run("delta does not restart", func(t *testing.T) {
 		vol, s := contentCursorSearchVolume(t, []contentFixtureFile{
 			{2, "a.txt", "needle"}, {3, "b.txt", "needle"}, {4, "c.txt", "needle"}, {5, "d.txt", "needle"},
 		})
 		one := callTestServiceCommand(t, s, serviceRequest{Command: "search", Query: "content:needle", Limit: 2})
+		full := contentCursorFull(t, s, "content:needle")
 		vol.content.deltaView().upsert(contentDeltaDoc{FRN: 99, Path: `C:\new.txt`, Text: []byte("needle")})
 		two := callTestServiceCommand(t, s, serviceRequest{Command: "search", Query: "content:needle", Limit: 2, Cursor: one.NextCursor})
-		assertCursorRestart(t, two, one)
+		if !two.OK {
+			t.Fatalf("resumed page failed: %s", two.Message)
+		}
+		if two.CursorRestarted {
+			t.Fatalf("content delta restarted the cursor: %s", two.CursorRestartReason)
+		}
+		if !reflect.DeepEqual(two.Results, full[2:]) {
+			t.Fatalf("resumed page %v != static continuation %v", two.Results, full[2:])
+		}
 	})
 	t.Run("name", func(t *testing.T) {
 		vol, s := contentCursorSearchVolume(t, []contentFixtureFile{
@@ -179,11 +188,6 @@ func TestContentCursorV2OutOfScopeStaysV1(t *testing.T) {
 	// Relevance: v1.
 	_, sRelevance := contentCursorSearchVolume(t, files)
 	assertV1Paging(t, sRelevance, "content:needle sort:relevance")
-
-	// Non-empty content delta: v1.
-	volDelta, sDelta := contentCursorSearchVolume(t, files)
-	volDelta.content.deltaView().upsert(contentDeltaDoc{FRN: 2, Path: `C:\a.txt`, Text: []byte("needle fresh")})
-	assertV1Paging(t, sDelta, "content:needle")
 }
 
 func assertV1Paging(t *testing.T, s *goSearchService, query string) {
@@ -272,6 +276,330 @@ func TestContentCursorV2ValveCappedPagesResumeWithoutGaps(t *testing.T) {
 	}
 	if len(got) != files {
 		t.Fatalf("paged rows=%d; want all %d (each v2 resume prices one page)", len(got), files)
+	}
+	for i, e := range full {
+		if got[i] != e.Path {
+			t.Fatalf("row %d = %q; want %q (pages must concatenate to the uncapped order)", i, got[i], e.Path)
+		}
+	}
+}
+
+func contentCursorPagesNoRestart(t *testing.T, s *goSearchService, query string, limit int) ([]string, []string) {
+	t.Helper()
+	var paths []string
+	var cursors []string
+	cursor := ""
+	for page := 0; page < 64; page++ {
+		r := callTestServiceCommand(t, s, serviceRequest{Command: "search", Query: query, Limit: limit, Cursor: cursor})
+		if !r.OK {
+			t.Fatalf("%s page %d: %s", query, page, r.Message)
+		}
+		if r.CursorRestarted {
+			t.Fatalf("%s page %d restarted: %s", query, page, r.CursorRestartReason)
+		}
+		paths = append(paths, r.Results...)
+		if r.NextCursor == "" {
+			return paths, cursors
+		}
+		cursors = append(cursors, r.NextCursor)
+		cursor = r.NextCursor
+	}
+	t.Fatalf("%s did not terminate", query)
+	return nil, nil
+}
+
+func assertCursorPagesV2(t *testing.T, query string, limit int, cursors []string) {
+	t.Helper()
+	if len(cursors) == 0 {
+		t.Fatal("no v2 cursor emitted")
+	}
+	for _, token := range cursors {
+		if _, v2, err := decodeAnySearchCursor(token, queryOptions{Query: query, Limit: limit}); err != nil || v2 == nil {
+			t.Fatalf("cursor %q is not v2: v2=%v err=%v", token, v2, err)
+		}
+	}
+}
+
+func assertNoDuplicatePaths(t *testing.T, paths []string) {
+	t.Helper()
+	seen := make(map[string]struct{}, len(paths))
+	for _, path := range paths {
+		if _, ok := seen[path]; ok {
+			t.Fatalf("duplicate path %q in %v", path, paths)
+		}
+		seen[path] = struct{}{}
+	}
+}
+
+func addCursorOverlayCreate(t *testing.T, vol *serviceVolumeIndex, frn uint64, name string) {
+	t.Helper()
+	addCursorOverlayCreateText(t, vol, frn, name, "needle")
+}
+
+func addCursorOverlayCreateText(t *testing.T, vol *serviceVolumeIndex, frn uint64, name, text string) {
+	t.Helper()
+	vol.applyUSNChanges([]usnChange{{
+		FRN: frn, ParentFRN: 1, USN: int64(frn), Reason: usnReasonFileCreate, Name: name,
+	}})
+	vol.content.deltaView().upsert(contentDeltaDoc{FRN: frn, Text: []byte(text)})
+}
+
+func addCursorOverlayRename(t *testing.T, vol *serviceVolumeIndex, frn uint64, name string) {
+	t.Helper()
+	vol.applyUSNChanges([]usnChange{{
+		FRN: frn, ParentFRN: 1, USN: int64(frn) + 1_000_000, Reason: usnReasonRenameNew, Name: name,
+	}})
+	vol.content.deltaView().upsert(contentDeltaDoc{FRN: frn, Text: []byte("needle")})
+}
+
+// TestContentCursorV2OverlayPagesMatchFull pages a content query on a volume
+// with a populated name overlay (creates and renames interleaving by name).
+// The concatenated pages must equal one big page, with no duplicate paths, all
+// v2 cursors, and no restart.
+func TestContentCursorV2OverlayPagesMatchFull(t *testing.T) {
+	vol, s := contentCursorSearchVolume(t, []contentFixtureFile{
+		{10, "m10.txt", "needle"},
+		{30, "m30.txt", "needle"},
+		{50, "m50.txt", "needle"},
+		{70, "m70.txt", "needle"},
+		{90, "m90.txt", "needle"},
+		{110, "m110.txt", "needle"},
+	})
+	addCursorOverlayCreate(t, vol, 999, "m20.txt")
+	addCursorOverlayCreate(t, vol, 998, "m60.txt")
+	addCursorOverlayRename(t, vol, 30, "m35.txt")
+	addCursorOverlayRename(t, vol, 70, "m75.txt")
+
+	const query = "content:needle"
+	paged, cursors := contentCursorPagesNoRestart(t, s, query, 2)
+	full := contentCursorFull(t, s, query)
+	if !reflect.DeepEqual(paged, full) {
+		t.Fatalf("paged %v != full %v", paged, full)
+	}
+	assertNoDuplicatePaths(t, paged)
+	assertCursorPagesV2(t, query, 2, cursors)
+}
+
+// TestContentCursorV2OverlaySymbolPromotion pages a symbol query with a
+// matching overlay row. Symbol-named rows stay ahead across page boundaries.
+func TestContentCursorV2OverlaySymbolPromotion(t *testing.T) {
+	vol, s := contentCursorSearchVolume(t, []contentFixtureFile{
+		{2, "Foo.go", "Foo definition"},
+		{3, "foo.h", "Foo header"},
+		{4, "alpha.txt", "Foo alpha"},
+		{5, "beta.txt", "Foo beta"},
+	})
+	addCursorOverlayCreateText(t, vol, 999, "foo.cc", "Foo definition")
+
+	const query = "content:Foo"
+	paged, cursors := contentCursorPagesNoRestart(t, s, query, 2)
+	full := contentCursorFull(t, s, query)
+	if !reflect.DeepEqual(paged, full) {
+		t.Fatalf("paged %v != full %v", paged, full)
+	}
+	assertNoDuplicatePaths(t, paged)
+	assertCursorPagesV2(t, query, 2, cursors)
+	if len(full) < 3 {
+		t.Fatalf("full result = %v", full)
+	}
+	for i := 0; i < 3; i++ {
+		name := filepath.Base(full[i])
+		if !strings.EqualFold(name, "foo.h") && !strings.EqualFold(name, "foo.go") && !strings.EqualFold(name, "foo.cc") {
+			t.Fatalf("symbol rows not promoted across pages: %v", full)
+		}
+	}
+}
+
+// TestContentCursorV2UnrelatedOverlayPublishKeepsPages publishes a
+// non-matching overlay record between pages. It must not restart or change the
+// page sequence.
+func TestContentCursorV2UnrelatedOverlayPublishKeepsPages(t *testing.T) {
+	vol, s := contentCursorSearchVolume(t, []contentFixtureFile{
+		{10, "m10.txt", "needle"},
+		{30, "m30.txt", "needle"},
+		{50, "m50.txt", "needle"},
+		{70, "m70.txt", "needle"},
+		{90, "m90.txt", "needle"},
+	})
+	addCursorOverlayCreate(t, vol, 999, "m20.txt")
+
+	const query = "content:needle"
+	var paged []string
+	var cursors []string
+	cursor := ""
+	for page := 0; page < 16; page++ {
+		r := callTestServiceCommand(t, s, serviceRequest{Command: "search", Query: query, Limit: 2, Cursor: cursor})
+		if !r.OK {
+			t.Fatalf("page %d: %s", page, r.Message)
+		}
+		if r.CursorRestarted {
+			t.Fatalf("page %d restarted: %s", page, r.CursorRestartReason)
+		}
+		paged = append(paged, r.Results...)
+		if page == 0 {
+			vol.applyUSNChanges([]usnChange{{
+				FRN: 1000, ParentFRN: 1, USN: 2000, Reason: usnReasonFileCreate, Name: "zzz.log",
+			}})
+		}
+		if r.NextCursor == "" {
+			break
+		}
+		cursors = append(cursors, r.NextCursor)
+		cursor = r.NextCursor
+	}
+	full := contentCursorFull(t, s, query)
+	if !reflect.DeepEqual(paged, full) {
+		t.Fatalf("paged %v != static full %v", paged, full)
+	}
+	assertNoDuplicatePaths(t, paged)
+	assertCursorPagesV2(t, query, 2, cursors)
+}
+
+// TestContentCursorV2OverlayRowBeforeCursorIsSkipped adds a matching overlay
+// row whose key is before the cursor between pages: it is not emitted later and
+// no path duplicates.
+func TestContentCursorV2OverlayRowBeforeCursorIsSkipped(t *testing.T) {
+	vol, s := contentCursorSearchVolume(t, []contentFixtureFile{
+		{10, "m10.txt", "needle"},
+		{30, "m30.txt", "needle"},
+		{50, "m50.txt", "needle"},
+		{70, "m70.txt", "needle"},
+		{90, "m90.txt", "needle"},
+	})
+	addCursorOverlayCreate(t, vol, 999, "m20.txt")
+
+	const query = "content:needle"
+	one := callTestServiceCommand(t, s, serviceRequest{Command: "search", Query: query, Limit: 2})
+	if !one.OK || one.NextCursor == "" {
+		t.Fatalf("first page: %+v", one)
+	}
+	addCursorOverlayCreate(t, vol, 997, "m15.txt")
+	paged := append([]string(nil), one.Results...)
+	cursors := []string{one.NextCursor}
+	cursor := one.NextCursor
+	for page := 0; page < 16; page++ {
+		r := callTestServiceCommand(t, s, serviceRequest{Command: "search", Query: query, Limit: 2, Cursor: cursor})
+		if !r.OK {
+			t.Fatalf("page %d: %s", page, r.Message)
+		}
+		if r.CursorRestarted {
+			t.Fatalf("page %d restarted: %s", page, r.CursorRestartReason)
+		}
+		paged = append(paged, r.Results...)
+		if r.NextCursor == "" {
+			break
+		}
+		cursors = append(cursors, r.NextCursor)
+		cursor = r.NextCursor
+	}
+	for _, path := range paged {
+		if filepath.Base(path) == "m15.txt" {
+			t.Fatalf("overlay row before the cursor was emitted: %v", paged)
+		}
+	}
+	assertNoDuplicatePaths(t, paged)
+	assertCursorPagesV2(t, query, 2, cursors)
+}
+
+// TestContentCursorV2OverlayRowAfterCursorEmittedOnce adds a matching overlay
+// row whose key is after the cursor between pages: it is emitted exactly once.
+func TestContentCursorV2OverlayRowAfterCursorEmittedOnce(t *testing.T) {
+	vol, s := contentCursorSearchVolume(t, []contentFixtureFile{
+		{10, "m10.txt", "needle"},
+		{30, "m30.txt", "needle"},
+		{50, "m50.txt", "needle"},
+		{70, "m70.txt", "needle"},
+		{90, "m90.txt", "needle"},
+	})
+	addCursorOverlayCreate(t, vol, 999, "m20.txt")
+
+	const query = "content:needle"
+	one := callTestServiceCommand(t, s, serviceRequest{Command: "search", Query: query, Limit: 2})
+	if !one.OK || one.NextCursor == "" {
+		t.Fatalf("first page: %+v", one)
+	}
+	addCursorOverlayCreate(t, vol, 996, "m25.txt")
+	paged := append([]string(nil), one.Results...)
+	cursors := []string{one.NextCursor}
+	cursor := one.NextCursor
+	for page := 0; page < 16; page++ {
+		r := callTestServiceCommand(t, s, serviceRequest{Command: "search", Query: query, Limit: 2, Cursor: cursor})
+		if !r.OK {
+			t.Fatalf("page %d: %s", page, r.Message)
+		}
+		if r.CursorRestarted {
+			t.Fatalf("page %d restarted: %s", page, r.CursorRestartReason)
+		}
+		paged = append(paged, r.Results...)
+		if r.NextCursor == "" {
+			break
+		}
+		cursors = append(cursors, r.NextCursor)
+		cursor = r.NextCursor
+	}
+	count := 0
+	for _, path := range paged {
+		if filepath.Base(path) == "m25.txt" {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Fatalf("overlay row after the cursor emitted %d times; want 1 (%v)", count, paged)
+	}
+	assertNoDuplicatePaths(t, paged)
+	assertCursorPagesV2(t, query, 2, cursors)
+}
+
+// TestContentCursorV2ValveCappedOverlayPagesResumeWithoutGaps is the valve test
+// with overlay hits: pages must concatenate to the uncapped merged order.
+func TestContentCursorV2ValveCappedOverlayPagesResumeWithoutGaps(t *testing.T) {
+	const files = 400
+	const valve = 150
+	vol := contentFilterV11Fixture(t, matchingBodies(files))
+	addContentOverlay(t, vol, 900001, "f0000z.txt")
+	addContentOverlay(t, vol, 900002, "f0150z.txt")
+	addContentOverlay(t, vol, 900003, "f0300z.txt")
+	const overlays = 3
+	prevMS, prevValve := contentDefaultBudgetMS, contentDiskVerifyBudget
+	contentDefaultBudgetMS = 0
+	contentDiskVerifyBudget = valve
+	pinContentDiskVerifyPageScale(t, 1)
+	t.Cleanup(func() {
+		contentDefaultBudgetMS = prevMS
+		contentDiskVerifyBudget = prevValve
+	})
+
+	full, err := searchServiceVolumes([]*serviceVolumeIndex{vol},
+		queryOptions{Query: "content:needle", Limit: files + overlays, Trace: &searchTrace{}, ContentDiskVerifyBudget: 2 * files}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(full) != files+overlays {
+		t.Fatalf("uncapped hits=%d; want %d", len(full), files+overlays)
+	}
+
+	s := &goSearchService{volumes: []*serviceVolumeIndex{vol}, indexes: []*Index{vol.index}}
+	var got []string
+	cursor := ""
+	for page := 0; page < 16; page++ {
+		resp := callTestServiceCommand(t, s, serviceRequest{Command: "search", Query: "content:needle", Limit: 100, Cursor: cursor})
+		if !resp.OK {
+			t.Fatalf("page %d: %s", page, resp.Message)
+		}
+		if resp.CursorRestarted {
+			t.Fatalf("page %d restarted: %s", page, resp.CursorRestartReason)
+		}
+		got = append(got, resp.Results...)
+		if resp.NextCursor == "" {
+			break
+		}
+		if page > 0 && !strings.HasPrefix(resp.NextCursor, "eyJ2IjoyL") {
+			t.Fatalf("page %d emitted a non-v2 cursor", page)
+		}
+		cursor = resp.NextCursor
+	}
+	if len(got) != files+overlays {
+		t.Fatalf("paged rows=%d; want all %d", len(got), files+overlays)
 	}
 	for i, e := range full {
 		if got[i] != e.Path {

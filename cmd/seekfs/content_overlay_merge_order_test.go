@@ -3,6 +3,8 @@ package main
 import (
 	"path/filepath"
 	"reflect"
+	"sort"
+	"strings"
 	"testing"
 )
 
@@ -125,5 +127,90 @@ func TestContentOverlayFrontierInsidePromotedGroup(t *testing.T) {
 	}
 	if !isNamePrefix(got, full) {
 		t.Fatalf("capped page = %v; want a prefix of %v", got, full)
+	}
+}
+
+// TestContentCursorKeyReproducesMergedPageOrder derives the cursor page key
+// independently, sorts the pre-merge rows by it, and checks the result is
+// exactly the order mergeContentOverlayMatches emits.
+func TestContentCursorKeyReproducesMergedPageOrder(t *testing.T) {
+	t.Run("plain", func(t *testing.T) {
+		vol, _ := contentCursorSearchVolume(t, []contentFixtureFile{
+			{10, "m10.txt", "needle"},
+			{30, "m30.txt", "needle"},
+			{50, "m50.txt", "needle"},
+			{70, "m70.txt", "needle"},
+		})
+		addContentOverlay(t, vol, 999, "m20.txt")
+		addContentOverlay(t, vol, 998, "m60.txt")
+		assertCursorKeyOrder(t, vol, "content:needle", []contentFixtureFile{
+			{10, "m10.txt", "needle"},
+			{30, "m30.txt", "needle"},
+			{50, "m50.txt", "needle"},
+			{70, "m70.txt", "needle"},
+		})
+	})
+	t.Run("symbol", func(t *testing.T) {
+		files := []contentFixtureFile{
+			{2, "Foo.go", "Foo definition"},
+			{3, "foo.h", "Foo header"},
+			{4, "alpha.txt", "Foo alpha"},
+			{5, "beta.txt", "Foo beta"},
+		}
+		vol, _ := contentCursorSearchVolume(t, files)
+		addContentOverlay(t, vol, 999, "foo.cc")
+		vol.content.deltaView().upsert(contentDeltaDoc{FRN: 999, Text: []byte("Foo")})
+		assertCursorKeyOrder(t, vol, "content:Foo", files)
+	})
+}
+
+func assertCursorKeyOrder(t *testing.T, vol *serviceVolumeIndex, query string, files []contentFixtureFile) {
+	t.Helper()
+	pq, err := parseQuery(queryOptions{Query: query, Limit: 100})
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := make([]Entry, len(files))
+	for i, f := range files {
+		path := `C:\` + f.name
+		base[i] = Entry{
+			Path:      path,
+			Name:      f.name,
+			LowerPath: strings.ToLower(path),
+			LowerName: strings.ToLower(f.name),
+			FRN:       f.frn,
+		}
+	}
+	sort.SliceStable(base, func(i, j int) bool {
+		a, b := vol.contentCursorBaseKey(base[i], pq), vol.contentCursorBaseKey(base[j], pq)
+		if n := a.compare(b); n != 0 {
+			return n < 0
+		}
+		return base[i].FRN < base[j].FRN
+	})
+	overlay := vol.overlayRankedMatches(vol.snap.Load(), pq, map[int]string{})
+	merged := vol.mergeContentOverlayMatches(append([]Entry(nil), base...), overlay, pq, nil)
+
+	type row struct {
+		entry Entry
+		key   contentCursorKey
+	}
+	rows := make([]row, 0, len(base)+len(overlay))
+	for _, entry := range base {
+		rows = append(rows, row{entry: entry, key: vol.contentCursorBaseKey(entry, pq)})
+	}
+	for _, item := range overlay {
+		rows = append(rows, row{entry: item.entry, key: vol.contentCursorOverlayKey(item, pq)})
+	}
+	sort.SliceStable(rows, func(i, j int) bool {
+		return rows[i].key.compare(rows[j].key) < 0
+	})
+	if len(merged) != len(rows) {
+		t.Fatalf("merged rows = %d; key rows = %d", len(merged), len(rows))
+	}
+	for i := range merged {
+		if merged[i].Path != rows[i].entry.Path {
+			t.Fatalf("row %d = %q; key order = %q (merged %v)", i, merged[i].Path, rows[i].entry.Path, contentCursorBaseNames(entryPaths(merged)))
+		}
 	}
 }
