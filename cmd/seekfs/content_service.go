@@ -23,6 +23,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -304,6 +305,15 @@ type contentDelta struct {
 	byFRN         map[uint64]int
 	liveDocCount  int
 	liveTextBytes int64
+	// gen is the owning volume's delta generation counter. Nil for standalone
+	// deltas (tests), where mutation bumps are not observable.
+	gen *atomic.Uint64
+}
+
+func (d *contentDelta) bumpGen() {
+	if d != nil && d.gen != nil {
+		d.gen.Add(1)
+	}
 }
 
 func newContentDelta() *contentDelta {
@@ -313,6 +323,7 @@ func newContentDelta() *contentDelta {
 func (d *contentDelta) upsert(doc contentDeltaDoc) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	defer d.bumpGen()
 	doc.Deleted = false
 	if i, ok := d.byFRN[doc.FRN]; ok {
 		old := &d.docs[i]
@@ -339,6 +350,7 @@ func (d *contentDelta) upsert(doc contentDeltaDoc) {
 func (d *contentDelta) delete(frn uint64) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	defer d.bumpGen()
 	if i, ok := d.byFRN[frn]; ok {
 		if !d.docs[i].Deleted {
 			d.liveDocCount--
@@ -392,6 +404,7 @@ func (d *contentDelta) rescind(frn uint64) bool {
 	if !ok || !d.docs[i].Deleted {
 		return false
 	}
+	defer d.bumpGen()
 	d.docs = append(d.docs[:i], d.docs[i+1:]...)
 	d.byFRN = make(map[uint64]int, len(d.docs))
 	for j := range d.docs {
@@ -488,6 +501,7 @@ func (d *contentDelta) removeUnchanged(snapshot []contentDeltaDoc) {
 	if len(snapshot) == 0 {
 		return
 	}
+	defer d.bumpGen()
 	folded := make(map[uint64]contentDeltaDoc, len(snapshot))
 	for _, s := range snapshot {
 		folded[s.FRN] = s
@@ -597,6 +611,10 @@ type contentVolumeState struct {
 	// reason, so service.log gets the first 20 of each and no more. In-memory
 	// only; a restart re-arms the diagnostic sample.
 	extractErrLog map[string]int
+	// deltaGen advances on every content-delta mutation (upsert, delete,
+	// removeUnchanged, rescind) and on delta replacement, so a v2 content
+	// cursor can reject a page sequence whose delta changed.
+	deltaGen atomic.Uint64
 }
 
 // walkDeclinedNote records that key extracted to nothing at print. A later
@@ -656,12 +674,14 @@ func newContentVolumeState(volume string) *contentVolumeState {
 		state = contentStateUnavailable
 		health.State = contentStateUnavailable
 	}
-	return &contentVolumeState{
+	statePtr := &contentVolumeState{
 		volume: volume,
 		delta:  newContentDelta(),
 		state:  state,
 		health: health,
 	}
+	statePtr.delta.gen = &statePtr.deltaGen
+	return statePtr
 }
 
 // contentStateSeverity orders content health states from best to worst so a
@@ -1038,6 +1058,8 @@ func (s *contentVolumeState) markIntegrityFailed(expect *contentIndex, reason st
 	s.reader = nil
 	s.resolver = nil
 	s.delta = newContentDelta()
+	s.delta.gen = &s.deltaGen
+	s.deltaGen.Add(1)
 	s.catchUpPending = false
 	s.catchUpFailed = false
 	s.refreshActive = false
@@ -1081,6 +1103,8 @@ func (s *contentVolumeState) markStale(reason string) {
 	s.reader = nil
 	s.resolver = nil
 	s.delta = newContentDelta()
+	s.delta.gen = &s.deltaGen
+	s.deltaGen.Add(1)
 	s.catchUpPending = false
 	s.catchUpFailed = false
 	s.refreshActive = false

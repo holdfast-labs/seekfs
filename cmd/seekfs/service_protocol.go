@@ -94,6 +94,11 @@ type serviceResponse struct {
 	// with "cannot see user activity" (notably input in session 0).
 	Governor   *governorHealth `json:"governor,omitempty"`
 	NextCursor string          `json:"next_cursor,omitempty"`
+	// CursorRestarted reports that a content cursor v2 could not resume
+	// (identity change, missing record, or delta change) and the request
+	// answered from offset zero instead. CursorRestartReason names why.
+	CursorRestarted     bool   `json:"cursor_restarted,omitempty"`
+	CursorRestartReason string `json:"cursor_restart_reason,omitempty"`
 }
 
 // redactContentText clears local-only matched content text (snippets) from the

@@ -257,6 +257,8 @@ type jsonSearchResponse struct {
 	Results                  []jsonResult   `json:"results,omitempty"`
 	BudgetExceeded           bool           `json:"budget_exceeded,omitempty"`
 	NextCursor               string         `json:"next_cursor,omitempty"`
+	CursorRestarted          bool           `json:"cursor_restarted,omitempty"`
+	CursorRestartReason      string         `json:"cursor_restart_reason,omitempty"`
 }
 
 type jsonInfoResponse struct {
@@ -581,6 +583,19 @@ type queryOptions struct {
 	lineBudgetDeadline      time.Time
 	lineDiskVerifyRemaining *int
 	Cursor                  string `json:"cursor,omitempty"`
+	// contentAfter is the v2 content cursor resume state. Local-only; nil on
+	// every normal request.
+	contentAfter *contentCursorResume
+}
+
+// contentCursorResume carries a v2 cursor's last emitted record and the
+// per-search flag that reports whether that record was found in the rebuilt
+// candidate order. skip is the scan position the bounded candidate path starts
+// from (set while rebuilding).
+type contentCursorResume struct {
+	FRN   uint64
+	Found bool
+	skip  int
 }
 
 // contentCompletenessProbe carries the reduced default-order path's
@@ -706,6 +721,9 @@ type parsedQuery struct {
 	// early-stop guard drops exactly the records the caller's verify loop drops
 	// instead of re-reading the volume snapshot and racing a republish.
 	hidden hiddenBaseIDs
+	// contentAfter mirrors queryOptions.contentAfter: the v2 cursor resume
+	// state. Local-only; nil on every normal request.
+	contentAfter *contentCursorResume
 }
 
 // contentCandidateMeta is the per-search-call channel a candidate source uses to

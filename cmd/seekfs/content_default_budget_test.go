@@ -263,7 +263,11 @@ func TestContentTruncatedPageResumesWithoutGaps(t *testing.T) {
 	if !page1.OK || len(page1.Results) != 100 || page1.NextCursor == "" {
 		t.Fatalf("page1 = %+v; want 100 hits and a next cursor", page1)
 	}
-	page2 := callTestServiceCommand(t, s, serviceRequest{Command: "search", Query: "content:needle", Limit: 100, Cursor: page1.NextCursor})
+	// This test pins the v1 offset cursor's truncated-tail semantics: page 2
+	// re-walks from the start with offset+limit, so the valve cuts it short.
+	// page1 emits a v2 content cursor now, so build an explicit v1 token.
+	v1Cursor := encodeSearchCursor(queryOptions{Query: "content:needle", Limit: 100}, 100)
+	page2 := callTestServiceCommand(t, s, serviceRequest{Command: "search", Query: "content:needle", Limit: 100, Cursor: v1Cursor})
 	if !page2.OK || len(page2.Results) != valve-100 {
 		t.Fatalf("page2 hits=%d; want the %d remaining rows before the valve", len(page2.Results), valve-100)
 	}

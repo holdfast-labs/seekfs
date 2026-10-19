@@ -393,9 +393,10 @@ func (s *goSearchService) serviceCommandSearch(w io.Writer, caps serviceCapabili
 	}
 	opts := requestToOptionsFromService(*req)
 	cursorOffset := 0
+	var v2Cursor *searchCursorV2
 	if req.Cursor != "" {
 		var cursorErr error
-		cursorOffset, cursorErr = decodeSearchCursor(req.Cursor, opts)
+		cursorOffset, v2Cursor, cursorErr = decodeAnySearchCursor(req.Cursor, opts)
 		if cursorErr != nil {
 			s.indexMu.RUnlock()
 			_ = json.NewEncoder(w).Encode(serviceResponse{OK: false, Message: cursorErr.Error()})
@@ -403,7 +404,7 @@ func (s *goSearchService) serviceCommandSearch(w io.Writer, caps serviceCapabili
 		}
 	}
 	pageLimit := normalizedLimit(opts.Limit, false)
-	if req.Cursor != "" && !req.CountOnly {
+	if req.Cursor != "" && !req.CountOnly && v2Cursor == nil {
 		opts.Limit = cursorOffset + pageLimit
 	}
 	// Start an explicitly requested wall-clock budget once for the complete
@@ -444,6 +445,34 @@ func (s *goSearchService) serviceCommandSearch(w io.Writer, caps serviceCapabili
 	if req.CancelOverride != nil {
 		opts.Cancel = req.CancelOverride
 	}
+	// Resolve a content cursor v2 against the current volume identity before
+	// the search. An identity mismatch restarts at offset zero; the search
+	// below then returns the first page again. A match resumes after the last
+	// emitted record and prices the disk budget at one page.
+	v2Resume := false
+	v2Restarted := false
+	v2RestartReason := ""
+	var cursorCtx *contentCursorContext
+	if !req.CountOnly {
+		if pq, parseErr := parseQuery(opts); parseErr == nil {
+			if ctx, ok := s.contentCursorContextFor(pq, opts); ok {
+				cursorCtx = ctx
+				if v2Cursor != nil {
+					if ok, reason := v2Cursor.check(*ctx); ok {
+						v2Resume = true
+						opts.contentAfter = &contentCursorResume{FRN: v2Cursor.ID}
+						opts.Limit = pageLimit
+					} else {
+						v2Restarted = true
+						v2RestartReason = reason
+					}
+				}
+			} else if v2Cursor != nil {
+				v2Restarted = true
+				v2RestartReason = "content cursor no longer applies"
+			}
+		}
+	}
 	var matches []Entry
 	var err error
 	var fuzzyApplied bool
@@ -477,10 +506,11 @@ func (s *goSearchService) serviceCommandSearch(w io.Writer, caps serviceCapabili
 		}
 		matches, err = searchServiceVolumes(volumes, opts, req.CountOnly)
 		fuzzied := false
-		if err == nil && !req.CountOnly {
+		if err == nil && !req.CountOnly && v2Cursor == nil {
 			// Fuzzy only runs when the exact tier underfilled the limit,
 			// and must stay under the read lock: it reads compact records
-			// that a background persist may unmap.
+			// that a background persist may unmap. A v2 content cursor
+			// never mixes fuzzy rows into a page: its resumption is exact.
 			if limit := normalizedLimit(opts.Limit, false); len(matches) < limit {
 				if handled := tryMultiTermFuzzyRewrite(volumes, &opts, &matches, &fuzzied); !handled {
 					if contentMatches, correction, ok := tryContentFuzzyRewrite(volumes, opts, matches); ok {
@@ -509,6 +539,20 @@ func (s *goSearchService) serviceCommandSearch(w io.Writer, caps serviceCapabili
 		_ = json.NewEncoder(w).Encode(serviceResponse{OK: false, Message: err.Error()})
 		return
 	}
+	if v2Resume && opts.contentAfter != nil && !opts.contentAfter.Found {
+		// The identity held but the rebuilt order did not contain the last
+		// emitted record. The search already answered from offset zero, so
+		// report the restart instead of silently skipping a page.
+		v2Resume = false
+		v2Restarted = true
+		v2RestartReason = "content cursor position not found"
+	}
+	rowsBefore := 0
+	if v2Resume && v2Cursor != nil {
+		rowsBefore = v2Cursor.Offset
+	} else if v2Cursor == nil && req.Cursor != "" {
+		rowsBefore = cursorOffset
+	}
 	if req.Cursor != "" && !req.CountOnly {
 		if cursorOffset >= len(matches) {
 			matches = nil
@@ -531,8 +575,25 @@ func (s *goSearchService) serviceCommandSearch(w io.Writer, caps serviceCapabili
 	remaining := max(0, trace.DiskVerifyBudget-trace.DiskVerified)
 	resp.ContentDiskVerifyRemaining = &remaining
 	if !req.CountOnly && len(matches) == pageLimit {
-		resp.NextCursor = encodeSearchCursor(requestToOptionsFromService(*req), cursorOffset+pageLimit)
+		emitted := rowsBefore + len(matches)
+		v2Token := ""
+		if cursorCtx != nil && !fuzzyApplied && len(matches) > 0 {
+			if pq, parseErr := parseQuery(opts); parseErr == nil {
+				if now, ok := s.contentCursorContextFor(pq, opts); ok && *now == *cursorCtx {
+					if lastID := matches[len(matches)-1].FRN; lastID != 0 {
+						v2Token = encodeSearchCursorV2(opts, *cursorCtx, lastID, emitted)
+					}
+				}
+			}
+		}
+		if v2Token != "" {
+			resp.NextCursor = v2Token
+		} else {
+			resp.NextCursor = encodeSearchCursor(requestToOptionsFromService(*req), emitted)
+		}
 	}
+	resp.CursorRestarted = v2Restarted
+	resp.CursorRestartReason = v2RestartReason
 	if !req.CountOnly {
 		resp.Results = make([]string, len(matches))
 		for i, entry := range matches {
@@ -981,6 +1042,13 @@ func searchService(pipeName string, opts queryOptions, countOnly bool, jsonOut b
 	if !resp.OK {
 		return serviceResponseError(resp)
 	}
+	if resp.CursorRestarted {
+		reason := resp.CursorRestartReason
+		if reason == "" {
+			reason = "cursor no longer valid"
+		}
+		fmt.Fprintf(os.Stderr, "warning: cursor restarted at the first page (%s)\n", reason)
+	}
 	if resp.ContentDiskVerifyRemaining != nil {
 		opts.lineBudgetMetadata = true
 		opts.lineDiskVerifyRemaining = resp.ContentDiskVerifyRemaining
@@ -1066,6 +1134,8 @@ func newJSONSearchResponse(resp serviceResponse, opts queryOptions, countOnly bo
 		Content:                  resp.Content,
 		BudgetExceeded:           resp.BudgetExceeded,
 		NextCursor:               resp.NextCursor,
+		CursorRestarted:          resp.CursorRestarted,
+		CursorRestartReason:      resp.CursorRestartReason,
 	}
 	if !countOnly {
 		if len(resp.Rows) > 0 {
