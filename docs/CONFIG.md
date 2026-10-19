@@ -119,6 +119,14 @@ Use `seekfs config` so agents and users do not need to locate the file manually:
 .\seekfs.exe config get dbs
 ```
 
+## Desktop app settings
+
+The desktop app reads and changes the service's volume and content settings
+over the service pipe (CLI: `seekfs settings get`, `seekfs settings set --json
+<file>`). The same `seekfs.toml` and `plugin.toml` files are used, and changes
+apply live. See [SETTINGS_API.md](SETTINGS_API.md) for the request and response
+contract.
+
 ## Build tuning (name trigrams)
 
 Index builds are bounded and parallel by default. These environment variables

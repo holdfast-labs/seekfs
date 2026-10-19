@@ -97,8 +97,9 @@ type serviceResponse struct {
 	// CursorRestarted reports that a content cursor v2 could not resume
 	// (identity change, missing record, or delta change) and the request
 	// answered from offset zero instead. CursorRestartReason names why.
-	CursorRestarted     bool   `json:"cursor_restarted,omitempty"`
-	CursorRestartReason string `json:"cursor_restart_reason,omitempty"`
+	CursorRestarted     bool             `json:"cursor_restarted,omitempty"`
+	CursorRestartReason string           `json:"cursor_restart_reason,omitempty"`
+	Settings            *serviceSettings `json:"settings,omitempty"`
 }
 
 // redactContentText clears local-only matched content text (snippets) from the
@@ -442,6 +443,7 @@ type goSearchService struct {
 	// handler and servePrivileged never run the teardown twice.
 	shutdownOnce sync.Once
 	dbs          []string
+	configPath   string
 	indexes      []*Index
 	volumes      []*serviceVolumeIndex
 	loading      bool
@@ -470,16 +472,19 @@ type goSearchService struct {
 	contentLockWarned map[string]bool
 	// contentCfg is the resolved seekfs.toml, used to derive the per-volume
 	// content scope for the service-owned build.
-	contentCfg     appConfig
-	featuresOnce   sync.Once
-	features       atomic.Pointer[serviceFeatures]
-	pluginSettings atomic.Pointer[pluginSettings]
-	pluginUpdateMu sync.Mutex
-	pluginQueueMu  sync.Mutex
-	pluginPending  map[string]pluginDefinition
-	pluginApplying atomic.Bool
-	pluginErrorMu  sync.Mutex
-	pluginError    string
+	contentCfg   appConfig
+	featuresOnce sync.Once
+	features     atomic.Pointer[serviceFeatures]
+	// contentForceRestart makes the next plugin apply restart content even
+	// when the plugin definitions are unchanged (per-volume scope edits).
+	contentForceRestart atomic.Bool
+	pluginSettings      atomic.Pointer[pluginSettings]
+	pluginUpdateMu      sync.Mutex
+	pluginQueueMu       sync.Mutex
+	pluginPending       map[string]pluginDefinition
+	pluginApplying      atomic.Bool
+	pluginErrorMu       sync.Mutex
+	pluginError         string
 }
 
 // signalServiceStop closes the stop channel exactly once.  It is safe to call

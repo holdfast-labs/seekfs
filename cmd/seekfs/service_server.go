@@ -218,7 +218,7 @@ const (
 // callers, and are otherwise denied by default.
 func classifyServiceCommand(command string) serviceCommandClass {
 	switch command {
-	case "search", "info", "status":
+	case "search", "info", "status", "settings-get":
 		return serviceCommandReadOnly
 	case "watch-delta", "plugin-list", "open", "recent", "input-heartbeat":
 		// watch-delta is a read-only local operation but is deferred remotely
@@ -228,7 +228,7 @@ func classifyServiceCommand(command string) serviceCommandClass {
 		// leave the machine. input-heartbeat is the same class: the UI's
 		// session input time, local only, never leaves the machine.
 		return serviceCommandLocalOnly
-	case "index-usn", "plugin-reload":
+	case "index-usn", "plugin-reload", "settings-set":
 		return serviceCommandMutate
 	default:
 		return serviceCommandUnknown
@@ -279,7 +279,9 @@ func serviceCommandAllowed(command string, caps serviceCapabilities) bool {
 func (s *goSearchService) handleServiceCommand(w io.Writer, principal servicePrincipal, caps serviceCapabilities, req *serviceRequest) {
 	if !serviceCommandAllowed(req.Command, caps) {
 		message := "command not permitted for this caller"
-		if classifyServiceCommand(req.Command) == serviceCommandMutate {
+		if req.Command == "settings-set" && !caps.Mutate {
+			message = "settings-set requires an elevated caller"
+		} else if classifyServiceCommand(req.Command) == serviceCommandMutate {
 			message = "this command requires elevation; rerun it from an elevated prompt"
 		}
 		_ = json.NewEncoder(w).Encode(serviceResponse{OK: false, Message: message})
@@ -304,6 +306,10 @@ func (s *goSearchService) handleServiceCommand(w io.Writer, principal servicePri
 		s.serviceCommandStatus(w)
 	case "plugin-list", "plugin-reload":
 		s.serviceCommandPlugins(w, req)
+	case "settings-get":
+		s.serviceCommandSettingsGet(w, caps)
+	case "settings-set":
+		s.serviceCommandSettingsSet(w, caps, req)
 	default:
 		_ = json.NewEncoder(w).Encode(serviceResponse{OK: false, Message: "unknown command"})
 	}
@@ -825,58 +831,66 @@ func (s *goSearchService) serviceCommandWatchDelta(w io.Writer, req *serviceRequ
 }
 
 func (s *goSearchService) serviceCommandIndexUSN(w io.Writer, req *serviceRequest) {
-	serviceLog("index-usn start volume=%s db=%s", req.Volume, req.DB)
-	idx, err := indexUSNVolume(req.Volume)
+	idx, err := s.buildIndexUSNVolume(req.Volume, req.DB)
 	if err != nil {
-		serviceLog("index-usn error volume=%s err=%v", req.Volume, err)
 		_ = json.NewEncoder(w).Encode(serviceResponse{OK: false, Message: err.Error()})
 		return
 	}
-	serviceLog("index-usn built volume=%s entries=%d", req.Volume, idx.entryCount())
+	_ = json.NewEncoder(w).Encode(serviceResponse{OK: true, Message: "indexed", Entries: idx.entryCount()})
+}
+
+// buildIndexUSNVolume runs the index-usn path for one volume and installs the
+// persisted index into the service. The settings API calls the same path when
+// an operator adds a volume.
+func (s *goSearchService) buildIndexUSNVolume(volume, db string) (*Index, error) {
+	serviceLog("index-usn start volume=%s db=%s", volume, db)
+	idx, err := indexUSNVolume(volume)
+	if err != nil {
+		serviceLog("index-usn error volume=%s err=%v", volume, err)
+		return nil, err
+	}
+	serviceLog("index-usn built volume=%s entries=%d", volume, idx.entryCount())
 	buildOrders(idx)
-	serviceLog("index-usn orders volume=%s", req.Volume)
+	serviceLog("index-usn orders volume=%s", volume)
 	// Stage the multi-GB v9 write outside the global lock so pipe
 	// requests keep serving while it runs; only the fast swap-in below
 	// takes indexMu.Lock().
-	tmp, stageErr := stageIndexFile(req.DB, idx)
+	tmp, stageErr := stageIndexFile(db, idx)
 	if stageErr != nil {
-		serviceLog("index-usn stage error volume=%s err=%v", req.Volume, stageErr)
-		_ = json.NewEncoder(w).Encode(serviceResponse{OK: false, Message: stageErr.Error()})
-		return
+		serviceLog("index-usn stage error volume=%s err=%v", volume, stageErr)
+		return nil, stageErr
 	}
 	s.indexMu.Lock()
 	// The low-memory mmap pins the target file open, so unmap any existing
 	// volume for this DB before the temp-file rename replaces the file.
 	for _, existing := range s.volumes {
-		if existing != nil && samePath(existing.dbPath, req.DB) {
+		if existing != nil && samePath(existing.dbPath, db) {
 			if err := closeIndexMMapRecords(existing.index); err != nil {
-				serviceLog("index-usn close mmap volume=%s err=%v", req.Volume, err)
+				serviceLog("index-usn close mmap volume=%s err=%v", volume, err)
 			}
 			break
 		}
 	}
-	if err := commitStageIndexFile(req.DB, tmp); err != nil {
+	if err := commitStageIndexFile(db, tmp); err != nil {
 		s.indexMu.Unlock()
-		serviceLog("index-usn save error volume=%s err=%v", req.Volume, err)
-		_ = json.NewEncoder(w).Encode(serviceResponse{OK: false, Message: err.Error()})
-		return
+		serviceLog("index-usn save error volume=%s err=%v", volume, err)
+		return nil, err
 	}
-	if err := removeWAL(req.DB); err != nil {
-		serviceLog("wal cleanup error volume=%s db=%s err=%v", req.Volume, req.DB, err)
+	if err := removeWAL(db); err != nil {
+		serviceLog("wal cleanup error volume=%s db=%s err=%v", volume, db, err)
 	}
 	// Reload from disk so the swapped-in volume carries the persisted
 	// derived sections (RANK/PNGR/PNGC etc.).  The in-memory idx built by
 	// indexUSNVolume never populates Derived; using it here would leave
 	// the volume without SelfNameTrigrams and force every multi-term name
 	// query onto the slow bounded-scan path.
-	loaded, loadErr := loadIndexForService(req.DB)
+	loaded, loadErr := loadIndexForService(db)
 	if loadErr != nil {
 		s.indexMu.Unlock()
-		serviceLog("index-usn reload error volume=%s err=%v", req.Volume, loadErr)
-		_ = json.NewEncoder(w).Encode(serviceResponse{OK: false, Message: loadErr.Error()})
-		return
+		serviceLog("index-usn reload error volume=%s err=%v", volume, loadErr)
+		return nil, loadErr
 	}
-	vol := s.replaceLoadedVolumeLocked(req.DB, loaded)
+	vol := s.replaceLoadedVolumeLocked(db, loaded)
 	s.indexMu.Unlock()
 	releaseServiceMemoryAfterSave()
 	s.startBackgroundNameOrderBuilds([]*serviceVolumeIndex{vol})
@@ -885,8 +899,8 @@ func (s *goSearchService) serviceCommandIndexUSN(w io.Writer, req *serviceReques
 	// A runtime-added or re-indexed volume gets content attached or scheduled
 	// (PF-3), instead of staying content-unavailable until a restart.
 	s.featuresVolumeReady(vol)
-	serviceLog("index-usn complete volume=%s entries=%d", req.Volume, idx.entryCount())
-	_ = json.NewEncoder(w).Encode(serviceResponse{OK: true, Message: "indexed", Entries: idx.entryCount()})
+	serviceLog("index-usn complete volume=%s entries=%d", volume, idx.entryCount())
+	return loaded, nil
 }
 
 func (s *goSearchService) serviceCommandStatus(w io.Writer) {

@@ -57,7 +57,7 @@ func cmdService(args []string) error {
 	if isService {
 		processMode = "windows-service"
 	}
-	handler := &goSearchService{pipeName: *pipeName, sddl: *sddl, processMode: processMode, stop: make(chan struct{}), dbs: dbs, remoteAddr: *remoteAddr, contentCfg: cfg}
+	handler := &goSearchService{pipeName: *pipeName, sddl: *sddl, processMode: processMode, stop: make(chan struct{}), dbs: dbs, configPath: *configPath, remoteAddr: *remoteAddr, contentCfg: cfg}
 	if isService {
 		return svc.Run(serviceName, handler)
 	}
