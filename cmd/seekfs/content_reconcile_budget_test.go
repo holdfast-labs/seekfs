@@ -56,7 +56,9 @@ func TestContentReconcileTrimNew(t *testing.T) {
 // 2026-10-13).
 func TestContentScopeReconcileHonorsReserveForNewFiles(t *testing.T) {
 	f := newScopeReconFixture(t, "drop.txt\n")
-	f.writeScopeReconBase(t, f.keepDocs(t))
+	// Stamp the base as the reserve-truncated build it is: the gate keys on
+	// the build's own ReserveBytes, not on the live free space.
+	f.writeScopeReconBasePolicy(t, f.keepDocs(t), contentBuildPolicy{ScopeDropped: 1, ReserveBytes: contentScopeReserveMaxBytes})
 	builds := stubContentBuildSchedule(t)
 	stubContentNoHeadroom(t)
 	oldFrac := contentScopeReconcileRebuildFrac
@@ -66,8 +68,13 @@ func TestContentScopeReconcileHonorsReserveForNewFiles(t *testing.T) {
 	f.rewriteIgnore(t, "")
 	f.s.attachContentForVolume(f.vol)
 
-	if got := f.vol.content.stateOf(); got != contentStateReady {
-		t.Fatalf("state = %q; want ready (reconciled within the budget)", got)
+	// A reserve-truncated base attaches usable but degraded (incomplete), and
+	// the reconcile enqueues nothing past the reserve it already hit.
+	if !f.vol.content.usableForQuery() {
+		t.Fatal("a reserve-truncated base must stay usable through a reconcile")
+	}
+	if got := f.vol.content.stateOf(); got != contentStateDegraded {
+		t.Fatalf("state = %q; want degraded (the base is reserve-truncated)", got)
 	}
 	if *builds != 0 {
 		t.Fatalf("scheduled %d builds; want 0 (nothing new fits, so nothing to rebuild for)", *builds)
@@ -81,7 +88,7 @@ func TestContentScopeReconcileHonorsReserveForNewFiles(t *testing.T) {
 // holds files new to the base to the reserve: with no headroom, the changed
 // a.txt re-extracts and the never-indexed c.txt stays out.
 func TestContentWrapReconcileHonorsReserveForNewFiles(t *testing.T) {
-	f := newWrapReconFixture(t)
+	f := newWrapReconFixturePolicy(t, contentBuildPolicy{ScopeDropped: 1, ReserveBytes: contentScopeReserveMaxBytes})
 	builds := stubContentBuildSchedule(t)
 	stubContentNoHeadroom(t)
 

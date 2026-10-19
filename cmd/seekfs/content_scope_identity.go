@@ -21,7 +21,9 @@ import (
 // cache skips. A worktree appearing or vanishing, or a skip-list edit,
 // reconciles the selection difference instead of rebuilding (see §6p),
 // except past the rebuild fraction.
-const contentScopeSelectionVersion = 6
+// Version 7: whole-volume auto root and the outside-repo dependency/binary
+// skips join the selection rules.
+const contentScopeSelectionVersion = 7
 
 // fingerprint identifies the effective scope and budget selection policy used
 // to build a sidecar. Old sidecars have a zero hash and must be rebuilt. The

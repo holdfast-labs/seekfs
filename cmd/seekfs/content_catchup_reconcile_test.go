@@ -24,6 +24,13 @@ type wrapReconFixture struct {
 }
 
 func newWrapReconFixture(t *testing.T) *wrapReconFixture {
+	return newWrapReconFixturePolicy(t, contentBuildPolicy{})
+}
+
+// newWrapReconFixturePolicy is newWrapReconFixture with an explicit build
+// policy on the base, so a test can stamp a reserve-truncated base
+// (Policy.ReserveBytes) and exercise the reconcile budget's keep-out gate.
+func newWrapReconFixturePolicy(t *testing.T, policy contentBuildPolicy) *wrapReconFixture {
 	t.Helper()
 	t.Setenv("SEEKFS_CONTENT_SEARCH", "1")
 	stubContentCatchUpSync(t)
@@ -79,6 +86,7 @@ func newWrapReconFixture(t *testing.T) *wrapReconFixture {
 	base.Origin = contentOriginUSN
 	base.JournalID = journal
 	base.CheckpointUSN = 100
+	base.Policy = policy
 	stampContentTestScope(dir, base)
 	if err := contentSaveFile(gsx, base); err != nil {
 		t.Fatal(err)

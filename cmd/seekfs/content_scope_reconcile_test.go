@@ -87,6 +87,13 @@ func newScopeReconFixture(t *testing.T, ignoreText string) *scopeReconFixture {
 // same index, same ignore files on disk), so any later scope edit is a
 // genuine drift the attach must reconcile.
 func (f *scopeReconFixture) writeScopeReconBase(t *testing.T, docs []contentBuildDoc) {
+	f.writeScopeReconBasePolicy(t, docs, contentBuildPolicy{})
+}
+
+// writeScopeReconBasePolicy is writeScopeReconBase with an explicit build
+// policy, so a test can stamp a reserve-truncated base (Policy.ReserveBytes)
+// and exercise the reconcile budget's keep-out gate for such a base.
+func (f *scopeReconFixture) writeScopeReconBasePolicy(t *testing.T, docs []contentBuildDoc, policy contentBuildPolicy) {
 	t.Helper()
 	base, err := assembleContentIndex(docs, t.TempDir())
 	if err != nil {
@@ -95,6 +102,7 @@ func (f *scopeReconFixture) writeScopeReconBase(t *testing.T, docs []contentBuil
 	base.Origin = contentOriginUSN
 	base.JournalID = 7
 	base.CheckpointUSN = 100
+	base.Policy = policy
 	resolved, ok := f.s.resolvedContentScope(f.vol)
 	if !ok {
 		t.Fatal("scope unresolvable for fixture volume")
