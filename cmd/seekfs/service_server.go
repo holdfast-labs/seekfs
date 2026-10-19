@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"runtime/debug"
 	"strings"
+	"syscall"
 	"time"
 	"unsafe"
 )
@@ -97,12 +98,64 @@ func handleServiceConn(conn *os.File, s *goSearchService) {
 		_ = json.NewEncoder(conn).Encode(serviceResponse{OK: false, Message: err.Error()})
 		return
 	}
+	// A client that gives up closes the pipe. Watch for that end-of-stream
+	// while the query runs, so an abandoned content request stops verifying
+	// instead of reading files for a response nobody reads. PeekNamedPipe is
+	// non-blocking, so it shares the synchronous pipe handle with the response
+	// write without consuming request bytes.
+	clientGone := make(chan struct{})
+	stopWatch := make(chan struct{})
+	watchDone := make(chan struct{})
+	go func() {
+		defer close(watchDone)
+		ticker := time.NewTicker(100 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stopWatch:
+				return
+			case <-ticker.C:
+				if servicePipeClientGone(conn.Fd()) {
+					close(clientGone)
+					return
+				}
+			}
+		}
+	}()
+	defer func() {
+		close(stopWatch)
+		<-watchDone
+	}()
+	priorCancel := req.CancelOverride
+	req.CancelOverride = func() bool {
+		if priorCancel != nil && priorCancel() {
+			return true
+		}
+		select {
+		case <-clientGone:
+			return true
+		default:
+			return false
+		}
+	}
 	// Phase 1: derive the caller's capabilities from its Windows identity by
 	// impersonating the pipe client.  Failures fail closed (read-only).  A
 	// RevertToSelf failure is process-fatal and does not return.
 	principal := servicePrincipalForPipeConn(conn)
 	caps := localServiceCapabilities(principal)
 	s.handleServiceCommand(conn, principal, caps, &req)
+}
+
+// procPeekNamedPipe exposes PeekNamedPipe, which x/sys/windows does not declare.
+var procPeekNamedPipe = syscall.NewLazyDLL("kernel32.dll").NewProc("PeekNamedPipe")
+
+// servicePipeClientGone reports whether the other end of the pipe has closed.
+// PeekNamedPipe is non-blocking and does not consume bytes; a failed call means
+// the client disconnected.
+func servicePipeClientGone(handle uintptr) bool {
+	var available uint32
+	r1, _, _ := procPeekNamedPipe.Call(handle, 0, 0, 0, uintptr(unsafe.Pointer(&available)), 0)
+	return r1 == 0
 }
 
 // serviceCommandClass classifies a service command for capability gating.
@@ -343,7 +396,8 @@ func (s *goSearchService) serviceCommandSearch(w io.Writer, caps serviceCapabili
 		opts.Trace = &searchTrace{}
 	}
 	if pq, parseErr := parseQuery(opts); parseErr == nil && queryHasAnyContentLeaf(pq) {
-		opts.Trace.armContentDeadline(opts.BudgetMS, opts.BudgetDisabled)
+		budgetMS, budgetDisabled := serviceClientContentBudgetMS(*req)
+		opts.Trace.armContentDeadline(budgetMS, budgetDisabled)
 	}
 	// Per-user ranking: the frecency/query-history store is keyed by the
 	// caller's SID so one LocalSystem service keeps each local user's
@@ -387,7 +441,14 @@ func (s *goSearchService) serviceCommandSearch(w io.Writer, caps serviceCapabili
 				s.indexMu.RUnlock()
 				searchMS := float64(time.Since(searchStart).Nanoseconds()) / 1_000_000
 				if countErr != nil {
-					_ = json.NewEncoder(w).Encode(serviceResponse{OK: false, Message: countErr.Error()})
+					resp := serviceResponse{OK: false, Message: countErr.Error(), Complete: trace.completePtr(), BudgetExceeded: trace.BudgetExceeded}
+					if trace.contentIncomplete() {
+						resp.Complete = boolPtr(false)
+					}
+					if !trace.BudgetDeadline.IsZero() {
+						resp.ContentBudgetDeadlineUnix = trace.BudgetDeadline.UnixNano()
+					}
+					_ = json.NewEncoder(w).Encode(resp)
 				} else {
 					trace.setSource("count-fast-posting", count)
 					fuzzy := trace.FuzzyCorrection != ""

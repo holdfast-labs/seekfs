@@ -92,6 +92,47 @@ func resolveContentBudget(d time.Duration, provided bool) (ms int, disabled bool
 	return int(d.Milliseconds()), false, nil
 }
 
+// contentClientTimeoutSafetyMS is the safety margin the service subtracts from
+// the client's own request timeout before it arms an implicit content deadline.
+// The service then settles a partial (incomplete) answer before the client
+// gives up, instead of the client timing out on a request nobody reads.
+const contentClientTimeoutSafetyMS = 2000
+
+// contentImplicitClientBudgetMS converts the client's request timeout into the
+// service-side content budget. It keeps the safety margin when the timeout is
+// long enough; a short timeout (for example an injected test timeout) uses half
+// the window so the answer still lands before the client stops waiting.
+func contentImplicitClientBudgetMS(clientTimeoutMS int) int {
+	if clientTimeoutMS <= 0 {
+		return 0
+	}
+	ms := clientTimeoutMS - contentClientTimeoutSafetyMS
+	if ms < 1 {
+		ms = clientTimeoutMS / 2
+	}
+	if ms < 1 {
+		ms = 1
+	}
+	return ms
+}
+
+// serviceClientContentBudgetMS selects the content budget for one service
+// request: the client's own timeout bounds the request, and an explicit
+// positive --budget smaller than that bound still wins. An explicit larger
+// budget is capped by the client bound, because the service must not outlive
+// the caller's wait. Explicit --budget 0 (disabled) still gets the implicit
+// client bound.
+func serviceClientContentBudgetMS(req serviceRequest) (ms int, disabled bool) {
+	implicit := contentImplicitClientBudgetMS(req.ClientTimeoutMS)
+	if implicit <= 0 {
+		return req.BudgetMS, req.BudgetDisabled
+	}
+	if req.BudgetMS > 0 && req.BudgetMS <= implicit {
+		return req.BudgetMS, false
+	}
+	return implicit, false
+}
+
 // contentBudgetFromFlagSet preserves whether the CLI flag was explicitly set;
 // flag.Duration's value alone cannot distinguish omitted from explicit zero.
 func contentBudgetFromFlagSet(fs *flag.FlagSet, d time.Duration) (ms int, disabled bool, err error) {
