@@ -253,6 +253,11 @@ func contentPathExtension(path string) string {
 // treats it as a per-document skip with a reason, never a crash.
 var contentExtractPanicError = errors.New("content extractor panic")
 
+// contentExtractFailure marks an error that came from an extractor rather than
+// from opening or reading the file. The delta path wraps extractor errors with
+// this sentinel so health can tell an extractor bug apart from an I/O failure.
+var contentExtractFailure = errors.New("content extractor failure")
+
 // contentExtractSafely runs one extractor over an already-open file with the
 // per-document deadline and panic isolation shared by the offline walk builder
 // and the service build. The deadline is enforced at this boundary rather than
