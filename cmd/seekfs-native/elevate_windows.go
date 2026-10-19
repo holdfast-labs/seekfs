@@ -3,6 +3,7 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -21,7 +22,7 @@ const (
 	seeMaskNoCloseProcess = 0x00000040
 	seeMaskNoAsync        = 0x00000100
 	seeMaskFlagNoUI       = 0x00000400
-	swShowNormal          = 1
+	swHide                = 0
 )
 
 type shellExecuteInfo struct {
@@ -82,10 +83,14 @@ func runElevatedSettings(patch *serviceSettings) error {
 		return err
 	}
 	defer os.Remove(name)
+	// The elevated helper's stderr is not visible to the app, so it writes
+	// its outcome (including a validation message) to a result file.
+	resultName := name + ".result"
+	defer os.Remove(resultName)
 
 	verb, _ := syscall.UTF16PtrFromString("runas")
 	file, _ := syscall.UTF16PtrFromString(helper)
-	params, _ := syscall.UTF16PtrFromString("settings set --json " + quoteArg(name))
+	params, _ := syscall.UTF16PtrFromString("settings set --json " + quoteArg(name) + " --result " + quoteArg(resultName))
 	dir, _ := syscall.UTF16PtrFromString(filepath.Dir(helper))
 	sei := shellExecuteInfo{
 		CbSize:       uint32(unsafe.Sizeof(shellExecuteInfo{})),
@@ -94,7 +99,7 @@ func runElevatedSettings(patch *serviceSettings) error {
 		LpFile:       file,
 		LpParameters: params,
 		LpDirectory:  dir,
-		NShow:        swShowNormal,
+		NShow:        swHide,
 	}
 	r, _, errno := syscall.SyscallN(pShellExecuteExW.Addr(), uintptr(unsafe.Pointer(&sei)))
 	if r == 0 {
@@ -115,6 +120,12 @@ func runElevatedSettings(patch *serviceSettings) error {
 		return err
 	}
 	if code != 0 {
+		var result struct {
+			Message string `json:"message"`
+		}
+		if data, err := os.ReadFile(resultName); err == nil && json.Unmarshal(data, &result) == nil && result.Message != "" {
+			return errors.New(result.Message)
+		}
 		return fmt.Errorf("elevated settings helper exited with code %d", code)
 	}
 	return nil

@@ -658,3 +658,40 @@ command = "C:\\Tools\\other.exe"
 		}
 	}
 }
+
+// TestSettingsCLISetWritesResultFile pins the elevated-helper contract: the
+// desktop app cannot read the elevated process's stderr, so a failed
+// `settings set --result` must record ok:false and the service's message.
+func TestSettingsCLISetWritesResultFile(t *testing.T) {
+	preservePluginSelection(t)
+	useSyntheticSettingsVolumes(t)
+	configPath := settingsTestConfig(t, "[content]\nmode = \"auto\"\n")
+	vol := syntheticServiceVolumeIndexForCacheTests()
+	s := settingsTestService(t, configPath, []*serviceVolumeIndex{vol})
+	pipeName := startSettingsTestService(t, s)
+
+	dir := t.TempDir()
+	patch := filepath.Join(dir, "patch.json")
+	if err := os.WriteFile(patch, []byte(`{"content":{"mode":"bogus"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	result := filepath.Join(dir, "result.json")
+	_, err := runCLICaptured(t, []string{"settings", "set", "--json", patch, "--result", result, "--pipe", pipeName})
+	if err == nil {
+		t.Fatal("settings set with an invalid mode succeeded")
+	}
+	data, rerr := os.ReadFile(result)
+	if rerr != nil {
+		t.Fatalf("result file: %v", rerr)
+	}
+	var got struct {
+		OK      bool   `json:"ok"`
+		Message string `json:"message"`
+	}
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatalf("result JSON %q: %v", data, err)
+	}
+	if got.OK || got.Message == "" || got.Message != err.Error() {
+		t.Fatalf("result = %+v; want ok:false with message %q", got, err.Error())
+	}
+}

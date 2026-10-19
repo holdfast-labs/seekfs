@@ -1090,14 +1090,23 @@ func runSettingsGet(args []string, out io.Writer) error {
 	return nil
 }
 
-func runSettingsSet(args []string, out io.Writer) error {
+func runSettingsSet(args []string, out io.Writer) (err error) {
+	var resp serviceResponse
 	fs := flag.NewFlagSet("settings set", flag.ContinueOnError)
 	fs.SetOutput(out)
 	configPath := fs.String("config", "", "seekfs.toml path")
 	pipe := fs.String("pipe", defaultServicePipe, "resident service pipe")
 	jsonPath := fs.String("json", "", "settings JSON file")
+	resultPath := fs.String("result", "", "write the service response JSON here (for the elevated app helper)")
 	if err := fs.Parse(args); err != nil {
 		return err
+	}
+	if *resultPath != "" {
+		// The desktop app runs this command elevated and cannot read its
+		// stderr, so record the outcome (including a validation message).
+		defer func() {
+			_ = writeSettingsResult(*resultPath, resp, err)
+		}()
 	}
 	if fs.NArg() > 0 {
 		return fmt.Errorf("unexpected settings set arguments")
@@ -1116,7 +1125,7 @@ func runSettingsSet(args []string, out io.Writer) error {
 	if err := json.Unmarshal(data, &raw); err != nil {
 		return fmt.Errorf("settings JSON: %w", err)
 	}
-	resp, err := callService(*pipe, serviceRequest{Command: "settings-set", Settings: raw})
+	resp, err = callService(*pipe, serviceRequest{Command: "settings-set", Settings: raw})
 	if err != nil {
 		return err
 	}
@@ -1127,6 +1136,23 @@ func runSettingsSet(args []string, out io.Writer) error {
 		return errors.New("service returned no settings")
 	}
 	return json.NewEncoder(out).Encode(resp.Settings)
+}
+
+// writeSettingsResult records a settings set outcome as {ok, message, settings}.
+func writeSettingsResult(path string, resp serviceResponse, err error) error {
+	out := struct {
+		OK       bool             `json:"ok"`
+		Message  string           `json:"message,omitempty"`
+		Settings *serviceSettings `json:"settings,omitempty"`
+	}{OK: err == nil, Settings: resp.Settings}
+	if err != nil {
+		out.Message = err.Error()
+	}
+	data, mErr := json.Marshal(out)
+	if mErr != nil {
+		return mErr
+	}
+	return os.WriteFile(path, data, 0o600)
 }
 
 func settingsApplyPipeConfig(fs *flag.FlagSet, configPath, pipe *string) error {
