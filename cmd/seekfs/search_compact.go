@@ -314,6 +314,9 @@ func searchCompactWithCacheHidden(idx *Index, opts queryOptions, countOnly bool,
 	// the feeder/merger sync has no verify work to amortize it. A query that
 	// must verify everything (limit beyond the candidate set, e.g. the
 	// relevance window) still scales at any worker count.
+	// A hidden-overlay v2 resume stops at the provable page, which needs the
+	// candidate order and the overlay keys in one place: keep it serial.
+	resumePageStop := pq.contentAfter != nil && pq.contentAfter.pageLimit > 0
 	if usedCandidates && !countOnly {
 		// The filename lane keeps its historical threshold; the content
 		// lane has its own (verifies cost ~100x a name verify). The
@@ -323,7 +326,7 @@ func searchCompactWithCacheHidden(idx *Index, opts queryOptions, countOnly bool,
 		if contentMatcher == nil && len(order) >= serviceTrigramParallelVerifyMinIDs {
 			return verifyCompactCandidateOrderParallel(idx, pq, order, pathCache, limit, skipEntryMatches, hidden, contentVol, contentMatcher)
 		}
-		if contentMatcher != nil && len(order) >= contentParallelVerifyMinIDs &&
+		if contentMatcher != nil && !resumePageStop && len(order) >= contentParallelVerifyMinIDs &&
 			(contentParallelWorkers() > 2 || limit >= len(order) || !skipEntryMatches) {
 			return verifyCompactContentParallel(idx, pq, order, pathCache, limit, skipEntryMatches, hidden, contentVol, contentMatcher)
 		}
@@ -340,6 +343,12 @@ func searchCompactWithCacheHidden(idx *Index, opts queryOptions, countOnly bool,
 	for pos := 0; pos < compactOrderLen(order, idx.compactRecordCount()); pos++ {
 		if pos&1023 == 0 && queryCanceled(pq) {
 			return nil, errQueryCanceled
+		}
+		if resumePageStop && contentVol != nil {
+			if next, ok := contentVol.contentResumeNextBaseKey(idx, order, pos, pq, pathCache); ok &&
+				pq.contentAfter.pageProvablyFull(len(results), next) {
+				break
+			}
 		}
 		recIndex := compactOrderAt(order, pos)
 		if hidden.contains(recIndex) {
