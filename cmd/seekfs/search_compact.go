@@ -948,6 +948,11 @@ func (vol *serviceVolumeIndex) verifyContentSupersetPage(pq parsedQuery, ranked 
 		// keep the hits found so far as a visible partial page.
 		return pq.Trace != nil && pq.Trace.stopDiskVerify()
 	}
+	// A v2 resume starts verification after the last emitted record. The
+	// candidate order is deterministic while the captured identity holds, so
+	// locating the record by FRN and starting at the next candidate verifies
+	// one page of disk reads instead of every earlier page again.
+	start := vol.contentAfterCandidateStart(ranked, pq.contentAfter)
 	// Verify in small parallel batches (like verifyCompactContentParallel),
 	// then take hits in rank order: the page is identical to the serial walk
 	// and over-verification is under one batch.
@@ -956,18 +961,24 @@ func (vol *serviceVolumeIndex) verifyContentSupersetPage(pq parsedQuery, ranked 
 		workers = 1
 	}
 	batch := 4 * workers
+	if pq.contentAfter != nil {
+		// A v2 resume prices one page: verify serially in rank order and stop
+		// at the first full page instead of pre-verifying a parallel batch.
+		workers = 1
+		batch = 1
+	}
 	ok := make([]bool, batch)
 	verified := make([]bool, batch)
 	caches := make([]map[int]string, workers)
 	for w := range caches {
 		caches[w] = make(map[int]string)
 	}
-	for start := 0; start < len(ranked); start += batch {
+	for pos := start; pos < len(ranked); pos += batch {
 		if stopped() {
 			return page, true
 		}
-		end := min(start+batch, len(ranked))
-		n := end - start
+		end := min(pos+batch, len(ranked))
+		n := end - pos
 		clear(ok)
 		clear(verified)
 		// A batch that could exhaust the exact per-candidate read cap is
@@ -978,7 +989,7 @@ func (vol *serviceVolumeIndex) verifyContentSupersetPage(pq parsedQuery, ranked 
 				candidatePQ := pq
 				var candidateState atomic.Bool
 				candidatePQ.contentVerifyState = &candidateState
-				ok[i] = scanCandidateMatches(vol, vol.index, candidatePQ, ranked[start+i], caches[0], matcher)
+				ok[i] = scanCandidateMatches(vol, vol.index, candidatePQ, ranked[pos+i], caches[0], matcher)
 				verified[i] = !candidateState.Load()
 			}
 		} else {
@@ -997,7 +1008,7 @@ func (vol *serviceVolumeIndex) verifyContentSupersetPage(pq parsedQuery, ranked 
 						candidatePQ := pq
 						var candidateState atomic.Bool
 						candidatePQ.contentVerifyState = &candidateState
-						ok[i] = scanCandidateMatches(vol, vol.index, candidatePQ, ranked[start+i], caches[w], matcher)
+						ok[i] = scanCandidateMatches(vol, vol.index, candidatePQ, ranked[pos+i], caches[w], matcher)
 						verified[i] = !candidateState.Load()
 					}
 				}(w)
@@ -1010,14 +1021,14 @@ func (vol *serviceVolumeIndex) verifyContentSupersetPage(pq parsedQuery, ranked 
 				// deadline. Record it as the rank frontier so an overlay merge
 				// keeps the partial page a prefix (see mergeOverlayMatches).
 				if pq.Trace != nil {
-					recIndex := ranked[start+i]
+					recIndex := ranked[pos+i]
 					rec := vol.index.compactRecord(recIndex)
 					pq.Trace.recordContentFrontier(compactEntryFromRecord(vol.index, recIndex, rec, caches[0], true), pq)
 				}
 				return page, true
 			}
 			if ok[i] {
-				page = append(page, ranked[start+i])
+				page = append(page, ranked[pos+i])
 				if len(page) == pq.Limit {
 					if pq.Trace != nil && pq.Trace.deadlineReached() {
 						pq.Trace.markBudgetExceeded()
@@ -1344,6 +1355,9 @@ func (vol *serviceVolumeIndex) nameTermCandidates(pq parsedQuery) ([]int, bool) 
 					// this order, so the defining file stays inside it).
 					if pq.SortColumn == "" || pq.SortColumn == "relevance" {
 						promoteSymbolNamedCandidates(candidates, vol.index, contentSymbolQueryKey(pq))
+					}
+					if start := vol.contentAfterCandidateStart(candidates, pq.contentAfter); start > 0 {
+						candidates = candidates[start:]
 					}
 					pq.Trace.setSource("content-candidates", len(candidates))
 					return candidates, true

@@ -1918,6 +1918,7 @@ func parseQuery(opts queryOptions) (parsedQuery, error) {
 		out.contentFullCandidates = opts.contentFullCandidates
 		out.contentWindow = opts.contentWindow
 		out.contentProbe = opts.contentProbe
+		out.contentAfter = opts.contentAfter
 		return out, nil
 	}
 	pq := parsedQuery{
@@ -1941,6 +1942,7 @@ func parseQuery(opts queryOptions) (parsedQuery, error) {
 		contentFullCandidates:   opts.contentFullCandidates,
 		contentWindow:           opts.contentWindow,
 		contentProbe:            opts.contentProbe,
+		contentAfter:            opts.contentAfter,
 		gitCtx:                  newQueryGitContext(),
 	}
 	if opts.ModifiedAfter != "" {

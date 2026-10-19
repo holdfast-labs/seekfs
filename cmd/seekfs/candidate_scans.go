@@ -414,7 +414,7 @@ func (vol *serviceVolumeIndex) boundedScanCandidatesFiltered(pq parsedQuery, fil
 	// this floor (callers without snapshots filter afterwards), matching
 	// the legacy contract exactly.
 	if ids, ok := vol.memoScanAll(pq, hiddenBaseIDs{}, filter); ok {
-		return ids, true
+		return vol.contentAfterSlice(ids, pq.contentAfter), true
 	}
 	recordCount := vol.index.compactRecordCount()
 	if recordCount == 0 {
@@ -447,6 +447,13 @@ func (vol *serviceVolumeIndex) boundedScanCandidatesFiltered(pq parsedQuery, fil
 	canStopAtLimit := !pq.CountOnly && limit > 0 &&
 		(!biased || (!pq.contentFullCandidates && pq.SortColumn != "relevance")) &&
 		pq.hidden.empty()
+	// A v2 resume starts the scan after the last emitted record: locate it in
+	// the scan order once, then walk only the remaining candidates.
+	scanStart := 0
+	if contentQuery && pq.contentAfter != nil {
+		scanStart = vol.contentAfterScanStart(order, recordCount, pq.contentAfter)
+		pq.contentAfter.skip = scanStart
+	}
 	if canStopAtLimit {
 		biasRoot := ""
 		if biased {
@@ -468,7 +475,7 @@ func (vol *serviceVolumeIndex) boundedScanCandidatesFiltered(pq parsedQuery, fil
 		var deferred []int
 		cache := make(map[int]string)
 		visited := 0
-		for pos := 0; pos < compactUint32OrderLen(order, recordCount); pos++ {
+		for pos := scanStart; pos < compactUint32OrderLen(order, recordCount); pos++ {
 			if pos&1023 == 0 && queryCanceled(pq) {
 				return nil, false
 			}
@@ -558,7 +565,7 @@ func (vol *serviceVolumeIndex) boundedScanCandidatesFiltered(pq parsedQuery, fil
 		if incomplete {
 			pq.Trace.setContentIncomplete()
 		}
-		return out, true
+		return vol.contentAfterSlice(out, pq.contentAfter), true
 	}
 
 	workers := min(max(1, recordCountWorkers(recordCount)), 16)
@@ -660,13 +667,17 @@ func (vol *serviceVolumeIndex) boundedScanCandidatesParallel(pq parsedQuery, ord
 	}()
 	var visited atomic.Int64
 	var canceled atomic.Bool
+	startPos := 0
+	if pq.contentAfter != nil {
+		startPos = pq.contentAfter.skip
+	}
 	// Feeder: the only goroutine that walks the order.
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		defer close(work)
 		var seq uint64
-		for pos := 0; pos < orderLen; pos++ {
+		for pos := startPos; pos < orderLen; pos++ {
 			if pos&1023 == 0 && queryCanceled(pq) {
 				canceled.Store(true)
 				return
