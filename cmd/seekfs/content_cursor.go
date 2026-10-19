@@ -202,7 +202,7 @@ func (s *goSearchService) contentCursorContextFor(pq parsedQuery, opts queryOpti
 // order and returns the position to verify from. A missing record leaves the
 // start at zero (restart) and reports Found=false through the shared state.
 func (vol *serviceVolumeIndex) contentAfterCandidateStart(ids []int, resume *contentCursorResume) int {
-	if resume == nil || resume.Found {
+	if resume == nil {
 		return 0
 	}
 	for i, id := range ids {
@@ -216,7 +216,7 @@ func (vol *serviceVolumeIndex) contentAfterCandidateStart(ids []int, resume *con
 
 // contentAfterScanStart is contentAfterCandidateStart for a compact scan order.
 func (vol *serviceVolumeIndex) contentAfterScanStart(order []uint32, recordCount int, resume *contentCursorResume) int {
-	if resume == nil || resume.Found {
+	if resume == nil {
 		return 0
 	}
 	for pos := 0; pos < compactUint32OrderLen(order, recordCount); pos++ {
