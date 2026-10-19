@@ -58,6 +58,16 @@ func newDriveReconFixture(t *testing.T) *driveReconFixture {
 	if err := os.WriteFile(outside, []byte("outside needleoutside"), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	// A dependency segment outside the repo: the whole-volume auto root admits
+	// its parent, then the inclusion policy rejects the file as "dependency".
+	depDir := filepath.Join(outsideDir, "node_modules", "pkg")
+	if err := os.MkdirAll(depDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	dep := filepath.Join(depDir, "index.js")
+	if err := os.WriteFile(dep, []byte("dependency needledep"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 
 	d := uint32(os.ModeDir)
 	records := []CompactRecord{
@@ -68,6 +78,9 @@ func newDriveReconFixture(t *testing.T) *driveReconFixture {
 		{FRN: 5, Parent: 1, ParentFRN: 2, Name: "b.txt", Size: 15},
 		{FRN: 6, Parent: 0, ParentFRN: 1, Mode: d, Name: "wisp-memory"},
 		{FRN: 7, Parent: 5, ParentFRN: 6, Name: "note.txt", Size: 20},
+		{FRN: 8, Parent: 5, ParentFRN: 6, Mode: d, Name: "node_modules"},
+		{FRN: 9, Parent: 7, ParentFRN: 8, Mode: d, Name: "pkg"},
+		{FRN: 10, Parent: 8, ParentFRN: 9, Name: "index.js", Size: 21},
 	}
 	// Hermetic disk: a 500 GiB volume with the 10 GiB reserve plus 1 GiB free,
 	// so the reserve allowance is ~1 GiB (minus the shard scratch slack), not
@@ -122,6 +135,12 @@ func (f *driveReconFixture) writeDriveBase(t *testing.T, docs []contentBuildDoc)
 	old.Roots = roots
 	old.buildScopePrefixes()
 	base.ScopeHash = old.fingerprint()
+	// The repo-only build saw the outside note and the node_modules file as
+	// not covered by any root. The drive-root reconcile must supersede this.
+	base.Inclusion = contentInclusionStats{
+		Skipped:      map[string]int64{"root": 2},
+		SkippedBytes: map[string]int64{"root": 41},
+	}
 	if resolved.fingerprint() == base.ScopeHash {
 		t.Fatal("precondition: stripping the drive root did not move the scope fingerprint")
 	}
@@ -177,5 +196,56 @@ func TestContentAttachReconcilesDriveRootScope(t *testing.T) {
 	}
 	if hits, err := contentServiceSearch(t, f.vol, "content:needleoutside", false); err != nil || len(hits) != 1 {
 		t.Fatalf("outside-repo content not findable after drain: %v %v", hits, err)
+	}
+}
+
+// A scope reconcile rescans the current selection, so the inclusion tallies
+// it reports must replace the last full build's: the newly admitted drive-root
+// file is no longer a "root" skip, the outside node_modules file is a
+// "dependency" skip, and the stats survive the fold that persists them.
+func TestContentScopeReconcileRefreshesInclusionStats(t *testing.T) {
+	f := newDriveReconFixture(t)
+	f.writeDriveBase(t, f.repoDocs(t))
+	builds := stubContentBuildSchedule(t)
+
+	f.s.attachContentForVolume(f.vol)
+	if *builds != 0 {
+		t.Fatalf("scope reconcile scheduled %d builds; want 0", *builds)
+	}
+	h := f.vol.content.healthSnapshot(0)
+	if got := h.Inclusion.Skipped["root"]; got != 0 {
+		t.Fatalf("inclusion root after drive-root reconcile = %d; want 0", got)
+	}
+	if got := h.Inclusion.Skipped[contentSkipDependency]; got != 1 {
+		t.Fatalf("inclusion dependency after reconcile = %d; want 1 (%+v)", got, h.Inclusion.Skipped)
+	}
+	if got := h.Inclusion.SkippedBytes[contentSkipDependency]; got != 21 {
+		t.Fatalf("inclusion dependency bytes = %d; want 21", got)
+	}
+
+	f.vol.contentCoord.processQueue(func(frn uint64) (string, bool) {
+		if frn == 7 {
+			return f.outside, true
+		}
+		return "", false
+	})
+	f.s.runContentFold(f.vol)
+
+	reloaded, err := contentLoadFile(f.gsx)
+	releaseContentIndexOnCleanup(t, reloaded)
+	if err != nil {
+		t.Fatalf("reload folded sidecar: %v", err)
+	}
+	if got := reloaded.Inclusion.Skipped["root"]; got != 0 {
+		t.Fatalf("persisted inclusion root = %d; want 0", got)
+	}
+	if got := reloaded.Inclusion.Skipped[contentSkipDependency]; got != 1 {
+		t.Fatalf("persisted inclusion dependency = %d; want 1 (%+v)", got, reloaded.Inclusion.Skipped)
+	}
+	if got := reloaded.Inclusion.SkippedBytes[contentSkipDependency]; got != 21 {
+		t.Fatalf("persisted inclusion dependency bytes = %d; want 21", got)
+	}
+	if got := f.vol.content.healthSnapshot(0).Inclusion.Skipped[contentSkipDependency]; got != 1 {
+		t.Fatalf("health inclusion dependency after fold = %d; want 1", got)
 	}
 }

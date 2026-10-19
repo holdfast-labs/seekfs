@@ -188,7 +188,7 @@ type contentScanWorker struct {
 	cache  map[int]string
 	count  int
 	// rejects tallies per-reason rejections for the scan's CXIS stats;
-	// nil disables tallying (reconcile scans).
+	// nil disables tallying (scans that do not publish stats).
 	rejects     map[string]int64
 	rejectBytes map[string]int64
 	// parentOrig memoizes one directory's reconstructed original-case path so

@@ -504,6 +504,12 @@ type contentVolumeState struct {
 	// every write leaves the volume stale instead of spinning rebuilds. It
 	// survives setReady (attach happens before the pass runs) and markStale.
 	integrityFailures int
+	// scopeInclusion holds the inclusion tallies from the last scope-reconcile
+	// scan. It replaces the persisted Skipped/SkippedBytes at the next publish
+	// or fold, so `loaded` reflects the current selection instead of the last
+	// full build. scopeInclusionSet marks it valid (zero stats are meaningful).
+	scopeInclusion    contentInclusionStats
+	scopeInclusionSet bool
 }
 
 // walkDeclinedNote records that key extracted to nothing at print. A later
@@ -860,6 +866,9 @@ func (s *contentVolumeState) setReady(idx *contentIndex, reader *contentReader, 
 		s.health.ReserveBytes = idx.Policy.ReserveBytes
 		s.health.Binary = int(idx.Policy.Binary)
 	}
+	// A scope reconcile scanned the current selection; its tallies replace
+	// the build's so loaded and the next fold both report the live scope.
+	s.applyScopeInclusionLocked(&idx.Inclusion)
 	// The CXIS inclusion stats ride their own section, independent of
 	// the CXPL policy block.
 	s.health.Inclusion = idx.Inclusion
@@ -1009,8 +1018,53 @@ func (s *contentVolumeState) clearScopeReconcileLocked() {
 	s.scopeFP = [32]byte{}
 	s.scopePending = 0
 	s.scopeActive = false
+	s.scopeInclusion = contentInclusionStats{}
+	s.scopeInclusionSet = false
 	s.health.ScopeReconcile = false
 	s.health.ScopeReconcilePending = 0
+}
+
+// markScopeInclusion records the inclusion tallies from the scope-reconcile
+// scan that produced the pending selection.
+func (s *contentVolumeState) markScopeInclusion(stats contentInclusionStats) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.scopeInclusion = stats
+	s.scopeInclusionSet = true
+}
+
+// applyScopeInclusion replaces the per-reason selection tallies with the
+// reconcile scan's stats. The scan covers the current selection, so its
+// tallies already supersede the build's; truncation, dedupe and worktree
+// counts are not selection decisions and stay as they are. Caller holds mu.
+func (s *contentVolumeState) applyScopeInclusionLocked(dst *contentInclusionStats) {
+	if !s.scopeInclusionSet || dst == nil {
+		return
+	}
+	dst.Skipped = make(map[string]int64, len(s.scopeInclusion.Skipped))
+	for r, n := range s.scopeInclusion.Skipped {
+		dst.Skipped[r] = n
+	}
+	dst.SkippedBytes = make(map[string]int64, len(s.scopeInclusion.SkippedBytes))
+	for r, b := range s.scopeInclusion.SkippedBytes {
+		dst.SkippedBytes[r] = b
+	}
+	s.scopeInclusion = contentInclusionStats{}
+	s.scopeInclusionSet = false
+}
+
+// applyScopeInclusion is applyScopeInclusionLocked for callers that do not
+// already hold mu (the fold path).
+func (s *contentVolumeState) applyScopeInclusion(dst *contentInclusionStats) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.applyScopeInclusionLocked(dst)
 }
 
 // markScopeReconcile records that fp is the selection the base is being

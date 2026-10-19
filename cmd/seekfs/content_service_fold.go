@@ -171,6 +171,10 @@ func (s *goSearchService) runContentFold(vol *serviceVolumeIndex) {
 	foldInclusion := base.Inclusion
 	foldInclusion.merge(vol.contentCoord.inclusion)
 	vol.contentCoord.inclusion = contentInclusionStats{}
+	// A scope reconcile between builds rescanned the current selection; its
+	// tallies replace the build's stale reasons so the fold persists the
+	// live scope (e.g. no `root` for files a new auto root admitted).
+	vol.content.applyScopeInclusion(&foldInclusion)
 	header := &contentIndex{Origin: base.Origin, JournalID: base.JournalID, CheckpointUSN: checkpoint, Policy: base.Policy, ScopeHash: base.ScopeHash, Inclusion: foldInclusion}
 	if base.Origin == contentOriginWalk {
 		if now := uint64(time.Now().UnixNano()); now > header.CheckpointUSN {

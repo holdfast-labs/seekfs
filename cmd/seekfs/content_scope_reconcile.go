@@ -59,12 +59,14 @@ func contentScopeMemberIgnored(scope *contentScopeResolved, path string) bool {
 // key fingerprints, plus each key's scan member (build priority, path and
 // size) for the reconcile budget. ok is false when the base moved mid-scan
 // (caller reschedules) or the scan stopped.
-func (s *goSearchService) scopeSelectionKeys(vol *serviceVolumeIndex, scope *contentScopeResolved, idx *Index, gen uint64, isWalk bool) (map[uint64]contentFilePrint, map[uint64]contentScopeMember, bool) {
+func (s *goSearchService) scopeSelectionKeys(vol *serviceVolumeIndex, scope *contentScopeResolved, idx *Index, gen uint64, isWalk bool) (map[uint64]contentFilePrint, map[uint64]contentScopeMember, contentInclusionStats, bool) {
+	var tally contentScanTally
 	cfg := contentScopeScanConfig{
 		scope:  scope,
 		idx:    idx,
 		isWalk: isWalk,
 		prog:   nil,
+		tally:  &tally,
 		stopped: func() bool {
 			return s.contentStopped(vol)
 		},
@@ -74,7 +76,7 @@ func (s *goSearchService) scopeSelectionKeys(vol *serviceVolumeIndex, scope *con
 	}
 	lists, ok := scanScopeMembers(s, vol, cfg)
 	if !ok {
-		return nil, nil, false
+		return nil, nil, contentInclusionStats{}, false
 	}
 	out := make(map[uint64]contentFilePrint)
 	ranks := make(map[uint64]contentScopeMember)
@@ -87,7 +89,9 @@ func (s *goSearchService) scopeSelectionKeys(vol *serviceVolumeIndex, scope *con
 			ranks[m.frn] = m
 		}
 	}
-	return out, ranks, true
+	var stats contentInclusionStats
+	tally.mergeInto(&stats)
+	return out, ranks, stats, true
 }
 
 // scopeDiffSelection diffs the current selection against a base doc table
@@ -138,8 +142,9 @@ func scopeDiffOverThreshold(diff contentScopeDiffResult, baseDocs int) bool {
 }
 
 // applyScopeDiff tombstones dropped keys and enqueues new ones, then records
-// the reconciled fingerprint and pending count for health and the next fold.
-func (s *goSearchService) applyScopeDiff(vol *serviceVolumeIndex, diff contentScopeDiffResult, fp [32]byte) {
+// the reconciled fingerprint, pending count and the reconcile scan's
+// inclusion stats for health and the next fold.
+func (s *goSearchService) applyScopeDiff(vol *serviceVolumeIndex, diff contentScopeDiffResult, fp [32]byte, inclusion contentInclusionStats) {
 	if vol == nil || vol.content == nil {
 		return
 	}
@@ -152,6 +157,7 @@ func (s *goSearchService) applyScopeDiff(vol *serviceVolumeIndex, diff contentSc
 		vol.contentCoord.enqueueFRNs(diff.enqueue)
 	}
 	vol.content.markScopeReconcile(fp, len(diff.enqueue)+len(diff.drop))
+	vol.content.markScopeInclusion(inclusion)
 	if len(diff.enqueue)+len(diff.drop) > 0 {
 		serviceLog("content scope reconcile volume=%s enqueue=%d drop=%d", vol.volume, len(diff.enqueue), len(diff.drop))
 	}
@@ -199,7 +205,7 @@ func (s *goSearchService) scopeReconcile(vol *serviceVolumeIndex, idx *contentIn
 	gen := vol.replayGen.Load()
 	s.indexMu.RUnlock()
 	fp := scope.fingerprint()
-	selected, ranks, ok := s.scopeSelectionKeys(vol, &scope, base, gen, isWalk)
+	selected, ranks, inclusion, ok := s.scopeSelectionKeys(vol, &scope, base, gen, isWalk)
 	if !ok {
 		return false
 	}
@@ -218,7 +224,7 @@ func (s *goSearchService) scopeReconcile(vol *serviceVolumeIndex, idx *contentIn
 			vol.volume, len(diff.enqueue), len(diff.drop), len(idx.Docs))
 		return false
 	}
-	s.applyScopeDiff(vol, diff, fp)
+	s.applyScopeDiff(vol, diff, fp, inclusion)
 	return true
 }
 
