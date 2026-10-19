@@ -136,6 +136,9 @@ var contentMinifiedNameSubs = []string{
 // the build-output reason wins for the names both lists share.
 var contentBuildOutputSegments = []string{
 	"dist", "build", "out", "target", "bin", "obj", "_build", ".next", ".nuxt", "coverage",
+	// Cargo target internals, so a target dir under any name (`foo-target`)
+	// still drops its build tree.
+	"deps", "incremental", ".fingerprint",
 }
 
 // contentCacheSegments are directory names that mark a cache tree wherever
@@ -230,7 +233,12 @@ func contentDependencySegment(seg string) bool {
 			return true
 		}
 	}
-	return false
+	// Browser profile copies (`User Data`, `chrome-user-data-backup`) and game
+	// libraries hold application state, not user text.
+	if seg == "user data" || strings.Contains(seg, "user-data") {
+		return true
+	}
+	return seg == "steamapps" || seg == "steamlibrary"
 }
 
 // contentCachePath reports whether the lowercase `/`-joined path matches a

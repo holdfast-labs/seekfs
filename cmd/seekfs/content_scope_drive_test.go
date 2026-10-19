@@ -85,6 +85,22 @@ func TestContentScopeDriveSkipsDependenciesOutsideRepos(t *testing.T) {
 			t.Errorf("outside-repo skip(%q) = (%q,%v); want dependency", p, reason, skip)
 		}
 	}
+	// Cargo target internals under any target dir name, browser profile
+	// copies and game libraries are skipped outside repos.
+	for _, c := range []struct{ path, want string }{
+		{`C:\wispd-target\release\deps\libfoo-1a2b.d`, contentSkipBuildOutput},
+		{`C:\wispd-target\debug\incremental\foo\s-1\dep-graph.txt`, contentSkipBuildOutput},
+		{`C:\wispd-target\debug\.fingerprint\foo\lib-foo.json`, contentSkipBuildOutput},
+		{`C:\backups\chrome-user-data-full2\Default\Preferences.json`, contentSkipDependency},
+		{`C:\Users\u\Chromium\User Data\Local State.txt`, contentSkipDependency},
+		{`C:\SteamLibrary\steamapps\common\Game\readme.txt`, contentSkipDependency},
+	} {
+		norm := contentNormPath(c.path)
+		base := strings.ToLower(filepath.Base(c.path))
+		if reason, skip := contentInclusionSkip(norm, base, contentPathExtension(norm), 100, false, true, nil); !skip || reason != c.want {
+			t.Errorf("outside-repo skip(%q) = (%q,%v); want %q", c.path, reason, skip, c.want)
+		}
+	}
 	// Module/toolchain caches outside repos are cache trees.
 	for _, p := range []string{
 		`C:\Users\u\go\pkg\mod\github.com\x\y@v1\a.go`,
