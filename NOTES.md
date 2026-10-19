@@ -22,3 +22,7 @@
   volume's persisted snapshot watermark (`baseCheckpoint`) — those events are
   already reflected in the base records. Sequence-aware identity (b) needs the
   sequence stored per record, which is a format change, so it is deferred.
+- Implemented in `applyUSNChanges` (`service_replay.go`): a per-change floor
+  `change.USN > 0 && floor > 0 && change.USN <= floor` skips records at or below
+  the snapshot watermark before they reach the overlay/tombstone path. The
+  reproducing test is `TestApplyUSNStaleDeleteForReusedRecordKeepsLiveSubtree`.
