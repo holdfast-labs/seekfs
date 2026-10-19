@@ -18,6 +18,9 @@ type serviceRequest struct {
 	RequestSeq    int64  `json:"request_seq,omitempty"`
 	CaseSensitive bool   `json:"case_sensitive,omitempty"`
 	Fuzzy         bool   `json:"fuzzy,omitempty"`
+	// Settings carries a settings-set payload. Only fields present in the
+	// JSON object change (docs/SETTINGS_API.md).
+	Settings *serviceSettings `json:"settings,omitempty"`
 }
 
 type serviceResponse struct {
@@ -35,6 +38,8 @@ type serviceResponse struct {
 	Health        string        `json:"health,omitempty"`
 	HealthMessage string        `json:"health_message,omitempty"`
 	Content       *contentState `json:"content,omitempty"`
+	// Settings is the settings-get/settings-set result.
+	Settings *serviceSettings `json:"settings,omitempty"`
 }
 
 type jsonResult struct {

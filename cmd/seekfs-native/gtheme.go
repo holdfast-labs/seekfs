@@ -152,6 +152,7 @@ const (
 	iconAdd      = "\ue710"
 	iconFolder   = "\ue8b7"
 	iconFile     = "\ue7b8"
+	iconSettings = "\ue713"
 )
 
 // fluentFace is the typeface name for Segoe Fluent Icons.

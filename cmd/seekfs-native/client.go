@@ -57,6 +57,16 @@ func (c *Client) Info() (serviceResponse, error) {
 	return c.roundTrip(serviceRequest{Command: "info"})
 }
 
+// SettingsGet reads the indexing settings (docs/SETTINGS_API.md).
+func (c *Client) SettingsGet() (serviceResponse, error) {
+	return c.roundTrip(serviceRequest{Command: "settings-get"})
+}
+
+// SettingsSet stages a settings change. Only fields present in patch change.
+func (c *Client) SettingsSet(patch serviceSettings) (serviceResponse, error) {
+	return c.roundTrip(serviceRequest{Command: "settings-set", Settings: &patch})
+}
+
 // SearchParams are the UI-level knobs for one search. Query is the raw typed
 // text; ContentsMode rewrites plain words to content: terms first.
 type SearchParams struct {

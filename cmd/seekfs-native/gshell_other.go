@@ -34,3 +34,6 @@ func (s *stubBridge) TypeName(path string, isDir bool) string {
 	}
 	return "File"
 }
+func (s *stubBridge) PickFolder(title string) (string, error) {
+	return "", errors.New("folder picker requires Windows")
+}
