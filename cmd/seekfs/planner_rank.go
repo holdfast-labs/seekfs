@@ -506,3 +506,45 @@ func contentIsHeaderName(name string) bool {
 	}
 	return false
 }
+
+// promoteSymbolNamedEntries is promoteSymbolNamedCandidates for a merged Entry
+// slice: it stably moves symbol-named entries to the front (headers first) and
+// leaves the relative order of both groups unchanged.
+func promoteSymbolNamedEntries(entries []Entry, key string) {
+	if key == "" || len(entries) < 2 {
+		return
+	}
+	named := make([]Entry, 0, 4)
+	rest := make([]Entry, 0, len(entries))
+	for _, entry := range entries {
+		if contentEntrySymbolNamed(entry, key) {
+			named = append(named, entry)
+		} else {
+			rest = append(rest, entry)
+		}
+	}
+	if len(named) == 0 {
+		return
+	}
+	sort.SliceStable(named, func(i, j int) bool {
+		return contentIsHeaderName(named[i].Name) && !contentIsHeaderName(named[j].Name)
+	})
+	copy(entries, named)
+	copy(entries[len(named):], rest)
+}
+
+// contentEntrySymbolNamed reports whether entry's file name (up to the first
+// '.') normalizes to the symbol key, the predicate promotion uses.
+func contentEntrySymbolNamed(entry Entry, key string) bool {
+	if key == "" {
+		return false
+	}
+	name := entry.Name
+	if name == "" {
+		name = filepath.Base(entry.Path)
+	}
+	if dot := strings.IndexByte(name, '.'); dot > 0 {
+		name = name[:dot]
+	}
+	return len(name) >= len(key) && contentNormalizeSymbolName(name) == key
+}
