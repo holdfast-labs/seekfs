@@ -333,6 +333,7 @@ func mergeGlobalVerifiedEntries(snapshot globalQuerySnapshot, base []globalRanke
 		}
 		return strings.Compare(a.tie, b.tie)
 	})
+	out = dedupeGlobalRankedEntries(out)
 	if limit > 0 && len(out) > limit {
 		out = out[:limit]
 	}
