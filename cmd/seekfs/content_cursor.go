@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -78,22 +77,11 @@ func (k contentCursorKey) compare(other contentCursorKey) int {
 
 // contentCursorTier is the promotion tier a row occupies. Promotion only runs
 // for the default sort; every explicit sort is a single tier.
-func contentCursorTier(entry Entry, pq parsedQuery) int {
+func contentCursorTier(entry Entry, pq parsedQuery, p contentPromotion) int {
 	if pq.SortColumn != "" {
 		return 0
 	}
-	key := contentSymbolQueryKey(pq)
-	if key == "" || !contentEntrySymbolNamed(entry, key) {
-		return 2
-	}
-	name := entry.Name
-	if name == "" {
-		name = filepath.Base(entry.Path)
-	}
-	if contentIsHeaderName(name) {
-		return 0
-	}
-	return 1
+	return p.tier(entry)
 }
 
 // contentCursorOverlayTiebreak mirrors the final tie-break
@@ -105,17 +93,17 @@ func contentCursorOverlayTiebreak(entry Entry, pq parsedQuery) string {
 	return entryLowerName(entry) + "\x00" + entry.Path
 }
 
-func (vol *serviceVolumeIndex) contentCursorOverlayKey(item rankedOverlayEntry, pq parsedQuery) contentCursorKey {
+func (vol *serviceVolumeIndex) contentCursorOverlayKey(item rankedOverlayEntry, pq parsedQuery, p contentPromotion) contentCursorKey {
 	return contentCursorKey{
-		Tier:     contentCursorTier(item.entry, pq),
+		Tier:     contentCursorTier(item.entry, pq, p),
 		Rank:     item.rank,
 		Tiebreak: contentCursorOverlayTiebreak(item.entry, pq),
 	}
 }
 
-func (vol *serviceVolumeIndex) contentCursorBaseKey(entry Entry, pq parsedQuery) contentCursorKey {
+func (vol *serviceVolumeIndex) contentCursorBaseKey(entry Entry, pq parsedQuery, p contentPromotion) contentCursorKey {
 	return contentCursorKey{
-		Tier: contentCursorTier(entry, pq),
+		Tier: contentCursorTier(entry, pq, p),
 		Rank: vol.baseEntryRank(entry, pq),
 	}
 }
@@ -349,14 +337,14 @@ func (vol *serviceVolumeIndex) contentAfterSlice(ids []int, resume *contentCurso
 // contentResumeNextBaseKey returns the page key of the candidate at pos. It is
 // used only by the hidden-overlay v2 resume stop, so it skips path
 // reconstruction: the default content order ranks and promotes on the name.
-func (vol *serviceVolumeIndex) contentResumeNextBaseKey(idx *Index, order []int, pos int, pq parsedQuery, pathCache map[int]string) (contentCursorKey, bool) {
+func (vol *serviceVolumeIndex) contentResumeNextBaseKey(idx *Index, order []int, pos int, pq parsedQuery, p contentPromotion, pathCache map[int]string) (contentCursorKey, bool) {
 	if idx == nil || pos < 0 || pos >= compactOrderLen(order, idx.compactRecordCount()) {
 		return contentCursorKey{}, false
 	}
 	recIndex := compactOrderAt(order, pos)
 	rec := idx.compactRecord(recIndex)
 	entry := compactEntryFromRecordPath(idx, recIndex, rec, pathCache, true, false)
-	return vol.contentCursorBaseKey(entry, pq), true
+	return vol.contentCursorBaseKey(entry, pq, p), true
 }
 
 // contentResumeFromFrontier builds an inclusive resume at the first candidate
@@ -370,7 +358,7 @@ func (vol *serviceVolumeIndex) contentResumeFromFrontier(trace *searchTrace, pq 
 	if frontier.FRN == 0 {
 		return nil
 	}
-	k := vol.contentCursorBaseKey(frontier, pq)
+	k := vol.contentCursorBaseKey(frontier, pq, newContentPromotion(pq))
 	return &contentCursorResume{FRN: frontier.FRN, Found: true, Key: &k, Inclusive: true}
 }
 
@@ -382,13 +370,14 @@ func (vol *serviceVolumeIndex) contentResumeFromMatches(matches []Entry, pq pars
 		return nil
 	}
 	last := matches[len(matches)-1]
+	promo := newContentPromotion(pq)
 	resume := &contentCursorResume{Found: true}
 	if vol.contentCursorEntryIsOverlay(last) {
 		k := vol.contentCursorOverlayKey(
-			rankedOverlayEntry{entry: last, rank: vol.overlayEntryRank(last, pq)}, pq)
+			rankedOverlayEntry{entry: last, rank: vol.overlayEntryRank(last, pq)}, pq, promo)
 		resume.Key = &k
 	} else {
-		k := vol.contentCursorBaseKey(last, pq)
+		k := vol.contentCursorBaseKey(last, pq, promo)
 		resume.Key = &k
 		resume.FRN = last.FRN
 	}
@@ -413,9 +402,10 @@ func (vol *serviceVolumeIndex) prepareContentResumeOverlay(pq parsedQuery, resum
 	}
 	pq.contentAfter = resume
 	overlay := vol.overlayRankedMatches(vol.snap.Load(), pq, make(map[int]string))
+	promo := newContentPromotion(pq)
 	keys := make([]contentCursorKey, 0, len(overlay))
 	for _, item := range overlay {
-		keys = append(keys, vol.contentCursorOverlayKey(item, pq))
+		keys = append(keys, vol.contentCursorOverlayKey(item, pq, promo))
 	}
 	sort.Slice(keys, func(i, j int) bool {
 		return keys[i].compare(keys[j]) < 0

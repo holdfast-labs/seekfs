@@ -710,14 +710,14 @@ func (vol *serviceVolumeIndex) mergeContentOverlayMatches(base []Entry, overlay 
 		// before every unpromoted row, so only promoted overlay rows can
 		// precede it.
 		frontierRank := vol.baseEntryRank(trace.contentFrontier, pq)
-		symKey := ""
+		promo := contentPromotion{}
 		if pq.SortColumn == "" {
-			symKey = contentSymbolQueryKey(pq)
+			promo = newContentPromotion(pq)
 		}
-		frontierPromoted := contentEntrySymbolNamed(trace.contentFrontier, symKey)
+		frontierPromoted := promo.tier(trace.contentFrontier) < 2
 		kept := overlay[:0]
 		for _, item := range overlay {
-			promoted := contentEntrySymbolNamed(item.entry, symKey)
+			promoted := promo.tier(item.entry) < 2
 			switch {
 			case promoted && !frontierPromoted:
 				kept = append(kept, item)
@@ -739,7 +739,7 @@ func (vol *serviceVolumeIndex) mergeContentOverlayMatches(base []Entry, overlay 
 	}
 	merged := vol.mergeRankedOverlayEntries(rankedBase, overlay, 0, false, pq)
 	if pq.SortColumn == "" {
-		promoteSymbolNamedEntries(merged, contentSymbolQueryKey(pq))
+		promoteNamedEntries(merged, newContentPromotion(pq))
 	}
 	return merged
 }
@@ -808,9 +808,10 @@ func (vol *serviceVolumeIndex) overlayRankedMatches(snap *volumeSnapshot, pq par
 	// the walk; a file renamed across the cursor can be missed. The divergence
 	// is bounded and never duplicates a path within the returned pages.
 	if resume := pq.contentAfter; resume != nil && resume.Key != nil {
+		promo := newContentPromotion(pq)
 		kept := overlay[:0]
 		for _, item := range overlay {
-			cmp := vol.contentCursorOverlayKey(item, pq).compare(*resume.Key)
+			cmp := vol.contentCursorOverlayKey(item, pq, promo).compare(*resume.Key)
 			if cmp > 0 || (resume.Inclusive && cmp == 0) {
 				kept = append(kept, item)
 			}

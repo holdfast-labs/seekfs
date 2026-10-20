@@ -3,6 +3,7 @@ package main
 import (
 	"container/heap"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"sort"
 	"strings"
@@ -294,24 +295,13 @@ func sortContentEntriesByRelevance(entries []Entry, volByPath map[string]*servic
 	}
 	defaultPQ := pq
 	defaultPQ.SortColumn = ""
-	// Tie-break equal scores by "named after the queried symbol" (headers
-	// first): a class's header and its .cc both define it, the header is
-	// the definition a reader wants.
-	symKey := contentSymbolQueryKey(pq)
+	// Tie-break equal scores by promotion (headers first): a class's header
+	// and its .cc both define it, the header is the definition a reader wants.
+	// The same rule covers symbol-named literal queries and regex-named ones.
+	promo := newContentPromotion(pq)
 	named := make([]int, len(entries))
-	if symKey != "" {
-		for i := range entries {
-			name := entries[i].Name
-			if dot := strings.IndexByte(name, '.'); dot > 0 {
-				name = name[:dot]
-			}
-			if contentNormalizeSymbolName(name) == symKey {
-				named[i] = 1
-				if contentIsHeaderName(entries[i].Name) {
-					named[i] = 2
-				}
-			}
-		}
+	for i := range entries {
+		named[i] = 2 - promo.tier(entries[i])
 	}
 	sort.SliceStable(order, func(a, b int) bool {
 		i, j := order[a], order[b]
@@ -469,20 +459,106 @@ func contentNormalizeSymbolName(s string) string {
 	return string(b)
 }
 
-// promoteSymbolNamedCandidates stably moves candidates whose file name (up to
-// the first '.') normalizes to key to the front, keeping relative order.
-func promoteSymbolNamedCandidates(ids []int, idx *Index, key string) {
-	if key == "" || idx == nil || len(ids) < 2 {
+// contentPromotion is the default-order name promotion rule for one query.
+// A literal query that names one symbol promotes files named after it; a
+// pure-regex query promotes files whose name matches a positive regex leaf.
+// Both use the same tiers (0 = promoted header, 1 = promoted other, 2 = rest),
+// so candidate order, the merged overlay page, and the v2 cursor key cannot
+// disagree about where a row belongs.
+type contentPromotion struct {
+	symbolKey string
+	regexes   []*regexp.Regexp
+}
+
+// newContentPromotion compiles the promotion rule once per query. Callers pass
+// the result through row loops instead of rebuilding it per row.
+func newContentPromotion(pq parsedQuery) contentPromotion {
+	p := contentPromotion{symbolKey: contentSymbolQueryKey(pq)}
+	if p.symbolKey == "" && contentLeavesAllRegex(pq) {
+		p.regexes = contentRegexNameMatchers(pq)
+	}
+	return p
+}
+
+func (p contentPromotion) active() bool {
+	return p.symbolKey != "" || len(p.regexes) > 0
+}
+
+// tierForName returns the promotion tier of a file name.
+func (p contentPromotion) tierForName(name string) int {
+	if p.symbolKey != "" {
+		base := name
+		if dot := strings.IndexByte(base, '.'); dot > 0 {
+			base = base[:dot]
+		}
+		if len(base) >= len(p.symbolKey) && contentNormalizeSymbolName(base) == p.symbolKey {
+			if contentIsHeaderName(name) {
+				return 0
+			}
+			return 1
+		}
+		return 2
+	}
+	for _, re := range p.regexes {
+		if re.MatchString(name) {
+			if contentIsHeaderName(name) {
+				return 0
+			}
+			return 1
+		}
+	}
+	return 2
+}
+
+// tier returns the promotion tier of an Entry, using its base name when Name
+// is empty (overlay rows built from a path).
+func (p contentPromotion) tier(entry Entry) int {
+	name := entry.Name
+	if name == "" {
+		name = filepath.Base(entry.Path)
+	}
+	return p.tierForName(name)
+}
+
+func contentIsHeaderName(name string) bool {
+	switch strings.ToLower(filepath.Ext(name)) {
+	case ".h", ".hh", ".hpp", ".hxx":
+		return true
+	}
+	return false
+}
+
+// contentRegexNameMatchers compiles the positive regex leaves of a
+// case-folded content query.
+func contentRegexNameMatchers(pq parsedQuery) []*regexp.Regexp {
+	var out []*regexp.Regexp
+	for _, leaf := range contentPositiveLeaves(pq) {
+		if leaf.Kind != contentLeafRegex {
+			continue
+		}
+		// The name hint is deliberately case-folded even for a case-sensitive
+		// leaf: tab_strip_model.h is the likely definition of TabStripModel.
+		// A wrong hint only costs a verified read, never a wrong result.
+		pat := "(?i)" + leaf.Text
+		re, err := regexp.Compile(pat)
+		if err != nil {
+			continue
+		}
+		out = append(out, re)
+	}
+	return out
+}
+
+// promoteNamedCandidates stably moves promoted candidates (tier < 2) to the
+// front, headers first, keeping the relative order of both groups.
+func promoteNamedCandidates(ids []int, idx *Index, p contentPromotion) {
+	if !p.active() || idx == nil || len(ids) < 2 {
 		return
 	}
 	named := make([]int, 0, 4)
 	rest := ids[:0:0]
 	for _, id := range ids {
-		name := idx.compactNameAt(id)
-		if dot := strings.IndexByte(name, '.'); dot > 0 {
-			name = name[:dot]
-		}
-		if len(name) >= len(key) && contentNormalizeSymbolName(name) == key {
+		if p.tierForName(idx.compactNameAt(id)) < 2 {
 			named = append(named, id)
 		} else {
 			rest = append(rest, id)
@@ -499,25 +575,21 @@ func promoteSymbolNamedCandidates(ids []int, idx *Index, key string) {
 	copy(ids[len(named):], rest)
 }
 
-func contentIsHeaderName(name string) bool {
-	switch strings.ToLower(filepath.Ext(name)) {
-	case ".h", ".hh", ".hpp", ".hxx":
-		return true
-	}
-	return false
+// promoteSymbolNamedCandidates is the symbol-only form used by tests and
+// hand-built callers.
+func promoteSymbolNamedCandidates(ids []int, idx *Index, key string) {
+	promoteNamedCandidates(ids, idx, contentPromotion{symbolKey: key})
 }
 
-// promoteSymbolNamedEntries is promoteSymbolNamedCandidates for a merged Entry
-// slice: it stably moves symbol-named entries to the front (headers first) and
-// leaves the relative order of both groups unchanged.
-func promoteSymbolNamedEntries(entries []Entry, key string) {
-	if key == "" || len(entries) < 2 {
+// promoteNamedEntries is promoteNamedCandidates for a merged Entry slice.
+func promoteNamedEntries(entries []Entry, p contentPromotion) {
+	if !p.active() || len(entries) < 2 {
 		return
 	}
 	named := make([]Entry, 0, 4)
 	rest := make([]Entry, 0, len(entries))
 	for _, entry := range entries {
-		if contentEntrySymbolNamed(entry, key) {
+		if p.tier(entry) < 2 {
 			named = append(named, entry)
 		} else {
 			rest = append(rest, entry)
@@ -531,20 +603,4 @@ func promoteSymbolNamedEntries(entries []Entry, key string) {
 	})
 	copy(entries, named)
 	copy(entries[len(named):], rest)
-}
-
-// contentEntrySymbolNamed reports whether entry's file name (up to the first
-// '.') normalizes to the symbol key, the predicate promotion uses.
-func contentEntrySymbolNamed(entry Entry, key string) bool {
-	if key == "" {
-		return false
-	}
-	name := entry.Name
-	if name == "" {
-		name = filepath.Base(entry.Path)
-	}
-	if dot := strings.IndexByte(name, '.'); dot > 0 {
-		name = name[:dot]
-	}
-	return len(name) >= len(key) && contentNormalizeSymbolName(name) == key
 }

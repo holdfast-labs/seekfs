@@ -630,14 +630,15 @@ func (s *goSearchService) serviceCommandSearch(w io.Writer, caps serviceCapabili
 						}
 						var key *contentCursorKey
 						if vol := s.volumes[0]; vol != nil {
+							promo := newContentPromotion(pq)
 							for i := range matches {
 								entry := matches[i]
 								var rowKey contentCursorKey
 								if vol.contentCursorEntryIsOverlay(entry) {
 									rowKey = vol.contentCursorOverlayKey(
-										rankedOverlayEntry{entry: entry, rank: vol.overlayEntryRank(entry, pq)}, pq)
+										rankedOverlayEntry{entry: entry, rank: vol.overlayEntryRank(entry, pq)}, pq, promo)
 								} else {
-									rowKey = vol.contentCursorBaseKey(entry, pq)
+									rowKey = vol.contentCursorBaseKey(entry, pq, promo)
 									bk = entry.FRN
 								}
 								if i == len(matches)-1 {
