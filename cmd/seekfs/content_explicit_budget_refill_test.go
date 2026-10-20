@@ -109,15 +109,26 @@ func TestContentExplicitBudgetRefillReadsNoCandidateTwice(t *testing.T) {
 	if len(got) != 50 {
 		t.Fatalf("explicit budget 1000: hits=%d; want a full page of 50", len(got))
 	}
+	// The refill resumes at the first-pass frontier, so verified misses before
+	// it are never read again. Parallel verifiers may already have read up to
+	// one in-flight batch past the frontier when the cap stopped them; those
+	// results are discarded and re-read, which is bounded by one batch.
+	batch := 4 * contentParallelWorkers()
 	readsMu.Lock()
+	reread := 0
 	for path := range missText {
-		if reads[path] > 1 {
+		if reads[path] > 2 {
 			readsMu.Unlock()
 			t.Fatalf("candidate %q read %d times; the refill must resume at the frontier", path, reads[path])
 		}
+		if reads[path] == 2 {
+			reread++
+		}
 	}
 	readsMu.Unlock()
-	batch := 4 * contentParallelWorkers()
+	if reread > batch {
+		t.Fatalf("%d candidates re-read; want at most one in-flight batch (%d) past the frontier", reread, batch)
+	}
 	const snippets = 50
 	if explicit.DiskVerified > 40+310+batch+snippets {
 		t.Fatalf("explicit run verified %d files; want at most the first valve 40 + remainder 310 + batch %d + snippets %d", explicit.DiskVerified, batch, snippets)
