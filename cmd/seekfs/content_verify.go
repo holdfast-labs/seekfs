@@ -1932,9 +1932,10 @@ func searchContentServiceVolumes(volumes []*serviceVolumeIndex, opts queryOption
 			// verify walk knows how many overlay rows precede its next base
 			// candidate and the merge reuses the same ranked list.
 			overlay := vol.overlayRankedMatches(vol.snap.Load(), pq, make(map[int]string))
+			promo := newContentPromotion(pq)
 			overlayKeys := make([]contentCursorKey, 0, len(overlay))
 			for _, item := range overlay {
-				overlayKeys = append(overlayKeys, vol.contentCursorOverlayKey(item, pq))
+				overlayKeys = append(overlayKeys, vol.contentCursorOverlayKey(item, pq, promo))
 			}
 			sort.Slice(overlayKeys, func(i, j int) bool {
 				return overlayKeys[i].compare(overlayKeys[j]) < 0

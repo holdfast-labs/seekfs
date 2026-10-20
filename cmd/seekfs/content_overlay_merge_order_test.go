@@ -181,8 +181,9 @@ func assertCursorKeyOrder(t *testing.T, vol *serviceVolumeIndex, query string, f
 			FRN:       f.frn,
 		}
 	}
+	promo := newContentPromotion(pq)
 	sort.SliceStable(base, func(i, j int) bool {
-		a, b := vol.contentCursorBaseKey(base[i], pq), vol.contentCursorBaseKey(base[j], pq)
+		a, b := vol.contentCursorBaseKey(base[i], pq, promo), vol.contentCursorBaseKey(base[j], pq, promo)
 		if n := a.compare(b); n != 0 {
 			return n < 0
 		}
@@ -197,10 +198,10 @@ func assertCursorKeyOrder(t *testing.T, vol *serviceVolumeIndex, query string, f
 	}
 	rows := make([]row, 0, len(base)+len(overlay))
 	for _, entry := range base {
-		rows = append(rows, row{entry: entry, key: vol.contentCursorBaseKey(entry, pq)})
+		rows = append(rows, row{entry: entry, key: vol.contentCursorBaseKey(entry, pq, promo)})
 	}
 	for _, item := range overlay {
-		rows = append(rows, row{entry: item.entry, key: vol.contentCursorOverlayKey(item, pq)})
+		rows = append(rows, row{entry: item.entry, key: vol.contentCursorOverlayKey(item, pq, promo)})
 	}
 	sort.SliceStable(rows, func(i, j int) bool {
 		return rows[i].key.compare(rows[j].key) < 0

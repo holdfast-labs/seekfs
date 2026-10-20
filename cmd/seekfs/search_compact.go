@@ -340,12 +340,16 @@ func searchCompactWithCacheHidden(idx *Index, opts queryOptions, countOnly bool,
 		}
 		return []Entry{}, nil
 	}
+	var resumePromo contentPromotion
+	if resumePageStop {
+		resumePromo = newContentPromotion(pq)
+	}
 	for pos := 0; pos < compactOrderLen(order, idx.compactRecordCount()); pos++ {
 		if pos&1023 == 0 && queryCanceled(pq) {
 			return nil, errQueryCanceled
 		}
 		if resumePageStop && contentVol != nil {
-			if next, ok := contentVol.contentResumeNextBaseKey(idx, order, pos, pq, pathCache); ok &&
+			if next, ok := contentVol.contentResumeNextBaseKey(idx, order, pos, pq, resumePromo, pathCache); ok &&
 				pq.contentAfter.pageProvablyFull(len(results), next) {
 				break
 			}
@@ -1295,11 +1299,11 @@ func (vol *serviceVolumeIndex) nameTermCandidates(pq parsedQuery) ([]int, bool) 
 					if contentLeavesAllRegex(pq) {
 						vol.sortCandidateIDsByScanOrder(candidates, pq)
 						if pq.SortColumn == "" {
-							promoteRegexNamedCandidates(candidates, vol.index, pq)
+							promoteNamedCandidates(candidates, vol.index, newContentPromotion(pq))
 						}
 					} else {
 						sortCandidateIDs(candidates, pq, vol.index, vol.rankForQuery(pq))
-						promoteSymbolNamedCandidates(candidates, vol.index, contentSymbolQueryKey(pq))
+						promoteNamedCandidates(candidates, vol.index, newContentPromotion(pq))
 					}
 					if page, verified := vol.verifyContentSupersetPage(pq, candidates); verified {
 						if pq.contentProbe != nil {
@@ -1364,11 +1368,7 @@ func (vol *serviceVolumeIndex) nameTermCandidates(pq parsedQuery) ([]int, bool) 
 					// bounded window in this order, so the defining file stays
 					// inside it).
 					if pq.SortColumn == "" || pq.SortColumn == "relevance" {
-						if contentLeavesAllRegex(pq) {
-							promoteRegexNamedCandidates(candidates, vol.index, pq)
-						} else {
-							promoteSymbolNamedCandidates(candidates, vol.index, contentSymbolQueryKey(pq))
-						}
+						promoteNamedCandidates(candidates, vol.index, newContentPromotion(pq))
 					}
 					if start := vol.contentAfterCandidateStart(candidates, pq.contentAfter); start > 0 {
 						candidates = candidates[start:]
