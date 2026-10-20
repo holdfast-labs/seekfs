@@ -639,12 +639,14 @@ func TestHeadlessFrameCost(t *testing.T) {
 		// broken, never merely busy. The soak tier (SEEKFS_TEST_SOAK=1, run
 		// by CI) applies a budget to the minimum instead of the average.
 		// GitHub's Windows runners have no GPU, so the frame renders through
-		// the software rasterizer and its floor is ~14.7ms there; 25ms still
-		// fails a real 2x frame-path regression on that path, and the 10ms
-		// layout CPU budget above stays the strict check.
+		// the software rasterizer, whose readback cost scales with pixels
+		// (measured floors ~15-20ms at 1280x800 and ~36ms at 2560x1440).
+		// 15ms + 10ms per megapixel still fails a 2x frame-path regression at
+		// both sizes, and the 10ms layout CPU budget above stays the strict
+		// check.
 		cap := 100.0
 		if testSoakEnabled() {
-			cap = 25.0
+			cap = 15.0 + 10.0*float64(size.X*size.Y)/1e6
 		}
 		if e2eMin > cap {
 			t.Fatalf("frame end-to-end min %.2fms exceeds %.0fms budget (%dx%d, soak=%v)",
