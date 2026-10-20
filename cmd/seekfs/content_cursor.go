@@ -1,6 +1,7 @@
 package main
 
 import (
+	"cmp"
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/hex"
@@ -51,21 +52,50 @@ type searchCursorV2 struct {
 	K *contentCursorKey `json:"k,omitempty"`
 }
 
-// contentCursorKey is a row's page position: (tier, rank, tiebreak).
+// contentCursorKey is a row's page position.
 //
-// tier is the default-sort promotion tier (0 = symbol-named header, 1 =
-// symbol-named other, 2 = rest); explicit sorts use 0. rank is the same value
-// mergeContentOverlayMatches uses (baseEntryRank / overlayEntryRank). tiebreak
-// orders equal ranks: base rows sort first, then overlay rows in their ranked
-// overlay order (name/path). Sorting rows by key reproduces the merged page
-// order.
+// For the default name sort it is (tier, rank, tiebreak). tier is the
+// promotion tier (0 = symbol-named header, 1 = symbol-named other, 2 = rest).
+// rank is the same value mergeContentOverlayMatches uses (baseEntryRank /
+// overlayEntryRank). tiebreak orders equal ranks: base rows sort first, then
+// overlay rows in their ranked overlay order (name/path).
+//
+// For an explicit sort the key carries the row's sort value and its
+// name/path fields, so compare reproduces compareSearchAllEntries exactly.
+// Explicit marks that shape; a token without it is an old default-shape key
+// and must restart an explicit-sort resume.
 type contentCursorKey struct {
 	Tier     int    `json:"t"`
 	Rank     int    `json:"r"`
 	Tiebreak string `json:"x,omitempty"`
+
+	Explicit   bool   `json:"e,omitempty"`
+	SortColumn string `json:"sc,omitempty"`
+	SortNum    int64  `json:"sn,omitempty"`
+	SortStr    string `json:"ss,omitempty"`
+	LowerName  string `json:"ln,omitempty"`
+	LowerPath  string `json:"lp,omitempty"`
+	Path       string `json:"p,omitempty"`
+	Name       string `json:"n,omitempty"`
 }
 
 func (k contentCursorKey) compare(other contentCursorKey) int {
+	if k.Explicit || other.Explicit {
+		switch {
+		case k.Explicit != other.Explicit:
+			// One query never mixes shapes; keep a total order anyway.
+			if k.Explicit {
+				return 1
+			}
+			return -1
+		case k.SortColumn != other.SortColumn:
+			return strings.Compare(k.SortColumn, other.SortColumn)
+		}
+		if n := k.compareExplicitSortValue(other); n != 0 {
+			return n
+		}
+		return k.compareExplicitNamePath(other)
+	}
 	if k.Tier != other.Tier {
 		return k.Tier - other.Tier
 	}
@@ -73,6 +103,51 @@ func (k contentCursorKey) compare(other contentCursorKey) int {
 		return k.Rank - other.Rank
 	}
 	return strings.Compare(k.Tiebreak, other.Tiebreak)
+}
+
+// compareExplicitSortValue compares the primary explicit-sort value. The path
+// sort has no separate primary field: compareSearchAllEntryPath starts with
+// the lowercased path, which compareExplicitNamePath covers.
+func (k contentCursorKey) compareExplicitSortValue(other contentCursorKey) int {
+	switch k.SortColumn {
+	case "size":
+		return cmp.Compare(k.SortNum, other.SortNum)
+	case "modified":
+		a, b := k.SortNum, other.SortNum
+		if a == b {
+			return 0
+		}
+		switch {
+		case a == 0:
+			return 1
+		case b == 0:
+			return -1
+		case a > b:
+			return -1
+		default:
+			return 1
+		}
+	case "extension":
+		return strings.Compare(k.SortStr, other.SortStr)
+	case "type":
+		return cmp.Compare(k.SortNum, other.SortNum)
+	}
+	return 0
+}
+
+func (k contentCursorKey) compareExplicitNamePath(other contentCursorKey) int {
+	if k.SortColumn != "path" {
+		if n := strings.Compare(k.LowerName, other.LowerName); n != 0 {
+			return n
+		}
+	}
+	if n := strings.Compare(k.LowerPath, other.LowerPath); n != 0 {
+		return n
+	}
+	if n := strings.Compare(k.Path, other.Path); n != 0 {
+		return n
+	}
+	return strings.Compare(k.Name, other.Name)
 }
 
 // contentCursorTier is the promotion tier a row occupies. Promotion only runs
@@ -93,7 +168,42 @@ func contentCursorOverlayTiebreak(entry Entry, pq parsedQuery) string {
 	return entryLowerName(entry) + "\x00" + entry.Path
 }
 
+// contentCursorExplicitKey builds the comparator-order key an explicit sort
+// needs. It returns false for the default and relevance orders, which keep
+// their rank/promotion key.
+func contentCursorExplicitKey(entry Entry, pq parsedQuery) (contentCursorKey, bool) {
+	if pq.SortColumn == "" || pq.SortColumn == "relevance" {
+		return contentCursorKey{}, false
+	}
+	k := contentCursorKey{
+		Explicit:   true,
+		SortColumn: pq.SortColumn,
+		LowerName:  entryLowerName(entry),
+		LowerPath:  entryLowerPath(entry),
+		Path:       entry.Path,
+		Name:       entry.Name,
+	}
+	switch pq.SortColumn {
+	case "size":
+		k.SortNum = entry.Size
+	case "modified":
+		k.SortNum = entry.ModUnix
+	case "extension":
+		k.SortStr = entryLowerExt(entry)
+	case "type":
+		k.SortNum = int64(entryTypeRank(entry))
+	case "path":
+		// The lower path is the primary key and is carried above.
+	default:
+		return contentCursorKey{}, false
+	}
+	return k, true
+}
+
 func (vol *serviceVolumeIndex) contentCursorOverlayKey(item rankedOverlayEntry, pq parsedQuery, p contentPromotion) contentCursorKey {
+	if k, ok := contentCursorExplicitKey(item.entry, pq); ok {
+		return k
+	}
 	return contentCursorKey{
 		Tier:     contentCursorTier(item.entry, pq, p),
 		Rank:     item.rank,
@@ -102,6 +212,9 @@ func (vol *serviceVolumeIndex) contentCursorOverlayKey(item rankedOverlayEntry, 
 }
 
 func (vol *serviceVolumeIndex) contentCursorBaseKey(entry Entry, pq parsedQuery, p contentPromotion) contentCursorKey {
+	if k, ok := contentCursorExplicitKey(entry, pq); ok {
+		return k
+	}
 	return contentCursorKey{
 		Tier: contentCursorTier(entry, pq, p),
 		Rank: vol.baseEntryRank(entry, pq),

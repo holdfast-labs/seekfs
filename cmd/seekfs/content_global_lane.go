@@ -623,6 +623,12 @@ func searchServiceVolumesGlobalContentComponentsSnapshot(snapshot globalQuerySna
 	if countOnly {
 		return nil, false, nil
 	}
+	if pq.contentAfter != nil {
+		// The lane drives a fresh filename iterator and has no resume walk. A
+		// v2 cursor page is exact only on the per-volume content path, so leave
+		// the resume to it instead of answering from offset zero.
+		return nil, false, nil
+	}
 	usable, _, merged, skipped, verified, ok, err := contentLaneMergedMatches(snapshot, opts, pq, true)
 	if !ok {
 		return nil, false, err
