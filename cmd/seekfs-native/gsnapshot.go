@@ -60,6 +60,7 @@ func runSnapshot(pipe string, limit int, cfg snapshotConfig) error {
 	// Sync service handshake for the sidebar/volumes + health line.
 	if resp, err := u.client.Info(); err == nil {
 		u.mu.Lock()
+		u.noVolumes = len(resp.DBs) == 0
 		if resp.Loading {
 			u.health, u.healthMsg = serviceHealthDegraded, "Loading indexes…"
 		} else if resp.OK && resp.Entries > 0 {

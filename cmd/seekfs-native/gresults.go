@@ -407,10 +407,18 @@ func (u *UI) layoutEmpty(gtx layout.Context) layout.Dimensions {
 	query := u.query
 	unavail := u.unavail
 	fuzzy := u.fuzzyMsg
+	noVolumes := u.noVolumes
 	u.mu.Unlock()
+	if firstRunClicked := noVolumes && query == "" && unavail == ""; firstRunClicked && u.emptyDrivesBtn.Clicked(gtx) {
+		u.openSettingsTab(settingsTabDrives)
+	}
 	icon, title, hint := iconSearch, "Type to search", "Results appear as you type"
+	firstRun := false
 	if unavail != "" {
 		icon, title, hint = iconContents, "Content search is off", "Run `seekfs plugin add content` to enable it"
+	} else if noVolumes && query == "" {
+		icon, title, hint = iconFolder, "No drives indexed", "Choose the drives seekfs should index"
+		firstRun = true
 	} else if query != "" {
 		icon, title = iconSearch, "No matches for \u201c"+query+"\u201d"
 		hint = fuzzy
@@ -432,6 +440,14 @@ func (u *UI) layoutEmpty(gtx layout.Context) layout.Dimensions {
 				layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 					return layout.Inset{Top: Dp(4)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
 						return label(th, Sp(13), hint, s.Muted).Layout(gtx)
+					})
+				}),
+				layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+					if !firstRun {
+						return layout.Dimensions{}
+					}
+					return layout.Inset{Top: Dp(16)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+						return chip(gtx, th, s, &u.emptyDrivesBtn, "Choose drives to index", true)
 					})
 				}),
 			)

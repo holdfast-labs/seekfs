@@ -136,6 +136,24 @@ func (u *UI) openSettings() {
 	go u.fetchSettings()
 }
 
+// openSettingsTab opens Settings on a specific section (for example Drives
+// from the first-run panel).
+func (u *UI) openSettingsTab(tab int) {
+	if tab < 0 || tab > settingsTabSearch {
+		tab = settingsTabDrives
+	}
+	if u.settingsOpen {
+		if u.gsettings != nil {
+			u.gsettings.tab = tab
+		}
+		return
+	}
+	u.openSettings()
+	if u.gsettings != nil {
+		u.gsettings.tab = tab
+	}
+}
+
 // closeSettings hides the panel and discards staged edits.
 func (u *UI) closeSettings() {
 	u.settingsOpen = false
