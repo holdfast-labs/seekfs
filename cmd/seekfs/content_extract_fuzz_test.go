@@ -2,7 +2,7 @@ package main
 
 // WP11 validation: one fuzz target per parser. Each asserts the extractor
 // contract on arbitrary bytes — no panic (the safe path recovers and reports
-// contentExtractPanicError), bounded output (never over the policy's maxRaw /
+// errContentExtractPanic), bounded output (never over the policy's maxRaw /
 // maxText), valid UTF-8 text, and a non-empty Reason whenever the result is a
 // skip. The per-document deadline bounds runtime; the extractors' own caps bound
 // memory, so even an input that ignores ctx cannot stall the fuzz worker past
@@ -34,7 +34,7 @@ func contentFuzzExtractor(f *testing.F, e contentExtractor, seeds ...[]byte) {
 			maxText: cap,
 		})
 		res, err := contentExtractSafely(ctx, e, bytes.NewReader(raw), int64(len(raw)))
-		if errors.Is(err, contentExtractPanicError) {
+		if errors.Is(err, errContentExtractPanic) {
 			t.Fatalf("%s panicked on %d bytes", e.Name(), len(raw))
 		}
 		// A deadline can surface either as the wrapper's skip or, if the

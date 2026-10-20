@@ -37,7 +37,7 @@ type wndClassEx struct {
 
 type nmhdr struct {
 	HwndFrom uintptr
-	IdFrom   uintptr
+	IDFrom   uintptr
 	Code     int32
 	_        [4]byte
 }

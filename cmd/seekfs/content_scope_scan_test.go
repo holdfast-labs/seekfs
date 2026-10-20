@@ -30,8 +30,6 @@ func buildScanTreeFixture(t *testing.T, rnd *rand.Rand) *scanTreeFixture {
 	// every path honest (real stats, real ignore-file reads).
 	exts := []string{".go", ".txt", ".md", ".png", ".log", "", ".html", ".bin"}
 	dirNames := []string{"src", "node_modules", "build", "vendor", "docs", "out", "pkg", ".git"}
-	var dirs []string
-	dirs = append(dirs, root)
 	repoRoots := map[string]string{
 		filepath.Join(root, "proj"):  "*.log\n/out/\n!important.keep\n",
 		filepath.Join(root, "other"): "build/\n",
@@ -43,7 +41,6 @@ func buildScanTreeFixture(t *testing.T, rnd *rand.Rand) *scanTreeFixture {
 		if err := os.WriteFile(filepath.Join(rel, ".gitignore"), []byte(ignore), 0o644); err != nil {
 			t.Fatal(err)
 		}
-		dirs = append(dirs, rel)
 	}
 	// Random subtrees under root and the repos.
 	targets := append([]string{root}, filepath.Join(root, "proj"), filepath.Join(root, "other"))
@@ -53,7 +50,6 @@ func buildScanTreeFixture(t *testing.T, rnd *rand.Rand) *scanTreeFixture {
 			if err := os.MkdirAll(d, 0o755); err != nil {
 				t.Fatal(err)
 			}
-			dirs = append(dirs, d)
 			for f := 0; f < 20; f++ {
 				name := fmt.Sprintf("f%03d%s", rnd.Intn(500), exts[rnd.Intn(len(exts))])
 				if err := os.WriteFile(filepath.Join(d, name), []byte("x"), 0o644); err != nil {

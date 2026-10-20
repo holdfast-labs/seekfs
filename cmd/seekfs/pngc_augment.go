@@ -494,10 +494,10 @@ type memoryStatusEx struct {
 	availExtendedVirtual uint64
 }
 
-// totalRamBytes reports total physical memory via kernel32's
+// totalRAMBytes reports total physical memory via kernel32's
 // GlobalMemoryStatusEx (x/sys has no wrapper for it in this version). Only
 // TotalPhys is read; an error means unknown.
-func totalRamBytes() (uint64, error) {
+func totalRAMBytes() (uint64, error) {
 	proc := windows.NewLazySystemDLL("kernel32.dll").NewProc("GlobalMemoryStatusEx")
 	var st memoryStatusEx
 	// MEMORYSTATUSEX is 64 bytes (two DWORDs + seven DWORDLONGs); the

@@ -78,7 +78,7 @@ func rowsFromServiceResponse(resp serviceResponse) []ResultRow {
 	return out
 }
 
-// Sort columns for the Details view. SortKey values are persisted.
+// SortKey is a sort column for the Details view. SortKey values are persisted.
 type SortKey int
 
 const (

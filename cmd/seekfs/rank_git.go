@@ -511,11 +511,9 @@ func gitResolveWith(state *gitRepoState, data *gitRepoData, root, absPath string
 			if data.head != nil && gitHeadHas(state, data, rel) {
 				ev.staged = true
 				ev.tracked = true // visible to the tracked predicate as staged
-			} else if !ev.ignored {
-				// Untracked (git shows untracked dirs collapsed; same rule).
 			}
-		} else if !ev.ignored {
-			// Untracked; nothing else to compute.
+			// Otherwise untracked (git shows untracked dirs collapsed; same
+			// rule): nothing else to compute.
 		}
 		if data.recent != nil && need.recent {
 			ev.recentHit = data.recent[rel] || (isDir && gitRecentHasUnder(data.recent, rel))

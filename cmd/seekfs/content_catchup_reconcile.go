@@ -160,10 +160,7 @@ func (s *goSearchService) reconcileMetadataPass(vol *serviceVolumeIndex, idx *co
 	}
 	lists, ok := scanScopeMembers(s, vol, cfg)
 	if !ok {
-		if s.contentStopped(vol) {
-			return true
-		}
-		return false
+		return s.contentStopped(vol)
 	}
 	live := make(map[uint64]contentFilePrint)
 	ranks := make(map[uint64]contentScopeMember)

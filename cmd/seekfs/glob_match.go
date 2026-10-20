@@ -48,7 +48,6 @@ func expandBraceAlternatives(pattern string) []string {
 			depth--
 			if depth == 0 {
 				end = i
-				break
 			}
 		}
 		if end >= 0 {
@@ -84,9 +83,7 @@ func expandBraceAlternatives(pattern string) []string {
 	prefix, suffix := pattern[:start], pattern[end+1:]
 	var out []string
 	for _, alt := range alts {
-		for _, expanded := range expandBraceAlternatives(prefix + alt + suffix) {
-			out = append(out, expanded)
-		}
+		out = append(out, expandBraceAlternatives(prefix+alt+suffix)...)
 	}
 	return out
 }

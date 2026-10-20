@@ -453,7 +453,7 @@ func TestContentPrunedIndexMatchesUnpruned(t *testing.T) {
 		return r
 	}
 	plain := build(1 << 30)
-	if plain.pruned != nil && len(plain.pruned) != 0 {
+	if len(plain.pruned) != 0 {
 		t.Fatal("unpruned index must carry no pruned set")
 	}
 	pruned := build(40)

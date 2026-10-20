@@ -319,9 +319,7 @@ func applyQueryToken(pq *parsedQuery, raw string) error {
 			// path posting lanes engage instead of full scans.
 			pq.PathGlobs = append(pq.PathGlobs, norm)
 			pq.PathGlobAlts = append(pq.PathGlobAlts, expandBraceAlternatives(norm))
-			for _, lit := range globCommonLiterals(norm, pq.CaseSensitive) {
-				pq.Dirs = append(pq.Dirs, lit)
-			}
+			pq.Dirs = append(pq.Dirs, globCommonLiterals(norm, pq.CaseSensitive)...)
 			// A brace set over final `*.ext` segments additionally
 			// constrains the extension (required: any path match ends
 			// in one of them), so AND an ext OR for the posting lanes.
@@ -332,9 +330,7 @@ func applyQueryToken(pq *parsedQuery, raw string) error {
 			pq.Globs = append(pq.Globs, norm)
 			pq.GlobAlts = append(pq.GlobAlts, expandBraceAlternatives(norm))
 			if strings.Contains(glob, "{") {
-				for _, lit := range globCommonLiterals(norm, pq.CaseSensitive) {
-					pq.Terms = append(pq.Terms, lit)
-				}
+				pq.Terms = append(pq.Terms, globCommonLiterals(norm, pq.CaseSensitive)...)
 			}
 		}
 	case strings.HasPrefix(raw, "git:"):
@@ -474,9 +470,7 @@ func applyQueryToken(pq *parsedQuery, raw string) error {
 		pq.Globs = append(pq.Globs, norm)
 		pq.GlobAlts = append(pq.GlobAlts, expandBraceAlternatives(norm))
 		if strings.Contains(raw, "{") {
-			for _, lit := range globCommonLiterals(norm, pq.CaseSensitive) {
-				pq.Terms = append(pq.Terms, lit)
-			}
+			pq.Terms = append(pq.Terms, globCommonLiterals(norm, pq.CaseSensitive)...)
 		}
 	default:
 		fuzzyMarked := false
@@ -771,9 +765,7 @@ func addBareGlobPattern(pq *parsedQuery, raw string) error {
 	if isPathGlobPattern(raw) {
 		pq.PathGlobs = append(pq.PathGlobs, norm)
 		pq.PathGlobAlts = append(pq.PathGlobAlts, expandBraceAlternatives(norm))
-		for _, lit := range globCommonLiterals(norm, pq.CaseSensitive) {
-			pq.Dirs = append(pq.Dirs, lit)
-		}
+		pq.Dirs = append(pq.Dirs, globCommonLiterals(norm, pq.CaseSensitive)...)
 		if exts, ok := bracePathGlobExts(norm); ok {
 			appendExtOrGroup(pq, exts)
 		}
@@ -785,9 +777,7 @@ func addBareGlobPattern(pq *parsedQuery, raw string) error {
 	}
 	pq.Globs = append(pq.Globs, norm)
 	pq.GlobAlts = append(pq.GlobAlts, expandBraceAlternatives(norm))
-	for _, lit := range globCommonLiterals(norm, pq.CaseSensitive) {
-		pq.Terms = append(pq.Terms, lit)
-	}
+	pq.Terms = append(pq.Terms, globCommonLiterals(norm, pq.CaseSensitive)...)
 	return nil
 }
 

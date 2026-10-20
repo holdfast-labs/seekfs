@@ -16,8 +16,8 @@ func contentTotalDiskBytes(_ string) (uint64, error) {
 	return 0, errors.New("content disk budget is windows-only")
 }
 
-// contentTotalRamBytes is a no-op off Windows: the block cache falls back
+// contentTotalRAMBytes is a no-op off Windows: the block cache falls back
 // to its fixed default.
-func contentTotalRamBytes() (uint64, error) {
+func contentTotalRAMBytes() (uint64, error) {
 	return 0, errors.New("content ram size is windows-only")
 }

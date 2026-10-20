@@ -10,8 +10,8 @@ import (
 )
 
 const (
-	testSID_A = "S-1-5-21-1111111111-2222222222-3333333333-1001"
-	testSID_B = "S-1-5-21-1111111111-2222222222-3333333333-1002"
+	testSIDA = "S-1-5-21-1111111111-2222222222-3333333333-1001"
+	testSIDB = "S-1-5-21-1111111111-2222222222-3333333333-1002"
 )
 
 // Per-user paths stay in the service state dir (SEEKFS_DIR-aware) with one
@@ -23,8 +23,8 @@ func TestSignalStorePathPerSID(t *testing.T) {
 	defer resetSharedSignalStoreForTest()
 
 	legacy := signalStorePath()
-	a := signalStorePathForSID(testSID_A)
-	b := signalStorePathForSID(testSID_B)
+	a := signalStorePathForSID(testSIDA)
+	b := signalStorePathForSID(testSIDB)
 	if a == b {
 		t.Fatal("different SIDs must map to different files")
 	}
@@ -53,8 +53,8 @@ func TestSignalStoresIsolatedBySID(t *testing.T) {
 	signalStoreDisableACLForTest = true
 	defer func() { signalStoreDisableACLForTest = false }()
 
-	a := signalStoreForSID(testSID_A)
-	b := signalStoreForSID(testSID_B)
+	a := signalStoreForSID(testSIDA)
+	b := signalStoreForSID(testSIDB)
 	if a == b {
 		t.Fatal("different SIDs must get different stores")
 	}
@@ -72,7 +72,7 @@ func TestSignalStoresIsolatedBySID(t *testing.T) {
 		t.Fatal("A must see its own open")
 	}
 	// Same object on repeat lookup (cached per SID+path).
-	if signalStoreForSID(testSID_A) != a {
+	if signalStoreForSID(testSIDA) != a {
 		t.Fatal("same SID must return the cached store")
 	}
 }
@@ -110,13 +110,13 @@ func TestSignalServiceOpenRecentPerUser(t *testing.T) {
 		return resp
 	}
 
-	if r := open(testSID_A, `T:\proj\a.go`, "a"); !r.OK {
+	if r := open(testSIDA, `T:\proj\a.go`, "a"); !r.OK {
 		t.Fatalf("A open: %s", r.Message)
 	}
-	if r := open(testSID_B, `T:\proj\b.go`, "b"); !r.OK {
+	if r := open(testSIDB, `T:\proj\b.go`, "b"); !r.OK {
 		t.Fatalf("B open: %s", r.Message)
 	}
-	ra, rb := recent(testSID_A), recent(testSID_B)
+	ra, rb := recent(testSIDA), recent(testSIDB)
 	if !ra.OK || len(ra.Recent) != 1 || ra.Recent[0].Path != normalizeSignalPath(`T:\proj\a.go`) {
 		t.Fatalf("A recent = %+v", ra)
 	}
@@ -124,10 +124,10 @@ func TestSignalServiceOpenRecentPerUser(t *testing.T) {
 		t.Fatalf("B recent = %+v", rb)
 	}
 	// Ranking evidence follows the caller too.
-	if got := serviceSignalStoreForSID(testSID_A).comboCount("a", `T:\proj\a.go`); got != 1 {
+	if got := serviceSignalStoreForSID(testSIDA).comboCount("a", `T:\proj\a.go`); got != 1 {
 		t.Fatalf("A combo = %d, want 1", got)
 	}
-	if got := serviceSignalStoreForSID(testSID_B).comboCount("a", `T:\proj\a.go`); got != 0 {
+	if got := serviceSignalStoreForSID(testSIDB).comboCount("a", `T:\proj\a.go`); got != 0 {
 		t.Fatalf("B combo for A's query = %d, want 0", got)
 	}
 }
@@ -141,8 +141,8 @@ func TestSignalRankingPerUser(t *testing.T) {
 	signalStoreDisableACLForTest = true
 	defer func() { signalStoreDisableACLForTest = false }()
 
-	a := serviceSignalStoreForSID(testSID_A)
-	b := serviceSignalStoreForSID(testSID_B)
+	a := serviceSignalStoreForSID(testSIDA)
+	b := serviceSignalStoreForSID(testSIDB)
 	hit, other := `T:\proj\x\config.yaml`, `T:\proj\y\config.yaml`
 	a.recordOpen(hit, "")
 	pq := mustParseBlendQuery(t, queryOptions{Query: "config.yaml", Limit: 10})
@@ -181,18 +181,18 @@ func TestSignalMigrationClaimsLegacy(t *testing.T) {
 	}
 	resetSharedSignalStoreForTest()
 
-	first := signalStoreForSID(testSID_A)
+	first := signalStoreForSID(testSIDA)
 	if _, err := os.Stat(legacy); !os.IsNotExist(err) {
 		t.Fatalf("legacy must move to the first user, stat err = %v", err)
 	}
 	if got := first.comboCount("legacy", `T:\proj\legacy.go`); got != 1 {
 		t.Fatalf("first user must inherit legacy history, combo = %d", got)
 	}
-	if _, err := os.Stat(signalStorePathForSID(testSID_A)); err != nil {
+	if _, err := os.Stat(signalStorePathForSID(testSIDA)); err != nil {
 		t.Fatalf("per-user file missing: %v", err)
 	}
 
-	second := signalStoreForSID(testSID_B)
+	second := signalStoreForSID(testSIDB)
 	if len(second.recent(10)) != 0 {
 		t.Fatalf("second user must start empty, got %+v", second.recent(10))
 	}
