@@ -636,13 +636,15 @@ func TestHeadlessFrameCost(t *testing.T) {
 		// average is load noise (15-24ms on a busy box), not signal. The
 		// default tier only trips the smoke cap: the frame path completing
 		// at all is the coverage, and 100ms means it is fundamentally
-		// broken, never merely busy. The soak tier (SEEKFS_TEST_SOAK=1,
-		// which CI runs on a quieter runner) re-applies the original 14ms
-		// headroom budget to the minimum instead of the average, so a real
-		// 2x GPU-path regression still fails there without flaking here.
+		// broken, never merely busy. The soak tier (SEEKFS_TEST_SOAK=1, run
+		// by CI) applies a budget to the minimum instead of the average.
+		// GitHub's Windows runners have no GPU, so the frame renders through
+		// the software rasterizer and its floor is ~14.7ms there; 25ms still
+		// fails a real 2x frame-path regression on that path, and the 10ms
+		// layout CPU budget above stays the strict check.
 		cap := 100.0
 		if testSoakEnabled() {
-			cap = 14.0
+			cap = 25.0
 		}
 		if e2eMin > cap {
 			t.Fatalf("frame end-to-end min %.2fms exceeds %.0fms budget (%dx%d, soak=%v)",
