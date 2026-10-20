@@ -51,8 +51,9 @@ index is trigram postings plus a per-file bloom filter, and every match and
 snippet verifies by reading the file from disk — §6y; v11 and older sidecars
 fail the version gate and rebuild) and sharded manifests are
 **v5** (see §6i). P4 document-extraction
-quality remains deferred (see §7). Content search is off by default; with
-`[features.content] enabled = true` or `SEEKFS_CONTENT_SEARCH=1`, `content:`
+quality remains deferred (see §7). Content search is on by default since v1.12.0
+(`[features.content] enabled = false` or `SEEKFS_CONTENT_SEARCH=0` turns it
+off); `content:`
 queries work through the service once the
 service-owned build has attached a `.gsx` — FRN-keyed for USN volumes,
 stable-path-hash-keyed for walk volumes (see §6k).
