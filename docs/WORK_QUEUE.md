@@ -136,7 +136,12 @@ and carries unchanged doc table, paths, filter rows, aliases and gram postings
 (byte-identical to a rebuild except pruned grams); per-shard CXFC counters force a
 full re-extract past 25% changed docs or 32 posting folds, restoring exact term df
 (fuzzy ordering) and pruning. A posting fold no longer repairs out-of-band edits
-that never reached the delta. Nothing running.
+that never reached the delta. Release v1.12.0 prep (2026-10-19): content search on by default (6ef1f6c); internal
+work queue kept out of the release zip (d22593a); settings API settings-get/set
+(51f521e, docs/SETTINGS_API.md); native Settings window (0cf26d1) with the elevated
+helper reporting the service message (7c4a993); seekfs-native as the primary app
+(670d8c0); release notes and CONFIG/CONTENT_SEARCH corrections (d3d9dc0). Owner:
+push release/next + draft PR for CI/soak, relaunch the live service, then tag.
 Owner action: relaunch
 the live service to see the 1,826 extract errors split by reason.
 

@@ -172,3 +172,7 @@ background. The previous web-view app, `seekfs-ui.exe`, remains available.
 - Fuzzy-suggestion ordering is approximate between full re-extracts: posting
   folds keep the old term frequencies, and a full re-extract (past 25% changed
   docs or 32 posting folds per shard) restores them.
+- The desktop app connects only to the installed seekfs service or to the
+  service from its own folder with the same build. If an older seekfs service
+  (for example one started from a previous install folder) holds the pipe, the
+  app asks you to close or restart it instead of stopping it.
