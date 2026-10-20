@@ -491,19 +491,27 @@ func (s *goSearchService) serviceCommandSearch(w io.Writer, caps serviceCapabili
 				cursorCtx = ctx
 				if v2Cursor != nil {
 					if ok, reason := v2Cursor.check(*ctx); ok {
-						v2Resume = true
-						resumeBaseFRN = v2Cursor.BK
-						if v2Cursor.K == nil {
-							// A pre-overlay token carried only the last row's
-							// FRN, and that row was always a base row.
-							resumeBaseFRN = v2Cursor.ID
+						if pq.SortColumn != "" &&
+							(v2Cursor.K == nil || !v2Cursor.K.Explicit || v2Cursor.K.SortColumn != pq.SortColumn) {
+							// Old tokens carry a rank key, which cannot order an
+							// explicit sort. Restart instead of skipping rows.
+							v2Restarted = true
+							v2RestartReason = "content cursor sort order changed"
+						} else {
+							v2Resume = true
+							resumeBaseFRN = v2Cursor.BK
+							if v2Cursor.K == nil {
+								// A pre-overlay token carried only the last row's
+								// FRN, and that row was always a base row.
+								resumeBaseFRN = v2Cursor.ID
+							}
+							opts.contentAfter = &contentCursorResume{
+								FRN:   resumeBaseFRN,
+								Found: resumeBaseFRN == 0,
+								Key:   v2Cursor.K,
+							}
+							opts.Limit = pageLimit
 						}
-						opts.contentAfter = &contentCursorResume{
-							FRN:   resumeBaseFRN,
-							Found: resumeBaseFRN == 0,
-							Key:   v2Cursor.K,
-						}
-						opts.Limit = pageLimit
 					} else {
 						v2Restarted = true
 						v2RestartReason = reason

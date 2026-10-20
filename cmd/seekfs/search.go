@@ -702,6 +702,33 @@ func (vol *serviceVolumeIndex) mergeContentOverlayMatches(base []Entry, overlay 
 		})
 		return merged
 	}
+	if pq.SortColumn != "" {
+		// An explicit sort ranks by the Entry fields, and compareSearchAllEntries
+		// owns the tie-break. The rank merge below only applies to the default
+		// name order: its overlay rank is exact for that order, while the
+		// explicit-sort ranks locate only the first row of a sort value.
+		merged := make([]Entry, 0, len(base)+len(overlay))
+		merged = append(merged, base...)
+		for _, item := range overlay {
+			merged = append(merged, item.entry)
+		}
+		sort.SliceStable(merged, func(i, j int) bool {
+			return compareSearchAllEntries(merged[i], merged[j], pq) < 0
+		})
+		// A partial base page covers only the comparator prefix up to the
+		// first unverified candidate; drop overlay rows at or after it.
+		if trace != nil && trace.contentFrontierSet && trace.contentIncomplete() {
+			frontier := trace.contentFrontier
+			kept := merged[:0]
+			for _, e := range merged {
+				if compareSearchAllEntries(e, frontier, pq) < 0 {
+					kept = append(kept, e)
+				}
+			}
+			merged = kept
+		}
+		return merged
+	}
 	if trace != nil && trace.contentFrontierSet && trace.contentIncomplete() {
 		// Base rows are already verified up to the frontier. Only overlay rows
 		// ranking at or after it must be dropped to keep the partial page a
