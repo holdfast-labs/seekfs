@@ -11,6 +11,43 @@ import (
 
 const maxTextPreviewBytes = 256 * 1024
 
+const (
+	previewTabStop            = 4
+	previewControlReplacement = "\uFFFD"
+)
+
+// sanitizePreviewText normalizes line endings, expands tabs to the next
+// 4-column tab stop, and replaces every other C0 control (plus DEL) with a
+// visible replacement rune. The text shaper therefore never sees a tab or a
+// control rune.
+func sanitizePreviewText(text string) string {
+	text = strings.ReplaceAll(text, "\r\n", "\n")
+	text = strings.ReplaceAll(text, "\r", "\n")
+	var b strings.Builder
+	b.Grow(len(text))
+	col := 0
+	for _, r := range text {
+		switch {
+		case r == '\n':
+			b.WriteRune(r)
+			col = 0
+		case r == '\t':
+			n := previewTabStop - col%previewTabStop
+			for i := 0; i < n; i++ {
+				b.WriteByte(' ')
+			}
+			col += n
+		case r < 0x20 || r == 0x7f:
+			b.WriteString(previewControlReplacement)
+			col++
+		default:
+			b.WriteRune(r)
+			col++
+		}
+	}
+	return b.String()
+}
+
 // textPreviewableExt reports whether the extension is plausibly plain text.
 func textPreviewableExt(path string) bool {
 	switch strings.ToLower(dotExt(path)) {

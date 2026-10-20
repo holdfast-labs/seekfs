@@ -55,6 +55,16 @@ func (b *fakeBridge) Icon(path string, isDir bool, size int) image.Image {
 		return im
 	}
 	im := image.NewRGBA(image.Rect(0, 0, size, size))
+	c := color.RGBA{R: 0x4C, G: 0x8B, B: 0xF5, A: 0xFF}
+	if isDir {
+		c = color.RGBA{R: 0xE0, G: 0xA8, B: 0x2E, A: 0xFF}
+	}
+	margin := size / 8
+	for y := margin; y < size-margin; y++ {
+		for x := margin; x < size-margin; x++ {
+			im.SetRGBA(x, y, c)
+		}
+	}
 	b.icons[key] = im
 	return im
 }

@@ -125,16 +125,44 @@ func (u *UI) layoutTipCard(gtx layout.Context, dir string) layout.Dimensions {
 	return layout.Dimensions{Size: sz}
 }
 
+// rowsHaveSnippetsLocked reports whether any row carries a content snippet.
+// The caller must hold u.mu.
+func (u *UI) rowsHaveSnippetsLocked() bool {
+	for i := range u.rows {
+		if u.rows[i].Snippet != "" {
+			return true
+		}
+	}
+	return false
+}
+
 // fitColumns sets showType/showMatch from the available width in dp and
 // shrinks Name/Folder to fit when even the essentials overflow (stale wide
-// persisted widths on a narrow window). Size/Date keep fixed widths so
+// persisted widths on a narrow window). In Contents mode with snippets the
+// Match column is the point of the view, so it outranks Type and the other
+// columns shrink before Match is dropped. Size/Date keep fixed widths so
 // dates never truncate; the region is hard-clipped as a backstop.
 func (u *UI) fitColumns(avail float32) {
 	u.mu.Lock()
 	defer u.mu.Unlock()
-	essentials := u.colW["name"] + u.colW["folder"] + u.colW["size"] + u.colW["modified"] + 48
-	u.showType = avail >= essentials+u.colW["type"]
-	u.showMatch = avail >= essentials+u.colW["type"]+140
+	const matchMin = float32(140)
+	base := u.colW["name"] + u.colW["folder"] + u.colW["size"] + u.colW["modified"] + 48
+	typeW := u.colW["type"]
+	contentSnippets := u.contents && u.rowsHaveSnippetsLocked()
+	if contentSnippets {
+		// Match is required whenever Name/Folder can shrink to their
+		// minimums and still leave matchMin for it.
+		minBase := float32(120+80) + u.colW["size"] + u.colW["modified"] + 48
+		u.showMatch = avail >= minBase+matchMin
+		u.showType = avail >= base+typeW+matchMin
+	} else {
+		u.showType = avail >= base+typeW
+		u.showMatch = avail >= base+typeW+matchMin
+	}
+	essentials := base
+	if u.showMatch {
+		essentials += matchMin
+	}
 	effName, effFolder := u.colW["name"], u.colW["folder"]
 	if over := essentials - avail; over > 0 {
 		// Folder yields first (min 80), then Name (min 120).
@@ -277,6 +305,17 @@ func (u *UI) headerCells(th *material.Theme, s Scheme, key SortKey, asc bool) []
 			} else {
 				title += " ▼"
 			}
+		}
+		if c.key == SortSnippet {
+			// Match takes the remaining width, exactly like the row's
+			// Flexed snippet cell; a fixed 320dp header would overflow the
+			// results region at common window widths.
+			out = append(out, layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
+				return layout.Inset{Top: Dp(7), Bottom: Dp(7), Left: Dp(4)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+					return label(th, Sp(12), title, s.Muted).Layout(gtx)
+				})
+			}))
+			continue
 		}
 		out = append(out, layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 			gtx.Constraints.Min.X = gtx.Dp(Dp(w))
@@ -520,6 +559,11 @@ func (u *UI) layoutRow(gtx layout.Context, rows []ResultRow, i int) layout.Dimen
 		}
 		row := layout.Flex{Axis: layout.Horizontal, Alignment: layout.Middle}.Layout(gtx,
 			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+				// Always reserve the same leading slot so selection and
+				// focus never shift the text x positions.
+				w := gtx.Dp(Dp(9))
+				gtx.Constraints.Min.X = w
+				gtx.Constraints.Max.X = w
 				if focused {
 					return layout.Inset{Right: Dp(6)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
 						gtx.Constraints.Min.X = gtx.Dp(Dp(3))
@@ -527,7 +571,7 @@ func (u *UI) layoutRow(gtx layout.Context, rows []ResultRow, i int) layout.Dimen
 						return fillRect(gtx, s.FocusBar)
 					})
 				}
-				return layout.Dimensions{}
+				return layout.Dimensions{Size: image.Pt(w, gtx.Constraints.Min.Y)}
 			}),
 			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 				return u.cellIcon(gtx, r, Dp(16))
@@ -684,7 +728,18 @@ func (u *UI) cellIcon(gtx layout.Context, r ResultRow, size unit.Dp) layout.Dime
 		op.Filter = paint.FilterNearest
 		return widget.Image{Src: op, Fit: widget.Contain}.Layout(gtx)
 	}
-	return layout.Dimensions{Size: image.Point{X: px, Y: px}}
+	// The shell can fail to resolve an icon (unknown type, icon cache
+	// problem). Fall back to the Fluent file/folder glyph so a row never
+	// renders an empty 16/40px hole.
+	glyph := iconFile
+	c := u.scheme.Subtle
+	if r.IsDir {
+		glyph = iconFolder
+		c = u.scheme.Accent
+	}
+	return layout.Center.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+		return ficon(u.th, unit.Sp(float32(size)*0.8), glyph, c).Layout(gtx)
+	})
 }
 
 func (u *UI) cellText(gtx layout.Context, txt string, w float32) layout.Dimensions {

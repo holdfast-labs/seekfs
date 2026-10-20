@@ -173,6 +173,7 @@ func downscale(img image.Image, max int) image.Image {
 func (u *UI) layoutPreviewText(gtx layout.Context, text string, terms []string) layout.Dimensions {
 	th := u.th
 	s := u.scheme
+	text = sanitizePreviewText(text)
 	if len(text) > 32768 {
 		text = text[:32768] + "\n…"
 	}
