@@ -58,6 +58,10 @@ type contentPDFTextWriter struct {
 	have      bool
 	sep       byte
 	truncated bool
+
+	// xobjectInvocations counts total Form XObject executions. The bound is a
+	// count (contentPDFMaxXObjectInvocations), never a wall clock.
+	xobjectInvocations int
 }
 
 func newContentPDFTextWriter(maxText int64) *contentPDFTextWriter {
@@ -119,9 +123,15 @@ func (w *contentPDFTextWriter) appendBytes(b []byte) {
 // extractPageText decodes every content stream of a page in order and appends
 // its text.
 func (d *contentPDFDoc) extractPageText(pg contentPDFPage, w *contentPDFTextWriter) error {
+	return d.extractPageTextBudget(pg, w, contentPDFMaxXObjectInvocations)
+}
+
+// extractPageTextBudget runs one page with an explicit Form invocation budget.
+// Tests inject a small budget to assert the structural bound without waiting
+// for the default 1<<16 invocations to drain.
+func (d *contentPDFDoc) extractPageTextBudget(pg contentPDFPage, w *contentPDFTextWriter, budget int) error {
 	fonts := d.pageFonts(pg.resources)
 	xobjs := d.pageXObjects(pg.resources)
-	budget := contentPDFMaxXObjectInvocations
 	for _, cv := range pg.contents {
 		if w.done() {
 			return nil
@@ -266,7 +276,8 @@ func (d *contentPDFDoc) contentStreamText(data []byte, fonts map[string]*content
 							// than silently dropping the rest of the page.
 							w.truncated = true
 						} else if frame, _, derr := contentPDFDecodeStream(d.ctx, d, ov.dict, ov.raw, d.maxRaw); derr == nil && len(frame) > 0 {
-							*budget--
+							*budget = *budget - 1
+							w.xobjectInvocations++
 							subFonts := d.pageFonts(ov.dict["Resources"])
 							subXobjs := d.pageXObjects(ov.dict["Resources"])
 							d.contentStreamText(frame, subFonts, subXobjs, w, depth+1, budget)

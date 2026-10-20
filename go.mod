@@ -1,6 +1,6 @@
 module seekfs
 
-go 1.26.3
+go 1.26.9
 
 require (
 	gioui.org v0.10.3
@@ -8,8 +8,8 @@ require (
 	github.com/go-git/go-git/v5 v5.19.3
 	github.com/klauspost/compress v1.18.0
 	github.com/wailsapp/wails/v2 v2.16.0
-	golang.org/x/image v0.41.0
-	golang.org/x/net v0.57.0
+	golang.org/x/image v0.43.0
+	golang.org/x/net v0.60.0
 	golang.org/x/sys v0.48.0
 	golang.org/x/text v0.42.0
 )
@@ -56,7 +56,7 @@ require (
 	github.com/wailsapp/go-webview2 v1.0.22 // indirect
 	github.com/wailsapp/mimetype v1.4.1 // indirect
 	github.com/xanzy/ssh-agent v0.3.3 // indirect
-	golang.org/x/crypto v0.56.0 // indirect
+	golang.org/x/crypto v0.57.0 // indirect
 	golang.org/x/exp/shiny v0.0.0-20250408133849-7e4ce0ab07d0 // indirect
 	gopkg.in/warnings.v0 v0.1.2 // indirect
 )

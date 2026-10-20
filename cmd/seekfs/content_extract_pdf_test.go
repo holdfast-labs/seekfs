@@ -499,12 +499,24 @@ func TestContentPDFFormFanoutBounded(t *testing.T) {
 		self,
 		contentPDFStreamBytes([]byte("/FmSelf Do"), ""),
 	}
-	done := make(chan contentExtractResult, 1)
-	go func() { done <- contentPDFTestExtract(t, contentPDFAssemble(objs, 1)) }()
-	select {
-	case <-done:
-	case <-time.After(15 * time.Second):
-		t.Fatal("form fan-out did not terminate within the invocation budget")
+	raw := contentPDFAssemble(objs, 1)
+	doc, ok := contentPDFLoadDoc(context.Background(), raw, contentExtractMaxRawBytes, contentExtractMaxTextBytes)
+	if !ok {
+		t.Fatal("form fan-out fixture did not load")
+	}
+	pages := doc.collectPages()
+	if len(pages) != 1 {
+		t.Fatalf("pages = %d, want 1", len(pages))
+	}
+	const budget = 8
+	tw := newContentPDFTextWriter(contentExtractMaxTextBytes)
+	if err := doc.extractPageTextBudget(pages[0], tw, budget); err != nil {
+		t.Fatalf("extract: %v", err)
+	}
+	// The guard is structural: at most `budget` Form executions, no matter how
+	// wide the fan-out or how slow the instrumented build is.
+	if tw.xobjectInvocations != budget {
+		t.Fatalf("form invocations = %d, want structural budget %d", tw.xobjectInvocations, budget)
 	}
 }
 
