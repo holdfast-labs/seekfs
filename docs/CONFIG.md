@@ -67,8 +67,12 @@ feature health independently of filename-search health.
 
 ## Content scope
 
-The service-owned content build indexes detected Git worktrees plus
-configured roots (never the whole volume). These `[content]` keys tune it
+Content search is on by default. In `auto` mode the service-owned content
+build indexes, in priority order, detected Git worktrees, configured roots,
+known folders (Documents, Desktop, Downloads), and finally the rest of the
+volume, until the disk reserve or an explicit budget stops it. Excludes, Git
+ignore rules and the built-in dependency/cache/build-output/binary skips still
+apply. These `[content]` keys tune it
 (`[content."E:"]` overrides one volume):
 
 ```toml
@@ -91,9 +95,9 @@ Files that sniff binary are tallied as `binary` in the `.gsx` policy and in
 `loaded --json` — expected rejections, never drops.
 
 There is no default `budget_bytes`: the build indexes everything selected
-and stops only when the build's projected peak disk use (extracted bytes ×
-1.5: the text spool plus the index) would push the sidecar's volume below a free-space reserve — 5% of the volume's
-capacity clamped to [10 GiB, 20 GiB], shared by selection and the write-time
+and stops only when the build's projected peak disk use (the compressed text
+spool plus the index) would push the sidecar's volume below a free-space
+reserve of 10 GiB, shared by selection and the write-time
 guard, monotonic (allowance 0 at or below the reserve, with drops counted).
 Only an explicit value joins the sidecar
 identity. Large corpora build as folder shards (past 64 MiB of text), each
