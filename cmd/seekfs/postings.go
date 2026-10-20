@@ -1961,7 +1961,7 @@ func parseQuery(opts queryOptions) (parsedQuery, error) {
 		pq.ModifiedAfter = time.Now().Add(-d)
 		pq.HasModAfter = true
 	}
-	tokens := strings.Fields(opts.Query)
+	var tokens []string
 	if queryHasContentToken(opts.Query) || queryHasFeatureToken(opts.Query) {
 		// Content queries need the quote/regex-span-aware tokenizer so
 		// content:"a b" and content:/a|b/ stay one constraint. Non-content

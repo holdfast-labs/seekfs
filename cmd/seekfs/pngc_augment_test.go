@@ -24,16 +24,16 @@ func TestTotalRamBytesProbesPhysicalMemory(t *testing.T) {
 	if got := unsafe.Sizeof(memoryStatusEx{}); got != 64 {
 		t.Fatalf("sizeof(memoryStatusEx) = %d; want 64 (Win32 MEMORYSTATUSEX)", got)
 	}
-	total, err := totalRamBytes()
+	total, err := totalRAMBytes()
 	if err != nil {
-		t.Fatalf("totalRamBytes: %v", err)
+		t.Fatalf("totalRAMBytes: %v", err)
 	}
 	const (
 		minPlausible = 512 << 20
 		maxPlausible = 16 << 50
 	)
 	if total < minPlausible || total > maxPlausible {
-		t.Fatalf("totalRamBytes = %d; want within [512 MiB, 16 PiB]", total)
+		t.Fatalf("totalRAMBytes = %d; want within [512 MiB, 16 PiB]", total)
 	}
 }
 

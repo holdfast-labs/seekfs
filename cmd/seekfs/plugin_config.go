@@ -21,7 +21,7 @@ type pluginDefinition struct {
 type pluginSettings struct{ Definitions map[string]pluginDefinition }
 
 func loadPluginDefinitions(path string) (map[string]pluginDefinition, error) {
-	data, err := os.ReadFile(path)
+	data, err := readConfigFile(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return map[string]pluginDefinition{}, nil
 	}
@@ -249,7 +249,7 @@ func updatePluginFile(path, name string, edit func(pluginDefinition, bool) (plug
 		return fmt.Errorf("plugin configuration is being edited: %w", err)
 	}
 	defer lock.release()
-	data, err := os.ReadFile(path)
+	data, err := readConfigFile(path)
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}

@@ -106,7 +106,7 @@ func contentExtractionErrorReason(err error) string {
 			return contentExtractReasonSharingViolation
 		}
 	}
-	if errors.Is(err, contentExtractFailure) || errors.Is(err, contentExtractPanicError) {
+	if errors.Is(err, errContentExtractFailure) || errors.Is(err, errContentExtractPanic) {
 		return contentExtractReasonExtractor
 	}
 	var pathErr *os.PathError
@@ -2211,7 +2211,7 @@ func contentExtractDeltaDocReason(baseCtx context.Context, frn uint64, path stri
 	if err != nil {
 		// Tag the error as an extractor failure so the caller's reason
 		// classifier does not mistake it for an open/read failure.
-		return contentDeltaDoc{}, false, "", size, fmt.Errorf("%w: %w", contentExtractFailure, err)
+		return contentDeltaDoc{}, false, "", size, fmt.Errorf("%w: %w", errContentExtractFailure, err)
 	}
 	if res.Skipped || len(res.Text) == 0 {
 		return contentDeltaDoc{}, false, "", size, nil

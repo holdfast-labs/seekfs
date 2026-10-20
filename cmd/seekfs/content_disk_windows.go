@@ -18,9 +18,9 @@ func contentTotalDiskBytes(path string) (uint64, error) {
 	return totalDiskBytes(path)
 }
 
-// contentTotalRamBytes reports the machine's total physical memory, for
+// contentTotalRAMBytes reports the machine's total physical memory, for
 // sizing the shared decompressed-block cache. An error (or 0) means unknown:
 // the cache falls back to its fixed default.
-func contentTotalRamBytes() (uint64, error) {
-	return totalRamBytes()
+func contentTotalRAMBytes() (uint64, error) {
+	return totalRAMBytes()
 }

@@ -561,6 +561,7 @@ func TestContentServiceBuildReleasesIndexLockDuringExtraction(t *testing.T) {
 		done := make(chan struct{})
 		go func() {
 			s.indexMu.Lock()
+			//lint:ignore SA2001 acquiring the lock is the event under test
 			s.indexMu.Unlock()
 			close(done)
 		}()
@@ -857,6 +858,7 @@ func TestContentSnapshotReleasesIndexLockBetweenBatches(t *testing.T) {
 		done := make(chan struct{})
 		go func() {
 			s.indexMu.Lock()
+			//lint:ignore SA2001 acquiring the lock is the event under test
 			s.indexMu.Unlock()
 			close(done)
 		}()

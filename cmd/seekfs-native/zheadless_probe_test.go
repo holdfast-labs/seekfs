@@ -1,9 +1,12 @@
 package main
 
 import (
+	"fmt"
 	"image"
 	"image/color"
 	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -352,8 +355,20 @@ func TestHeadlessPreviewBody(t *testing.T) {
 	u.mu.Lock()
 	u.settings.PreviewOpen = true
 	u.mu.Unlock()
+	// A self-contained file: the test must not depend on a local checkout.
+	dir := t.TempDir()
+	path := filepath.Join(dir, "about_chrome_preferences.xml")
+	var body strings.Builder
+	body.WriteString("<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<PreferenceScreen>\n")
+	for i := 0; i < 40; i++ {
+		fmt.Fprintf(&body, "    <Preference android:key=\"pref_%02d\" android:title=\"Preference title %02d\" />\n", i, i)
+	}
+	body.WriteString("</PreferenceScreen>\n")
+	if err := os.WriteFile(path, []byte(body.String()), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	setRows(u, []ResultRow{
-		{Path: `E:\bench\chromium\chrome\android\java\res\xml\about_chrome_preferences.xml`, Name: "about_chrome_preferences.xml", Dir: `E:\bench\chromium\chrome\android\java\res\xml`, Type: "xml", Exists: true},
+		{Path: path, Name: "about_chrome_preferences.xml", Dir: dir, Type: "xml", Exists: true},
 	})
 	u.mu.Lock()
 	u.focus = 0

@@ -26,8 +26,8 @@ func TestContentExtractionErrorReasonClassification(t *testing.T) {
 		{"permission", os.ErrPermission, contentExtractReasonAccessDenied},
 		{"sharing violation", &os.PathError{Op: "open", Path: `C:\busy\a.txt`, Err: syscall.Errno(32)}, contentExtractReasonSharingViolation},
 		{"lock violation", &os.PathError{Op: "open", Path: `C:\busy\a.txt`, Err: syscall.Errno(33)}, contentExtractReasonSharingViolation},
-		{"extractor", fmt.Errorf("%w: %w", contentExtractFailure, errors.New("bad xref")), contentExtractReasonExtractor},
-		{"panic", contentExtractPanicError, contentExtractReasonExtractor},
+		{"extractor", fmt.Errorf("%w: %w", errContentExtractFailure, errors.New("bad xref")), contentExtractReasonExtractor},
+		{"panic", errContentExtractPanic, contentExtractReasonExtractor},
 		{"timeout", context.DeadlineExceeded, contentExtractReasonTimeout},
 		{"io", &os.PathError{Op: "read", Path: `C:\a.txt`, Err: syscall.Errno(1117)}, contentExtractReasonIO},
 		{"other", errors.New("unexpected"), contentExtractReasonOther},
@@ -46,7 +46,7 @@ func TestContentHealthReportsExtractionErrorReasons(t *testing.T) {
 	state.noteExtractionError(`C:\gone.txt`, &os.PathError{Op: "open", Path: `C:\gone.txt`, Err: syscall.Errno(2)})
 	state.noteExtractionError(`C:\denied.txt`, &os.PathError{Op: "open", Path: `C:\denied.txt`, Err: syscall.Errno(5)})
 	state.noteExtractionError(`C:\busy.txt`, &os.PathError{Op: "open", Path: `C:\busy.txt`, Err: syscall.Errno(32)})
-	state.noteExtractionError(`C:\bad.pdf`, fmt.Errorf("%w: %w", contentExtractFailure, errors.New("bad xref")))
+	state.noteExtractionError(`C:\bad.pdf`, fmt.Errorf("%w: %w", errContentExtractFailure, errors.New("bad xref")))
 
 	h := state.healthSnapshot(0)
 	if h.ExtractionErrors != 3 {

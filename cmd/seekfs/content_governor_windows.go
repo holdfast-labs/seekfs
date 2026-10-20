@@ -196,11 +196,7 @@ func contentSystemCPUBusy() bool {
 		return false
 	}
 	var create, exit, procKernel, procUser windows.Filetime
-	proc, err := windows.GetCurrentProcess()
-	if err != nil {
-		contentCPULastOK.Store(false)
-		return false
-	}
+	proc := windows.CurrentProcess()
 	r1, _, _ = procGetProcessTimesGov.Call(
 		uintptr(proc),
 		uintptr(unsafe.Pointer(&create)),

@@ -21,10 +21,8 @@ func TestContentHighlightTerms(t *testing.T) {
 
 func TestHighlightSegments(t *testing.T) {
 	segs := highlightSegments("func needle() NEEDLE", []string{"needle"})
-	var texts []string
 	matches := 0
 	for _, s := range segs {
-		texts = append(texts, s.Text)
 		if s.Match {
 			matches++
 		}

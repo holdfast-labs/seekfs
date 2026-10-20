@@ -171,7 +171,7 @@ func contentComposeShards(manifest *contentIndex, gsx string) error {
 		// Docs at its slice of it (global DocIDs) so the shard's own decoded
 		// table is freed. Shard-local structures (paths, filter rows, postings,
 		// aliases) stay local-keyed; shard code reads DocIDs by index.
-		idx.Docs = docs[int(base):len(docs)]
+		idx.Docs = docs[int(base):]
 		size += idx.EncodedSize
 		shards = append(shards, &contentShard{info: info, idx: idx, reader: reader, base: base})
 	}

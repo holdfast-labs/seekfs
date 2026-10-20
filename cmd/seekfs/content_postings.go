@@ -566,7 +566,7 @@ func (idx *contentPostingIndex) postings(key string) (next func() (uint32, uint3
 		return true
 	}
 	next = func() (uint32, uint32, bool) {
-		for left > 0 {
+		if left > 0 {
 			if blockLeft == 0 {
 				if !load() {
 					return 0, 0, false

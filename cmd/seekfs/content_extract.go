@@ -249,14 +249,14 @@ func contentPathExtension(path string) string {
 	return strings.ToLower(base[dot:])
 }
 
-// contentExtractPanicError is returned when an extractor panics. The caller
+// errContentExtractPanic is returned when an extractor panics. The caller
 // treats it as a per-document skip with a reason, never a crash.
-var contentExtractPanicError = errors.New("content extractor panic")
+var errContentExtractPanic = errors.New("content extractor panic")
 
-// contentExtractFailure marks an error that came from an extractor rather than
+// errContentExtractFailure marks an error that came from an extractor rather than
 // from opening or reading the file. The delta path wraps extractor errors with
 // this sentinel so health can tell an extractor bug apart from an I/O failure.
-var contentExtractFailure = errors.New("content extractor failure")
+var errContentExtractFailure = errors.New("content extractor failure")
 
 // contentExtractSafely runs one extractor over an already-open file with the
 // per-document deadline and panic isolation shared by the offline walk builder
@@ -292,7 +292,7 @@ func contentExtractSafely(ctx context.Context, e contentExtractor, r io.ReaderAt
 	go func() {
 		defer func() {
 			if recover() != nil {
-				done <- outcome{res: contentExtractResult{Skipped: true, Reason: "extractor panic"}, err: contentExtractPanicError}
+				done <- outcome{res: contentExtractResult{Skipped: true, Reason: "extractor panic"}, err: errContentExtractPanic}
 			}
 		}()
 		res, err := e.Extract(ectx, r, size)
@@ -314,7 +314,7 @@ func contentExtractTextDirectly(ctx context.Context, e contentExtractor, r io.Re
 	defer func() {
 		if recover() != nil {
 			res = contentExtractResult{Skipped: true, Reason: "extractor panic"}
-			err = contentExtractPanicError
+			err = errContentExtractPanic
 		}
 	}()
 	return e.Extract(ctx, r, size)
@@ -436,6 +436,7 @@ func contentVerifyBufPut(b []byte) {
 	if cap(b) == 0 || cap(b) > contentVerifyBufPoolMax {
 		return
 	}
+	//lint:ignore SA6002 a slice header is small; pooling *[]byte would change every Get site
 	contentVerifyBufPool.Put(b[:0])
 }
 

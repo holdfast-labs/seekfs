@@ -30,7 +30,12 @@ func assertSignalStoreACL(t *testing.T, path, sid string) {
 	if ctrl&seDACLProtected == 0 {
 		t.Fatalf("per-user DACL must be protected (no inheritance), control = %#x", uint32(ctrl))
 	}
-	if sddl := sd.String(); !strings.Contains(sddl, sid) {
+	// SDDL prints the built-in Administrator account (RID 500, the user on
+	// some CI runners) as the alias LA instead of its full SID.
+	sddl := sd.String()
+	ownerNamed := strings.Contains(sddl, sid) ||
+		(strings.HasSuffix(sid, "-500") && strings.Contains(sddl, ";;;LA)"))
+	if !ownerNamed {
 		t.Fatalf("per-user SDDL must name the owner SID %s: %q", sid, sddl)
 	}
 }

@@ -753,9 +753,11 @@ func parseBudgetGB(s string) (int64, error) {
 	s = strings.TrimSpace(s)
 	f, err := strconv.ParseFloat(s, 64)
 	if err != nil || math.IsNaN(f) || math.IsInf(f, 0) || f < 0 {
+		//lint:ignore ST1005 shown verbatim as an inline message in the Settings window
 		return 0, errors.New("Enter a size in GB, or choose No limit")
 	}
 	if f > float64(math.MaxInt64)/float64(gbBytes) {
+		//lint:ignore ST1005 shown verbatim as an inline message in the Settings window
 		return 0, errors.New("Size limit is too large")
 	}
 	return int64(math.Round(f * float64(gbBytes))), nil
@@ -788,6 +790,7 @@ func parseExtList(s string) ([]string, error) {
 		}
 		for _, r := range f {
 			if !unicode.IsLetter(r) && !unicode.IsDigit(r) && r != '+' && r != '-' && r != '_' {
+				//lint:ignore ST1005 shown verbatim as an inline message in the Settings window
 				return nil, fmt.Errorf("Invalid extension %q", f)
 			}
 		}

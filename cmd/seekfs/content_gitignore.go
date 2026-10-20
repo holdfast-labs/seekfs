@@ -642,7 +642,7 @@ func (f *contentIgnoreFile) matchFile(comps []string, depth int) gitignore.Match
 			best, bestLine = 2, x[ix-1].pat.line
 		}
 		if ir > 0 && r[ir-1].line > bestLine {
-			best, bestLine = 3, r[ir-1].line
+			best = 3
 		}
 		switch best {
 		case 0:

@@ -1216,6 +1216,7 @@ func contentFoldScratchPut(b []byte) {
 	if cap(b) == 0 || cap(b) > contentFoldScratchMax {
 		return
 	}
+	//lint:ignore SA6002 a slice header is small; pooling *[]byte would change every Get site
 	contentFoldScratchPool.Put(b[:0])
 }
 

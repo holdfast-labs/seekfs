@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"golang.org/x/sys/windows"
 	"os"
 	"path/filepath"
 	"strings"
@@ -144,8 +145,10 @@ roots = ["C:\src"]
 		t.Fatalf("settings-get = %+v", resp)
 	}
 	settings := resp.Settings
-	if settings.CanWrite {
-		t.Fatal("settings-get reported can_write for a read-only caller")
+	// can_write follows the caller's elevation: false for a normal user,
+	// true when the test process itself is elevated (e.g. CI runners).
+	if want := windows.GetCurrentProcessToken().IsElevated(); settings.CanWrite != want {
+		t.Fatalf("settings-get can_write = %v; want %v (caller elevated = %v)", settings.CanWrite, want, want)
 	}
 	byVolume := make(map[string]settingsVolume, len(settings.Volumes))
 	for _, volume := range settings.Volumes {

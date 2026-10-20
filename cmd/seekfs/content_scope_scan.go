@@ -634,7 +634,7 @@ func (w *contentScanWorker) memoize(id int32, d contentParentDecision) {
 // exact behavior by using reconstruction itself for the parent.
 func (w *contentScanWorker) fileOrigPath(id int, rec CompactRecord) string {
 	parent, name := rec.Parent, rec.Name
-	if parent >= 0 && name != "" && name != "." && strings.IndexAny(name, `/\`) < 0 {
+	if parent >= 0 && name != "" && name != "." && !strings.ContainsAny(name, `/\`) {
 		if pop, ok := w.parentOrig[parent]; ok {
 			return pop + `\` + name
 		}
