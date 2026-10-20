@@ -3,6 +3,7 @@ package main
 import (
 	"container/heap"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"sort"
 	"strings"
@@ -505,6 +506,71 @@ func contentIsHeaderName(name string) bool {
 		return true
 	}
 	return false
+}
+
+// promoteRegexNamedCandidates stably moves candidates whose file name matches
+// one of the query's positive regex leaves to the front (headers first),
+// keeping the relative order of both groups. A regex with common required
+// literals ("Tab" and "Model") yields a large trigram postings set; without a
+// name signal the scan order can spend the whole disk valve on files that
+// contain the literals far apart. A file named after the pattern is the likely
+// defining file for the same reason contentSymbolQueryKey promotes term-named
+// files. Verification still decides every hit, so this only changes read
+// order.
+func promoteRegexNamedCandidates(ids []int, idx *Index, pq parsedQuery) {
+	if idx == nil || len(ids) < 2 {
+		return
+	}
+	matchers := contentRegexNameMatchers(pq)
+	if len(matchers) == 0 {
+		return
+	}
+	named := make([]int, 0, 4)
+	rest := ids[:0:0]
+	for _, id := range ids {
+		name := idx.compactNameAt(id)
+		matched := false
+		for _, re := range matchers {
+			if re.MatchString(name) {
+				matched = true
+				break
+			}
+		}
+		if matched {
+			named = append(named, id)
+		} else {
+			rest = append(rest, id)
+		}
+	}
+	if len(named) == 0 {
+		return
+	}
+	sort.SliceStable(named, func(i, j int) bool {
+		return contentIsHeaderName(idx.compactNameAt(named[i])) && !contentIsHeaderName(idx.compactNameAt(named[j]))
+	})
+	copy(ids, named)
+	copy(ids[len(named):], rest)
+}
+
+// contentRegexNameMatchers compiles the positive regex leaves of a
+// case-folded content query once per candidate sort.
+func contentRegexNameMatchers(pq parsedQuery) []*regexp.Regexp {
+	var out []*regexp.Regexp
+	for _, leaf := range contentPositiveLeaves(pq) {
+		if leaf.Kind != contentLeafRegex {
+			continue
+		}
+		// The name hint is deliberately case-folded even for a case-sensitive
+		// leaf: tab_strip_model.h is the likely definition of TabStripModel.
+		// A wrong hint only costs a verified read, never a wrong result.
+		pat := "(?i)" + leaf.Text
+		re, err := regexp.Compile(pat)
+		if err != nil {
+			continue
+		}
+		out = append(out, re)
+	}
+	return out
 }
 
 // promoteSymbolNamedEntries is promoteSymbolNamedCandidates for a merged Entry

@@ -1285,12 +1285,18 @@ func (vol *serviceVolumeIndex) nameTermCandidates(pq parsedQuery) ([]int, bool) 
 			}
 			if candidates, ok, capped := vol.contentCandidatesBounded(pq, candidateCap); ok {
 				if useFullSuperset && len(candidates) > 0 {
-					// Pure-regex queries keep the historical scan order (see the
-					// capped branch below); verifying their prefiltered superset
-					// in that order emits the scan's sequence without its
-					// name-order walk over files that cannot match.
+					// Pure-regex queries keep the scan order (it is also the
+					// resume order the bounded scan uses), then move files named
+					// after the pattern to the front. A name match is a free,
+					// no-disk signal that the file is where the pattern lives,
+					// so a broad literal intersection does not spend the disk
+					// valve on files that merely contain the literals far apart.
+					// Verification still decides every hit.
 					if contentLeavesAllRegex(pq) {
 						vol.sortCandidateIDsByScanOrder(candidates, pq)
+						if pq.SortColumn == "" {
+							promoteRegexNamedCandidates(candidates, vol.index, pq)
+						}
 					} else {
 						sortCandidateIDs(candidates, pq, vol.index, vol.rankForQuery(pq))
 						promoteSymbolNamedCandidates(candidates, vol.index, contentSymbolQueryKey(pq))
@@ -1345,13 +1351,6 @@ func (vol *serviceVolumeIndex) nameTermCandidates(pq parsedQuery) ([]int, bool) 
 					// way. sort:relevance keeps its own post-verify ranking and
 					// is left in candidate (docID) order here.
 					//
-					// Pure-regex queries are the exception: they were full
-					// scans before the regex prefilter, so their candidates
-					// keep the scan's walk order (orderForQuery position,
-					// record order when nil). Verifying the prefiltered set
-					// in that relative order emits exactly the historical
-					// sequence; the rank-ordered path would visibly reorder
-					// results on volumes whose rank and scan orders differ.
 					if pq.SortColumn != "relevance" {
 						if contentLeavesAllRegex(pq) {
 							vol.sortCandidateIDsByScanOrder(candidates, pq)
@@ -1360,10 +1359,16 @@ func (vol *serviceVolumeIndex) nameTermCandidates(pq parsedQuery) ([]int, bool) 
 						}
 					}
 					// Default order and relevance: files named after a queried
-					// symbol go first (relevance verifies a bounded window in
-					// this order, so the defining file stays inside it).
+					// symbol go first, and pure-regex files named after the
+					// pattern go first the same way (relevance verifies a
+					// bounded window in this order, so the defining file stays
+					// inside it).
 					if pq.SortColumn == "" || pq.SortColumn == "relevance" {
-						promoteSymbolNamedCandidates(candidates, vol.index, contentSymbolQueryKey(pq))
+						if contentLeavesAllRegex(pq) {
+							promoteRegexNamedCandidates(candidates, vol.index, pq)
+						} else {
+							promoteSymbolNamedCandidates(candidates, vol.index, contentSymbolQueryKey(pq))
+						}
 					}
 					if start := vol.contentAfterCandidateStart(candidates, pq.contentAfter); start > 0 {
 						candidates = candidates[start:]
