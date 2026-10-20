@@ -542,6 +542,11 @@ func (s *goSearchService) serviceCommandSearch(w io.Writer, caps serviceCapabili
 					if trace.contentIncomplete() {
 						resp.Complete = boolPtr(false)
 					}
+					resp.Content = s.searchContentHealth(trace)
+					if resp.Content != nil && resp.Content.Stale {
+						resp.ContentStale = true
+						resp.Complete = boolPtr(false)
+					}
 					if !trace.BudgetDeadline.IsZero() {
 						resp.ContentBudgetDeadlineUnix = trace.BudgetDeadline.UnixNano()
 					}
@@ -549,7 +554,7 @@ func (s *goSearchService) serviceCommandSearch(w io.Writer, caps serviceCapabili
 				} else {
 					trace.setSource("count-fast-posting", count)
 					fuzzy := trace.FuzzyCorrection != ""
-					_ = json.NewEncoder(w).Encode(serviceResponse{OK: true, Count: count, SearchMS: searchMS, Fuzzy: fuzzy, FuzzyCorrection: trace.FuzzyCorrection, Source: trace.Source, Decline: trace.Decline, Candidates: trace.Candidates, PlannerMode: trace.PlannerMode, EligibleVolumes: trace.EligibleVolumes, BlocksDecoded: trace.BlocksDecoded, BlocksSkipped: trace.BlocksSkipped, ScalarDriver: trace.ScalarDriver, ScalarInterval: trace.ScalarInterval, RecordsVerified: trace.ScalarRecordsVerified, ComponentDriver: trace.ComponentDriver, ComponentRoots: trace.ComponentRoots, ComponentIntervals: trace.ComponentIntervals, ComponentCardinality: trace.ComponentCardinality, ComponentSelfHits: trace.ComponentSelfHits, ComponentBounds: trace.ComponentBounds, ComponentRecordsVerified: trace.ComponentRecordsVerified, FilenameDriver: trace.FilenameDriver, FilenameRequiredGrams: trace.FilenameRequiredGrams, FilenamePostingHint: trace.FilenamePostingHint, FilenameRecordsVerified: trace.FilenameRecordsVerified, OverlayBaseWindow: trace.OverlayBaseWindow, PostingPrefetchBytes: trace.PostingPrefetchBytes, PostingPrefetchRanges: trace.PostingPrefetchRanges, PostingPrefetchPages: trace.PostingPrefetchPages, Terms: trace.Terms, Declines: trace.Declines, Fallback: trace.Fallback, Complete: trace.completePtr(), Content: s.searchContentHealth(trace), BudgetExceeded: trace.BudgetExceeded})
+					_ = json.NewEncoder(w).Encode(serviceResponse{OK: true, Count: count, SearchMS: searchMS, Fuzzy: fuzzy, FuzzyCorrection: trace.FuzzyCorrection, Source: trace.Source, Decline: trace.Decline, Candidates: trace.Candidates, PlannerMode: trace.PlannerMode, EligibleVolumes: trace.EligibleVolumes, BlocksDecoded: trace.BlocksDecoded, BlocksSkipped: trace.BlocksSkipped, ScalarDriver: trace.ScalarDriver, ScalarInterval: trace.ScalarInterval, RecordsVerified: trace.ScalarRecordsVerified, ComponentDriver: trace.ComponentDriver, ComponentRoots: trace.ComponentRoots, ComponentIntervals: trace.ComponentIntervals, ComponentCardinality: trace.ComponentCardinality, ComponentSelfHits: trace.ComponentSelfHits, ComponentBounds: trace.ComponentBounds, ComponentRecordsVerified: trace.ComponentRecordsVerified, FilenameDriver: trace.FilenameDriver, FilenameRequiredGrams: trace.FilenameRequiredGrams, FilenamePostingHint: trace.FilenamePostingHint, FilenameRecordsVerified: trace.FilenameRecordsVerified, OverlayBaseWindow: trace.OverlayBaseWindow, PostingPrefetchBytes: trace.PostingPrefetchBytes, PostingPrefetchRanges: trace.PostingPrefetchRanges, PostingPrefetchPages: trace.PostingPrefetchPages, Terms: trace.Terms, Declines: trace.Declines, Fallback: trace.Fallback, Complete: trace.completePtr(), ContentStale: trace.ContentStale, Content: s.searchContentHealth(trace), BudgetExceeded: trace.BudgetExceeded})
 				}
 				return
 			}
@@ -685,6 +690,10 @@ func (s *goSearchService) serviceCommandSearch(w io.Writer, caps serviceCapabili
 		}
 	}
 	resp.Content = s.searchContentHealth(trace)
+	if resp.Content != nil && resp.Content.Stale {
+		resp.ContentStale = true
+		resp.Complete = boolPtr(false)
+	}
 	_ = json.NewEncoder(w).Encode(resp)
 }
 
@@ -1213,6 +1222,7 @@ func newJSONSearchResponse(resp serviceResponse, opts queryOptions, countOnly bo
 		Declines:                 resp.Declines,
 		Fallback:                 resp.Fallback,
 		Complete:                 resp.Complete,
+		ContentStale:             resp.ContentStale,
 		Content:                  resp.Content,
 		BudgetExceeded:           resp.BudgetExceeded,
 		NextCursor:               resp.NextCursor,
@@ -1225,6 +1235,9 @@ func newJSONSearchResponse(resp serviceResponse, opts queryOptions, countOnly bo
 		} else {
 			out.Results = pathsToJSON(resp.Results)
 		}
+	}
+	if out.ContentStale {
+		out.Complete = boolPtr(false)
 	}
 	return out
 }

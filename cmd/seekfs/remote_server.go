@@ -135,6 +135,7 @@ type remoteContentHealth struct {
 	State           string   `json:"state,omitempty"`
 	Partial         bool     `json:"partial,omitempty"`
 	Incomplete      bool     `json:"incomplete,omitempty"`
+	Stale           bool     `json:"content_stale,omitempty"`
 	CountDivergent  bool     `json:"count_divergent,omitempty"`
 	DegradedVolumes []string `json:"degraded_volumes,omitempty"`
 }
@@ -654,6 +655,7 @@ func remoteResponseFromService(resp serviceResponse, countOnly bool) remoteRespo
 			State:           resp.Content.State,
 			Partial:         resp.Content.Partial,
 			Incomplete:      resp.Content.Incomplete,
+			Stale:           resp.Content.Stale,
 			CountDivergent:  resp.Content.CountDivergent,
 			DegradedVolumes: resp.Content.DegradedVolumes,
 		}

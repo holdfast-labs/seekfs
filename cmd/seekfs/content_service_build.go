@@ -1344,9 +1344,11 @@ func (s *goSearchService) runContentBuild(vol *serviceVolumeIndex, reuseSidecar 
 	}
 	// Publish through the normal attach path: it loads under indexMu and
 	// re-validates the journal generation, so a base swapped in during the
-	// save is not overwritten with this build.
-	s.attachContentForVolume(vol)
-	if vol.content.readerView() != nil {
+	// save is not overwritten with this build. replace=true swaps out the
+	// previous base this rebuild kept serving.
+	previousReader := vol.content.readerView()
+	s.attachContentForVolumeReplace(vol, true)
+	if reader := vol.content.readerView(); reader != nil && reader != previousReader {
 		// The replaced base is released by now, so shards it alone named
 		// can be deleted.
 		contentSweepShards(gsx)

@@ -253,6 +253,7 @@ type jsonSearchResponse struct {
 	Declines                 []traceDecline `json:"declines,omitempty"`
 	Fallback                 string         `json:"fallback,omitempty"`
 	Complete                 *bool          `json:"complete,omitempty"`
+	ContentStale             bool           `json:"content_stale,omitempty"`
 	Content                  *contentHealth `json:"content,omitempty"`
 	Results                  []jsonResult   `json:"results,omitempty"`
 	BudgetExceeded           bool           `json:"budget_exceeded,omitempty"`
@@ -789,6 +790,11 @@ type searchTrace struct {
 	// candidate superset within the memory budget. The result is a visible
 	// degradation, never a silent truncation; a count refuses outright.
 	ContentIncomplete bool
+	// ContentStale is set when a content query is answered from the previous
+	// base while a rebuild runs. Every hit is verified against disk, so the
+	// answer can miss recent changes but never invent a match. It is also
+	// surfaced as content_stale with complete=false.
+	ContentStale bool
 	// ContentCountDivergent is set on a content count for the `under:`/Exists
 	// shapes: a count never stats, so it can exceed the search result set. The
 	// count is still returned; this only makes the divergence visible.

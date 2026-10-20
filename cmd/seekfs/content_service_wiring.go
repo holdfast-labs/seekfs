@@ -45,6 +45,15 @@ func contentBaseFRNColumns(idx *Index) ([]uint64, []uint32, bool) {
 // A missing or unreadable index leaves the volume in the `unavailable` state, so
 // queries are refused rather than reported as no matches.
 func (s *goSearchService) attachContentForVolume(vol *serviceVolumeIndex) {
+	s.attachContentForVolumeReplace(vol, false)
+}
+
+// attachContentForVolumeReplace is attachContentForVolume with an explicit
+// replace decision. A completed rebuild passes replace=true so its fresh
+// sidecar is published even while the previous base is still attached and
+// serving with the stale flag. Every other caller passes false and keeps the
+// early return that avoids re-attaching a base already in use.
+func (s *goSearchService) attachContentForVolumeReplace(vol *serviceVolumeIndex, replace bool) {
 	if vol == nil {
 		return
 	}
@@ -76,11 +85,12 @@ func (s *goSearchService) attachContentForVolume(vol *serviceVolumeIndex) {
 	}
 	isWalk := wantOrigin == contentOriginWalk
 	s.acquireContentVolumeLock(vol)
-	// A volume that already has a usable base attached is done. This replaced
-	// the old "drain enabled" guard: after a journal reset invalidates the base
-	// the drain stays enabled, so keying on it would skip the re-attach of a
-	// freshly rebuilt sidecar (PF-3/WP1e).
-	if vol.content.readerView() != nil {
+	// A volume that already has a usable base attached is done, unless this is
+	// a rebuild publishing its replacement. This replaced the old "drain
+	// enabled" guard: after a journal reset invalidates the base the drain
+	// stays enabled, so keying on it would skip the re-attach of a freshly
+	// rebuilt sidecar (PF-3/WP1e).
+	if !replace && vol.content.readerView() != nil {
 		return
 	}
 	gsx := contentIndexPathForDB(vol.dbPath)

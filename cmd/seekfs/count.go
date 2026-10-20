@@ -89,6 +89,7 @@ func countServiceVolumes(volumes []*serviceVolumeIndex, opts queryOptions) (int,
 			// The same completeness refusal as the exact tail: a capped
 			// retry is not an exact count.
 			if opts.Trace != nil && opts.Trace.contentIncomplete() {
+				opts.Trace.setComplete(false)
 				return 0, true, errContentIncomplete
 			}
 			opts.Trace.setPlannerMode("service-content")
@@ -117,6 +118,7 @@ func countServiceVolumes(volumes []*serviceVolumeIndex, opts queryOptions) (int,
 		// A capped candidate superset means the count is not exact. Refuse it
 		// instead of returning a partial number that looks complete.
 		if opts.Trace != nil && opts.Trace.contentIncomplete() {
+			opts.Trace.setComplete(false)
 			return 0, true, errContentIncomplete
 		}
 		opts.Trace.setPlannerMode("service-content")
