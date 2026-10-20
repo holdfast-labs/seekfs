@@ -191,6 +191,12 @@ type contentHealth struct {
 	// memory budget, so the answer is a visible subset, never a silent
 	// truncation. A count in this state is refused instead of answered.
 	Incomplete bool `json:"incomplete,omitempty"`
+	// Stale is set while a rebuild is in flight and queries are answered from
+	// the previous base, which is still structurally valid. Every hit is
+	// verified against the file on disk, so a stale answer can miss files
+	// changed since that base but never invent one. Search responses also
+	// carry content_stale and complete=false. The state stays indexing.
+	Stale bool `json:"content_stale,omitempty"`
 	// CountDivergent is set on a content count whose shape (under:/Exists)
 	// would stat on search but not on count, so the count can exceed the search
 	// result set. It is a visibility flag only: the count is still returned.
@@ -554,6 +560,12 @@ type contentVolumeState struct {
 	// stays correct and usable; the flag only keeps the volume surfaced as
 	// degraded across drain ticks until a base that fits is published.
 	sidecarCapped bool
+	// servingStale is true while a rebuild runs over a still-attached previous
+	// base. Queries use that base (plus the live delta) and are flagged stale.
+	// An integrity/CRC failure, a format-version mismatch, a journal identity
+	// change, or a disabled scope drops the base instead, so those cases never
+	// set it. setReady clears it when the rebuild publishes.
+	servingStale bool
 	// refreshActive is true while a targeted extractor-version refresh is in
 	// flight for this volume (set by attach, cleared once a fold publishes a
 	// base with no stale docs or a rebuild/stale transition drops the base).
@@ -747,6 +759,7 @@ func mergeContentHealth(dst *contentHealth, src contentHealth) {
 	}
 	dst.Partial = dst.Partial || src.Partial
 	dst.Incomplete = dst.Incomplete || src.Incomplete
+	dst.Stale = dst.Stale || src.Stale
 	dst.CountDivergent = dst.CountDivergent || src.CountDivergent
 	dst.ExtractorRefresh = dst.ExtractorRefresh || src.ExtractorRefresh
 	dst.StaleExtractorDocs += src.StaleExtractorDocs
@@ -924,7 +937,7 @@ func (s *goSearchService) contentHealthSnapshot() *contentHealth {
 // volume degraded.
 func (s *goSearchService) searchContentHealth(trace *searchTrace) *contentHealth {
 	h := s.contentHealthSnapshot()
-	if trace == nil || (!trace.ContentPartial && !trace.ContentIncomplete && !trace.ContentCountDivergent) {
+	if trace == nil || (!trace.ContentPartial && !trace.ContentIncomplete && !trace.ContentCountDivergent && !trace.ContentStale) {
 		return h
 	}
 	if h == nil {
@@ -937,10 +950,16 @@ func (s *goSearchService) searchContentHealth(trace *searchTrace) *contentHealth
 	if trace.ContentIncomplete {
 		h.Incomplete = true
 	}
+	if trace.ContentStale {
+		h.Stale = true
+	}
 	if trace.ContentCountDivergent {
 		h.CountDivergent = true
 	}
-	if trace.ContentPartial || trace.ContentIncomplete {
+	// A stale-serving rebuild keeps its `indexing` state: the answer is a
+	// verified subset of the previous base, not a degraded volume. Only a
+	// partial/incomplete answer over a serving base reports degraded.
+	if (trace.ContentPartial || trace.ContentIncomplete) && !h.Stale {
 		h.State = contentStateDegraded
 	}
 	return h
@@ -960,6 +979,8 @@ func (s *contentVolumeState) setReady(idx *contentIndex, reader *contentReader, 
 	s.resolver = resolver
 	s.state = contentStateReady
 	s.health.State = contentStateReady
+	s.servingStale = false
+	s.health.Stale = false
 	// A freshly attached base is complete as of its checkpoint; any earlier
 	// catch-up truncation belonged to the replaced base.
 	s.health.Incomplete = false
@@ -1055,6 +1076,8 @@ func (s *contentVolumeState) markIntegrityFailed(expect *contentIndex, reason st
 	s.state = contentStateStale
 	s.health.State = contentStateStale
 	s.health.BuildPhase = ""
+	s.servingStale = false
+	s.health.Stale = false
 	s.reader = nil
 	s.resolver = nil
 	s.delta = newContentDelta()
@@ -1100,6 +1123,8 @@ func (s *contentVolumeState) markStale(reason string) {
 	s.state = contentStateStale
 	s.health.State = contentStateStale
 	s.health.BuildPhase = ""
+	s.servingStale = false
+	s.health.Stale = false
 	s.reader = nil
 	s.resolver = nil
 	s.delta = newContentDelta()
@@ -1124,17 +1149,39 @@ const (
 
 // markScanning enters the indexing state for the metadata selection scan,
 // before any record is read. The scan on a large volume runs minutes; prior
-// to phases it reported "unavailable" with no progress. Like markIndexing it
-// drops any prior reader/resolver so a query never sees a torn base.
+// to phases it reported "unavailable" with no progress.
 func (s *contentVolumeState) markScanning(total int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.beginBuildLocked(contentBuildPhaseScanning, total)
+}
+
+// beginBuildLocked enters the indexing state for a build. If a structurally
+// valid base is still attached, it stays attached and serving: the rebuild
+// runs alongside it and queries answer from it (plus the live delta) with the
+// stale flag set. Every hit is verified against disk, so the answer can miss
+// changes since that base but never invent a match. A first build, or a base
+// already dropped by markStale/markIntegrityFailed, has no reader and leaves
+// queries refused as before. Caller holds mu.
+func (s *contentVolumeState) beginBuildLocked(phase string, total int) {
 	s.state = contentStateIndexing
 	s.health.State = contentStateIndexing
-	s.health.BuildPhase = contentBuildPhaseScanning
+	s.health.BuildPhase = phase
 	s.health.BuildTotal = total
 	s.health.BuildDone = 0
 	s.health.BuildError = ""
+	s.reconcileActive = false
+	s.clearScopeReconcileLocked()
+	if s.reader != nil && s.resolver != nil {
+		s.servingStale = true
+		s.health.Stale = true
+		// A rebuild started from a capped catch-up keeps its truncation
+		// visible, and a count stays refused instead of claiming exact.
+		s.health.Incomplete = true
+		return
+	}
+	s.servingStale = false
+	s.health.Stale = false
 	s.health.Incomplete = false
 	s.reader = nil
 	s.resolver = nil
@@ -1144,8 +1191,6 @@ func (s *contentVolumeState) markScanning(total int) {
 	s.refreshPending = 0
 	s.health.ExtractorRefresh = false
 	s.health.StaleExtractorDocs = 0
-	s.reconcileActive = false
-	s.clearScopeReconcileLocked()
 }
 
 // clearScopeReconcileLocked drops scope-reconcile tracking. Caller holds mu.
@@ -1303,28 +1348,13 @@ func (s *contentVolumeState) clearReconcileActive() {
 }
 
 // markIndexing is the service-owned background build's visible state. A
-// partially built index is never served: any prior reader/resolver is dropped
-// so a query during the build sees `indexing` (unavailable) rather than a
-// torn or stale base. PF-3/WP1d.
+// partially built index is never served. A previous valid base, when one is
+// still attached (a rebuild), keeps answering with the stale flag; a first
+// build has no base, so queries see `indexing` (unavailable). PF-3/WP1d.
 func (s *contentVolumeState) markIndexing(total int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.state = contentStateIndexing
-	s.health.State = contentStateIndexing
-	s.health.BuildPhase = contentBuildPhaseExtracting
-	s.health.BuildTotal = total
-	s.health.BuildDone = 0
-	s.health.BuildError = ""
-	s.health.Incomplete = false
-	s.reader = nil
-	s.resolver = nil
-	s.catchUpPending = false
-	s.catchUpFailed = false
-	s.refreshActive = false
-	s.refreshPending = 0
-	s.health.ExtractorRefresh = false
-	s.health.StaleExtractorDocs = 0
-	s.clearScopeReconcileLocked()
+	s.beginBuildLocked(contentBuildPhaseExtracting, total)
 }
 
 // setBuildPhase moves an in-flight build between phases; ignored once the
@@ -1367,19 +1397,28 @@ func (s *contentVolumeState) markBuildFailed(reason string) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.reader = nil
-	s.resolver = nil
 	s.state = contentStateDegraded
 	s.health.State = contentStateDegraded
 	s.health.BuildPhase = ""
 	s.health.Incomplete = true
 	s.health.BuildError = reason
+	s.reconcileActive = false
+	s.clearScopeReconcileLocked()
+	if s.servingStale && s.reader != nil && s.resolver != nil {
+		// The rebuild failed, but the previous base is still structurally
+		// valid. Keep serving it (verified against disk) and keep the answer
+		// visibly stale instead of blanking content.
+		s.health.Stale = true
+		return
+	}
+	s.servingStale = false
+	s.health.Stale = false
+	s.reader = nil
+	s.resolver = nil
 	s.refreshActive = false
 	s.refreshPending = 0
 	s.health.ExtractorRefresh = false
 	s.health.StaleExtractorDocs = 0
-	s.reconcileActive = false
-	s.clearScopeReconcileLocked()
 }
 
 // markSidecarCapped surfaces an index whose encoded size exceeds
@@ -1400,10 +1439,16 @@ func (s *contentVolumeState) markSidecarCapped(size, cap int64) {
 	s.health.BuildError = fmt.Sprintf("content index exceeds size cap (%d bytes > %d)", size, cap)
 	s.health.State = contentStateDegraded
 	if s.state == contentStateIndexing {
-		s.reader = nil
-		s.resolver = nil
 		s.state = contentStateDegraded
 		s.health.BuildPhase = ""
+		if s.servingStale && s.reader != nil && s.resolver != nil {
+			// A rebuild refused to publish over the cap; the previous base is
+			// still valid, so keep answering from it with the stale flag.
+			s.health.Stale = true
+			return
+		}
+		s.reader = nil
+		s.resolver = nil
 	}
 }
 
@@ -1458,11 +1503,19 @@ func (s *contentVolumeState) markBuildCanceled(reason string) {
 	if s.state != contentStateIndexing {
 		return
 	}
-	s.state = contentStateUnavailable
-	s.health.State = contentStateUnavailable
 	s.health.BuildPhase = ""
 	s.health.BuildError = reason
 	s.reconcileActive = false
+	if s.servingStale && s.reader != nil && s.resolver != nil {
+		// A canceled rebuild leaves the previous base in place. Keep serving it
+		// and keep the stale signal rather than reporting unavailable.
+		s.state = contentStateDegraded
+		s.health.State = contentStateDegraded
+		s.health.Stale = true
+		return
+	}
+	s.state = contentStateUnavailable
+	s.health.State = contentStateUnavailable
 }
 
 func (s *contentVolumeState) stateOf() string {
@@ -1489,10 +1542,10 @@ func (s *contentVolumeState) readerResolverView() (*contentReader, *contentResol
 // usableForQuery reports whether the volume can answer content semantics: it
 // has a decoded base index joined to records, or at least a populated delta.
 // A stale/unavailable volume with neither must be refused, never treated as
-// "no matches". An `indexing` volume is refused even with a populated delta:
-// markIndexing drops the reader/resolver but leaves the delta, so without this
-// guard a content query could serve delta-only partial results and report
-// complete while the fresh base is still being built.
+// "no matches". An `indexing` volume is refused unless a previous valid base
+// is still attached (a rebuild serving it stale); a delta alone during a
+// first build stays refused, so the query cannot report complete while the
+// fresh base is still being built.
 func (s *contentVolumeState) usableForQuery() bool {
 	if s == nil {
 		return false
@@ -1501,13 +1554,24 @@ func (s *contentVolumeState) usableForQuery() bool {
 	state := s.state
 	reader, resolver, delta := s.reader, s.resolver, s.delta
 	s.mu.RUnlock()
-	if state == contentStateIndexing {
-		return false
-	}
 	if reader != nil && resolver != nil {
 		return true
 	}
+	if state == contentStateIndexing {
+		return false
+	}
 	return delta != nil && delta.len() > 0
+}
+
+// servingStaleNow reports whether queries are answered from a previous base
+// while a rebuild runs (or after it failed).
+func (s *contentVolumeState) servingStaleNow() bool {
+	if s == nil {
+		return false
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.servingStale
 }
 
 func (s *contentVolumeState) deltaView() *contentDelta {

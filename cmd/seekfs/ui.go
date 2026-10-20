@@ -87,6 +87,7 @@ type UIContentStatus struct {
 	BuildPhase        string `json:"build_phase,omitempty"`
 	Partial           bool   `json:"partial,omitempty"`
 	Incomplete        bool   `json:"incomplete,omitempty"`
+	Stale             bool   `json:"content_stale,omitempty"`
 	ScopeDropped      int    `json:"scope_dropped,omitempty"`
 	ScopeDroppedBytes int64  `json:"scope_dropped_bytes,omitempty"`
 	BudgetBytes       int64  `json:"budget_bytes,omitempty"`
@@ -119,6 +120,7 @@ func uiContentStatusFrom(h *contentHealth) *UIContentStatus {
 		BuildPhase:        h.BuildPhase,
 		Partial:           h.Partial,
 		Incomplete:        h.Incomplete,
+		Stale:             h.Stale,
 		ScopeDropped:      h.ScopeDropped,
 		ScopeDroppedBytes: h.ScopeDroppedBytes,
 		BudgetBytes:       h.BudgetBytes,

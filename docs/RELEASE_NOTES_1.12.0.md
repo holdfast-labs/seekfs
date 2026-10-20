@@ -26,6 +26,11 @@ catches up.
   through results; a single-volume page resumes where the previous one ended,
   so each page reads about one page of files, even while the index is
   catching up with changes.
+- During a content index rebuild, the previous index keeps answering. Each
+  hit is verified against the file on disk, and the response carries
+  `content_stale: true` with `complete: false`. Such an answer can miss files
+  changed since the previous index, but it never returns a wrong match. The
+  health state stays `indexing` until the new index publishes.
 
 ### Scope
 

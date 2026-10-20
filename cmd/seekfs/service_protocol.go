@@ -72,8 +72,13 @@ type serviceResponse struct {
 	Declines                 []traceDecline      `json:"declines,omitempty"`
 	Fallback                 string              `json:"fallback,omitempty"`
 	Complete                 *bool               `json:"complete,omitempty"`
-	Results                  []string            `json:"results,omitempty"`
-	BudgetExceeded           bool                `json:"budget_exceeded,omitempty"`
+	// ContentStale marks a content answer served from the previous base while
+	// a rebuild runs. Such an answer is verified against disk, so it can miss
+	// files changed since that base but never invents a match; Complete is
+	// false alongside it.
+	ContentStale   bool     `json:"content_stale,omitempty"`
+	Results        []string `json:"results,omitempty"`
+	BudgetExceeded bool     `json:"budget_exceeded,omitempty"`
 	// ContentBudgetDeadlineUnix and ContentDiskVerifyRemaining let the CLI's
 	// optional --lines enrichment share the query's absolute time deadline and
 	// exact remaining per-query read cap. A zero deadline means explicitly

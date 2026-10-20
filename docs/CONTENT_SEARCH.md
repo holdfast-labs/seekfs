@@ -747,10 +747,19 @@ Residual / known limitations (all explicit deferrals):
   exceeds `contentGSXMaxBytes` is kept correct and usable (previous base +
   delta), with a 15-minute capped backoff that recovers a transient over-cap.
   Once the delta hard bound sets `health.Incomplete`, folds are gated and no
-  rebuild is scheduled: `runContentBuild`'s `markIndexing` would drop the usable
-  base, and a rebuild at the same cap fails again while the corpus is too large.
+  rebuild is scheduled: a rebuild at the same cap fails again while the corpus
+  is too large, and it would not recover the over-cap corpus.
   The operator must lower the indexed content or raise the cap, then restart;
   `markDeltaCapped` now records that action in `build_error`.
+- **Serve during rebuild.** While a full rebuild runs, the previous base keeps
+  answering when it loaded and passed the identity, format and integrity gates.
+  Every hit is verified against the file on disk, so the answer can miss files
+  changed since that base but never adds a wrong match. Health stays `indexing`
+  with `incomplete`, and search responses carry `content_stale: true` with
+  `complete: false`; the live USN delta still applies on top. A CRC failure, a
+  version mismatch, a different journal generation or a disabled scope drops
+  the base, so those cases stay `unavailable`/`stale`. The rebuild swaps the
+  new index in atomically on publish, and the flags clear.
 - **Capped/aborted catch-up (verified, P6-3).** A successful self-heal rebuild
   re-attaches and re-runs catch-up to the live checkpoint, which clears
   `catchUpPending` and `health.Incomplete` (asserted in

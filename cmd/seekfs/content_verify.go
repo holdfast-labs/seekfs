@@ -1322,9 +1322,14 @@ func markContentQueryIncomplete(trace *searchTrace, volumes []*serviceVolumeInde
 		return
 	}
 	for _, vol := range volumes {
-		if vol != nil && vol.content != nil && vol.content.healthIncomplete() {
+		if vol == nil || vol.content == nil {
+			continue
+		}
+		if vol.content.healthIncomplete() {
 			trace.setContentIncomplete()
-			return
+		}
+		if vol.content.servingStaleNow() {
+			trace.ContentStale = true
 		}
 	}
 }
