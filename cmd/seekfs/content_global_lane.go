@@ -536,71 +536,99 @@ func globalContentFilenameIteratorNoUnder(volumes []*serviceVolumeIndex, filenam
 	return globalComponentQueryIterator(volumes, filenamePQ, trace)
 }
 
-// searchServiceVolumesGlobalContentComponentsSnapshot answers a compound
-// content + filename query from the filename iterator with inline content
-// verification. It declines for anything outside the lane's scope, leaving the
-// per-volume content path to answer.
-func searchServiceVolumesGlobalContentComponentsSnapshot(snapshot globalQuerySnapshot, opts queryOptions, countOnly bool, pq parsedQuery) ([]Entry, bool, error) {
-	if countOnly || !contentGlobalLaneEnabled() {
-		return nil, false, nil
+// contentLaneMergedMatches runs the compound content lane and returns the
+// verified, overlay-merged, FRN-deduplicated rows. Search and count share it so
+// both sides apply the same delta shadowing and duplicate rules.
+func contentLaneMergedMatches(snapshot globalQuerySnapshot, opts queryOptions, pq parsedQuery, needOrder bool) (usable []*serviceVolumeIndex, usableSnaps []*volumeSnapshot, merged []globalRankedEntry, skipped []string, verified int, ok bool, err error) {
+	if !contentGlobalLaneEnabled() {
+		return nil, nil, nil, nil, 0, false, nil
 	}
 	pq.ensureDiskBudget()
-	usable, skipped, ok := contentLaneScope(snapshot, pq, true)
+	usable, skipped, ok = contentLaneScope(snapshot, pq, needOrder)
 	if !ok {
-		return nil, false, nil
+		return nil, nil, nil, nil, 0, false, nil
 	}
 	for _, vol := range usable {
-		if err := checkQueryCapabilities(pq, vol.index); err != nil {
-			return nil, true, err
+		if err = checkQueryCapabilities(pq, vol.index); err != nil {
+			return nil, nil, nil, nil, 0, true, err
 		}
 	}
-	usableSnaps, snapOK := contentLaneUsableSnapshots(snapshot, usable)
+	var snapOK bool
+	usableSnaps, snapOK = contentLaneUsableSnapshots(snapshot, usable)
 	if !snapOK {
-		return nil, false, nil
+		return nil, nil, nil, nil, 0, false, nil
 	}
 	// Verify the original predicate (filename + content) inline; the matcher is
 	// built once and compactCandidateEntryIfMatchIn consumes base and delta
 	// content through the volume's reader/resolver. Hidden base IDs are
 	// skipped during the drive; live overlay records merge afterward.
 	matcher := newContentLeafMatcher(pq)
-	limit := normalizedLimit(opts.Limit, false)
-	it, ok := globalContentFilenameIterator(usable, stripContentLeaves(pq), opts.Trace, contentLaneDriveBudget(limit))
+	driveLimit := normalizedLimit(opts.Limit, !needOrder)
+	it, ok := globalContentFilenameIterator(usable, stripContentLeaves(pq), opts.Trace, contentLaneDriveBudget(driveLimit))
 	if !ok {
-		return nil, false, nil
+		return nil, nil, nil, nil, 0, false, nil
 	}
 	base, verified, err := collectContentLaneEntries(it, usable, usableSnaps, pq, matcher)
 	if err != nil {
-		return nil, true, err
+		return nil, nil, nil, nil, verified, true, err
 	}
-	// Merge live overlay records exactly as mergeOverlayMatches does per
-	// volume: no overlay records means the base set is returned as-is (the
-	// lane's rank/bias order above is final); otherwise the merged set is
-	// stable-sorted by the shared comparator, which owns the order there
-	// (the scope only engages bias on overlay-quiet volumes, so bias never
-	// meets this re-sort). mergeGlobalOverlayEntries cannot be reused: it
-	// re-sorts by rank even with no overlay entries, which would destroy
-	// the bias partition above.
-	var merged []globalRankedEntry
-	if globalSnapshotsHaveOverlayRecords(usableSnaps) {
-		merged = append(merged, base...)
-		pathCache := make(map[int]string)
-		for i, vol := range usable {
-			if i >= len(usableSnaps) || usableSnaps[i] == nil {
-				continue
-			}
-			for _, overlay := range vol.overlayRankedMatches(usableSnaps[i], pq, pathCache) {
-				merged = append(merged, globalRankedEntry{entry: overlay.entry, volume: i, tie: overlay.entry.Path, overlay: true})
-			}
+	merged = mergeContentLaneOverlay(base, usable, usableSnaps, pq)
+	// A base index can carry a stale and a replacement record with the same FRN
+	// after an unshadowed fold. The per-volume content path is keyed on the
+	// resolved record; the global lane drives records directly, so it must drop
+	// the duplicate identity here. The overlay row wins when both exist.
+	merged = dedupeGlobalRankedEntries(merged)
+	return usable, usableSnaps, merged, skipped, verified, true, nil
+}
+
+// mergeContentLaneOverlay merges live overlay records exactly as
+// mergeOverlayMatches does per volume: no overlay records means the base set is
+// returned as-is (the lane's rank/bias order above is final); otherwise the
+// merged set is stable-sorted by the shared comparator, which owns the order
+// there (the scope only engages bias on overlay-quiet volumes, so bias never
+// meets this re-sort). mergeGlobalOverlayEntries cannot be reused: it re-sorts
+// by rank even with no overlay entries, which would destroy the bias partition
+// above.
+func mergeContentLaneOverlay(base []globalRankedEntry, usable []*serviceVolumeIndex, usableSnaps []*volumeSnapshot, pq parsedQuery) []globalRankedEntry {
+	if !globalSnapshotsHaveOverlayRecords(usableSnaps) {
+		if globalRankedEntriesSpanMultipleVolumes(base) {
+			sortGlobalRankedEntries(base, pq)
 		}
-		sort.SliceStable(merged, func(i, j int) bool {
-			return compareSearchAllEntries(merged[i].entry, merged[j].entry, pq) < 0
-		})
-	} else {
-		merged = base
+		return base
 	}
+	merged := append([]globalRankedEntry(nil), base...)
+	pathCache := make(map[int]string)
+	for i, vol := range usable {
+		if i >= len(usableSnaps) || usableSnaps[i] == nil {
+			continue
+		}
+		for _, overlay := range vol.overlayRankedMatches(usableSnaps[i], pq, pathCache) {
+			merged = append(merged, globalRankedEntry{entry: overlay.entry, volume: i, tie: overlay.entry.Path, overlay: true})
+		}
+	}
+	sort.SliceStable(merged, func(i, j int) bool {
+		return compareSearchAllEntries(merged[i].entry, merged[j].entry, pq) < 0
+	})
 	if globalRankedEntriesSpanMultipleVolumes(merged) {
 		sortGlobalRankedEntries(merged, pq)
 	}
+	return merged
+}
+
+// searchServiceVolumesGlobalContentComponentsSnapshot answers a compound
+// content + filename query from the filename iterator with inline content
+// verification. It declines for anything outside the lane's scope, leaving the
+// per-volume content path to answer.
+func searchServiceVolumesGlobalContentComponentsSnapshot(snapshot globalQuerySnapshot, opts queryOptions, countOnly bool, pq parsedQuery) ([]Entry, bool, error) {
+	if countOnly {
+		return nil, false, nil
+	}
+	usable, _, merged, skipped, verified, ok, err := contentLaneMergedMatches(snapshot, opts, pq, true)
+	if !ok {
+		return nil, false, err
+	}
+	matcher := newContentLeafMatcher(pq)
+	limit := normalizedLimit(opts.Limit, false)
 	filtered := globalRankedEntriesToEntries(merged)
 	// The content path applies the implicit-under filesystem re-check
 	// per volume BEFORE the caller's global merge and limit; the lane holds
@@ -633,42 +661,17 @@ func searchServiceVolumesGlobalContentComponentsSnapshot(snapshot globalQuerySna
 }
 
 // countServiceVolumesGlobalContentComponentsSnapshot is the count twin of the
-// compound content lane: it drives the same filename iterator and tallies the
-// inline content verification, so count == len(search) for the in-scope shapes.
-// A count never uses a capped content superset, so it is exact.
+// compound content lane: it drives the same filename iterator and verifies the
+// same predicate, so count == len(search) for the in-scope shapes. A count never
+// uses a capped content superset, so it is exact.
 func countServiceVolumesGlobalContentComponentsSnapshot(snapshot globalQuerySnapshot, opts queryOptions, pq parsedQuery) (int, bool, error) {
-	if !contentGlobalLaneEnabled() {
-		return 0, false, nil
-	}
-	pq.ensureDiskBudget()
-	usable, skipped, ok := contentLaneScope(snapshot, pq, false)
+	_, _, merged, skipped, verified, ok, err := contentLaneMergedMatches(snapshot, opts, pq, false)
 	if !ok {
-		return 0, false, nil
+		return 0, false, err
 	}
-	for _, vol := range usable {
-		if err := checkQueryCapabilities(pq, vol.index); err != nil {
-			return 0, true, err
-		}
-	}
-	it, ok := globalContentFilenameIterator(usable, stripContentLeaves(pq), opts.Trace, contentLaneDriveBudget(normalizedLimit(opts.Limit, true)))
-	if !ok {
-		return 0, false, nil
-	}
-	usableSnaps, snapOK := contentLaneUsableSnapshots(snapshot, usable)
-	if !snapOK {
-		return 0, false, nil
-	}
-	matcher := newContentLeafMatcher(pq)
-	count, verified, err := countGlobalVerifiedIterator(it, usable, usableSnaps, pq, matcher)
-	if err != nil {
-		return 0, true, err
-	}
-	// The overlay merge owns the live-slot count, mirroring countContentVolume
-	// (base tally plus overlayLiveMatchCountCancellable); both sides verify
-	// the full predicate including content. A count never stats, so the
-	// `under:`/Exists shapes can exceed a matching search: surface the M9
-	// split with ContentCountDivergent exactly as searchContentVolume does.
-	count += globalOverlayMatchCount(usable, usableSnaps, pq)
+	// The merged set already contains the live overlay rows and one row per
+	// FRN, so a duplicate base record can never be counted twice.
+	count := len(merged)
 	markContentQueryDegraded(opts.Trace, skipped)
 	if opts.Trace != nil && (opts.Under != "" || opts.Exists) {
 		opts.Trace.ContentCountDivergent = true

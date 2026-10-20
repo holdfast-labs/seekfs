@@ -667,7 +667,7 @@ func (vol *serviceVolumeIndex) forgetReusedOccupant(frn uint64) {
 	if vol.overlay == nil {
 		vol.overlay = newOverlaySegment()
 	}
-	if baseID, ok := vol.idForFRN(frn); ok {
+	for _, baseID := range vol.baseIDsForFRN(frn) {
 		vol.tombstoneBaseSubtree(baseID)
 	}
 	vol.cascadeOverlayDelete(frn)
@@ -700,8 +700,15 @@ func (vol *serviceVolumeIndex) recordOverlayChange(change usnChange, refreshInfo
 		// correctness wins. This keeps mass file-delete churn (e.g. a
 		// node_modules removal WITH per-child USN records) at O(deletes)
 		// on the apply path instead of O(deletes x overlay).
-		baseID, hasBase := vol.idForFRN(change.FRN)
-		provenFile := hasBase && vol.index.compactRecord(baseID).Mode&uint32(os.ModeDir) == 0
+		baseIDs := vol.baseIDsForFRN(change.FRN)
+		hasBase := len(baseIDs) > 0
+		provenFile := hasBase
+		for _, baseID := range baseIDs {
+			if vol.index.compactRecord(baseID).Mode&uint32(os.ModeDir) != 0 {
+				provenFile = false
+				break
+			}
+		}
 		if slot, ok := overlay.byFRN[change.FRN]; ok && slot >= 0 && int(slot) < len(overlay.records) {
 			prev := overlay.records[slot]
 			if rec.Name == "" {
@@ -721,7 +728,7 @@ func (vol *serviceVolumeIndex) recordOverlayChange(change usnChange, refreshInfo
 		slot := int32(len(overlay.records))
 		overlay.byFRN[change.FRN] = slot
 		overlay.records = append(overlay.records, rec)
-		if hasBase {
+		for _, baseID := range baseIDs {
 			vol.tombstoneBaseSubtree(baseID)
 		}
 		if !provenFile {
@@ -744,13 +751,15 @@ func (vol *serviceVolumeIndex) recordOverlayChange(change usnChange, refreshInfo
 		Seq:       change.Seq,
 	}
 	vol.index.CompactAttrs = true
-	if baseID, ok := vol.idForFRN(change.FRN); ok {
-		overlay.shadowed.add(int32(baseID))
+	if baseIDs := vol.baseIDsForFRN(change.FRN); len(baseIDs) > 0 {
+		for _, baseID := range baseIDs {
+			overlay.shadowed.add(int32(baseID))
+		}
 		// A replacement must not inherit the previous occupant's name, parent,
 		// size, or timestamp. Only fall back to base metadata for an in-place
 		// update of the same occupant.
 		if !replaced {
-			base := vol.index.compactRecord(baseID)
+			base := vol.index.compactRecord(baseIDs[0])
 			if rec.Name == "" {
 				rec.Name = base.Name
 			}

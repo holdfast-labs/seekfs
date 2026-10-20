@@ -556,6 +556,7 @@ func globalRankedEntriesToEntries(ranked []globalRankedEntry) []Entry {
 func mergeGlobalOverlayEntries(volumes []*serviceVolumeIndex, snapshots []*volumeSnapshot, base []globalRankedEntry, pq parsedQuery, limit int) []globalRankedEntry {
 	if len(snapshots) == 0 {
 		sortGlobalRankedEntries(base, pq)
+		base = dedupeGlobalRankedEntries(base)
 		if limit > 0 && len(base) > limit {
 			return base[:limit]
 		}
@@ -576,6 +577,7 @@ func mergeGlobalOverlayEntries(volumes []*serviceVolumeIndex, snapshots []*volum
 		}
 	}
 	sortGlobalRankedEntries(out, pq)
+	out = dedupeGlobalRankedEntries(out)
 	if limit > 0 && len(out) > limit {
 		out = out[:limit]
 	}

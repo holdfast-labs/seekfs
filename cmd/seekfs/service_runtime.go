@@ -547,6 +547,37 @@ func (vol *serviceVolumeIndex) applyDerivedSections() {
 	}
 }
 
+// dedupeCompactRecordsByFRN removes duplicate-FRN records, keeping the last
+// occurrence in append order. FRN 0 is not an identity and is left alone.
+func dedupeCompactRecordsByFRN(records []CompactRecord) []CompactRecord {
+	if len(records) < 2 {
+		return records
+	}
+	last := make(map[uint64]int, len(records))
+	duplicate := false
+	for i := range records {
+		frn := records[i].FRN
+		if frn == 0 {
+			continue
+		}
+		if _, ok := last[frn]; ok {
+			duplicate = true
+		}
+		last[frn] = i
+	}
+	if !duplicate {
+		return records
+	}
+	out := records[:0]
+	for i := range records {
+		frn := records[i].FRN
+		if frn == 0 || last[frn] == i {
+			out = append(out, records[i])
+		}
+	}
+	return out
+}
+
 func sortFRNIndexEntries(frns []uint64, ids []uint32) {
 	if len(frns) <= 1 || len(frns) != len(ids) || sort.SliceIsSorted(frns, func(i, j int) bool {
 		return frns[i] < frns[j]
@@ -692,6 +723,40 @@ func (vol *serviceVolumeIndex) idForFRN(frn uint64) (int, bool) {
 		return int(vol.frnRecordIDs[i]), true
 	}
 	return 0, false
+}
+
+// baseIDsForFRN returns every base record id that carries frn. A healthy index
+// has one; a base that folded an unshadowed replacement can carry a stale and a
+// live record with the same FRN, and every one of them must be shadowed or
+// tombstoned together.
+func (vol *serviceVolumeIndex) baseIDsForFRN(frn uint64) []int {
+	if vol == nil || frn == 0 {
+		return nil
+	}
+	var ids []int
+	if vol.frnToID != nil {
+		if id, ok := vol.frnToID[frn]; ok {
+			ids = append(ids, id)
+		}
+	}
+	lo := sort.Search(len(vol.frns), func(i int) bool { return vol.frns[i] >= frn })
+	for i := lo; i < len(vol.frns) && vol.frns[i] == frn; i++ {
+		if i >= len(vol.frnRecordIDs) {
+			break
+		}
+		id := int(vol.frnRecordIDs[i])
+		seen := false
+		for _, existing := range ids {
+			if existing == id {
+				seen = true
+				break
+			}
+		}
+		if !seen {
+			ids = append(ids, id)
+		}
+	}
+	return ids
 }
 
 func (vol *serviceVolumeIndex) addFRNID(frn uint64, id int) {
@@ -1427,6 +1492,11 @@ func compactOverlayIndexLocked(vol *serviceVolumeIndex, foldOverlay *overlaySegm
 			records = append(records, rec)
 		}
 	}
+	// A base written by an older fold can carry a stale and a replacement
+	// record with the same FRN. Keep the last occurrence (the fold appends the
+	// replacement after the row it shadows) so the duplicate does not survive
+	// another persist.
+	records = dedupeCompactRecordsByFRN(records)
 	idByFRN := make(map[uint64]int32, len(records))
 	for i, rec := range records {
 		idByFRN[rec.FRN] = int32(i)
