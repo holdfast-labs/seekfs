@@ -24,20 +24,31 @@ type serviceRequest struct {
 }
 
 type serviceResponse struct {
-	OK            bool          `json:"ok"`
-	Message       string        `json:"message,omitempty"`
-	Fuzzy         bool          `json:"fuzzy,omitempty"`
-	Entries       int           `json:"entries,omitempty"`
-	Loading       bool          `json:"loading,omitempty"`
-	Count         int           `json:"count,omitempty"`
-	SearchMS      float64       `json:"search_ms,omitempty"`
-	Source        string        `json:"source,omitempty"`
-	Results       []string      `json:"results,omitempty"`
-	Rows          []jsonResult  `json:"rows,omitempty"`
-	DBs           []dbInfo      `json:"dbs,omitempty"`
-	Health        string        `json:"health,omitempty"`
-	HealthMessage string        `json:"health_message,omitempty"`
-	Content       *contentState `json:"content,omitempty"`
+	OK       bool    `json:"ok"`
+	Message  string  `json:"message,omitempty"`
+	Fuzzy    bool    `json:"fuzzy,omitempty"`
+	Entries  int     `json:"entries,omitempty"`
+	Loading  bool    `json:"loading,omitempty"`
+	Count    int     `json:"count,omitempty"`
+	SearchMS float64 `json:"search_ms,omitempty"`
+	Source   string  `json:"source,omitempty"`
+	// Identity fields returned by the info handshake. They gate service
+	// startup exactly like cmd/seekfs/ui.go.
+	PID            int           `json:"pid,omitempty"`
+	Executable     string        `json:"executable,omitempty"`
+	ExecutableHash string        `json:"executable_hash,omitempty"`
+	Version        string        `json:"version,omitempty"`
+	Commit         string        `json:"commit,omitempty"`
+	Date           string        `json:"date,omitempty"`
+	BuildFlavor    string        `json:"build_flavor,omitempty"`
+	PipeName       string        `json:"pipe_name,omitempty"`
+	ProcessMode    string        `json:"process_mode,omitempty"`
+	Results        []string      `json:"results,omitempty"`
+	Rows           []jsonResult  `json:"rows,omitempty"`
+	DBs            []dbInfo      `json:"dbs,omitempty"`
+	Health         string        `json:"health,omitempty"`
+	HealthMessage  string        `json:"health_message,omitempty"`
+	Content        *contentState `json:"content,omitempty"`
 	// Settings is the settings-get/settings-set result.
 	Settings *serviceSettings `json:"settings,omitempty"`
 }

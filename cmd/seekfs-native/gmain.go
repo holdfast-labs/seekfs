@@ -208,8 +208,9 @@ func (u *UI) themePoll(w *app.Window) {
 
 // initialInfo runs the service handshake off the UI thread.
 func (u *UI) initialInfo() {
-	resp, err := u.client.Info()
+	resp, err := u.ensureService()
 	u.mu.Lock()
+	u.noVolumes = err == nil && len(resp.DBs) == 0
 	if err != nil {
 		u.health, u.healthMsg = serviceHealthError, err.Error()
 	} else if resp.Loading {

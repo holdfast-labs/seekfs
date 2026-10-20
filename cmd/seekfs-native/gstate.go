@@ -51,6 +51,9 @@ type UI struct {
 	health    string
 	healthMsg string
 	entries   int
+	// noVolumes reports that the service has no indexed volumes loaded, so
+	// the first-run panel can offer Settings > Drives.
+	noVolumes bool
 
 	// Theme.
 	th     *material.Theme
@@ -63,6 +66,7 @@ type UI struct {
 	gsettings       *settingsPanelState
 	settingsPending settingsPendingResult
 	settingsBtn     widget.Clickable
+	emptyDrivesBtn  widget.Clickable
 
 	// Widgets.
 	searchEd    widget.Editor
