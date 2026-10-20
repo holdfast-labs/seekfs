@@ -638,6 +638,11 @@ func TestHeadlessFrameCost(t *testing.T) {
 
 func TestHeadlessRowBaselines(t *testing.T) {
 	u := testUI(t, true)
+	// Keep the x bands deterministic: the on-disk native.json may hold
+	// wider persisted columns than this test's fixed pixel bands assume.
+	u.mu.Lock()
+	u.colW = defaultColW()
+	u.mu.Unlock()
 	setRows(u, []ResultRow{{
 		Path: `C:\proj\active_tab_chrome_pages.go`, Name: "active_tab_chrome_pages.go",
 		Dir: `C:\proj\api_test\tab_capture`, Size: 900, HasSize: true,

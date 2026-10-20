@@ -438,6 +438,25 @@ func (u *UI) layoutSettingsCard(gtx layout.Context) layout.Dimensions {
 	return dims
 }
 
+// settingsHeaderSubtitle reports the truthful state line under the Settings
+// title: only an in-flight request or an actually indexing volume qualifies.
+func settingsHeaderSubtitle(p *settingsPanelState) string {
+	if p.saving {
+		return "Applying..."
+	}
+	if p.load {
+		return "Loading..."
+	}
+	if p.model != nil {
+		for _, v := range p.model.draft.Volumes {
+			if v.State == "indexing" {
+				return "Indexing..."
+			}
+		}
+	}
+	return ""
+}
+
 func (u *UI) layoutSettingsHeader(gtx layout.Context, p *settingsPanelState) layout.Dimensions {
 	s := u.scheme
 	if p.closeBtn.Clicked(gtx) {
@@ -455,7 +474,11 @@ func (u *UI) layoutSettingsHeader(gtx layout.Context, p *settingsPanelState) lay
 							return label(u.th, Sp(18), "Settings", s.Text).Layout(gtx)
 						}),
 						layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-							return label(u.th, Sp(12), "Indexing...", s.Muted).Layout(gtx)
+							subtitle := settingsHeaderSubtitle(p)
+							if subtitle == "" {
+								return layout.Dimensions{}
+							}
+							return label(u.th, Sp(12), subtitle, s.Muted).Layout(gtx)
 						}),
 					)
 				})
