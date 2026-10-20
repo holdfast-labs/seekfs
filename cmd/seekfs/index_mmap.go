@@ -1223,7 +1223,7 @@ func loadConfig(path string) (appConfig, error) {
 		cfg.Plugins, err = loadPluginDefinitions(cfg.PluginPath)
 		return cfg, err
 	}
-	data, err := os.ReadFile(path)
+	data, err := readConfigFile(path)
 	if err != nil {
 		return appConfig{}, err
 	}
