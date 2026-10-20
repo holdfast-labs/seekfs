@@ -445,6 +445,11 @@ type mappedPostingSection struct {
 	Bytes      int
 	Data       []byte
 	RankBounds postingRankBounds
+	// identity is unique per decoded section. The posting-block cache keys on
+	// it because a raw data pointer can be reused after an mmap is closed or a
+	// heap section is freed; a pointer-only key then serves a stale block from
+	// a different index. See postingBlockCacheKey.
+	identity uint64
 }
 
 type postingRankBounds struct {
@@ -458,10 +463,18 @@ type postingRankBounds struct {
 }
 
 type postingBlockCacheKey struct {
-	base  uintptr
-	bytes int
-	block int
+	identity uint64
+	base     uintptr
+	bytes    int
+	block    int
 }
+
+// postingSectionSeq hands every decoded posting section a process-unique
+// identity so a cache entry can never match a different section that happens
+// to reuse the same address and length.
+var postingSectionSeq atomic.Uint64
+
+func nextPostingSectionIdentity() uint64 { return postingSectionSeq.Add(1) }
 
 type postingBlockCacheEntry struct {
 	key   postingBlockCacheKey

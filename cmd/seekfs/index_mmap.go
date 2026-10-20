@@ -508,7 +508,7 @@ func decodePostingSection(data []byte) mappedPostingSection {
 	if off+blockBlobLen < off || off+blockBlobLen > len(data) {
 		return mappedPostingSection{}
 	}
-	section := mappedPostingSection{EntryCount: entryCount, BlockCount: blockCount, Bytes: len(data), Data: data}
+	section := mappedPostingSection{EntryCount: entryCount, BlockCount: blockCount, Bytes: len(data), Data: data, identity: nextPostingSectionIdentity()}
 	if keyBlobLen == 0 {
 		return section
 	}
@@ -630,9 +630,10 @@ func (section mappedPostingSection) postingBlockCacheKey(blockIndex int) (postin
 		return postingBlockCacheKey{}, false
 	}
 	return postingBlockCacheKey{
-		base:  uintptr(unsafe.Pointer(unsafe.SliceData(section.Data))),
-		bytes: len(section.Data),
-		block: blockIndex,
+		identity: section.identity,
+		base:     uintptr(unsafe.Pointer(unsafe.SliceData(section.Data))),
+		bytes:    len(section.Data),
+		block:    blockIndex,
 	}, true
 }
 
@@ -1162,7 +1163,7 @@ func decodeGramPostingIndex(data []byte, recordCount int) *compressedTrigramInde
 		gramUnionComplete:  unionComplete,
 		gramSize:           3,
 		recordCount:        recordCount,
-		mappedGrams:        &mappedPostingSection{EntryCount: entryCount, BlockCount: blockCount, Bytes: len(data), Data: data},
+		mappedGrams:        &mappedPostingSection{EntryCount: entryCount, BlockCount: blockCount, Bytes: len(data), Data: data, identity: nextPostingSectionIdentity()},
 	}
 	if omittedCount > 0 {
 		ti.omitted = make(map[uint32]struct{}, omittedCount)
