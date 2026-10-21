@@ -105,7 +105,10 @@ first makes the installed Windows service own the pipe, then sends the write:
   as LocalSystem, delayed automatic start, command
   `seekfs.exe service -pipe <pipe> -sddl <default>`. It passes no `-db`, so the
   service loads the configured drive list and drives added later in Settings
-  survive a restart (`seekfs install` pins `-db` paths instead).
+  survive a restart (`seekfs install` pins `-db` paths instead). When an
+  existing service had pinned `-db` paths, they are first added to the `dbs`
+  list of the `seekfs.toml` the service reads (`%ProgramData%\seekfs`, else
+  next to `seekfs.exe`), so no index is dropped.
 - The helper starts the service, waits until it answers as `windows-service`,
   and then applies the settings (an empty `{}` patch is valid for install only).
 

@@ -225,8 +225,9 @@ GOMAXPROCS=2, peak disk 0.56x extracted. Limit-20 warm/first: rare literal
 
 ## Smaller follow-ups
 
-- **Native first-run "Error" on added drives: FIXED 2026-10-21, pending merge**
-  (`fix/settings-apply-error`). seekfs-native starts its sibling service
+- **Native first-run "Error" on added drives: FIXED 2026-10-21, release v1.12.1**
+  (`fix/settings-apply-error`; also bumps Go to 1.26.10 for GO-2026-6809, which
+  had turned main's CI analysis job red at v1.12.0). seekfs-native starts its sibling service
   unelevated; UAC elevated only the `settings set` helper, so the drive build ran
   in the unelevated service and failed with "Access is denied", and the drive
   row hid the reason. The elevated helper now restarts an unelevated standalone
@@ -236,9 +237,13 @@ GOMAXPROCS=2, peak disk 0.56x extracted. Limit-20 warm/first: rare literal
   `--install-service` (auto-start LocalSystem service, no pinned `-db`). Owner
   check: on a machine without the installed service, open seekfs-native, tick
   a drive, Apply, approve UAC; confirm `sc qc seekfs` shows AUTO_START, the
-  drive indexes, and it is still current after a reboot. Follow-ups: no
-  uninstall button; `seekfs install` still pins `-db` (drives added in
-  Settings are lost on restart for CLI-installed services).
+  drive indexes, and it is still current after a reboot. Reconfiguring an
+  existing service copies its pinned `-db` paths into `seekfs.toml` first.
+  Follow-ups: no uninstall button; `seekfs install`/`launch` still pin `-db`
+  (drives added in Settings are lost on restart for CLI-installed services);
+  the user-run sibling searches `.\seekfs.toml` (exe dir) before
+  `%ProgramData%`, the SYSTEM service the reverse, so the two can read
+  different configs when both files exist.
 
 - **Whole-drive coverage, build peak: CLOSED 2026-10-15** (`content/stream-postings`
   NOTES.md). Spooling posting runs instead of text: raw runs are ~1.02x of text

@@ -228,3 +228,45 @@ func TestAppServiceArgsDoNotPinDBs(t *testing.T) {
 		t.Fatalf("args = %v", args)
 	}
 }
+
+func TestPinnedServiceDBsParsesInstalledCommandLine(t *testing.T) {
+	cmdline := `"C:\Program Files\seekfs\seekfs.exe" service -pipe \\.\pipe\seekfs-service -sddl D:(A;;GA;;;SY) -db "C:\ProgramData\seekfs\indexes\C.gsi" -db=E:\idx\E.gsi --db F:\F.gsi`
+	got := pinnedServiceDBs(cmdline)
+	want := []string{`C:\ProgramData\seekfs\indexes\C.gsi`, `E:\idx\E.gsi`, `F:\F.gsi`}
+	if strings.Join(got, "|") != strings.Join(want, "|") {
+		t.Fatalf("pinned = %q, want %q", got, want)
+	}
+	if got := pinnedServiceDBs(`C:\seekfs\seekfs.exe service -pipe \\.\pipe\p`); len(got) != 0 {
+		t.Fatalf("no -db = %q", got)
+	}
+}
+
+// Reconfiguring a CLI-installed service must not lose the indexes that were
+// only on its command line.
+func TestCarryPinnedServiceDBsMergesIntoConfig(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "seekfs.toml")
+	existing := filepath.Join(dir, "C.gsi")
+	if err := os.WriteFile(path, []byte("default_limit = 10\ndbs = ['"+existing+"']\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	pinned := filepath.Join(dir, "E.gsi")
+	if err := carryPinnedServiceDBs(path, []string{existing, pinned}); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := loadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.DBs) != 2 || !samePath(cfg.DBs[0], existing) || !samePath(cfg.DBs[1], pinned) || cfg.DefaultLimit != 10 {
+		t.Fatalf("config after carry = dbs %q limit %d", cfg.DBs, cfg.DefaultLimit)
+	}
+
+	fresh := filepath.Join(dir, "sub", "seekfs.toml")
+	if err := carryPinnedServiceDBs(fresh, []string{pinned}); err != nil {
+		t.Fatal(err)
+	}
+	if cfg, err := loadConfig(fresh); err != nil || len(cfg.DBs) != 1 {
+		t.Fatalf("new config = %+v, %v", cfg.DBs, err)
+	}
+}

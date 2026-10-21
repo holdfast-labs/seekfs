@@ -11,6 +11,7 @@ import (
 	"syscall"
 	"time"
 
+	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/svc/mgr"
 )
 
@@ -253,6 +254,11 @@ func configureAppWindowsService(exe string, args []string) error {
 	if err != nil {
 		return err
 	}
+	// "seekfs install"/"launch" pin the index list on the command line, which
+	// the new command line drops; keep those indexes in the config instead.
+	if err := carryPinnedServiceDBs(appServiceConfigPath(exe), pinnedServiceDBs(cfg.BinaryPathName)); err != nil {
+		return fmt.Errorf("keep the service's index list: %w", err)
+	}
 	cmdline := syscall.EscapeArg(exe)
 	for _, arg := range args {
 		cmdline += " " + syscall.EscapeArg(arg)
@@ -265,4 +271,69 @@ func configureAppWindowsService(exe string, args []string) error {
 		return fmt.Errorf("update the seekfs service: %w", err)
 	}
 	return nil
+}
+
+// appServiceConfigPath is the seekfs.toml the LocalSystem service reads. Its
+// working directory and profile hold none, so its config search finds
+// %ProgramData%\seekfs before the executable's folder.
+func appServiceConfigPath(exe string) string {
+	primary := defaultConfigPath()
+	if _, err := os.Stat(primary); err == nil {
+		return primary
+	}
+	if beside := filepath.Join(filepath.Dir(exe), "seekfs.toml"); exe != "" {
+		if _, err := os.Stat(beside); err == nil {
+			return beside
+		}
+	}
+	return primary
+}
+
+// pinnedServiceDBs returns the -db paths on an installed service command line.
+func pinnedServiceDBs(binaryPath string) []string {
+	args, err := windows.DecomposeCommandLine(binaryPath)
+	if err != nil {
+		return nil
+	}
+	var dbs []string
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		switch {
+		case (arg == "-db" || arg == "--db") && i+1 < len(args):
+			dbs = append(dbs, args[i+1])
+			i++
+		case strings.HasPrefix(arg, "-db="):
+			dbs = append(dbs, strings.TrimPrefix(arg, "-db="))
+		case strings.HasPrefix(arg, "--db="):
+			dbs = append(dbs, strings.TrimPrefix(arg, "--db="))
+		}
+	}
+	return dbs
+}
+
+// carryPinnedServiceDBs adds pinned index paths to the config's dbs list so
+// a service that follows the config still loads them.
+func carryPinnedServiceDBs(configPath string, pinned []string) error {
+	if len(pinned) == 0 {
+		return nil
+	}
+	var dbs []string
+	if _, err := os.Stat(configPath); err == nil {
+		cfg, err := loadConfig(configPath)
+		if err != nil {
+			return err
+		}
+		dbs = append(dbs, cfg.DBs...)
+	}
+	changed := false
+	for _, db := range pinned {
+		if !settingsContainsDB(dbs, db) {
+			dbs = append(dbs, db)
+			changed = true
+		}
+	}
+	if !changed {
+		return nil
+	}
+	return setConfigKey(configPath, "dbs", formatStringArray(dbs))
 }
