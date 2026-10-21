@@ -57,12 +57,29 @@ try {
     Remove-Item $UiSysoBackup -Force -ErrorAction SilentlyContinue
 }
 
+# Native Gio desktop UI. Gio loads the window/title-bar icon from icon group
+# resource id 1 (gioui.org/app iconID), unlike Wails' 3, hence -group 1.
+# Its manifest (comctl32 v6 + per-monitor-v2 DPI,
+// asInvoker) and icon are regenerated deterministically into
+// cmd/seekfs-native/rsrc.syso, which is also committed for dev builds.
+$NativePkg = Join-Path $Root "cmd\seekfs-native"
+$NativeSyso = Join-Path $NativePkg "rsrc.syso"
+$NativeIcon = Join-Path $UiPkg "ui_frontend\assets\seekfs.ico"
+$NativeManifest = Join-Path $NativePkg "seekfs-native.manifest"
+go run ./scripts/ui-rsrcgen -arch amd64 -group 1 -ico $NativeIcon -manifest $NativeManifest -o $NativeSyso
+Assert-LastExit "native resource generation"
+go build -trimpath -ldflags "$LdFlags -H windowsgui" -o (Join-Path $Target "seekfs-native.exe") ./cmd/seekfs-native
+Assert-LastExit "go build (seekfs-native.exe)"
+
 Copy-Item README.md,LICENSE,NOTICE.md -Destination $Target
 
 # Copy only files tracked by git so local research notes, private benchmark
 # data, and other untracked docs cannot leak into release artifacts.
 $DocFiles = git ls-files docs
 Assert-LastExit "git ls-files docs"
+# Internal coordination notes (local paths, agent setup) are not release docs.
+$InternalDocs = @("docs/WORK_QUEUE.md")
+$DocFiles = $DocFiles | Where-Object { $InternalDocs -notcontains $_ }
 foreach ($doc in $DocFiles) {
     $dest = Join-Path $Target $doc
     $destDir = Split-Path -Parent $dest

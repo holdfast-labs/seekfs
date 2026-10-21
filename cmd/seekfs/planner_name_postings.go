@@ -99,6 +99,10 @@ func (vol *serviceVolumeIndex) filterCandidates(pq parsedQuery) ([]int, bool) {
 		lists = append(lists, list)
 	}
 	for _, term := range pq.Terms {
+		if pq.MatchPath && vol.pathTermSatisfiedByVolume(term) {
+			// Vacuous for sourcing; verification re-checks it.
+			continue
+		}
 		list := vol.nameTermPosting(term)
 		if pq.MatchPath {
 			list = vol.pathTermPosting(term)
@@ -146,7 +150,7 @@ func (vol *serviceVolumeIndex) regexLiteralCandidates(pq parsedQuery) ([]int, bo
 }
 
 func (vol *serviceVolumeIndex) pathRootLimitedCandidates(pq parsedQuery) ([]int, bool) {
-	if vol == nil || vol.index == nil || !pq.MatchPath || pq.CountOnly || len(pq.Terms) < 2 || len(pq.Dirs) > 0 || len(pq.Regexps) > 0 || pq.Under != "" || pq.CaseSensitive || pq.Limit <= 0 {
+	if vol == nil || vol.index == nil || !pq.MatchPath || pq.CountOnly || len(pq.Terms) < 2 || len(pq.Dirs) > 0 || len(pq.Regexps) > 0 || pq.Under != "" || pq.CaseSensitive || pq.Limit <= 0 || pq.hiddenBlocksTruncation() {
 		return nil, false
 	}
 	type rootTerm struct {
@@ -212,7 +216,7 @@ func (vol *serviceVolumeIndex) subtreeIDsInOrder(rootID int) []int {
 }
 
 func (vol *serviceVolumeIndex) exactDirCandidates(pq parsedQuery) ([]int, bool) {
-	if vol == nil || vol.index == nil || len(pq.Terms) != 1 || pq.Type != "dir" || len(pq.Dirs) > 0 || len(pq.Regexps) > 0 || pq.Under != "" || len(pq.Exts) > 0 || len(pq.Globs) > 0 || pq.HasModAfter || pq.Exists || pq.CaseSensitive {
+	if vol == nil || vol.index == nil || len(pq.Terms) != 1 || pq.Type != "dir" || len(pq.Dirs) > 0 || len(pq.Regexps) > 0 || pq.Under != "" || len(pq.Exts) > 0 || len(pq.Globs) > 0 || pq.HasModAfter || pq.lateVerified() || pq.CaseSensitive || vol.accentUnionActive(pq) {
 		return nil, false
 	}
 	list := vol.exactNameIDs(pq.Terms[0])
@@ -235,11 +239,20 @@ func (vol *serviceVolumeIndex) pathTermSubtreeCandidates(pq parsedQuery) ([]int,
 	}
 	lists := make([][]int, 0, len(pq.Terms))
 	for _, term := range pq.Terms {
+		if vol.pathTermSatisfiedByVolume(term) {
+			// Vacuous for sourcing (matches every path via the volume);
+			// verification re-checks it. Sourcing it would intersect an
+			// incomplete name-derived subset.
+			continue
+		}
 		list := vol.pathPlanTermPosting(term)
 		if len(list) == 0 {
 			return []int{}, true
 		}
 		lists = append(lists, list)
+	}
+	if len(lists) == 0 {
+		return nil, false
 	}
 	sortIntListsByLen(lists)
 	candidates := append([]int(nil), lists[0]...)
@@ -274,7 +287,10 @@ func (vol *serviceVolumeIndex) unionNamePostings(terms []string) ([]int, bool) {
 }
 
 func (vol *serviceVolumeIndex) exactNameCandidates(pq parsedQuery) ([]int, bool) {
-	if vol == nil || vol.index == nil || len(pq.Terms) != 1 || len(pq.Dirs) > 0 || len(pq.Regexps) > 0 || pq.Under != "" || len(pq.Exts) > 0 || len(pq.Globs) > 0 || pq.Type != "" || pq.HasModAfter || pq.Exists || pq.CaseSensitive {
+	if vol == nil || vol.index == nil || len(pq.Terms) != 1 || len(pq.Dirs) > 0 || len(pq.Regexps) > 0 || pq.Under != "" || len(pq.Exts) > 0 || len(pq.Globs) > 0 || pq.Type != "" || pq.HasModAfter || pq.lateVerified() || pq.CaseSensitive || vol.accentUnionActive(pq) {
+		// Exact IDs read unfolded bytes; a non-empty unfolded hit would
+		// serve while accent-folded equals stay missing. Decline so the
+		// posting intersection (with the accent union) answers instead.
 		return nil, false
 	}
 	term := pq.Terms[0]
@@ -307,7 +323,10 @@ func samePath(a, b string) bool {
 }
 
 func (vol *serviceVolumeIndex) namePrefixCandidates(pq parsedQuery) ([]int, bool) {
-	if vol == nil || vol.index == nil || len(pq.Terms) != 1 || len(pq.Dirs) > 0 || len(pq.Regexps) > 0 || pq.Under != "" || len(pq.Exts) > 0 || len(pq.Globs) > 0 || pq.Type != "" || pq.HasModAfter || pq.Exists || pq.CaseSensitive {
+	if vol == nil || vol.index == nil || len(pq.Terms) != 1 || len(pq.Dirs) > 0 || len(pq.Regexps) > 0 || pq.Under != "" || len(pq.Exts) > 0 || len(pq.Globs) > 0 || pq.Type != "" || pq.HasModAfter || pq.lateVerified() || pq.CaseSensitive || vol.accentUnionActive(pq) {
+		// The name-order prefix walk reads unfolded bytes; with foldable
+		// names it would truncate before accent matches. Decline so the
+		// posting intersection (with the accent union) answers instead.
 		return nil, false
 	}
 	term := pq.Terms[0]
@@ -462,9 +481,79 @@ func (vol *serviceVolumeIndex) nameTermPosting(term string) []int {
 		}
 	}
 	vol.termMu.Unlock()
+	// Service searches run on per-request views whose term cache starts
+	// empty, so a miss here used to cost a full name scan on every query.
+	// The name trigram postings give the same verified set when no recent
+	// records need merging; otherwise keep the scan's exact semantics.
+	if len(vol.recentIDs) == 0 && len(vol.nameTrigramRecent) == 0 {
+		if list, ok := vol.nameTrigramNameTermPostingLimited(term, 0); ok {
+			list = vol.unionAccentNameMatches(list, term)
+			vol.cacheNamePosting(term, list)
+			return list
+		}
+	}
 	list := vol.scanNameTermPosting(term)
+	list = vol.unionAccentNameMatches(list, term)
 	vol.cacheNamePosting(term, list)
 	return list
+}
+
+// unionAccentNameMatches adds records whose accent-folded name contains the
+// folded term. The trigram/scan lanes above read unfolded bytes and miss
+// them (`resume` vs `résumé`); this comparison-side union restores recall
+// with no index format change. On ASCII corpora the foldable set is empty
+// and this is a nil check. Both inputs are in ID order, so the merge stays
+// sorted for downstream intersection lanes.
+func (vol *serviceVolumeIndex) unionAccentNameMatches(list []int, term string) []int {
+	if vol == nil || vol.index == nil || foldOffKillSwitch {
+		return list
+	}
+	ids := accentRecordIDs(vol.index)
+	if len(ids) == 0 {
+		return list
+	}
+	foldedTerm := foldAccentLower(term)
+	recordCount := vol.index.compactRecordCount()
+	extra := make([]int, 0, 4)
+	for _, id32 := range ids {
+		id := int(id32)
+		if id < 0 || id >= recordCount {
+			continue
+		}
+		rec := vol.index.compactRecord(id)
+		if rec.Deleted {
+			continue
+		}
+		lower := vol.index.compactLowerNameAt(id)
+		if strings.Contains(lower, term) {
+			continue // already covered by the unfolded lane
+		}
+		if strings.Contains(foldAccentLower(lower), foldedTerm) {
+			extra = append(extra, id)
+		}
+	}
+	if len(extra) == 0 {
+		return list
+	}
+	out := make([]int, 0, len(list)+len(extra))
+	i, j := 0, 0
+	for i < len(list) && j < len(extra) {
+		switch {
+		case list[i] == extra[j]:
+			out = append(out, list[i])
+			i++
+			j++
+		case list[i] < extra[j]:
+			out = append(out, list[i])
+			i++
+		default:
+			out = append(out, extra[j])
+			j++
+		}
+	}
+	out = append(out, list[i:]...)
+	out = append(out, extra[j:]...)
+	return out
 }
 
 func postingListCacheMaxBytes() int64 {

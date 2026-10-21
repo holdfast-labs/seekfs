@@ -25,6 +25,25 @@ type r5OverlayGateState struct {
 	name    string
 	vol     *serviceVolumeIndex
 	logical map[uint64]CompactRecord
+	// oracle is the clean-index reference volume for state.logical, built
+	// once per state. The old helpers rebuilt it (plus a t.TempDir) on
+	// every compare/count call — thousands of redundant builds of a
+	// ~10-record index. Searches only read it through deterministic memo
+	// caches, so reusing it across the sequential matrix compares the
+	// same arms with the same assertions.
+	oracle *serviceVolumeIndex
+}
+
+// r5GateState builds a state with its oracle volume in one place, so every
+// construction site shares the build-once contract documented above.
+func r5GateState(t *testing.T, name string, vol *serviceVolumeIndex, logical map[uint64]CompactRecord) r5OverlayGateState {
+	t.Helper()
+	return r5OverlayGateState{
+		name:    name,
+		vol:     vol,
+		logical: logical,
+		oracle:  newServiceVolumeIndex(filepath.Join(t.TempDir(), "oracle-"+name+".gsi"), r5OverlayGateFreshIndex(logical)),
+	}
 }
 
 func TestR5ActiveOverlayOwnedInProcessGate(t *testing.T) {
@@ -33,7 +52,7 @@ func TestR5ActiveOverlayOwnedInProcessGate(t *testing.T) {
 
 	base := r5OverlayGateLogical()
 	baseVol := newServiceVolumeIndex(filepath.Join(t.TempDir(), "base.gsi"), r5OverlayGateFreshIndex(base))
-	baseState := r5OverlayGateState{name: "clean-base", vol: baseVol, logical: cloneR5Logical(base)}
+	baseState := r5GateState(t, "clean-base", baseVol, cloneR5Logical(base))
 	r5OverlayGateParitySmoke(t, baseState)
 
 	activeVol := newServiceVolumeIndex(filepath.Join(t.TempDir(), "active.gsi"), r5OverlayGateFreshIndex(base))
@@ -41,10 +60,10 @@ func TestR5ActiveOverlayOwnedInProcessGate(t *testing.T) {
 	for i, changes := range r5OverlayGateChanges() {
 		activeVol.applyUSNChanges(changes)
 		r5OverlayGateApplyOracleChanges(activeLogical, changes)
-		state := r5OverlayGateState{name: fmt.Sprintf("active-%02d", i+1), vol: activeVol, logical: cloneR5Logical(activeLogical)}
+		state := r5GateState(t, fmt.Sprintf("active-%02d", i+1), activeVol, cloneR5Logical(activeLogical))
 		r5OverlayGateParitySmoke(t, state)
 	}
-	active := r5OverlayGateState{name: "active-overlay", vol: activeVol, logical: activeLogical}
+	active := r5GateState(t, "active-overlay", activeVol, activeLogical)
 	if snap := activeVol.snap.Load(); snap == nil || snap.watermark <= 1 {
 		t.Fatalf("active overlay structural fixture has watermark=%v, want multiple additions/tombstones beyond limit 1", snap)
 	}
@@ -54,11 +73,9 @@ func TestR5ActiveOverlayOwnedInProcessGate(t *testing.T) {
 	if compacted == nil || len(compacted.Records) == 0 {
 		t.Fatal("flush-equivalent compaction returned no records")
 	}
-	flushed := r5OverlayGateState{
-		name:    "flush-equivalent",
-		vol:     newServiceVolumeIndex(filepath.Join(t.TempDir(), "flushed.gsi"), compacted),
-		logical: cloneR5Logical(activeLogical),
-	}
+	flushed := r5GateState(t, "flush-equivalent",
+		newServiceVolumeIndex(filepath.Join(t.TempDir(), "flushed.gsi"), compacted),
+		cloneR5Logical(activeLogical))
 	r5OverlayGateParitySmoke(t, flushed)
 
 	walDir := t.TempDir()
@@ -76,14 +93,14 @@ func TestR5ActiveOverlayOwnedInProcessGate(t *testing.T) {
 	if err := walReplay.replayWAL(); err != nil {
 		t.Fatalf("replay WAL: %v", err)
 	}
-	replayed := r5OverlayGateState{name: "wal-replay", vol: walReplay, logical: walLogical}
+	replayed := r5GateState(t, "wal-replay", walReplay, walLogical)
 	r5OverlayGateParitySmoke(t, replayed)
 
 	restarted := newServiceVolumeIndex(walDB, r5OverlayGateFreshIndex(base))
 	if err := restarted.replayWAL(); err != nil {
 		t.Fatalf("restart WAL replay: %v", err)
 	}
-	restartedState := r5OverlayGateState{name: "restart-wal-replay", vol: restarted, logical: cloneR5Logical(walLogical)}
+	restartedState := r5GateState(t, "restart-wal-replay", restarted, cloneR5Logical(walLogical))
 	r5OverlayGateParitySmoke(t, restartedState)
 	if err := removeWAL(walDB); err != nil {
 		t.Fatalf("remove owned WAL: %v", err)
@@ -245,7 +262,7 @@ func r5OverlayGateMatrix(t *testing.T, state r5OverlayGateState) {
 
 func r5OverlayGateCompare(t *testing.T, state r5OverlayGateState, query r5OverlayGateQuery, sortColumn string, limit, repetitions int) (float64, int, string, string, error) {
 	t.Helper()
-	oracleVol := newServiceVolumeIndex(filepath.Join(t.TempDir(), "oracle.gsi"), r5OverlayGateFreshIndex(state.logical))
+	oracleVol := state.oracle
 	queryText := query.query
 	if sortColumn != "" {
 		queryText += " " + sortColumn
@@ -293,7 +310,7 @@ func r5OverlayGateCompare(t *testing.T, state r5OverlayGateState, query r5Overla
 
 func r5OverlayGateCount(t *testing.T, state r5OverlayGateState, query r5OverlayGateQuery, sortColumn string, limit int) (float64, string, string, error) {
 	t.Helper()
-	oracleVol := newServiceVolumeIndex(filepath.Join(t.TempDir(), "oracle-count.gsi"), r5OverlayGateFreshIndex(state.logical))
+	oracleVol := state.oracle
 	queryText := query.query
 	if sortColumn != "" {
 		queryText += " " + sortColumn

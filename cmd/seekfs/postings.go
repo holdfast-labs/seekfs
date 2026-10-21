@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"sort"
 	"strings"
@@ -372,11 +373,55 @@ func (vol *serviceVolumeIndex) buildMappedComponentCoverage(component string, se
 		len(vol.subtreeOrder) == 0 || len(vol.subtreeStart) == 0 || len(vol.subtreeEnd) == 0 {
 		return coverage, false
 	}
-	candidate, ok := vol.componentPostingCountCandidate(component)
-	if !ok || (!candidate.mapped && candidate.ids == nil) {
+	roots, ok := vol.componentSubstringRoots(component)
+	if !ok {
 		return coverage, false
 	}
-	return vol.buildMappedComponentCoverageFromRoots(candidate.materialize(), coverage.selfIDs)
+	return vol.buildMappedComponentCoverageFromRoots(roots, coverage.selfIDs)
+}
+
+// componentSubstringRoots returns every directory whose component name
+// contains component. Path terms are substrings of the full path, so a
+// directory named "main_content" roots matches for "content" just like one
+// named exactly "content"; using only the exact key dropped those subtrees.
+func (vol *serviceVolumeIndex) componentSubstringRoots(component string) ([]uint32, bool) {
+	if vol == nil || vol.index == nil {
+		return nil, false
+	}
+	key := strings.ToLower(component)
+	if vol.index.Derived.Postings != nil {
+		if section, exists := vol.index.Derived.Postings[indexSectionPCMP]; exists {
+			keys, complete := section.matchingStringPostingKeys(key)
+			if !complete {
+				return nil, false
+			}
+			var roots []uint32
+			for _, postingKey := range keys {
+				it, _, ok := section.stringPostingIterator(postingKey)
+				if !ok {
+					return nil, false
+				}
+				for {
+					ids, _, ok := it.nextBlock()
+					if !ok {
+						break
+					}
+					roots = append(roots, ids...)
+				}
+			}
+			return roots, true
+		}
+	}
+	if vol.queryIndex != nil && vol.queryIndex.components != nil {
+		var roots []uint32
+		for name, ids := range vol.queryIndex.components {
+			if strings.Contains(name, key) {
+				roots = append(roots, ids...)
+			}
+		}
+		return roots, true
+	}
+	return nil, false
 }
 
 func (vol *serviceVolumeIndex) buildMappedComponentCoverageFromRoots(roots []uint32, selfIDs []int) (mappedComponentCoverage, bool) {
@@ -1778,19 +1823,127 @@ func (idx *Index) compactPathContainsAll(i int, terms []string) bool {
 	return true
 }
 
+// cloneParsedQuery returns a deep copy of pq: every slice field gets its own
+// backing array and OR/NOT subqueries are copied recursively, so a caller can
+// mutate the result without touching pq. parseQuery uses it on the
+// parsedOverride path (the filename-only fallback), which runs only when a
+// volume's content index is unusable, not on the hot filename path.
+func cloneParsedQuery(pq parsedQuery) parsedQuery {
+	out := pq
+	out.Terms = append([]string(nil), pq.Terms...)
+	out.ImplicitPathTerms = append([]string(nil), pq.ImplicitPathTerms...)
+	out.Exts = append([]string(nil), pq.Exts...)
+	out.Dirs = append([]string(nil), pq.Dirs...)
+	out.Globs = append([]string(nil), pq.Globs...)
+	out.PathGlobs = append([]string(nil), pq.PathGlobs...)
+	if pq.GlobAlts != nil {
+		out.GlobAlts = make([][]string, len(pq.GlobAlts))
+		for i, a := range pq.GlobAlts {
+			out.GlobAlts[i] = append([]string(nil), a...)
+		}
+	}
+	if pq.PathGlobAlts != nil {
+		out.PathGlobAlts = make([][]string, len(pq.PathGlobAlts))
+		for i, a := range pq.PathGlobAlts {
+			out.PathGlobAlts[i] = append([]string(nil), a...)
+		}
+	}
+	out.ExactTerms = append([]string(nil), pq.ExactTerms...)
+	out.Prefixes = append([]string(nil), pq.Prefixes...)
+	out.Suffixes = append([]string(nil), pq.Suffixes...)
+	out.InUnders = append([]string(nil), pq.InUnders...)
+	out.NotUnders = append([]string(nil), pq.NotUnders...)
+	if pq.QuotedTerms != nil {
+		out.QuotedTerms = make(map[string]struct{}, len(pq.QuotedTerms))
+		for k := range pq.QuotedTerms {
+			out.QuotedTerms[k] = struct{}{}
+		}
+	}
+	out.Regexps = append([]*regexp.Regexp(nil), pq.Regexps...)
+	out.RegexTerms = append([]string(nil), pq.RegexTerms...)
+	if pq.RegexMasks != nil {
+		out.RegexMasks = make([][]uint64, len(pq.RegexMasks))
+		for i, m := range pq.RegexMasks {
+			out.RegexMasks[i] = append([]uint64(nil), m...)
+		}
+	}
+	out.Parents = append([]string(nil), pq.Parents...)
+	out.GitFilters = append([]string(nil), pq.GitFilters...)
+	out.SizeFilters = append([]sizeFilter(nil), pq.SizeFilters...)
+	out.DateFilters = append([]dateFilter(nil), pq.DateFilters...)
+	out.AttrFilters = append([]uint32(nil), pq.AttrFilters...)
+	out.Content = append([]contentLeaf(nil), pq.Content...)
+	out.Features = append([]featureLeaf(nil), pq.Features...)
+	if len(pq.OrGroups) > 0 {
+		out.OrGroups = make([][]parsedQuery, len(pq.OrGroups))
+		for i, group := range pq.OrGroups {
+			out.OrGroups[i] = make([]parsedQuery, len(group))
+			for j := range group {
+				out.OrGroups[i][j] = cloneParsedQuery(group[j])
+			}
+		}
+	}
+	if len(pq.NotGroups) > 0 {
+		out.NotGroups = make([]parsedQuery, len(pq.NotGroups))
+		for i := range pq.NotGroups {
+			out.NotGroups[i] = cloneParsedQuery(pq.NotGroups[i])
+		}
+	}
+	return out
+}
+
 func parseQuery(opts queryOptions) (parsedQuery, error) {
+	if opts.parsedOverride != nil {
+		// PF-7b: a caller supplied a pre-built tree (the stripped filename-only
+		// query). Deep-copy it so a downstream in-place mutator
+		// (dropSatisfiedVolumeTerms) cannot reach the shared request-level tree.
+		out := cloneParsedQuery(*opts.parsedOverride)
+		// The tree carries the parsed leaves; the request carries the
+		// per-search scalars. A retried search threads per-volume fields
+		// (contentWindow/contentProbe, budgets) through opts AFTER the tree
+		// was built — overlay them so the override path evaluates exactly
+		// like a normally-parsed query. Without the window the bounded
+		// candidate path caps materialization at the page limit, declares a
+		// broad posting superset capped, and falls back to a full-corpus
+		// bounded scan: identical results at ~50x the cost (a fuzzy trial
+		// re-verifies the whole corpus instead of its posting superset).
+		// Leaf fields (terms, content leaves, Under, sort, filters) stay
+		// with the tree: the retry built them from this same request.
+		out.Trace = opts.Trace
+		out.DeadlineUnix = opts.DeadlineUnix
+		out.Cancel = opts.Cancel
+		out.ContentCandidateBudget = opts.ContentCandidateBudget
+		out.ContentScanVisitBudget = opts.ContentScanVisitBudget
+		out.ContentDiskVerifyBudget = opts.ContentDiskVerifyBudget
+		out.contentFullCandidates = opts.contentFullCandidates
+		out.contentWindow = opts.contentWindow
+		out.contentProbe = opts.contentProbe
+		out.contentAfter = opts.contentAfter
+		return out, nil
+	}
 	pq := parsedQuery{
-		Raw:           opts.Query,
-		MatchPath:     opts.MatchPath || queryLooksPathScoped(opts.Query),
-		CaseSensitive: opts.CaseSensitive,
-		Fuzzy:         opts.Fuzzy,
-		Under:         normalizeFilterPath(opts.Under),
-		Exists:        opts.Exists,
-		CWDBias:       normalizeFilterPath(opts.CWDBias),
-		RootBias:      normalizeFilterPath(opts.RootBias),
-		DeadlineUnix:  opts.DeadlineUnix,
-		Cancel:        opts.Cancel,
-		Trace:         opts.Trace,
+		Raw:                     opts.Query,
+		MatchPath:               opts.MatchPath || queryLooksPathScoped(opts.Query),
+		CaseSensitive:           opts.CaseSensitive,
+		CaseExplicit:            opts.CaseSensitive,
+		Fuzzy:                   opts.Fuzzy,
+		Under:                   normalizeFilterPath(opts.Under),
+		Exists:                  opts.Exists,
+		CWDBias:                 normalizeFilterPath(opts.CWDBias),
+		RootBias:                normalizeFilterPath(opts.RootBias),
+		Near:                    normalizeFilterPath(opts.Near),
+		Current:                 normalizeFilterPath(opts.Current),
+		DeadlineUnix:            opts.DeadlineUnix,
+		Cancel:                  opts.Cancel,
+		Trace:                   opts.Trace,
+		ContentCandidateBudget:  opts.ContentCandidateBudget,
+		ContentScanVisitBudget:  opts.ContentScanVisitBudget,
+		ContentDiskVerifyBudget: opts.ContentDiskVerifyBudget,
+		contentFullCandidates:   opts.contentFullCandidates,
+		contentWindow:           opts.contentWindow,
+		contentProbe:            opts.contentProbe,
+		contentAfter:            opts.contentAfter,
+		gitCtx:                  newQueryGitContext(),
 	}
 	if opts.ModifiedAfter != "" {
 		t, err := parseTimeValue(opts.ModifiedAfter)
@@ -1808,7 +1961,18 @@ func parseQuery(opts queryOptions) (parsedQuery, error) {
 		pq.ModifiedAfter = time.Now().Add(-d)
 		pq.HasModAfter = true
 	}
-	for _, raw := range strings.Fields(opts.Query) {
+	var tokens []string
+	if queryHasContentToken(opts.Query) || queryHasFeatureToken(opts.Query) {
+		// Content queries need the quote/regex-span-aware tokenizer so
+		// content:"a b" and content:/a|b/ stay one constraint. Non-content
+		// queries keep the historical strings.Fields behavior.
+		tokens = contentTokenizeQuery(opts.Query)
+	} else {
+		// Name queries keep double-quoted phrases together (`"foo bar"`
+		// is one quoted term); without quotes this is strings.Fields.
+		tokens = splitNameQueryTokens(opts.Query)
+	}
+	for _, raw := range tokens {
 		if implicitPathSeparatorToken(raw) {
 			pq.ImplicitPathTerms = append(pq.ImplicitPathTerms, queryPlainTerms(raw, pq.CaseSensitive, true)...)
 		}
@@ -1817,6 +1981,13 @@ func parseQuery(opts queryOptions) (parsedQuery, error) {
 		}
 	}
 	promotePathExtensionTerms(&pq)
+	mergeInUnders(&pq)
+	// Assign deterministic content LeafIDs from the parsed tree, so the content
+	// verifier and relevance ordering can key on stable per-leaf IDs. A query
+	// with no content leaves is a no-op; a content: token only returns from
+	// applyQueryToken, not from parseQuery, so this runs for content queries too.
+	contentAssignLeafIDs(&pq)
+	pq.ContentSmartCase = !pq.CaseExplicit && contentLeavesSmartCase(pq)
 	if pq.isEmpty() {
 		return pq, errors.New("query has no searchable terms or filters")
 	}

@@ -8,10 +8,12 @@ import "container/heap"
 // Overlay records are merged by the caller after hidden base IDs are removed.
 // Queries requiring path verification or ranks that are unavailable retain
 // the existing verifier. Unfoldable records still use that verifier inline.
-func collectGlobalMemoTopN(ids []globalRecordID, volumes []*serviceVolumeIndex, snapshots []*volumeSnapshot, volumePQs []parsedQuery, rankers []func(int) int, ranksComplete bool, pq parsedQuery, limit int) ([]globalRankedEntry, int, bool, error) {
+// A nil matcher keeps the pure name/scalar behavior; a non-nil matcher
+// declines the lane, since the memo cannot decide content leaves.
+func collectGlobalMemoTopN(ids []globalRecordID, volumes []*serviceVolumeIndex, snapshots []*volumeSnapshot, volumePQs []parsedQuery, rankers []func(int) int, ranksComplete bool, pq parsedQuery, limit int, matcher *contentLeafMatcher) ([]globalRankedEntry, int, bool, error) {
 	// The caller has already resolved the rank arrays. Rechecking through
 	// rankForQuery could rebuild an uncached scalar/path rank a second time.
-	if !ranksComplete {
+	if !ranksComplete || matcher != nil {
 		return nil, 0, false, nil
 	}
 	memos := make([]*queryMemo, len(volumes))
@@ -63,7 +65,7 @@ func collectGlobalMemoTopN(ids []globalRecordID, volumes []*serviceVolumeIndex, 
 			selected = append(selected, globalRecordID{volume: v, local: item.id})
 		}
 	}
-	out, err := rankedEntriesFromGlobalIDs(volumes, selected, pq)
+	out, err := rankedEntriesFromGlobalIDs(volumes, selected, pq, matcher)
 	if err != nil {
 		return nil, verified, true, err
 	}

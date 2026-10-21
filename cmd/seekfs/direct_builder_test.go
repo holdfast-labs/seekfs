@@ -178,6 +178,87 @@ func TestDirectRankFamiliesMatchComparator(t *testing.T) {
 	}
 }
 
+// Rank sections persist the order alone; the rank-by-id vector is rebuilt
+// at load as its exact inverse. Both on-disk forms decode identically.
+func TestDecodeRankSectionCompactAndLegacy(t *testing.T) {
+	order := []uint32{3, 1, 0, 2}
+	legacy := encodeUint32Section(order, []uint32{2, 1, 3, 0})
+	compact := encodeUint32Section(order)
+	gotOrder, gotRank := decodeRankSection(legacy, 4)
+	if !equalUint32s(gotOrder, order) || !equalUint32s(gotRank, []uint32{2, 1, 3, 0}) {
+		t.Fatalf("legacy decode = %v/%v", gotOrder, gotRank)
+	}
+	gotOrder, gotRank = decodeRankSection(compact, 4)
+	if !equalUint32s(gotOrder, order) || !equalUint32s(gotRank, []uint32{2, 1, 3, 0}) {
+		t.Fatalf("compact decode = %v/%v; want order %v with inverted rank", gotOrder, gotRank, order)
+	}
+	// Compact form is one part (4 + 4/live entries), not two.
+	if parts := directTestUint32Parts(t, compact); len(parts) != 1 {
+		t.Fatalf("compact section has %d parts; want 1", len(parts))
+	}
+	// Corrupt sections yield nils, never a panic or a wrong rank.
+	if o, r := decodeRankSection([]byte{9, 0, 0, 0, 1, 2, 3}, 4); o != nil || r != nil {
+		t.Fatal("truncated section must decode to nils")
+	}
+	badOrder := append([]uint32(nil), order...)
+	badOrder[0] = 99
+	if o, r := decodeRankSection(encodeUint32Section(badOrder), 4); o != nil || r != nil {
+		t.Fatal("out-of-range order value must decode to nils")
+	}
+	// Deleted records keep rank 0: the order covers only live IDs.
+	gotOrder, gotRank = decodeRankSection(encodeUint32Section([]uint32{2, 0}), 3)
+	if !equalUint32s(gotOrder, []uint32{2, 0}) || !equalUint32s(gotRank, []uint32{1, 0, 0}) {
+		t.Fatalf("sparse decode = %v/%v; want [2 0]/[1 0 0]", gotOrder, gotRank)
+	}
+}
+
+// The direct builder writes order-only rank sections while the loaded index
+// still exposes both arrays with the exact inverse relationship.
+func TestDirectRankSectionsPersistOrderOnly(t *testing.T) {
+	records := []directRecord{
+		{FRN: 40, Name: "zeta.TXT", Path: `X:\zeta.TXT`, Size: 0, ModUnix: 0},
+		{FRN: 10, Name: "dir", Path: `X:\dir`, Mode: uint32(os.ModeDir), Size: 0, ModUnix: 20},
+		{FRN: 30, Name: "a.go", Path: `X:\dir\a.go`, Size: 5, ModUnix: 10},
+		{FRN: 20, Name: ".profile", Path: `X:\.profile`, Size: 2, ModUnix: 30},
+	}
+	dir := t.TempDir()
+	out := filepath.Join(dir, "ranks-compact.gsi")
+	if _, err := buildDirect(context.Background(), directBuildOptions{OutputPath: out, SpoolDir: filepath.Join(dir, "spool"), Records: newDirectSliceSource(records), RunRecords: 2, RunBytes: 4096}); err != nil {
+		t.Fatal(err)
+	}
+	for _, tag := range []uint32{indexSectionRANK, indexSectionSRNK, indexSectionMRNK, indexSectionERNK, indexSectionTRNK, indexSectionPRNK} {
+		data := directTestSectionData(t, out, tag)
+		parts := directTestUint32Parts(t, data)
+		if len(parts) != 1 || len(parts[0]) != len(records) {
+			t.Fatalf("section %08x has %d parts x %d entries; want 1 x %d", tag, len(parts), len(parts[0]), len(records))
+		}
+	}
+	idx, err := loadIndexMMap(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = idx.MMapRecords.file.close() })
+	for _, tc := range []struct {
+		name  string
+		order []uint32
+		rank  []uint32
+	}{
+		{"RANK", idx.Derived.NameOrder, idx.Derived.NameRank},
+		{"SRNK", idx.Derived.SizeOrder, idx.Derived.SizeRank},
+		{"MRNK", idx.Derived.ModOrder, idx.Derived.ModRank},
+		{"ERNK", idx.Derived.ExtOrder, idx.Derived.ExtRank},
+		{"TRNK", idx.Derived.TypeOrder, idx.Derived.TypeRank},
+		{"PRNK", idx.Derived.PathOrder, idx.Derived.PathRank},
+	} {
+		if len(tc.order) != len(records) || len(tc.rank) != len(records) {
+			t.Fatalf("%s resident lengths=%d/%d want=%d", tc.name, len(tc.order), len(tc.rank), len(records))
+		}
+		if !equalUint32s(tc.rank, invertRankOrder(tc.order, len(records))) {
+			t.Fatalf("%s resident rank is not the inverse of the order", tc.name)
+		}
+	}
+}
+
 func TestDirectRankWorkerCountsPreserveOutput(t *testing.T) {
 	records := make([]directRecord, 0, 256)
 	for i := 0; i < 256; i++ {
@@ -306,6 +387,55 @@ func TestDirectMFTSourceNormalizesRootSelfParent(t *testing.T) {
 	child, err := mft.Next(context.Background())
 	if err != nil || child.FRN != 10 || child.ParentFRN != 5 {
 		t.Fatalf("MFT child=%+v err=%v", child, err)
+	}
+}
+
+func TestDirectMFTSourcePersistsSequenceNumbers(t *testing.T) {
+	entries := map[uint64]mftEntry{
+		5:  {frn: 5, parentFRN: 5, name: "root", attr: fileAttributeDir, isDir: true, inUse: true, seq: 17},
+		10: {frn: 10, parentFRN: 5, name: "alpha.txt", size: 3, inUse: true, seq: 23},
+		20: {frn: 20, parentFRN: 5, name: "beta.bin", size: 4, inUse: true, seq: 31},
+		30: {frn: 30, parentFRN: 5, name: "unknown-seq.txt", size: 5, inUse: true},
+	}
+	dir := t.TempDir()
+	out := filepath.Join(dir, "mft-seq.gsi")
+	if _, err := buildDirect(context.Background(), directBuildOptions{
+		OutputPath: out,
+		SpoolDir:   filepath.Join(dir, "spool"),
+		Roots:      []string{`X:\`},
+		Volume:     "X:",
+		Source:     "usn",
+		BuiltAt:    time.Unix(123, 0),
+		Records:    newDirectMFTSource(entries),
+		RunRecords: 1,
+		RunBytes:   4096,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	idx, err := loadIndexMMap(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = idx.MMapRecords.file.close() })
+	if len(directTestSectionData(t, out, indexSectionSEQN)) == 0 {
+		t.Fatal("direct MFT build did not publish the SEQN section")
+	}
+	want := map[uint64]uint16{5: 17, 10: 23, 20: 31, 30: 0}
+	if len(idx.Derived.FRNSeq) != len(want) {
+		t.Fatalf("derived FRNSeq = %v, want %d entries", idx.Derived.FRNSeq, len(want))
+	}
+	for id := 0; id < idx.compactRecordCount(); id++ {
+		rec := idx.compactRecord(id)
+		expected, ok := want[rec.FRN]
+		if !ok {
+			t.Fatalf("record %d unexpected FRN %d", id, rec.FRN)
+		}
+		if got := idx.recordSeq(id); got != expected {
+			t.Fatalf("record %d FRN %d Seq=%d, want %d", id, rec.FRN, got, expected)
+		}
+		if got := idx.Derived.FRNSeq[id]; got != expected {
+			t.Fatalf("record %d FRN %d derived Seq=%d, want %d", id, rec.FRN, got, expected)
+		}
 	}
 }
 
@@ -599,14 +729,14 @@ func TestDirectCanonicalDerivedParity(t *testing.T) {
 	t.Setenv("SEEKFS_LOW_MEMORY_TRIGRAM_MAX_POSTING", "2")
 	t.Setenv("SEEKFS_SELF_NAME_GRAMS", "1")
 	records := []directRecord{
-		{FRN: 1, Name: ".", Path: `X:\`, Mode: uint32(os.ModeDir)},
-		{FRN: 2, ParentFRN: 1, Name: "common", Path: `X:\common`, Mode: uint32(os.ModeDir)},
-		{FRN: 3, ParentFRN: 1, Name: "rare", Path: `X:\rare`, Mode: uint32(os.ModeDir)},
-		{FRN: 4, ParentFRN: 2, Name: "common-alpha-nrrd.txt", Path: `X:\common\common-alpha-nrrd.txt`, Size: 30, ModUnix: 300},
-		{FRN: 5, ParentFRN: 2, Name: "common-beta.txt", Path: `X:\common\common-beta.txt`, Size: 10, ModUnix: 100},
-		{FRN: 6, ParentFRN: 2, Name: "common-gamma.go", Path: `X:\common\common-gamma.go`, Size: 20, ModUnix: 200},
-		{FRN: 7, ParentFRN: 3, Name: "zqx-rare-nrrd.bin", Path: `X:\rare\zqx-rare-nrrd.bin`, Size: 40, ModUnix: 400},
-		{FRN: 8, ParentFRN: 3, Name: "neutral.txt", Path: `X:\rare\neutral.txt`, Size: 50, ModUnix: 500},
+		{FRN: 1, Name: ".", Path: `X:\`, Mode: uint32(os.ModeDir), Seq: 101},
+		{FRN: 2, ParentFRN: 1, Name: "common", Path: `X:\common`, Mode: uint32(os.ModeDir), Seq: 102},
+		{FRN: 3, ParentFRN: 1, Name: "rare", Path: `X:\rare`, Mode: uint32(os.ModeDir), Seq: 103},
+		{FRN: 4, ParentFRN: 2, Name: "common-alpha-nrrd.txt", Path: `X:\common\common-alpha-nrrd.txt`, Size: 30, ModUnix: 300, Seq: 104},
+		{FRN: 5, ParentFRN: 2, Name: "common-beta.txt", Path: `X:\common\common-beta.txt`, Size: 10, ModUnix: 100, Seq: 105},
+		{FRN: 6, ParentFRN: 2, Name: "common-gamma.go", Path: `X:\common\common-gamma.go`, Size: 20, ModUnix: 200, Seq: 106},
+		{FRN: 7, ParentFRN: 3, Name: "zqx-rare-nrrd.bin", Path: `X:\rare\zqx-rare-nrrd.bin`, Size: 40, ModUnix: 400, Seq: 107},
+		{FRN: 8, ParentFRN: 3, Name: "neutral.txt", Path: `X:\rare\neutral.txt`, Size: 50, ModUnix: 500, Seq: 108},
 	}
 	dir := t.TempDir()
 	out := filepath.Join(dir, "canonical-parity.gsi")
@@ -628,6 +758,55 @@ func TestDirectCanonicalDerivedParity(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = idx.MMapRecords.file.close() })
+	if len(directTestSectionData(t, out, indexSectionSEQN)) == 0 {
+		t.Fatal("direct index did not publish the SEQN section")
+	}
+	entries := make(map[uint64]mftEntry, len(records))
+	for _, rec := range records {
+		attr := uint32(fileAttributeArchive)
+		if rec.Mode&uint32(os.ModeDir) != 0 {
+			attr = fileAttributeDir
+		}
+		entries[rec.FRN] = mftEntry{
+			frn:       rec.FRN,
+			parentFRN: rec.ParentFRN,
+			name:      rec.Name,
+			attr:      attr,
+			size:      rec.Size,
+			modUnix:   rec.ModUnix,
+			isDir:     attr&fileAttributeDir != 0,
+			inUse:     true,
+			seq:       rec.Seq,
+		}
+	}
+	normalPath := filepath.Join(dir, "canonical-normal.gsi")
+	normal := &Index{
+		Version:      indexVersion,
+		Roots:        []string{`X:\`},
+		BuiltAt:      time.Unix(123, 0),
+		Source:       "usn",
+		Volume:       "X:",
+		Compact:      true,
+		CompactAttrs: true,
+	}
+	buildRecordsFromMFT(normal, entries)
+	if err := saveIndex(normalPath, normal); err != nil {
+		t.Fatalf("saveIndex: %v", err)
+	}
+	normalIdx, err := loadIndexMMap(normalPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = normalIdx.MMapRecords.file.close() })
+	for id := 0; id < idx.compactRecordCount(); id++ {
+		want := records[id].Seq
+		if got := idx.recordSeq(id); got != want {
+			t.Fatalf("direct record %d Seq=%d, want %d", id, got, want)
+		}
+		if got, normalSeq := idx.recordSeq(id), normalIdx.recordSeq(id); got != normalSeq {
+			t.Fatalf("record %d Seq direct=%d normal=%d", id, got, normalSeq)
+		}
+	}
 	sizeRank := append([]uint32(nil), idx.Derived.SizeRank...)
 	modRank := append([]uint32(nil), idx.Derived.ModRank...)
 	extRank := append([]uint32(nil), idx.Derived.ExtRank...)
@@ -636,8 +815,8 @@ func TestDirectCanonicalDerivedParity(t *testing.T) {
 	vol := newServiceVolumeIndex(out, idx)
 
 	subt := directTestSectionData(t, out, indexSectionSUBT)
-	if parts := directTestUint32Parts(t, subt); len(parts) != 8 {
-		t.Fatalf("SUBT parts=%d, want canonical 8", len(parts))
+	if parts := directTestUint32Parts(t, subt); len(parts) != 7 {
+		t.Fatalf("SUBT parts=%d, want canonical 7 (end/order/5 minima; start is rebuilt at load)", len(parts))
 	}
 	for _, tc := range []struct {
 		name string
@@ -759,6 +938,94 @@ func TestDecodeUint32SectionRejectsTrailingSUBTPart(t *testing.T) {
 	}
 	if got := decodeUint32Section(encodeUint32Section(parts...), 8); got != nil {
 		t.Fatalf("decoded %d SUBT parts from a nine-part payload; want strict rejection", len(got))
+	}
+}
+
+// The compact 7-part SUBT (end/order/5 minima, start rebuilt at load)
+// decodes to the same arrays as the legacy 8-part form.
+func TestDecodeSubtreeSectionCompactAndLegacy(t *testing.T) {
+	// Four records: dir 0 with children 1,2; dir 3 with child... a flat
+	// chain 0 -> 1 -> 2 plus an orphan 3. start=[0 1 2 3], end=[3 3 3 4],
+	// order=[0 1 2 3].
+	start := []uint32{0, 1, 2, 3}
+	end := []uint32{3, 3, 3, 4}
+	order := []uint32{0, 1, 2, 3}
+	minima := [][]uint32{{0, 1, 2, 0}, {3, 1, 0, 2}, {1, 1, 1, 0}, {2, 0, 1, 3}, {0, 2, 1, 3}}
+	eight := [][]uint32{start, end, order}
+	eight = append(eight, minima...)
+	legacy := encodeUint32Section(eight...)
+	seven := [][]uint32{end, order}
+	seven = append(seven, minima...)
+	compact := encodeUint32Section(seven...)
+	var want indexDerivedSections
+	decodeDerivedSection(&want, indexSectionSUBT, legacy, 4)
+	var got indexDerivedSections
+	decodeDerivedSection(&got, indexSectionSUBT, compact, 4)
+	for _, tc := range []struct {
+		name string
+		a, b []uint32
+	}{
+		{"start", want.SubtreeStart, got.SubtreeStart},
+		{"end", want.SubtreeEnd, got.SubtreeEnd},
+		{"order", want.SubtreeOrder, got.SubtreeOrder},
+		{"size", want.SubtreeSizeRank, got.SubtreeSizeRank},
+		{"mod", want.SubtreeModRank, got.SubtreeModRank},
+		{"ext", want.SubtreeExtRank, got.SubtreeExtRank},
+		{"type", want.SubtreeTypeRank, got.SubtreeTypeRank},
+		{"path", want.SubtreePathRank, got.SubtreePathRank},
+	} {
+		if !equalUint32s(tc.a, tc.b) {
+			t.Fatalf("SUBT %s: legacy %v vs compact %v", tc.name, tc.a, tc.b)
+		}
+	}
+	if !equalUint32s(got.SubtreeStart, start) {
+		t.Fatalf("rebuilt start = %v; want %v", got.SubtreeStart, start)
+	}
+	// A corrupt order drops the whole section, never a half section.
+	bad := encodeUint32Section(end, []uint32{0, 1, 2, 9}, minima[0], minima[1], minima[2], minima[3], minima[4])
+	var corrupt indexDerivedSections
+	decodeDerivedSection(&corrupt, indexSectionSUBT, bad, 4)
+	if corrupt.SubtreeOrder != nil || corrupt.SubtreeEnd != nil || corrupt.SubtreeSizeRank != nil {
+		t.Fatal("corrupt compact SUBT must decode to nothing")
+	}
+}
+
+// PATR delta-varint sections decode to the same ID lists as the legacy
+// raw-u32 form at a fraction of the bytes.
+func TestAttrPostingSectionDeltaAndLegacy(t *testing.T) {
+	bits := queryAttrBits()
+	in := map[uint32][]uint32{
+		bits[0]: {1, 2, 3, 100, 1000, 100000},
+		bits[1]: {5, 5, 5},
+		bits[3]: {0, 1, 2, 3, 4, 5, 6, 7, 8, 9},
+	}
+	legacy := encodeUint32Section(in[bits[0]], in[bits[1]], nil, in[bits[3]], nil)
+	// The raw legacy framing carries no dedup contract; the encoder dedups.
+	if got := decodeAttrPostingSection(legacy); !reflect.DeepEqual(got[bits[0]], []uint32{1, 2, 3, 100, 1000, 100000}) || !equalUint32s(got[bits[1]], []uint32{5, 5, 5}) || !equalUint32s(got[bits[3]], []uint32{0, 1, 2, 3, 4, 5, 6, 7, 8, 9}) || len(got) != 3 {
+		t.Fatalf("legacy PATR decode = %v", got)
+	}
+	enc := encodeAttrPostingSection(in)
+	if len(enc) >= len(legacy) {
+		t.Fatalf("delta PATR = %d bytes; want smaller than legacy %d", len(enc), len(legacy))
+	}
+	got := decodeAttrPostingSection(enc)
+	if !equalUint32s(got[bits[0]], []uint32{1, 2, 3, 100, 1000, 100000}) || !equalUint32s(got[bits[1]], []uint32{5}) || !equalUint32s(got[bits[3]], []uint32{0, 1, 2, 3, 4, 5, 6, 7, 8, 9}) || len(got) != 3 {
+		t.Fatalf("delta PATR decode = %v", got)
+	}
+	// Corrupt framings yield nil, never a panic or a partial map.
+	bad := append([]byte(nil), enc...)
+	binary.LittleEndian.PutUint32(bad[8:], 99)
+	if decodeAttrPostingSection(bad) != nil {
+		t.Fatal("wrong part count must decode to nil")
+	}
+	if decodeAttrPostingSection(enc[:len(enc)-1]) != nil {
+		t.Fatal("truncated section must decode to nil")
+	}
+	if decodeAttrPostingSection(enc[:0]) != nil {
+		t.Fatal("empty section must decode to nil")
+	}
+	if encodeAttrPostingSection(nil) != nil || encodeAttrPostingSection(map[uint32][]uint32{}) != nil {
+		t.Fatal("empty input must encode as nil (section omitted)")
 	}
 }
 

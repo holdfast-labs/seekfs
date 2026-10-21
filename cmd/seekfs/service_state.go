@@ -34,7 +34,12 @@ func (vol *serviceVolumeIndex) replayWALWithLimit(maxBytes int64) error {
 		}
 		return err
 	}
-	defer f.Close()
+	closed := false
+	defer func() {
+		if !closed {
+			_ = f.Close()
+		}
+	}()
 	if maxBytes > 0 {
 		if info, err := f.Stat(); err == nil && info.Size() > maxBytes {
 			return staleIndexError{
@@ -45,9 +50,23 @@ func (vol *serviceVolumeIndex) replayWALWithLimit(maxBytes int64) error {
 	}
 	br := bufio.NewReaderSize(f, 1024*1024)
 	prefix, err := br.Peek(len(walMagicV1))
-	if err == nil && bytes.Equal(prefix, walMagicV1) {
-		_, _ = br.Discard(len(walMagicV1))
-		return vol.replayBinaryWAL(br)
+	if err == nil && (bytes.Equal(prefix, walMagicV1) || bytes.Equal(prefix, walMagicV2)) {
+		withSeq := bytes.Equal(prefix, walMagicV2)
+		_, _ = br.Discard(len(prefix))
+		frames, replayErr := vol.replayBinaryWAL(br, withSeq)
+		if replayErr != nil {
+			return replayErr
+		}
+		if !withSeq {
+			// Legacy v1 frames carry no sequence. Keep them (Seq reads back as
+			// 0 = unknown) and rewrite the file as v2 so later appends to this
+			// WAL stay one version. The rewrite renames over the WAL, so close
+			// the read handle first (Windows refuses a rename over an open file).
+			_ = f.Close()
+			closed = true
+			return rewriteWAL(vol.dbPath, frames)
+		}
+		return nil
 	}
 	dec := json.NewDecoder(br)
 	applied := 0
@@ -74,34 +93,35 @@ func (vol *serviceVolumeIndex) replayWALWithLimit(maxBytes int64) error {
 	return nil
 }
 
-func (vol *serviceVolumeIndex) replayBinaryWAL(r io.Reader) error {
+func (vol *serviceVolumeIndex) replayBinaryWAL(r io.Reader, withSeq bool) ([]walBatch, error) {
+	var kept []walBatch
 	applied := 0
 	for {
 		var header [8]byte
 		if _, err := io.ReadFull(r, header[:]); err != nil {
 			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) && applied == 0 {
-				return nil
+				return kept, nil
 			}
 			if errors.Is(err, io.ErrUnexpectedEOF) {
-				return err
+				return kept, err
 			}
-			return err
+			return kept, err
 		}
 		length := binary.LittleEndian.Uint32(header[0:4])
 		wantCRC := binary.LittleEndian.Uint32(header[4:8])
 		if length == 0 || length > 64*1024*1024 {
-			return fmt.Errorf("invalid wal frame length %d", length)
+			return kept, fmt.Errorf("invalid wal frame length %d", length)
 		}
 		payload := make([]byte, length)
 		if _, err := io.ReadFull(r, payload); err != nil {
-			return err
+			return kept, err
 		}
 		if got := crc32.ChecksumIEEE(payload); got != wantCRC {
-			return fmt.Errorf("wal frame crc mismatch got=%08x want=%08x", got, wantCRC)
+			return kept, fmt.Errorf("wal frame crc mismatch got=%08x want=%08x", got, wantCRC)
 		}
-		batch, err := decodeBinaryWALBatch(payload)
+		batch, err := decodeBinaryWALBatch(payload, withSeq)
 		if err != nil {
-			return err
+			return kept, err
 		}
 		if batch.NextUSN <= vol.checkpoint {
 			continue
@@ -111,6 +131,7 @@ func (vol *serviceVolumeIndex) replayBinaryWAL(r io.Reader) error {
 		vol.index.Checkpoint = batch.NextUSN
 		vol.dirty = true
 		applied++
+		kept = append(kept, batch)
 	}
 }
 
@@ -131,11 +152,12 @@ func readWALFramesAfter(dbPath string, checkpoint int64) ([]walBatch, error) {
 	defer f.Close()
 	br := bufio.NewReaderSize(f, 1024*1024)
 	prefix, err := br.Peek(len(walMagicV1))
-	if err != nil || !bytes.Equal(prefix, walMagicV1) {
+	if err != nil || !(bytes.Equal(prefix, walMagicV1) || bytes.Equal(prefix, walMagicV2)) {
 		// Legacy JSON WAL (or empty/invalid magic): nothing to rewrite safely.
 		return nil, nil
 	}
-	_, _ = br.Discard(len(walMagicV1))
+	withSeq := bytes.Equal(prefix, walMagicV2)
+	_, _ = br.Discard(len(prefix))
 	var frames []walBatch
 	for {
 		var header [8]byte
@@ -157,7 +179,7 @@ func readWALFramesAfter(dbPath string, checkpoint int64) ([]walBatch, error) {
 		if got := crc32.ChecksumIEEE(payload); got != wantCRC {
 			return frames, fmt.Errorf("wal frame crc mismatch got=%08x want=%08x", got, wantCRC)
 		}
-		batch, err := decodeBinaryWALBatch(payload)
+		batch, err := decodeBinaryWALBatch(payload, withSeq)
 		if err != nil {
 			return frames, err
 		}
@@ -186,7 +208,7 @@ func rewriteWAL(dbPath string, frames []walBatch) error {
 	}
 	tmpName := tmp.Name()
 	writeErr := func() error {
-		if _, err := tmp.Write(walMagicV1); err != nil {
+		if _, err := tmp.Write(walMagicV2); err != nil {
 			return err
 		}
 		for _, frame := range frames {
@@ -218,7 +240,7 @@ func appendWAL(dbPath string, nextUSN int64, changes []usnChange) error {
 	if err := os.MkdirAll(filepath.Dir(dbPath), 0o755); err != nil {
 		return err
 	}
-	f, err := os.OpenFile(walPath(dbPath), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	f, err := os.OpenFile(walPath(dbPath), os.O_CREATE|os.O_RDWR|os.O_APPEND, 0o644)
 	if err != nil {
 		return err
 	}
@@ -237,12 +259,21 @@ func appendBinaryWALFrame(f *os.File, nextUSN int64, changes []usnChange) error 
 	if err != nil {
 		return err
 	}
+	withSeq := true
 	if info.Size() == 0 {
-		if _, err := f.Write(walMagicV1); err != nil {
+		if _, err := f.Write(walMagicV2); err != nil {
 			return err
 		}
+	} else {
+		// Append in the layout of the file's own magic. Replay upgrades a v1
+		// WAL to v2, but if that rewrite failed (disk full, rename refused) a
+		// v2 frame appended under a v1 magic would decode with the wrong layout.
+		prefix := make([]byte, len(walMagicV1))
+		if n, err := f.ReadAt(prefix, 0); err == nil && n == len(prefix) && bytes.Equal(prefix, walMagicV1) {
+			withSeq = false
+		}
 	}
-	payload, err := encodeBinaryWALBatch(nextUSN, changes)
+	payload, err := encodeBinaryWALBatchLayout(nextUSN, changes, withSeq)
 	if err != nil {
 		return err
 	}
@@ -257,6 +288,13 @@ func appendBinaryWALFrame(f *os.File, nextUSN int64, changes []usnChange) error 
 }
 
 func encodeBinaryWALBatch(nextUSN int64, changes []usnChange) ([]byte, error) {
+	return encodeBinaryWALBatchLayout(nextUSN, changes, true)
+}
+
+// encodeBinaryWALBatchLayout encodes one frame payload in the v2 layout
+// (withSeq) or the legacy v1 layout, so an append always matches the magic of
+// the file it lands in.
+func encodeBinaryWALBatchLayout(nextUSN int64, changes []usnChange, withSeq bool) ([]byte, error) {
 	var buf bytes.Buffer
 	_ = binary.Write(&buf, binary.LittleEndian, nextUSN)
 	_ = binary.Write(&buf, binary.LittleEndian, uint32(len(changes)))
@@ -269,16 +307,26 @@ func encodeBinaryWALBatch(nextUSN int64, changes []usnChange) ([]byte, error) {
 		_ = binary.Write(&buf, binary.LittleEndian, change.USN)
 		_ = binary.Write(&buf, binary.LittleEndian, change.Reason)
 		_ = binary.Write(&buf, binary.LittleEndian, change.Attr)
+		if withSeq {
+			_ = binary.Write(&buf, binary.LittleEndian, change.Seq)
+		}
 		_ = binary.Write(&buf, binary.LittleEndian, uint16(len(change.Name)))
 		_, _ = buf.WriteString(change.Name)
 	}
 	return buf.Bytes(), nil
 }
 
-func decodeBinaryWALBatch(payload []byte) (walBatch, error) {
+// decodeBinaryWALBatch decodes one WAL frame payload. withSeq selects the v2
+// layout (a uint16 sequence after the attributes); v1 frames have no sequence
+// and decode with Seq = 0 (unknown).
+func decodeBinaryWALBatch(payload []byte, withSeq bool) (walBatch, error) {
 	var batch walBatch
 	if len(payload) < 12 {
 		return batch, errors.New("wal frame too small")
+	}
+	fixedChange := 34
+	if withSeq {
+		fixedChange = 36
 	}
 	off := 0
 	batch.NextUSN = int64(binary.LittleEndian.Uint64(payload[off:]))
@@ -290,7 +338,7 @@ func decodeBinaryWALBatch(payload []byte) (walBatch, error) {
 	}
 	batch.Changes = make([]usnChange, 0, count)
 	for i := 0; i < count; i++ {
-		if off+34 > len(payload) {
+		if off+fixedChange > len(payload) {
 			return batch, errors.New("truncated wal change")
 		}
 		change := usnChange{}
@@ -304,6 +352,10 @@ func decodeBinaryWALBatch(payload []byte) (walBatch, error) {
 		off += 4
 		change.Attr = binary.LittleEndian.Uint32(payload[off:])
 		off += 4
+		if withSeq {
+			change.Seq = binary.LittleEndian.Uint16(payload[off:])
+			off += 2
+		}
 		nameLen := int(binary.LittleEndian.Uint16(payload[off:]))
 		off += 2
 		if off+nameLen < off || off+nameLen > len(payload) {
@@ -482,7 +534,7 @@ func (vol *serviceVolumeIndex) needsCompactChildrenBuild() bool {
 	return vol != nil &&
 		vol.index != nil &&
 		vol.index.Compact &&
-		vol.index.Source == "usn" &&
+		(vol.index.Source == "usn" || vol.index.Source == "walk") &&
 		len(vol.childOffsets) == 0 &&
 		len(vol.childIDs) == 0 &&
 		len(vol.index.Derived.ChildOffsets) == 0
@@ -1318,6 +1370,35 @@ func (vol *serviceVolumeIndex) clearSearchCachesLocked() {
 	vol.underRootCache = nil
 }
 
+// releaseIdleCaches drops the per-volume query-result caches (term, path
+// term, ext, under) plus the decoded posting-block cache. Everything here
+// is rebuilt on demand from the mmapped base, so the next query pays a
+// re-decode, not a wrong answer. Called only from the idle release path.
+func (vol *serviceVolumeIndex) releaseIdleCaches() {
+	if vol == nil {
+		return
+	}
+	vol.termMu.Lock()
+	vol.clearSearchCachesLocked()
+	vol.termMu.Unlock()
+}
+
+// serviceReleaseIdleCaches drops all idle-releasable name-query caches
+// across every volume. It precedes debug.FreeOSMemory in the idle loop so
+// the freed spans actually reach the OS.
+func serviceReleaseIdleCaches(s *goSearchService) {
+	servicePostingBlockCache.clear()
+	if s == nil {
+		return
+	}
+	s.indexMu.RLock()
+	volumes := append([]*serviceVolumeIndex(nil), s.volumes...)
+	s.indexMu.RUnlock()
+	for _, vol := range volumes {
+		vol.releaseIdleCaches()
+	}
+}
+
 func (vol *serviceVolumeIndex) trimSearchCachesLocked() {
 	if len(vol.pathCache) > servicePathCacheLimit {
 		vol.pathCache = make(map[int]string)
@@ -1379,6 +1460,9 @@ func (vol *serviceVolumeIndex) residentMemoryInfo() *residentMemoryInfo {
 		info.NameTrigramBytes = trigrams.postingBytes
 		info.NameTrigramKeys = trigrams.keyCount()
 	}
+	vol.termMu.Lock()
+	info.CacheBytes = vol.postingListCacheBytesLocked()
+	vol.termMu.Unlock()
 	info.ChildBytes = (len(vol.childOffsets) + len(vol.childIDs) + len(vol.rootIDs) + len(vol.subtreeOrder) + len(vol.subtreeStart) + len(vol.subtreeEnd)) * 4
 	info.FRNIndexBytes = len(vol.frns)*8 + len(vol.frnRecordIDs)*4
 	info.FRNOverlayEntries = len(vol.frnToID)
@@ -1402,7 +1486,8 @@ func (vol *serviceVolumeIndex) residentMemoryInfo() *residentMemoryInfo {
 		int64(info.NameTrigramBytes) +
 		int64(info.TypePostBytes) +
 		int64(info.ChildBytes) +
-		int64(info.FRNIndexBytes) + info.NameIdentityBytes + info.NameMemoBytes
+		int64(info.FRNIndexBytes) + info.NameIdentityBytes + info.NameMemoBytes +
+		info.CacheBytes
 	return info
 }
 
@@ -1421,6 +1506,7 @@ func runtimeMemorySnapshot() *runtimeMemoryInfo {
 		NumGC:             m.NumGC,
 		GCCPUFraction:     m.GCCPUFraction,
 		GoMemLimitBytes:   limit,
+		BlockCacheBytes:   servicePostingBlockCache.liveBytes(),
 	}
 }
 
@@ -1431,7 +1517,17 @@ func serviceNoteQueryActivity() {
 	serviceLastQueryUnixNano.Store(time.Now().UnixNano())
 }
 
-func applyServiceRuntimeMemoryTuning() {
+// serviceActiveQueries counts in-flight foreground search commands, so the
+// content build governor can pause while a query is actually running — not
+// just within the recent-activity window afterwards. Incremented and
+// decremented around the search commands that note query activity.
+var serviceActiveQueries atomic.Int64
+
+func serviceActiveQueryEnter() { serviceActiveQueries.Add(1) }
+
+func serviceActiveQueryLeave() { serviceActiveQueries.Add(-1) }
+
+func applyServiceRuntimeMemoryTuning(s *goSearchService) {
 	serviceRuntimeTuningOnce.Do(func() {
 		if raw := strings.TrimSpace(os.Getenv("SEEKFS_GO_MEM_LIMIT_MB")); raw != "" {
 			if mb, err := strconv.ParseInt(raw, 10, 64); err == nil && mb > 0 {
@@ -1446,12 +1542,12 @@ func applyServiceRuntimeMemoryTuning() {
 			}
 		}
 		if idle > 0 {
-			go serviceIdleMemoryReleaseLoop(idle)
+			go serviceIdleMemoryReleaseLoop(s, idle)
 		}
 	})
 }
 
-func serviceIdleMemoryReleaseLoop(idle time.Duration) {
+func serviceIdleMemoryReleaseLoop(s *goSearchService, idle time.Duration) {
 	var lastRelease time.Time
 	ticker := time.NewTicker(time.Minute)
 	defer ticker.Stop()
@@ -1463,6 +1559,7 @@ func serviceIdleMemoryReleaseLoop(idle time.Duration) {
 		if !lastRelease.IsZero() && time.Since(lastRelease) < idle {
 			continue
 		}
+		serviceReleaseIdleCaches(s)
 		debug.FreeOSMemory()
 		lastRelease = time.Now()
 		serviceLog("idle memory release ran (threshold %s)", idle)

@@ -37,6 +37,7 @@ func (vol *serviceVolumeIndex) overlaySlotEntry(records []CompactRecord, latest 
 		Size:        rec.Size,
 		ModUnix:     rec.ModUnix,
 		IndexSource: vol.index.Source,
+		FRN:         rec.FRN,
 	}, true
 }
 
@@ -77,7 +78,7 @@ func (vol *serviceVolumeIndex) overlayLiveMatchCountCancellable(snap *volumeSnap
 		if !ok {
 			continue
 		}
-		if entryMatches(entry, pq, pq.MatchPath) {
+		if entryMatchesWithContent(vol, entry, pq, pq.MatchPath) {
 			count++
 		}
 	}
@@ -481,6 +482,7 @@ func (vol *serviceVolumeIndex) overlayEntry(records []CompactRecord, latest map[
 		Size:        rec.Size,
 		ModUnix:     rec.ModUnix,
 		IndexSource: vol.index.Source,
+		FRN:         rec.FRN,
 	}, true
 }
 
@@ -523,6 +525,13 @@ func (vol *serviceVolumeIndex) overlayRecordPath(records []CompactRecord, latest
 		if parentPath != "" {
 			return joinOverlayPath(parentPath, name)
 		}
+	}
+	// The parent FRN is nonzero and is neither a live overlay slot nor a base
+	// record: the parent was dropped (or is itself an orphan). Report no path
+	// instead of fabricating a child of the volume root. Indexes without a
+	// persisted root anchor (in-memory fixtures) keep the old fallback.
+	if vol.index != nil && len(vol.index.Roots) > 0 {
+		return ""
 	}
 	if vol.volume != "" {
 		return vol.volume + `\` + name
@@ -631,6 +640,46 @@ func filesystemUnderFallbackSearch(opts queryOptions, countOnly bool) ([]Entry, 
 	return filesystemUnderFallbackSearchLimited(opts, countOnly, filesystemFallbackMaxVisited, filesystemFallbackMaxDuration)
 }
 
+// serviceOnDemandFolderResponse answers a search from a bounded walk of the
+// request's --under folder when the service holds no index at all (fresh
+// volume, first run). It reuses the same bounded folder-first walk the
+// single-volume path uses as a zero-hit backstop, so an unindexed folder is
+// searchable the moment it is queried while the full index builds
+// elsewhere. Only --under searches qualify (the fallback declines
+// everything else, including counts and volume roots); counts and
+// folder-less queries keep the no-index error contract.
+func serviceOnDemandFolderResponse(s *goSearchService, req *serviceRequest) (serviceResponse, bool) {
+	if s == nil || req == nil || req.CountOnly {
+		return serviceResponse{}, false
+	}
+	opts := requestToOptionsFromService(*req)
+	if opts.DeadlineUnix == 0 {
+		opts.DeadlineUnix = time.Now().Add(serviceQueryTimeout - 250*time.Millisecond).UnixNano()
+	}
+	trace := &searchTrace{}
+	opts.Trace = trace
+	start := time.Now()
+	fallback, ok, complete := filesystemUnderFallbackSearch(opts, false)
+	if !ok {
+		return serviceResponse{}, false
+	}
+	trace.setFallback("filesystem-under-fallback")
+	trace.setSource("filesystem-under-fallback", len(fallback))
+	trace.setComplete(complete)
+	searchMS := float64(time.Since(start).Nanoseconds()) / 1_000_000
+	resp := serviceResponse{OK: true, Count: len(fallback), SearchMS: searchMS, Source: trace.Source, Fallback: trace.Fallback, Complete: trace.completePtr()}
+	resp.Results = make([]string, len(fallback))
+	for i, entry := range fallback {
+		resp.Results[i] = entry.Path
+	}
+	resp.Rows = entriesToJSON(fallback)
+	if pq, perr := parseQuery(opts); perr == nil {
+		annotateJSONGitStatus(resp.Rows, fallback, pq)
+	}
+	resp.Content = s.searchContentHealth(trace)
+	return resp, true
+}
+
 func filesystemUnderFallbackSearchLimited(opts queryOptions, countOnly bool, maxVisited int, maxDuration time.Duration) ([]Entry, bool, bool) {
 	if countOnly || opts.Under == "" || isVolumeRoot(opts.Under) {
 		return nil, false, true
@@ -682,6 +731,10 @@ func filesystemUnderFallbackSearchLimited(opts queryOptions, countOnly bool, max
 		if entryMatches(entry, pq, pq.MatchPath) {
 			matches = append(matches, entry)
 			if limit > 0 && len(matches) >= limit {
+				// A full top-N page, not a full enumeration: complete stays
+				// as-is (true unless a visit cap tripped). Callers must not
+				// read it as "the whole scope was walked" — counts never
+				// take this path (countOnly returns early above).
 				return filepath.SkipAll
 			}
 		}

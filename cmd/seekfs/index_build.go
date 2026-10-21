@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 	"unsafe"
@@ -98,14 +99,15 @@ func cmdCompactIndex(args []string) error {
 // once, from the compacted output.
 func newCompactionVolumeIndex(dbPath string, idx *Index) *serviceVolumeIndex {
 	vol := &serviceVolumeIndex{
-		dbPath:      dbPath,
-		index:       idx,
-		volume:      idx.Volume,
-		journalID:   idx.JournalID,
-		checkpoint:  idx.Checkpoint,
-		state:       "ready",
-		pathCache:   make(map[int]string),
-		lastPersist: time.Now(),
+		dbPath:         dbPath,
+		index:          idx,
+		volume:         idx.Volume,
+		journalID:      idx.JournalID,
+		checkpoint:     idx.Checkpoint,
+		baseCheckpoint: idx.Checkpoint,
+		state:          "ready",
+		pathCache:      make(map[int]string),
+		lastPersist:    time.Now(),
 	}
 	if idx.Compact && idx.Source == "usn" {
 		vol.ownedDirFRNs = ownedReplayDirFRNs(idx.Volume)
@@ -324,6 +326,7 @@ func indexUSNVolume(volume string) (*Index, error) {
 			Parent:    parent,
 			Name:      node.name,
 			Mode:      modeFromAttrs(node.attr),
+			Seq:       node.seq,
 		})
 	}
 	serviceLog("compact records complete volume=%s entries=%d source=usn", vol, len(idx.Records))
@@ -349,6 +352,8 @@ func mergeUSNNodesIntoMFT(entries map[uint64]mftEntry, nodes map[uint64]usnNode)
 			attr:      node.attr,
 			isDir:     node.attr&fileAttributeDir != 0,
 			inUse:     true,
+			seq:       node.seq,
+			parentSeq: node.parentSeq,
 		}
 		added++
 	}
@@ -383,6 +388,7 @@ func buildRecordsFromMFT(idx *Index, entries map[uint64]mftEntry) {
 			Mode:      modeFromAttrs(e.attr),
 			Size:      e.size,
 			ModUnix:   e.modUnix,
+			Seq:       e.seq,
 		})
 	}
 }
@@ -459,7 +465,7 @@ func enumUSN(handle windows.Handle, highUSN int64) (map[uint64]usnNode, error) {
 			}
 			major := binary.LittleEndian.Uint16(record[4:6])
 			if major == 2 || major == 3 {
-				frn, parent, attr, nameLen, nameOff, ok := parseUSNRecordFields(record, major)
+				frn, parent, attr, nameLen, nameOff, frnSeq, parentSeq, ok := parseUSNRecordFields(record, major)
 				if !ok {
 					pos += recordLen
 					continue
@@ -468,7 +474,7 @@ func enumUSN(handle windows.Handle, highUSN int64) (map[uint64]usnNode, error) {
 					nameBytes := record[nameOff : uint32(nameOff)+uint32(nameLen)]
 					name := windows.UTF16ToString(bytesToUTF16(nameBytes))
 					if name != "" {
-						nodes[frn] = usnNode{frn: frn, parentFRN: parent, name: name, attr: attr}
+						nodes[frn] = usnNode{frn: frn, parentFRN: parent, name: name, attr: attr, seq: frnSeq, parentSeq: parentSeq}
 					}
 				}
 			}
@@ -654,7 +660,7 @@ func parseUSNRecords(buffer []byte) ([]usnChange, error) {
 		}
 		major := binary.LittleEndian.Uint16(record[4:6])
 		if major == 2 || major == 3 {
-			frn, parent, attr, nameLen, nameOff, ok := parseUSNRecordFields(record, major)
+			frn, parent, attr, nameLen, nameOff, frnSeq, _, ok := parseUSNRecordFields(record, major)
 			if !ok {
 				pos += recordLen
 				continue
@@ -670,6 +676,7 @@ func parseUSNRecords(buffer []byte) ([]usnChange, error) {
 				Reason:    parseUSNRecordReason(record, major),
 				Attr:      attr,
 				Name:      windows.UTF16ToString(bytesToUTF16(nameBytes)),
+				Seq:       frnSeq,
 			})
 		}
 		pos += recordLen
@@ -677,30 +684,38 @@ func parseUSNRecords(buffer []byte) ([]usnChange, error) {
 	return changes, nil
 }
 
-func parseUSNRecordFields(record []byte, major uint16) (frn, parent uint64, attr uint32, nameLen, nameOff uint16, ok bool) {
+func parseUSNRecordFields(record []byte, major uint16) (frn, parent uint64, attr uint32, nameLen, nameOff, frnSeq, parentSeq uint16, ok bool) {
 	switch major {
 	case 2:
 		if len(record) < 60 {
-			return 0, 0, 0, 0, 0, false
+			return 0, 0, 0, 0, 0, 0, 0, false
 		}
-		return fileReferenceRecordNumber(binary.LittleEndian.Uint64(record[8:16])),
-			fileReferenceRecordNumber(binary.LittleEndian.Uint64(record[16:24])),
+		fileRef := binary.LittleEndian.Uint64(record[8:16])
+		parentRef := binary.LittleEndian.Uint64(record[16:24])
+		return fileReferenceRecordNumber(fileRef),
+			fileReferenceRecordNumber(parentRef),
 			binary.LittleEndian.Uint32(record[52:56]),
 			binary.LittleEndian.Uint16(record[56:58]),
 			binary.LittleEndian.Uint16(record[58:60]),
+			uint16(fileRef >> 48),
+			uint16(parentRef >> 48),
 			true
 	case 3:
 		if len(record) < 76 {
-			return 0, 0, 0, 0, 0, false
+			return 0, 0, 0, 0, 0, 0, 0, false
 		}
-		return fileReferenceRecordNumber(binary.LittleEndian.Uint64(record[8:16])),
-			fileReferenceRecordNumber(binary.LittleEndian.Uint64(record[24:32])),
+		fileRef := binary.LittleEndian.Uint64(record[8:16])
+		parentRef := binary.LittleEndian.Uint64(record[24:32])
+		return fileReferenceRecordNumber(fileRef),
+			fileReferenceRecordNumber(parentRef),
 			binary.LittleEndian.Uint32(record[68:72]),
 			binary.LittleEndian.Uint16(record[72:74]),
 			binary.LittleEndian.Uint16(record[74:76]),
+			uint16(fileRef >> 48),
+			uint16(parentRef >> 48),
 			true
 	default:
-		return 0, 0, 0, 0, 0, false
+		return 0, 0, 0, 0, 0, 0, 0, false
 	}
 }
 
@@ -876,18 +891,39 @@ func cmdSearch(args []string, countOnly bool) error {
 	forceLocal := fs.Bool("local", false, "do not auto-query the resident service")
 	pipeName := fs.String("pipe", defaultServicePipe, "service named pipe")
 	jsonOut := fs.Bool("json", false, "write machine-readable JSON")
+	withLines := fs.Bool("lines", false, "content queries: print ripgrep-style path:LINE:text for matching lines")
+	maxPerFile := fs.Int("max-per-file", 10, "with --lines: matching lines printed per file")
+	contextN := fs.Int("context", 0, "with --lines: context lines before and after each match")
+	fs.IntVar(contextN, "C", 0, "with --lines: context lines before and after each match")
+	afterN := fs.Int("A", -1, "with --lines: context lines after each match")
+	beforeN := fs.Int("B", -1, "with --lines: context lines before each match")
 	limit := fs.Int("n", 100, "maximum results")
 	matchPath := fs.Bool("path", false, "match full path")
 	under := fs.String("under", "", "only return results under this path")
 	exists := fs.Bool("exists", false, "verify result paths still exist")
 	cwdBias := fs.Bool("cwd-bias", false, "rank paths under the current working directory first")
 	rootBias := fs.String("root-bias", "", "rank paths under this root first")
+	near := fs.String("near", "", "rank files fewer path hops from this path higher (within a match-quality band)")
+	current := fs.String("current", "", "demote this open file to the bottom of its match-quality band")
 	recent := fs.String("recent", "", "only return results modified within this duration, for example 24h")
 	modifiedAfter := fs.String("modified-after", "", "only return results modified after RFC3339 time or YYYY-MM-DD")
 	caseSensitive := fs.Bool("case", false, "case-sensitive query matching")
 	fuzzy := fs.Bool("fuzzy", false, "append close matches (edit distance) below exact results")
+	budget := fs.Duration("budget", 0, "opt-in wall-clock limit for content verification (for example 150ms); omitted or 0 leaves time unbounded")
+	contentVerifyBudget := fs.Int("content-verify-budget", 0, "override the per-query content disk-verification budget: 0 = default ("+strconv.Itoa(contentDiskVerifyBudget)+" reads), max "+strconv.Itoa(contentDiskVerifyBudgetMax)+"; --budget is an optional time bound")
+	cursor := fs.String("cursor", "", "continue a search page from an opaque cursor")
 	if err := fs.Parse(normalizeSearchArgs(args)); err != nil {
 		return err
+	}
+	budgetMS, budgetDisabled, berr := contentBudgetFromFlagSet(fs, *budget)
+	if berr != nil {
+		return berr
+	}
+	if *contentVerifyBudget < 0 {
+		return fmt.Errorf("--content-verify-budget must be >= 0 (0 = default), got %d", *contentVerifyBudget)
+	}
+	if *contentVerifyBudget > contentDiskVerifyBudgetMax {
+		return fmt.Errorf("--content-verify-budget exceeds the maximum %d, got %d", contentDiskVerifyBudgetMax, *contentVerifyBudget)
 	}
 	cfg, err := loadConfig(*configPath)
 	if err != nil {
@@ -922,16 +958,22 @@ func cmdSearch(args []string, countOnly bool) error {
 		return errors.New("query required")
 	}
 	opts := queryOptions{
-		Query:         query,
-		MatchPath:     *matchPath || queryLooksLoosePathScoped(query),
-		Limit:         *limit,
-		Under:         *under,
-		Exists:        *exists,
-		RootBias:      *rootBias,
-		Recent:        *recent,
-		ModifiedAfter: *modifiedAfter,
-		CaseSensitive: *caseSensitive,
-		Fuzzy:         *fuzzy,
+		Query:                   query,
+		MatchPath:               *matchPath || queryLooksLoosePathScoped(query),
+		Limit:                   *limit,
+		Under:                   *under,
+		Exists:                  *exists,
+		RootBias:                *rootBias,
+		Near:                    *near,
+		Current:                 *current,
+		Recent:                  *recent,
+		ModifiedAfter:           *modifiedAfter,
+		CaseSensitive:           *caseSensitive,
+		Fuzzy:                   *fuzzy,
+		BudgetMS:                budgetMS,
+		BudgetDisabled:          budgetDisabled,
+		ContentDiskVerifyBudget: *contentVerifyBudget,
+		Cursor:                  *cursor,
 	}
 	if *cwdBias {
 		cwd, err := os.Getwd()
@@ -940,12 +982,32 @@ func cmdSearch(args []string, countOnly bool) error {
 		}
 		opts.CWDBias = cwd
 	}
+	if opts.Current != "" {
+		// The service resolves relative paths against its own working
+		// directory, so absolutize client-side (same treatment as --under
+		// roots, which parseQuery absolutizes server-side against the
+		// service cwd and therefore require absolute input to be exact).
+		if abs, err := filepath.Abs(opts.Current); err == nil {
+			opts.Current = abs
+		}
+	}
+	if *withLines && !countOnly {
+		before, after := *contextN, *contextN
+		if *beforeN >= 0 {
+			before = *beforeN
+		}
+		if *afterN >= 0 {
+			after = *afterN
+		}
+		opts.lineOutput = &contentLineOutput{maxPerFile: *maxPerFile, before: before, after: after}
+	}
 	if *useService || autoService {
-		if err := searchService(*pipeName, opts, countOnly, *jsonOut); err == nil {
+		svcErr := searchService(*pipeName, opts, countOnly, *jsonOut)
+		if svcErr == nil {
 			return nil
 		}
 		if *useService || len(dbs) == 0 {
-			return err
+			return svcErr
 		}
 		// Auto-service failed but configured DBs exist: fall back to a direct
 		// local search so the CLI still works without a running service.
@@ -971,6 +1033,12 @@ func cmdSearch(args []string, countOnly bool) error {
 		}
 		if !countOnly {
 			resp.Results = entriesToJSON(matches)
+			if pq, perr := parseQuery(opts); perr == nil {
+				annotateJSONGitStatus(resp.Results, matches, pq)
+			}
+			if p := cliContentLinePrinter(opts); p != nil {
+				p.annotateJSON(resp.Results)
+			}
 		}
 		return writeJSON(os.Stdout, resp)
 	}
@@ -979,7 +1047,12 @@ func cmdSearch(args []string, countOnly bool) error {
 		return nil
 	}
 	w := bufio.NewWriter(os.Stdout)
+	p := cliContentLinePrinter(opts)
 	for _, entry := range matches {
+		if p != nil {
+			p.print(w, entry.Path, entry.Snippet)
+			continue
+		}
 		fmt.Fprintln(w, entry.Path)
 	}
 	return w.Flush()

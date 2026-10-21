@@ -25,6 +25,7 @@ func writeDirectSpoolRecord(w io.Writer, rec directRecord) (int64, error) {
 	binary.LittleEndian.PutUint64(header[28:36], uint64(rec.ModUnix))
 	binary.LittleEndian.PutUint32(header[36:40], uint32(len(rec.Name)))
 	binary.LittleEndian.PutUint32(header[40:44], uint32(len(rec.Path)))
+	binary.LittleEndian.PutUint16(header[44:46], rec.Seq)
 	n, err := w.Write(header[:])
 	if err != nil {
 		return int64(n), err
@@ -78,6 +79,7 @@ func readDirectSpoolRecord(r *bufio.Reader) (directRecord, error) {
 		ModUnix:   int64(binary.LittleEndian.Uint64(header[28:36])),
 		Name:      string(name),
 		Path:      string(path),
+		Seq:       binary.LittleEndian.Uint16(header[44:46]),
 	}, nil
 }
 

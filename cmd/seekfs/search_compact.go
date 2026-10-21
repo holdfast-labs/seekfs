@@ -197,7 +197,7 @@ func (idx *Index) appendCompactRecord(rec CompactRecord) int {
 }
 
 func searchCompactWithCache(idx *Index, opts queryOptions, countOnly bool, pathCache map[int]string, candidateFn func(parsedQuery) ([]int, bool)) ([]Entry, error) {
-	return searchCompactWithCacheHidden(idx, opts, countOnly, pathCache, candidateFn, hiddenBaseIDs{})
+	return searchCompactWithCacheHidden(idx, opts, countOnly, pathCache, candidateFn, hiddenBaseIDs{}, nil)
 }
 
 type hiddenBaseIDs struct {
@@ -207,6 +207,14 @@ type hiddenBaseIDs struct {
 
 func (h hiddenBaseIDs) empty() bool {
 	return len(h.tombstone) == 0 && len(h.shadowed) == 0
+}
+
+// hiddenBlocksTruncation reports whether top-N/limited candidate lanes must
+// decline. With overlay-hidden base records, the verify loop drops hidden
+// ids from a truncated set and the page underfills with no way to recover;
+// complete lanes stay exact because every surviving match is still present.
+func (pq parsedQuery) hiddenBlocksTruncation() bool {
+	return !pq.hidden.empty()
 }
 
 func (h hiddenBaseIDs) contains(id int) bool {
@@ -223,11 +231,17 @@ func (h hiddenBaseIDs) contains(id int) bool {
 	return false
 }
 
-func searchCompactWithCacheHidden(idx *Index, opts queryOptions, countOnly bool, pathCache map[int]string, candidateFn func(parsedQuery) ([]int, bool), hidden hiddenBaseIDs) ([]Entry, error) {
+// searchCompactWithCacheHidden verifies candidates from idx. contentVol is
+// non-nil only on the content query path: content semantics are then enforced
+// inline (before a match is appended or counted toward the limit), and the
+// ordinary limit-based collection is restored. A nil contentVol is the
+// unchanged name/scalar path.
+func searchCompactWithCacheHidden(idx *Index, opts queryOptions, countOnly bool, pathCache map[int]string, candidateFn func(parsedQuery) ([]int, bool), hidden hiddenBaseIDs, contentVol *serviceVolumeIndex) ([]Entry, error) {
 	pq, err := parseQuery(opts)
 	if err != nil {
 		return nil, err
 	}
+	pq.ensureDiskBudget()
 	if pq.Impossible {
 		pq.Trace.setPlannerMode("impossible-query")
 		pq.Trace.setSource("impossible-query", 0)
@@ -240,6 +254,12 @@ func searchCompactWithCacheHidden(idx *Index, opts queryOptions, countOnly bool,
 	limit := normalizedLimit(opts.Limit, countOnly)
 	pq.Limit = limit
 	pq.CountOnly = countOnly
+	pq.contentCandidateMeta = &contentCandidateMeta{}
+	pq.hidden = hidden
+	var contentMatcher *contentLeafMatcher
+	if contentVol != nil && queryHasAnyContentLeaf(pq) {
+		contentMatcher = newContentLeafMatcher(pq)
+	}
 	order := idx.CompactNameOrder
 	if pq.SortColumn == "size" {
 		order = uint32OrderToInts((&serviceVolumeIndex{index: idx}).sizeOrderForRank())
@@ -276,12 +296,63 @@ func searchCompactWithCacheHidden(idx *Index, opts queryOptions, countOnly bool,
 		pathCache = make(map[int]string)
 	}
 	skipEntryMatches := compactCandidateCanSkipEntryMatches(pq, usedCandidates)
-	if usedCandidates && !countOnly && len(order) >= serviceTrigramParallelVerifyMinIDs {
-		return verifyCompactCandidateOrderParallel(idx, pq, order, pathCache, limit, skipEntryMatches, hidden)
+	// The rank-ordered bounded content scan (used when the posting superset is
+	// capped to the window) already ran the full name+content predicate inline,
+	// so the verify loop below must not repeat it.
+	if contentMatcher != nil && !countOnly && pq.contentCandidateMeta.verified {
+		skipEntryMatches = true
+	}
+	// Content verification is inline and must stop at the limit. The
+	// filename parallel verifier runs every worker over its full range and
+	// only caps the merged output, so it is kept for the name/scalar path;
+	// the content verifier below merges in candidate order and stops at the
+	// limit like the serial walk, with over-verification bounded by the
+	// channel buffer plus one job per worker. Two workers also parallelize
+	// a verify-heavy early-stop page (per-candidate decode/fold work spreads
+	// ~2x warm and cold); a collect-only page (skipEntryMatches, e.g. the
+	// pre-verified bounded scan) keeps the serial walk at two workers, where
+	// the feeder/merger sync has no verify work to amortize it. A query that
+	// must verify everything (limit beyond the candidate set, e.g. the
+	// relevance window) still scales at any worker count.
+	// A hidden-overlay v2 resume stops at the provable page, which needs the
+	// candidate order and the overlay keys in one place: keep it serial.
+	resumePageStop := pq.contentAfter != nil && pq.contentAfter.pageLimit > 0
+	if usedCandidates && !countOnly {
+		// The filename lane keeps its historical threshold; the content
+		// lane has its own (verifies cost ~100x a name verify). The
+		// verify-heavy early-stop case is covered by the gate below; the
+		// serial range walk stays for small candidate sets, where goroutine
+		// setup exceeds the win.
+		if contentMatcher == nil && len(order) >= serviceTrigramParallelVerifyMinIDs {
+			return verifyCompactCandidateOrderParallel(idx, pq, order, pathCache, limit, skipEntryMatches, hidden, contentVol, contentMatcher)
+		}
+		if contentMatcher != nil && !resumePageStop && len(order) >= contentParallelVerifyMinIDs &&
+			(contentParallelWorkers() > 2 || limit >= len(order) || !skipEntryMatches) {
+			return verifyCompactContentParallel(idx, pq, order, pathCache, limit, skipEntryMatches, hidden, contentVol, contentMatcher)
+		}
+	}
+	// A content count tallies every candidate with no ordering to preserve,
+	// so a large candidate set fans out to sharded tallies.
+	if opts.contentCount != nil && contentVol != nil && contentMatcher != nil &&
+		contentParallelWorkers() > 1 && compactOrderLen(order, idx.compactRecordCount()) >= contentParallelVerifyMinIDs {
+		if err := countCompactContentParallel(idx, pq, order, hidden, contentVol, contentMatcher, opts.contentCount); err != nil {
+			return nil, err
+		}
+		return []Entry{}, nil
+	}
+	var resumePromo contentPromotion
+	if resumePageStop {
+		resumePromo = newContentPromotion(pq)
 	}
 	for pos := 0; pos < compactOrderLen(order, idx.compactRecordCount()); pos++ {
 		if pos&1023 == 0 && queryCanceled(pq) {
 			return nil, errQueryCanceled
+		}
+		if resumePageStop && contentVol != nil {
+			if next, ok := contentVol.contentResumeNextBaseKey(idx, order, pos, pq, resumePromo, pathCache); ok &&
+				pq.contentAfter.pageProvablyFull(len(results), next) {
+				break
+			}
 		}
 		recIndex := compactOrderAt(order, pos)
 		if hidden.contains(recIndex) {
@@ -294,22 +365,54 @@ func searchCompactWithCacheHidden(idx *Index, opts queryOptions, countOnly bool,
 		if !compactRecordPrecheck(rec, pq, pq.MatchPath) {
 			continue
 		}
-		if queryPathTermPrecheckSafe(pq) && !idx.compactPathContainsAll(recIndex, pq.Terms) {
+		if queryPathTermPrecheckSafe(pq) && !idx.compactPathContainsAllFolded(recIndex, pq.Terms, pq) {
 			continue
 		}
+		// Bound the path memo: full scans would otherwise retain every
+		// visited path (see boundPathCache).
+		pathCache = boundPathCache(pathCache)
 		if skipEntryMatches {
-			results = append(results, compactEntryFromRecord(idx, recIndex, rec, pathCache, false))
-			if !countOnly && len(results) >= limit {
-				break
+			entry := compactEntryFromRecord(idx, recIndex, rec, pathCache, false)
+			if entry.Path == "" {
+				continue
 			}
-			continue
-		}
-		entry := compactEntryFromRecord(idx, recIndex, rec, pathCache, true)
-		if entryMatches(entry, pq, pq.MatchPath) {
 			results = append(results, entry)
 			if !countOnly && len(results) >= limit {
 				break
 			}
+			continue
+		}
+		// Counting mode skips path reconstruction when the query has no path
+		// constraint, and tallies the match instead of retaining an Entry.
+		// Walk-origin volumes always keep the path: their content
+		// resolution keys on it (see scanCandidateMatches). v11 content
+		// verification always reads the file from disk, so a content query
+		// always keeps the path too.
+		withPath := true
+		if opts.contentCount != nil {
+			withPath = queryNeedsEntryPath(pq) || queryHasAnyContentLeaf(pq) || contentVol.contentWalkOriginAttached()
+		}
+		entry := compactEntryFromRecordPath(idx, recIndex, rec, pathCache, true, withPath)
+		if withPath && entry.Path == "" {
+			continue
+		}
+		if entryMatchesWithContentMatcher(contentVol, entry, pq, pq.MatchPath, contentMatcher) {
+			if opts.contentCount != nil {
+				*opts.contentCount++
+				continue
+			}
+			results = append(results, entry)
+			if !countOnly && len(results) >= limit {
+				break
+			}
+		}
+		// The disk verification budget (count or --budget time) short-circuits
+		// every further verify to a miss once hit: stop the walk there instead
+		// of burning the whole candidate set past an already-incomplete page.
+		// Results are identical (every later verify would miss); only wasted
+		// reads stop. A pre-verified page (skipEntryMatches) never gets here.
+		if contentMatcher != nil && pq.Trace != nil && pq.Trace.stopDiskVerify() {
+			break
 		}
 	}
 	return results, nil
@@ -319,8 +422,13 @@ func compactCandidateCanSkipEntryMatches(pq parsedQuery, usedCandidates bool) bo
 	if !usedCandidates {
 		return false
 	}
+	if queryHasAnyContentLeaf(pq) {
+		// Content verification is inline and needs the materialized entry, so
+		// the name/scalar precheck cannot be skipped.
+		return false
+	}
 	if pq.Under != "" ||
-		pq.Exists ||
+		pq.lateVerified() ||
 		len(pq.Dirs) > 0 ||
 		len(pq.Regexps) > 0 ||
 		len(pq.Parents) > 0 ||
@@ -328,7 +436,19 @@ func compactCandidateCanSkipEntryMatches(pq parsedQuery, usedCandidates bool) bo
 		len(pq.DateFilters) > 0 ||
 		len(pq.AttrFilters) > 0 ||
 		len(pq.OrGroups) > 0 ||
-		len(pq.NotGroups) > 0 {
+		len(pq.NotGroups) > 0 ||
+		len(pq.Features) > 0 ||
+		// Name anchors, path globs, negated in: roots, quoted terms and
+		// case-sensitive matching all narrow beyond the posting the
+		// candidates came from (the accent union is a superset for the
+		// latter two), so the entry gate must run.
+		len(pq.ExactTerms) > 0 ||
+		len(pq.Prefixes) > 0 ||
+		len(pq.Suffixes) > 0 ||
+		len(pq.PathGlobs) > 0 ||
+		len(pq.NotUnders) > 0 ||
+		len(pq.QuotedTerms) > 0 ||
+		pq.CaseSensitive {
 		return false
 	}
 	if len(pq.Terms) == 0 {
@@ -349,7 +469,17 @@ func compactCandidateCanSkipEntryMatches(pq parsedQuery, usedCandidates bool) bo
 }
 
 func compactEntryFromRecord(idx *Index, recIndex int, rec CompactRecord, pathCache map[int]string, withLower bool) Entry {
-	path := idx.reconstructCompactPathCached(recIndex, pathCache)
+	return compactEntryFromRecordPath(idx, recIndex, rec, pathCache, withLower, true)
+}
+
+// compactEntryFromRecordPath is compactEntryFromRecord with an explicit path
+// switch. withPath=false skips reconstructing Entry.Path (used by the content
+// count path when the query reads only the record's name/metadata).
+func compactEntryFromRecordPath(idx *Index, recIndex int, rec CompactRecord, pathCache map[int]string, withLower, withPath bool) Entry {
+	path := ""
+	if withPath {
+		path = idx.reconstructCompactPathCached(recIndex, pathCache)
+	}
 	entry := Entry{
 		Path:        path,
 		Name:        rec.Name,
@@ -357,6 +487,7 @@ func compactEntryFromRecord(idx *Index, recIndex int, rec CompactRecord, pathCac
 		Size:        rec.Size,
 		ModUnix:     rec.ModUnix,
 		IndexSource: idx.Source,
+		FRN:         rec.FRN,
 	}
 	if rec.Mode&uint32(os.ModeDir) != 0 && recIndex >= 0 && recIndex < len(idx.Derived.SubtreeBytes) {
 		size := int64(idx.Derived.SubtreeBytes[recIndex])
@@ -375,13 +506,13 @@ func compactEntryFromRecord(idx *Index, recIndex int, rec CompactRecord, pathCac
 	return entry
 }
 
-func verifyCompactCandidateOrderParallel(idx *Index, pq parsedQuery, order []int, pathCache map[int]string, limit int, skipEntryMatches bool, hidden hiddenBaseIDs) ([]Entry, error) {
+func verifyCompactCandidateOrderParallel(idx *Index, pq parsedQuery, order []int, pathCache map[int]string, limit int, skipEntryMatches bool, hidden hiddenBaseIDs, contentVol *serviceVolumeIndex, matcher *contentLeafMatcher) ([]Entry, error) {
 	if len(order) == 0 || limit <= 0 {
 		return nil, nil
 	}
 	workers := min(runtime.GOMAXPROCS(0), max(1, len(order)/serviceTrigramParallelVerifyMinIDs))
 	if workers <= 1 {
-		return verifyCompactCandidateOrderRange(idx, pq, order, pathCache, limit, skipEntryMatches, hidden)
+		return verifyCompactCandidateOrderRange(idx, pq, order, pathCache, limit, skipEntryMatches, hidden, contentVol, matcher)
 	}
 	parts := make([][]Entry, workers)
 	var canceled atomic.Bool
@@ -403,7 +534,8 @@ func verifyCompactCandidateOrderParallel(idx *Index, pq parsedQuery, order []int
 				if hidden.contains(recIndex) {
 					continue
 				}
-				if entry, ok := compactCandidateEntryIfMatch(idx, pq, recIndex, localCache, true, skipEntryMatches); ok {
+				localCache = boundPathCache(localCache)
+				if entry, ok := compactCandidateEntryIfMatchIn(contentVol, idx, pq, recIndex, localCache, true, skipEntryMatches, matcher); ok {
 					local = append(local, entry)
 					if len(local) >= limit {
 						break
@@ -429,18 +561,26 @@ func verifyCompactCandidateOrderParallel(idx *Index, pq parsedQuery, order []int
 	return out, nil
 }
 
-func verifyCompactCandidateOrderRange(idx *Index, pq parsedQuery, order []int, pathCache map[int]string, limit int, skipEntryMatches bool, hidden hiddenBaseIDs) ([]Entry, error) {
+func verifyCompactCandidateOrderRange(idx *Index, pq parsedQuery, order []int, pathCache map[int]string, limit int, skipEntryMatches bool, hidden hiddenBaseIDs, contentVol *serviceVolumeIndex, matcher *contentLeafMatcher) ([]Entry, error) {
 	out := make([]Entry, 0, min(limit, 1024))
 	for pos, recIndex := range order {
+		if pq.Trace != nil && pq.Trace.deadlineReached() {
+			pq.Trace.markBudgetExceeded()
+			return out, nil
+		}
 		if pos&1023 == 0 && queryCanceled(pq) {
 			return nil, errQueryCanceled
 		}
 		if hidden.contains(recIndex) {
 			continue
 		}
-		if entry, ok := compactCandidateEntryIfMatch(idx, pq, recIndex, pathCache, true, skipEntryMatches); ok {
+		pathCache = boundPathCache(pathCache)
+		if entry, ok := compactCandidateEntryIfMatchIn(contentVol, idx, pq, recIndex, pathCache, true, skipEntryMatches, matcher); ok {
 			out = append(out, entry)
 			if len(out) >= limit {
+				if pq.Trace != nil && pq.Trace.deadlineReached() {
+					pq.Trace.markBudgetExceeded()
+				}
 				return out, nil
 			}
 		}
@@ -448,7 +588,306 @@ func verifyCompactCandidateOrderRange(idx *Index, pq parsedQuery, order []int, p
 	return out, nil
 }
 
+// contentParallelVerifyMinIDs gates the parallel content verifier: below
+// this many candidates the feeder/channel setup exceeds the win. Content
+// verifies cost ~100x a name verify (disk open + extract + fold +
+// substring), so the gate is far below the filename parallel threshold.
+const contentParallelVerifyMinIDs = 256
+
+// contentParallelMaxWorkers caps the content verify fan-out: disk-bound
+// verification scales with a handful of concurrent reads, and past that the
+// ordered merge contends instead of helping.
+const contentParallelMaxWorkers = 8
+
+// contentParallelWorkers sizes the content verify fan-out: GOMAXPROCS
+// workers up to contentParallelMaxWorkers; 1 keeps the zero-overhead serial
+// path.
+func contentParallelWorkers() int {
+	w := runtime.GOMAXPROCS(0)
+	if w < 1 {
+		w = 1
+	}
+	if w > contentParallelMaxWorkers {
+		w = contentParallelMaxWorkers
+	}
+	return w
+}
+
+// contentVerifyJob is one candidate for the parallel content verifier: seq
+// numbers the candidate order, so the merger restores the exact serial
+// order regardless of which worker finishes first.
+type contentVerifyJob struct {
+	seq uint64
+	id  int
+}
+
+// contentVerifyResult is one verified candidate: ok=false is a miss, but
+// every job reports so the merger can advance past it.
+type contentVerifyResult struct {
+	seq      uint64
+	entry    Entry
+	ok       bool
+	verified bool
+}
+
+// contentVerifyParallelTestHook is nil outside tests. It lets the cap-frontier
+// regression test coordinate worker completion deterministically.
+var contentVerifyParallelTestHook func(seq, candidateID int, phase string, used int64, matched, capped bool)
+
+// verifyCompactContentParallel verifies content candidates across workers
+// and merges matches in candidate order with the exact serial limit: the
+// first limit matches in candidate order, no more, no fewer. Verification
+// is CPU-bound (block decompress + fold + substring), so workers scale;
+// the feeder, the merger and the limit accounting stay single-threaded.
+// Over-verification past an early limit is bounded by the channel buffer
+// plus one job per worker. Proven identical to the serial walk by
+// TestContentParallelContentMatchesSerial across terms x limits x workers.
+func verifyCompactContentParallel(idx *Index, pq parsedQuery, order []int, pathCache map[int]string, limit int, skipEntryMatches bool, hidden hiddenBaseIDs, contentVol *serviceVolumeIndex, matcher *contentLeafMatcher) ([]Entry, error) {
+	if len(order) == 0 || limit <= 0 {
+		return nil, nil
+	}
+	pq.ensureDiskBudget()
+	workers := contentParallelWorkers()
+	if workers < 2 {
+		return verifyCompactCandidateOrderRange(idx, pq, order, pathCache, limit, skipEntryMatches, hidden, contentVol, matcher)
+	}
+	// Workers keep local path memos (like the filename parallel lane); the
+	// passed-in memo stays with the serial path.
+	quit := make(chan struct{})
+	var quitOnce sync.Once
+	stop := func() { quitOnce.Do(func() { close(quit) }) }
+	work := make(chan contentVerifyJob, 64)
+	out := make(chan contentVerifyResult, 64)
+	var wg sync.WaitGroup
+	defer func() {
+		stop()
+		// Reads already inside contentDiskReadForVerify are non-interruptible.
+		// Join workers before publishing the per-query reservation so no disk
+		// read or accounting update escapes the completed request.
+		wg.Wait()
+	}()
+	// Feeder: the only goroutine that walks the candidate order.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		defer close(work)
+		var seq uint64
+		for pos, recIndex := range order {
+			if pos&1023 == 0 && queryCanceled(pq) {
+				return
+			}
+			select {
+			case work <- contentVerifyJob{seq: seq, id: recIndex}:
+				seq++
+			case <-quit:
+				return
+			}
+		}
+	}()
+	// Workers: verify only; no ordering, no limits here. Each drops hidden
+	// IDs exactly like the serial walk, so a hidden-filled page still
+	// backfills from later candidates.
+	var canceled atomic.Bool
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			localCache := make(map[int]string)
+			var done int
+			for {
+				select {
+				case job, ok := <-work:
+					if !ok {
+						return
+					}
+					done++
+					if done&1023 == 0 && queryCanceled(pq) {
+						canceled.Store(true)
+						return
+					}
+					var res contentVerifyResult
+					res.seq = job.seq
+					res.verified = true
+					if !hidden.contains(job.id) {
+						if pq.Trace != nil && pq.Trace.deadlineReached() {
+							pq.Trace.markBudgetExceeded()
+							res.verified = false
+						}
+						if contentVerifyParallelTestHook != nil {
+							used := int64(0)
+							if pq.Trace != nil && pq.Trace.disk != nil {
+								used = pq.Trace.disk.used.Load()
+							}
+							contentVerifyParallelTestHook(int(job.seq), job.id, "merge-start", used, false, pq.Trace.stopDiskVerify())
+						}
+						if res.verified {
+							localCache = boundPathCache(localCache)
+							candidatePQ := pq
+							var candidateState atomic.Bool
+							candidatePQ.contentVerifyState = &candidateState
+							if entry, ok := compactCandidateEntryIfMatchIn(contentVol, idx, candidatePQ, job.id, localCache, true, skipEntryMatches, matcher); ok {
+								res.entry, res.ok = entry, true
+							}
+							if candidateState.Load() {
+								res.verified = false
+							}
+							if skipEntryMatches && pq.Trace != nil && pq.Trace.deadlineReached() {
+								pq.Trace.markBudgetExceeded()
+								res.verified = false
+							}
+						}
+						if contentVerifyParallelTestHook != nil {
+							used := int64(0)
+							if pq.Trace != nil && pq.Trace.disk != nil {
+								used = pq.Trace.disk.used.Load()
+							}
+							contentVerifyParallelTestHook(int(job.seq), job.id, "merge-done", used, res.ok, pq.Trace.stopDiskVerify())
+						}
+					}
+					select {
+					case out <- res:
+					case <-quit:
+						return
+					}
+					if !res.verified {
+						return
+					}
+				case <-quit:
+					return
+				}
+			}
+		}()
+	}
+	// Closer: once the feeder and every worker are done, no more results.
+	go func() {
+		wg.Wait()
+		close(out)
+	}()
+	// Merger (this goroutine): emit in candidate order, stopping at exactly
+	// the limit like the serial walk. The disk verification budget is shared
+	// mutable trace state, so stop feeding it once hit: every further verify
+	// short-circuits to a miss anyway, and an uncapped feeder would burn the
+	// whole candidate set past an already-incomplete page.
+	hits := make([]Entry, 0, min(limit, 1024))
+	pending := make(map[uint64]contentVerifyResult)
+	var expect uint64
+	emit := func() bool {
+		for limit <= 0 || len(hits) < limit {
+			res, ok := pending[expect]
+			if !ok {
+				return true
+			}
+			delete(pending, expect)
+			if !res.verified {
+				// A later worker may finish after an earlier rank hits the cap
+				// or deadline. Stop at this contiguous verified frontier rather
+				// than treating an unverified candidate as a nonmatch and
+				// admitting a later hit. Record the frontier so an overlay merge
+				// keeps the partial page a prefix (see mergeOverlayMatches).
+				if pq.Trace != nil && int(expect) < len(order) {
+					recIndex := order[expect]
+					rec := idx.compactRecord(recIndex)
+					pq.Trace.recordContentFrontier(compactEntryFromRecord(idx, recIndex, rec, pathCache, true), pq)
+				}
+				return false
+			}
+			expect++
+			if res.ok {
+				hits = append(hits, res.entry)
+			}
+		}
+		return false
+	}
+	for res := range out {
+		pending[res.seq] = res
+		if !emit() {
+			return hits, nil
+		}
+		// A pre-verified page (skipEntryMatches) owns its results even if the
+		// earlier rank-ordered superset pass exhausted the disk cap; only the
+		// wall-clock deadline limits this no-disk reconstruction. Inline
+		// verification instead stops at the first per-candidate unverified
+		// frontier in emit, preserving earlier jobs already verified before a
+		// later worker exhausted the shared cap.
+		if skipEntryMatches && pq.Trace != nil && pq.Trace.deadlineReached() {
+			pq.Trace.markBudgetExceeded()
+			return hits, nil
+		}
+	}
+	emit()
+	if canceled.Load() {
+		return nil, errQueryCanceled
+	}
+	return hits, nil
+}
+
+// countCompactContentParallel tallies content matches over sharded record
+// ranges: a count keeps no order and no entries, so ranges are independent
+// and the partial tallies sum exactly. Each worker runs the same predicate
+// as the serial count loop (prechecks, then the content-aware match over a
+// path-free entry unless the query reads paths), so the total equals the
+// serial count by construction.
+func countCompactContentParallel(idx *Index, pq parsedQuery, order []int, hidden hiddenBaseIDs, contentVol *serviceVolumeIndex, matcher *contentLeafMatcher, count *int) error {
+	pq.ensureDiskBudget()
+	total := compactOrderLen(order, idx.compactRecordCount())
+	workers := contentParallelWorkers()
+	if workers > total {
+		workers = total
+	}
+	if workers < 1 {
+		return nil
+	}
+	tallies := make([]int, workers)
+	var canceled atomic.Bool
+	var wg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		start := w * total / workers
+		end := (w + 1) * total / workers
+		wg.Add(1)
+		go func(worker, start, end int) {
+			defer wg.Done()
+			localCache := make(map[int]string)
+			n := 0
+			for pos := start; pos < end; pos++ {
+				if pos&1023 == 0 && queryCanceled(pq) {
+					canceled.Store(true)
+					return
+				}
+				recIndex := compactOrderAt(order, pos)
+				if hidden.contains(recIndex) {
+					continue
+				}
+				localCache = boundPathCache(localCache)
+				// The same predicate as the serial count loop: prechecks,
+				// then the content-aware match (see scanCandidateMatches;
+				// content queries always verify with full entries, since
+				// v11 reads the file from disk).
+				if scanCandidateMatches(contentVol, idx, pq, recIndex, localCache, matcher) {
+					n++
+				}
+			}
+			tallies[worker] = n
+		}(w, start, end)
+	}
+	wg.Wait()
+	if canceled.Load() {
+		return errQueryCanceled
+	}
+	for _, n := range tallies {
+		*count += n
+	}
+	return nil
+}
+
 func compactCandidateEntryIfMatch(idx *Index, pq parsedQuery, recIndex int, pathCache map[int]string, usedCandidates bool, skipEntryMatches bool) (Entry, bool) {
+	return compactCandidateEntryIfMatchIn(nil, idx, pq, recIndex, pathCache, usedCandidates, skipEntryMatches, nil)
+}
+
+// compactCandidateEntryIfMatchIn is compactCandidateEntryIfMatch with inline
+// content verification: when vol has content and pq carries a content leaf, the
+// entry must satisfy the joint name+content predicate. Other callers pass nil
+// vol and keep the pure name/scalar behavior.
+func compactCandidateEntryIfMatchIn(vol *serviceVolumeIndex, idx *Index, pq parsedQuery, recIndex int, pathCache map[int]string, usedCandidates bool, skipEntryMatches bool, matcher *contentLeafMatcher) (Entry, bool) {
 	rec := idx.compactRecord(recIndex)
 	if rec.Deleted {
 		return Entry{}, false
@@ -456,17 +895,166 @@ func compactCandidateEntryIfMatch(idx *Index, pq parsedQuery, recIndex int, path
 	if !compactRecordPrecheck(rec, pq, pq.MatchPath) {
 		return Entry{}, false
 	}
-	if queryPathTermPrecheckSafe(pq) && !idx.compactPathContainsAll(recIndex, pq.Terms) {
+	if queryPathTermPrecheckSafe(pq) && !idx.compactPathContainsAllFolded(recIndex, pq.Terms, pq) {
 		return Entry{}, false
 	}
 	if skipEntryMatches {
-		return compactEntryFromRecord(idx, recIndex, rec, pathCache, false), true
+		entry := compactEntryFromRecord(idx, recIndex, rec, pathCache, false)
+		if entry.Path == "" {
+			return Entry{}, false
+		}
+		return entry, true
 	}
 	entry := compactEntryFromRecord(idx, recIndex, rec, pathCache, true)
-	if !entryMatches(entry, pq, pq.MatchPath) {
+	if entry.Path == "" {
+		return Entry{}, false
+	}
+	if !entryMatchesWithContentMatcher(vol, entry, pq, pq.MatchPath, matcher) {
 		return Entry{}, false
 	}
 	return entry, true
+}
+
+// scanCandidateMatches reports whether recIndex satisfies the ordered-scan
+// predicate. For a content scan whose query reads no path (a plain content
+// query), it verifies against a path-free Entry: the scan discards the Entry,
+// and the returned candidate reconstructs its path downstream, so building one
+// here would be wasted work. Any query that reads a path keeps the full entry.
+// Walk-origin volumes always keep the full entry: their content resolution
+// keys on the entry path, so a path-free entry would miss every document.
+// v11 content verification always reads the file from disk, so a content
+// query never takes the path-free form either: without a path there is
+// nothing to open.
+func scanCandidateMatches(vol *serviceVolumeIndex, idx *Index, pq parsedQuery, recIndex int, pathCache map[int]string, matcher *contentLeafMatcher) bool {
+	if matcher != nil && !queryHasAnyContentLeaf(pq) && !queryNeedsEntryPath(pq) && !vol.contentWalkOriginAttached() {
+		rec := idx.compactRecord(recIndex)
+		if rec.Deleted || !compactRecordPrecheck(rec, pq, pq.MatchPath) {
+			return false
+		}
+		entry := Entry{
+			Name:        rec.Name,
+			Mode:        rec.Mode,
+			Size:        rec.Size,
+			ModUnix:     rec.ModUnix,
+			IndexSource: idx.Source,
+			FRN:         rec.FRN,
+		}
+		return entryMatchesWithContentMatcher(vol, entry, pq, pq.MatchPath, matcher)
+	}
+	_, ok := compactCandidateEntryIfMatchIn(vol, idx, pq, recIndex, pathCache, true, false, matcher)
+	return ok
+}
+
+// verifyContentSupersetPage verifies candidates in result order until the
+// requested page is full. A full page is exact because all omitted candidates
+// rank later; a short page exhausts the available superset.
+
+func (vol *serviceVolumeIndex) verifyContentSupersetPage(pq parsedQuery, ranked []int) ([]int, bool) {
+	if vol == nil || vol.index == nil || pq.Limit <= 0 || len(ranked) == 0 {
+		return nil, false
+	}
+	pq.ensureDiskBudget()
+	matcher := newContentLeafMatcher(pq)
+	page := make([]int, 0, min(pq.Limit, len(ranked)))
+	stopped := func() bool {
+		// The verify cap / time budget already marked the trace incomplete;
+		// keep the hits found so far as a visible partial page.
+		return pq.Trace != nil && pq.Trace.stopDiskVerify()
+	}
+	// A v2 resume starts verification after the last emitted record. The
+	// candidate order is deterministic while the captured identity holds, so
+	// locating the record by FRN and starting at the next candidate verifies
+	// one page of disk reads instead of every earlier page again.
+	start := vol.contentAfterCandidateStart(ranked, pq.contentAfter)
+	// Verify in small parallel batches (like verifyCompactContentParallel),
+	// then take hits in rank order: the page is identical to the serial walk
+	// and over-verification is under one batch.
+	workers := contentParallelWorkers()
+	if workers < 1 {
+		workers = 1
+	}
+	batch := 4 * workers
+	if pq.contentAfter != nil {
+		// A v2 resume prices one page: verify serially in rank order and stop
+		// at the first full page instead of pre-verifying a parallel batch.
+		workers = 1
+		batch = 1
+	}
+	ok := make([]bool, batch)
+	verified := make([]bool, batch)
+	caches := make([]map[int]string, workers)
+	for w := range caches {
+		caches[w] = make(map[int]string)
+	}
+	for pos := start; pos < len(ranked); pos += batch {
+		if stopped() {
+			return page, true
+		}
+		end := min(pos+batch, len(ranked))
+		n := end - pos
+		clear(ok)
+		clear(verified)
+		// A batch that could exhaust the exact per-candidate read cap is
+		// verified serially, in rank order; other batches stay parallel.
+		if workers == 1 || n == 1 || pq.Trace.capFiresWithin(n) {
+			for i := 0; i < n && !stopped(); i++ {
+				caches[0] = boundPathCache(caches[0])
+				candidatePQ := pq
+				var candidateState atomic.Bool
+				candidatePQ.contentVerifyState = &candidateState
+				ok[i] = scanCandidateMatches(vol, vol.index, candidatePQ, ranked[pos+i], caches[0], matcher)
+				verified[i] = !candidateState.Load()
+			}
+		} else {
+			var next atomic.Int64
+			var wg sync.WaitGroup
+			for w := 0; w < workers; w++ {
+				wg.Add(1)
+				go func(w int) {
+					defer wg.Done()
+					for {
+						i := int(next.Add(1)) - 1
+						if i >= n || stopped() {
+							return
+						}
+						caches[w] = boundPathCache(caches[w])
+						candidatePQ := pq
+						var candidateState atomic.Bool
+						candidatePQ.contentVerifyState = &candidateState
+						ok[i] = scanCandidateMatches(vol, vol.index, candidatePQ, ranked[pos+i], caches[w], matcher)
+						verified[i] = !candidateState.Load()
+					}
+				}(w)
+			}
+			wg.Wait()
+		}
+		for i := 0; i < n; i++ {
+			if !verified[i] {
+				// This candidate's read was denied by the exact cap or the
+				// deadline. Record it as the rank frontier so an overlay merge
+				// keeps the partial page a prefix (see mergeOverlayMatches).
+				if pq.Trace != nil {
+					recIndex := ranked[pos+i]
+					rec := vol.index.compactRecord(recIndex)
+					pq.Trace.recordContentFrontier(compactEntryFromRecord(vol.index, recIndex, rec, caches[0], true), pq)
+				}
+				return page, true
+			}
+			if ok[i] {
+				page = append(page, ranked[pos+i])
+				if len(page) == pq.Limit {
+					if pq.Trace != nil && pq.Trace.deadlineReached() {
+						pq.Trace.markBudgetExceeded()
+					}
+					return page, true
+				}
+			}
+		}
+	}
+	if pq.Trace != nil && pq.Trace.deadlineReached() {
+		pq.Trace.markBudgetExceeded()
+	}
+	return page, true
 }
 
 func dropSatisfiedVolumeTerms(pq *parsedQuery, volume string) {
@@ -487,14 +1075,33 @@ var errQueryCanceled = errors.New("query superseded")
 
 var errGlobalMultiVolumePlannerDeclined = errors.New("global planner declined multi-volume query")
 
-func globalMultiVolumePlannerDeclineError(opts queryOptions) error {
+func globalMultiVolumePlannerDeclineError(opts queryOptions, volumes []*serviceVolumeIndex) error {
 	if queryCanceled(parsedQuery{DeadlineUnix: opts.DeadlineUnix, Cancel: opts.Cancel}) {
 		return errQueryCanceled
 	}
-	if opts.Trace != nil && opts.Trace.Decline != "" {
-		return fmt.Errorf("%w: %s", errGlobalMultiVolumePlannerDeclined, opts.Trace.Decline)
+	// A bare decline reads as a broken query. Name the scale and how to
+	// narrow it: per-volume fallback was deliberately removed (it cannot
+	// preserve global rank/limit semantics), so the actionable path is a
+	// more selective query, not a retry.
+	names := make([]string, 0, len(volumes))
+	total := 0
+	for _, vol := range volumes {
+		if vol == nil || vol.index == nil {
+			continue
+		}
+		if vol.index.Volume != "" {
+			names = append(names, vol.index.Volume)
+		}
+		total += vol.index.compactRecordCount()
 	}
-	return errGlobalMultiVolumePlannerDeclined
+	scope := ""
+	if len(names) > 0 {
+		scope = fmt.Sprintf(" across %s (%d records)", strings.Join(names, ", "), total)
+	}
+	if opts.Trace != nil && opts.Trace.Decline != "" {
+		return fmt.Errorf("%w%s: %s; narrow with --under <dir>, a volume prefix, or a more selective term", errGlobalMultiVolumePlannerDeclined, scope, opts.Trace.Decline)
+	}
+	return fmt.Errorf("%w%s; narrow with --under <dir>, a volume prefix, or a more selective term", errGlobalMultiVolumePlannerDeclined, scope)
 }
 
 func queryCanceled(pq parsedQuery) bool {
@@ -509,6 +1116,11 @@ func queryCanceled(pq parsedQuery) bool {
 // dm:, --recent, and --modified-after would otherwise silently match nothing.
 // Failing loudly is consistent with rejecting unknown filters at parse time.
 func checkQueryCapabilities(pq parsedQuery, idx *Index) error {
+	for _, leaf := range featureAllLeaves(pq) {
+		if leaf.matches == nil {
+			return fmt.Errorf("feature queries require the resident seekfs service")
+		}
+	}
 	needsSize, needsMod := queryNeedsSizeOrMod(pq)
 	if needsSize && !idx.compactHasSize() {
 		return errors.New("size: filters require an index with file sizes; the current index has none (rebuild with a size-capable indexer)")
@@ -572,7 +1184,12 @@ func queryNeedsAttrs(pq parsedQuery) bool {
 func compactRecordPrecheck(rec CompactRecord, pq parsedQuery, matchPath bool) bool {
 	name := rec.Name
 	cmpName := normalizeCase(name, pq.CaseSensitive)
-	if !matchPath && !containsAll(cmpName, pq.Terms) {
+	if !matchPath && !containsAllFolded(cmpName, nil, pq.Terms, pq) {
+		return false
+	}
+	// Anchors constrain the file name with the record at hand, in both
+	// modes; path globs need the full path and stay with the entry gate.
+	if !matchNameAnchors(cmpName, nil, pq) {
 		return false
 	}
 	if pq.Type == "file" && rec.Mode&uint32(os.ModeDir) != 0 {
@@ -595,9 +1212,21 @@ func compactRecordPrecheck(rec CompactRecord, pq parsedQuery, matchPath bool) bo
 			return false
 		}
 	}
-	for _, glob := range pq.Globs {
-		ok, err := filepath.Match(glob, cmpName)
-		if err != nil || !ok {
+	for gi, glob := range pq.Globs {
+		if matchNameAlts(globAltsFor(pq.GlobAlts, gi, glob), cmpName) {
+			continue
+		}
+		if pq.CaseSensitive || (!nameNeedsFold(glob) && !nameNeedsFold(cmpName)) {
+			return false
+		}
+		fp, fn := glob, cmpName
+		if nameNeedsFold(glob) {
+			fp = foldAccentLower(glob)
+		}
+		if nameNeedsFold(cmpName) {
+			fn = foldAccentLower(cmpName)
+		}
+		if !matchNameGlob(fp, fn) {
 			return false
 		}
 	}
@@ -605,6 +1234,165 @@ func compactRecordPrecheck(rec CompactRecord, pq parsedQuery, matchPath bool) bo
 }
 
 func (vol *serviceVolumeIndex) nameTermCandidates(pq parsedQuery) ([]int, bool) {
+	// Content is a first-class constraint. A content posting superset is
+	// preferred; when none exists (mixed OR, negative-only, an unindexable
+	// gram, or any other decline) the bounded ordered scan is the correct
+	// superset and inline verification narrows it. Returning ok=true even for
+	// an empty set is a real answer, not a fallback.
+	if queryHasAnyContentLeaf(pq) {
+		if queryHasPositiveContentLeaf(pq) {
+			// Bounded candidate materialization (PB8). For a non-count query
+			// that only needs its top window and does not re-rank by relevance
+			// after verification, the result ordering equals the candidate
+			// ordering, so the posting intersection may be capped at the
+			// window. When the cap is hit the set is broad and ordered by
+			// docID, not by rank: using the truncated set would drop a
+			// candidate that verification could still promote into the window.
+			// The rank-ordered bounded scan below is the exact superset-ordered
+			// substitute: it walks the same rank/result order and verifies
+			// inline, stopping at the window.
+			bounded := !pq.contentFullCandidates && !pq.CountOnly && pq.Limit > 0 &&
+				pq.SortColumn != "relevance" && pq.hidden.empty()
+			// The default-order driver (searchContentServiceVolumes) verifies
+			// only the page but probes broadness against the completeness
+			// window, so cap there, not at the page limit. An unbiased
+			// default-order page whose superset fits the disk verification
+			// budget materializes it in full (cap 0) instead of truncating at
+			// the window and falling through to an unfiltered name-order scan:
+			// the page then fills after ~page verifies. The verify loop stops
+			// at the limit in this exact order with the exact predicate, so
+			// sets, order, and the completeness signal are unchanged (the
+			// superset is complete, hence supersetBelowWindow). Biased and
+			// walk-origin queries keep the window cap so their early-stop
+			// scans stay the source; supersets past the disk budget keep it
+			// too, so a capped broad query still burns at most ~budget+window
+			// verifies and the allocation gate (TestContentBroadAllocationBudget)
+			// holds.
+			useFullSuperset := bounded && pq.contentWindow > 0 && pq.contentProbe != nil &&
+				pq.RootBias == "" && pq.CWDBias == ""
+			candidateCap := 0
+			if bounded && !useFullSuperset {
+				// Probe broadness against the completeness window, not the
+				// verify limit: a single-volume default-order query verifies
+				// only its page limit but must still surface a candidate
+				// superset that exceeds the window as incomplete.
+				candidateCap = pq.Limit
+				if pq.contentWindow > candidateCap {
+					candidateCap = pq.contentWindow
+				}
+			}
+			if useFullSuperset {
+				// A capped intersection is deliberately rejected by the posting
+				// reader because its prefix is not a candidate superset. Materialize
+				// the complete posting superset, then only disk-verify the ranked page.
+				candidateCap = 0
+			}
+			if candidates, ok, capped := vol.contentCandidatesBounded(pq, candidateCap); ok {
+				if useFullSuperset && len(candidates) > 0 {
+					// Pure-regex queries keep the scan order (it is also the
+					// resume order the bounded scan uses), then move files named
+					// after the pattern to the front. A name match is a free,
+					// no-disk signal that the file is where the pattern lives,
+					// so a broad literal intersection does not spend the disk
+					// valve on files that merely contain the literals far apart.
+					// Verification still decides every hit.
+					if contentLeavesAllRegex(pq) {
+						vol.sortCandidateIDsByScanOrder(candidates, pq)
+						if pq.SortColumn == "" {
+							promoteNamedCandidates(candidates, vol.index, newContentPromotion(pq))
+						}
+					} else {
+						sortCandidateIDs(candidates, pq, vol.index, vol.rankForQuery(pq))
+						promoteNamedCandidates(candidates, vol.index, newContentPromotion(pq))
+					}
+					if page, verified := vol.verifyContentSupersetPage(pq, candidates); verified {
+						if pq.contentProbe != nil {
+							// The page is the exact rank-ordered top: later
+							// candidates rank after it. The total match count is
+							// not proven below the window, though, so a superset
+							// past the window carries the same window-capped
+							// signal as the truncated path (a filled page marks
+							// the result incomplete, without widening).
+							if len(candidates) > pq.contentWindow {
+								pq.contentProbe.windowCapped = true
+							} else if len(candidates) < pq.contentWindow {
+								pq.contentProbe.supersetBelowWindow = true
+							}
+						}
+						if !pq.CountOnly && pq.contentCandidateMeta != nil {
+							pq.contentCandidateMeta.verified = true
+						}
+						pq.Trace.setSource("content-candidates", len(candidates))
+						return page, true
+					}
+					pq.Trace.setSource("content-candidates", len(candidates))
+					return nil, true
+				}
+				if capped && bounded && pq.contentWindow > 0 && pq.contentProbe != nil {
+					// The reduced default-order path caps materialization at the
+					// completeness window, so when the posting superset exceeds
+					// it the caller can no longer probe the window with
+					// len(matches) >= window (matches is page-bounded). Record
+					// the cap for the driver; it marks incomplete only if the
+					// page actually filled, i.e. the extra window candidates
+					// could hold more matches.
+					pq.contentProbe.windowCapped = true
+				}
+				// A default-order page verifies the rank-ordered posting
+				// superset directly (see useFullSuperset above): a fully
+				// materialized superset strictly smaller than the completeness
+				// window proves every match fits below it, so the reduced path
+				// is complete without widening.
+				if !capped && bounded && pq.contentWindow > 0 && pq.contentProbe != nil &&
+					len(candidates) < pq.contentWindow {
+					pq.contentProbe.supersetBelowWindow = true
+				}
+				if !capped || !bounded {
+					// Single-volume filename parity: the filename path orders
+					// its candidates by rankForQuery(pq) (name rank for the
+					// default order; size/modified/extension/type/path for
+					// explicit sorts), so order the content posting set the same
+					// way. sort:relevance keeps its own post-verify ranking and
+					// is left in candidate (docID) order here.
+					//
+					if pq.SortColumn != "relevance" {
+						if contentLeavesAllRegex(pq) {
+							vol.sortCandidateIDsByScanOrder(candidates, pq)
+						} else {
+							sortCandidateIDs(candidates, pq, vol.index, vol.rankForQuery(pq))
+						}
+					}
+					// Default order and relevance: files named after a queried
+					// symbol go first, and pure-regex files named after the
+					// pattern go first the same way (relevance verifies a
+					// bounded window in this order, so the defining file stays
+					// inside it).
+					if pq.SortColumn == "" || pq.SortColumn == "relevance" {
+						promoteNamedCandidates(candidates, vol.index, newContentPromotion(pq))
+					}
+					if start := vol.contentAfterCandidateStart(candidates, pq.contentAfter); start > 0 {
+						candidates = candidates[start:]
+					}
+					pq.Trace.setSource("content-candidates", len(candidates))
+					return candidates, true
+				}
+				// Capped and broad: fall through to the rank-ordered bounded
+				// scan, which is a complete superset in result order.
+			}
+		}
+		// The bounded scan is already produced in orderForQuery(pq) order, which
+		// is the same rank sequence for every sort column. It also runs the full
+		// name+content predicate inline, so for a search (not a count) it can
+		// report the candidate set as already verified.
+		if candidates, ok := vol.boundedScanCandidates(pq); ok {
+			pq.Trace.setSource("content-scan", len(candidates))
+			if !pq.CountOnly && pq.contentCandidateMeta != nil {
+				pq.contentCandidateMeta.verified = true
+			}
+			return candidates, true
+		}
+		return nil, false
+	}
 	if !pq.CountOnly && !pq.MatchPath && (len(pq.OrGroups) > 0 || len(pq.NotGroups) > 0) {
 		if candidates, ok := vol.plannedCandidates(pq); ok {
 			pq.Trace.setSource("planned:boolean", len(candidates))
@@ -618,76 +1406,110 @@ func (vol *serviceVolumeIndex) nameTermCandidates(pq parsedQuery) ([]int, bool) 
 		}
 	}
 	if len(pq.Terms) == 0 && len(pq.Exts) == 0 && len(pq.Globs) == 0 && len(pq.OrGroups) == 0 {
-		if candidates, ok := vol.boundedScanCandidates(pq); ok {
+		if candidates, ok := vol.boundedScanSearchCandidates(pq); ok {
 			pq.Trace.setSource("bounded-scan", len(candidates))
 			return candidates, true
 		}
 	}
 	if queryHasNonASCIIPlainTerm(pq) {
-		if candidates, ok := vol.boundedScanCandidates(pq); ok {
+		if candidates, ok := vol.boundedScanSearchCandidates(pq); ok {
 			pq.Trace.setSource("bounded-scan", len(candidates))
 			return candidates, true
 		}
 	}
 	if pq.MatchPath {
-		if candidates, ok := vol.extensionShapedPathTopCandidates(pq); ok {
-			pq.Trace.setSource("path-extension-top", len(candidates))
-			return candidates, true
-		}
-		if candidates, ok := vol.bareExtensionMultiPathTopCandidates(pq); ok {
-			pq.Trace.setSource("path-bare-extension-multi-top", len(candidates))
-			return candidates, true
-		}
-		if candidates, ok := vol.selectiveNamePathTermCandidates(pq); ok {
-			pq.Trace.setSource("path-selective-name-term", len(candidates))
-			return candidates, true
-		}
-		if candidates, ok := vol.pathDirectoryTermTopCandidates(pq); ok {
-			pq.Trace.setSource("path-directory-term-top", len(candidates))
-			return candidates, true
-		}
-		if candidates, ok := vol.componentDirectTopCandidates(pq); ok {
-			pq.Trace.setSource("path-component-direct-top", len(candidates))
-			return candidates, true
-		}
-		if candidates, ok := vol.componentRootTopCandidates(pq); ok {
-			pq.Trace.setSource("path-component-root-top", len(candidates))
-			return candidates, true
-		}
-		if candidates, ok := vol.componentMultiTermTopCandidates(pq); ok {
-			pq.Trace.setSource("path-component-multi-top", len(candidates))
-			return candidates, true
-		}
-		if candidates, ok := vol.multiTermEmptyPathCandidates(pq); ok {
-			pq.Trace.setSource("path-multi-empty", len(candidates))
-			return candidates, true
-		}
-		if candidates, ok := vol.nameTrigramCandidates(pq); ok {
-			if compactCandidateCanSkipEntryMatches(pq, true) && pq.Limit > 0 {
-				candidates = topCandidateIDsByRank(candidates, pq.Limit, vol.index, vol.rankForQuery(pq))
-			} else {
-				sortCandidateIDs(candidates, pq, vol.index, vol.rankForQuery(pq))
+		// With foldable names, unfolded-proposal lanes (component/trigram
+		// postings, rank-truncated scans) would miss accent matches. Skip
+		// them so the posting intersection (planned, with the accent
+		// union), the filtered intersection, and the bounded scans answer
+		// instead. ASCII corpora never take this branch.
+		accentActive := vol.accentUnionActive(pq)
+		if !accentActive {
+			if candidates, ok := vol.extensionShapedPathTopCandidates(pq); ok {
+				pq.Trace.setSource("path-extension-top", len(candidates))
+				return candidates, true
 			}
-			pq.Trace.setSource("path-component-trigram", len(candidates))
-			return candidates, true
 		}
-		if candidates, ok := vol.nameTrigramPathNameTopCandidates(pq); ok {
-			pq.Trace.setSource("path-name-trigram-top", len(candidates))
-			return candidates, true
+		if !accentActive {
+			if candidates, ok := vol.bareExtensionMultiPathTopCandidates(pq); ok {
+				pq.Trace.setSource("path-bare-extension-multi-top", len(candidates))
+				return candidates, true
+			}
 		}
-		if candidates, ok := vol.limitedPathTermCandidates(pq); ok {
-			pq.Trace.setSource("path-term-limited", len(candidates))
-			return candidates, true
+		if !accentActive {
+			if candidates, ok := vol.selectiveNamePathTermCandidates(pq); ok {
+				pq.Trace.setSource("path-selective-name-term", len(candidates))
+				return candidates, true
+			}
 		}
-		if candidates, ok := vol.limitedDottedPathScanCandidates(pq); ok {
-			pq.Trace.setSource("path-dotted-limited-scan", len(candidates))
-			return candidates, true
+		if !accentActive {
+			if candidates, ok := vol.pathDirectoryTermTopCandidates(pq); ok {
+				pq.Trace.setSource("path-directory-term-top", len(candidates))
+				return candidates, true
+			}
+		}
+		if !accentActive {
+			if candidates, ok := vol.componentDirectTopCandidates(pq); ok {
+				pq.Trace.setSource("path-component-direct-top", len(candidates))
+				return candidates, true
+			}
+		}
+		if !accentActive {
+			if candidates, ok := vol.componentRootTopCandidates(pq); ok {
+				pq.Trace.setSource("path-component-root-top", len(candidates))
+				return candidates, true
+			}
+		}
+		if !accentActive {
+			if candidates, ok := vol.componentMultiTermTopCandidates(pq); ok {
+				pq.Trace.setSource("path-component-multi-top", len(candidates))
+				return candidates, true
+			}
+		}
+		if !accentActive {
+			if candidates, ok := vol.multiTermEmptyPathCandidates(pq); ok {
+				pq.Trace.setSource("path-multi-empty", len(candidates))
+				return candidates, true
+			}
+		}
+		if !accentActive {
+			if candidates, ok := vol.nameTrigramCandidates(pq); ok {
+				// See hiddenBlocksTruncation: never truncate before the verify
+				// loop can drop hidden ids.
+				if compactCandidateCanSkipEntryMatches(pq, true) && pq.Limit > 0 && !pq.hiddenBlocksTruncation() {
+					candidates = topCandidateIDsByRank(candidates, pq.Limit, vol.index, vol.rankForQuery(pq))
+				} else {
+					sortCandidateIDs(candidates, pq, vol.index, vol.rankForQuery(pq))
+				}
+				pq.Trace.setSource("path-component-trigram", len(candidates))
+				return candidates, true
+			}
+		}
+		if !accentActive {
+			if candidates, ok := vol.nameTrigramPathNameTopCandidates(pq); ok {
+				pq.Trace.setSource("path-name-trigram-top", len(candidates))
+				return candidates, true
+			}
+		}
+		if !accentActive {
+			if candidates, ok := vol.limitedPathTermCandidates(pq); ok {
+				pq.Trace.setSource("path-term-limited", len(candidates))
+				return candidates, true
+			}
+		}
+		if !accentActive {
+			if candidates, ok := vol.limitedDottedPathScanCandidates(pq); ok {
+				pq.Trace.setSource("path-dotted-limited-scan", len(candidates))
+				return candidates, true
+			}
 		}
 	} else {
-		if candidates, ok := vol.nameTrigramCandidates(pq); ok {
-			sortCandidateIDs(candidates, pq, vol.index, vol.rankForQuery(pq))
-			pq.Trace.setSource("name-trigram", len(candidates))
-			return candidates, true
+		if !vol.accentUnionActive(pq) {
+			if candidates, ok := vol.nameTrigramCandidates(pq); ok {
+				sortCandidateIDs(candidates, pq, vol.index, vol.rankForQuery(pq))
+				pq.Trace.setSource("name-trigram", len(candidates))
+				return candidates, true
+			}
 		}
 	}
 	if candidates, ok := vol.limitedSingleTermCandidates(pq); ok {
@@ -701,14 +1523,20 @@ func (vol *serviceVolumeIndex) nameTermCandidates(pq parsedQuery) ([]int, bool) 
 		}
 	}
 	if pq.MatchPath {
-		if candidates, ok := vol.nameTrigramCandidates(pq); ok {
-			if compactCandidateCanSkipEntryMatches(pq, true) && pq.Limit > 0 {
-				candidates = topCandidateIDsByRank(candidates, pq.Limit, vol.index, vol.rankForQuery(pq))
-			} else {
-				sortCandidateIDs(candidates, pq, vol.index, vol.rankForQuery(pq))
+		if !vol.accentUnionActive(pq) {
+			if candidates, ok := vol.nameTrigramCandidates(pq); ok {
+				// A truncated top-N here would underfill the page once the
+				// verify loop drops hidden ids; keep the complete rank order
+				// instead so later base matches backfill (see
+				// hiddenBlocksTruncation).
+				if compactCandidateCanSkipEntryMatches(pq, true) && pq.Limit > 0 && !pq.hiddenBlocksTruncation() {
+					candidates = topCandidateIDsByRank(candidates, pq.Limit, vol.index, vol.rankForQuery(pq))
+				} else {
+					sortCandidateIDs(candidates, pq, vol.index, vol.rankForQuery(pq))
+				}
+				pq.Trace.setSource("path-component-trigram", len(candidates))
+				return candidates, true
 			}
-			pq.Trace.setSource("path-component-trigram", len(candidates))
-			return candidates, true
 		}
 	}
 	if candidates, ok := vol.plannedCandidates(pq); ok {
@@ -716,16 +1544,18 @@ func (vol *serviceVolumeIndex) nameTermCandidates(pq parsedQuery) ([]int, bool) 
 		return candidates, true
 	}
 	if pq.MatchPath {
-		if candidates, ok := vol.componentTrigramCandidates(pq); ok {
-			pq.Trace.setSource("component-trigram", len(candidates))
-			return candidates, true
+		if !vol.accentUnionActive(pq) {
+			if candidates, ok := vol.componentTrigramCandidates(pq); ok {
+				pq.Trace.setSource("component-trigram", len(candidates))
+				return candidates, true
+			}
 		}
 	}
 	if candidates, ok := vol.underCandidates(pq); ok {
 		pq.Trace.setSource("under", len(candidates))
 		return candidates, true
 	}
-	if candidates, ok := vol.boundedScanCandidates(pq); ok {
+	if candidates, ok := vol.boundedScanSearchCandidates(pq); ok {
 		pq.Trace.setSource("bounded-scan", len(candidates))
 		return candidates, true
 	}
@@ -733,21 +1563,31 @@ func (vol *serviceVolumeIndex) nameTermCandidates(pq parsedQuery) ([]int, bool) 
 		pq.Trace.setSource("legacy-planner", len(candidates))
 		return candidates, true
 	}
-	if candidates, ok := vol.pathDirFilterCandidates(pq); ok {
-		pq.Trace.setSource("path-dir-filter", len(candidates))
-		return candidates, true
+	if !vol.accentUnionActive(pq) {
+		if candidates, ok := vol.pathDirFilterCandidates(pq); ok {
+			pq.Trace.setSource("path-dir-filter", len(candidates))
+			return candidates, true
+		}
 	}
 	if candidates, ok := vol.filterCandidates(pq); ok {
 		pq.Trace.setSource("filter", len(candidates))
 		return candidates, true
 	}
-	if candidates, ok := vol.pathRootLimitedCandidates(pq); ok {
-		pq.Trace.setSource("path-root-limited", len(candidates))
-		return candidates, true
+	// The lanes below propose from unfolded name bytes (component roots,
+	// exact dir/name IDs) and would miss accent matches; the posting
+	// intersection at the end of this function (with the accent union)
+	// answers those shapes instead on foldable indexes.
+	if !vol.accentUnionActive(pq) {
+		if candidates, ok := vol.pathRootLimitedCandidates(pq); ok {
+			pq.Trace.setSource("path-root-limited", len(candidates))
+			return candidates, true
+		}
 	}
-	if candidates, ok := vol.pathTermSubtreeCandidates(pq); ok {
-		pq.Trace.setSource("path-term-subtree", len(candidates))
-		return candidates, true
+	if !vol.accentUnionActive(pq) {
+		if candidates, ok := vol.pathTermSubtreeCandidates(pq); ok {
+			pq.Trace.setSource("path-term-subtree", len(candidates))
+			return candidates, true
+		}
 	}
 	if candidates, ok := vol.regexLiteralCandidates(pq); ok {
 		pq.Trace.setSource("regex-literal", len(candidates))
@@ -797,12 +1637,81 @@ func (vol *serviceVolumeIndex) nameTermCandidates(pq parsedQuery) ([]int, bool) 
 	return candidates, true
 }
 
+// sortCandidateIDsByScanOrder orders candidates in the bounded scan's walk
+// order: orderForQuery position, record order when the volume has no order.
+// A pure-regex query answered from trigram-prefiltered candidates verifies
+// that subset in the same relative order the historical full scan walked,
+// so the emitted matches (sets, order, counts, snippets) are identical
+// while most records are never touched. Record IDs the order does not know
+// (delta additions, or a short order) sort last by record ID, deterministically.
+func (vol *serviceVolumeIndex) sortCandidateIDsByScanOrder(ids []int, pq parsedQuery) {
+	order := vol.orderForQuery(pq)
+	if len(order) == 0 {
+		sort.Ints(ids)
+		return
+	}
+	recordCount := vol.index.compactRecordCount()
+	// Positions come from the resident rank array when it is the order's
+	// inverse for every candidate (the common case): a prefiltered set is
+	// small, while a position array costs 8 bytes per record per query
+	// (~190 MB on a 23.7M-entry index). Any candidate the rank does not place
+	// at its own order slot (a deleted or delta ID, or a volume whose rank
+	// and scan orders differ) falls back to the exact position array.
+	var rankOf func(id int) [2]int
+	if rank := vol.rankForQuery(pq); len(rank) == recordCount {
+		inverse := true
+		for _, id := range ids {
+			if id < 0 || id >= recordCount {
+				inverse = false
+				break
+			}
+			if r := int(rank[id]); r >= len(order) || int(order[r]) != id {
+				inverse = false
+				break
+			}
+		}
+		if inverse {
+			rankOf = func(id int) [2]int { return [2]int{0, int(rank[id])} }
+		}
+	}
+	if rankOf == nil {
+		pos := make([]int, recordCount)
+		for i := range pos {
+			pos[i] = -1
+		}
+		for p, id32 := range order {
+			if id := int(id32); id >= 0 && id < recordCount && pos[id] < 0 {
+				pos[id] = p
+			}
+		}
+		// An ID outside the order sorts after every ordered ID, by record ID.
+		rankOf = func(id int) [2]int {
+			if id >= 0 && id < recordCount && pos[id] >= 0 {
+				return [2]int{0, pos[id]}
+			}
+			return [2]int{1, id}
+		}
+	}
+	sort.SliceStable(ids, func(i, j int) bool {
+		ai, bj := rankOf(ids[i]), rankOf(ids[j])
+		if ai[0] != bj[0] {
+			return ai[0] < bj[0]
+		}
+		return ai[1] < bj[1]
+	})
+}
+
 func (vol *serviceVolumeIndex) overlayAwareNameTermCandidates(pq parsedQuery) ([]int, bool) {
 	candidates, ok := vol.nameTermCandidates(pq)
 	if !ok {
 		return nil, false
 	}
 	if len(candidates) == 0 {
+		// A content query with no candidate postings is a real empty answer;
+		// only fall back for the name lanes.
+		if queryHasPositiveContentLeaf(pq) {
+			return []int{}, true
+		}
 		return nil, false
 	}
 	return candidates, true

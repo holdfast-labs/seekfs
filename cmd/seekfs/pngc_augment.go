@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"time"
+	"unsafe"
 
 	"golang.org/x/sys/windows"
 )
@@ -357,8 +358,8 @@ func readRawSectionTable(path string, size int64) (rawSectionTable, error) {
 	if err := binary.Read(f, binary.LittleEndian, &header); err != nil {
 		return rawSectionTable{}, err
 	}
-	if header.Magic != indexMagic || header.Version != indexVersion {
-		return rawSectionTable{}, errors.New("source is not a v9 index")
+	if header.Magic != indexMagic || !indexVersionSupported(int(header.Version)) {
+		return rawSectionTable{}, errors.New("source is not a v9/v10 index")
 	}
 	var ptr [8]byte
 	if _, err := io.ReadFull(f, ptr[:]); err != nil {
@@ -449,7 +450,13 @@ func freeDiskBytes(path string) (uint64, error) {
 		return 0, err
 	}
 	for {
-		if _, err := os.Stat(path); err == nil {
+		if st, err := os.Stat(path); err == nil {
+			// GetDiskFreeSpaceEx takes a directory: an existing file (a
+			// published sidecar, say) anchors at its parent instead of
+			// failing, which callers read as unknown free space.
+			if !st.IsDir() {
+				path = filepath.Dir(path)
+			}
 			break
 		} else if !errors.Is(err, os.ErrNotExist) {
 			return 0, err
@@ -469,6 +476,80 @@ func freeDiskBytes(path string) (uint64, error) {
 		return 0, err
 	}
 	return free, nil
+}
+
+// memoryStatusEx mirrors Win32 MEMORYSTATUSEX: two DWORDs followed by seven
+// DWORDLONGs, 64 bytes total (package scope so tests can pin the size: a
+// wrong size makes GlobalMemoryStatusEx fail and every consumer silently
+// fall back).
+type memoryStatusEx struct {
+	length               uint32
+	memoryLoad           uint32
+	totalPhys            uint64
+	availPhys            uint64
+	totalPageFile        uint64
+	availPageFile        uint64
+	totalVirtual         uint64
+	availVirtual         uint64
+	availExtendedVirtual uint64
+}
+
+// totalRAMBytes reports total physical memory via kernel32's
+// GlobalMemoryStatusEx (x/sys has no wrapper for it in this version). Only
+// TotalPhys is read; an error means unknown.
+func totalRAMBytes() (uint64, error) {
+	proc := windows.NewLazySystemDLL("kernel32.dll").NewProc("GlobalMemoryStatusEx")
+	var st memoryStatusEx
+	// MEMORYSTATUSEX is 64 bytes (two DWORDs + seven DWORDLONGs); the
+	// length field must say so or the call fails. There is no padding
+	// between dwMemoryLoad and ullTotalPhys: 4+4 already aligns the
+	// 8-byte fields.
+	st.length = uint32(unsafe.Sizeof(st))
+	r1, _, _ := proc.Call(uintptr(unsafe.Pointer(&st)))
+	if r1 == 0 {
+		return 0, errors.New("GlobalMemoryStatusEx failed")
+	}
+	if st.totalPhys == 0 {
+		return 0, errors.New("no physical memory reported")
+	}
+	return st.totalPhys, nil
+}
+
+// totalDiskBytes reports the total capacity bytes of the volume holding path,
+// resolving through non-existent parents to the enclosing volume like
+// freeDiskBytes.
+func totalDiskBytes(path string) (uint64, error) {
+	path, err := filepath.Abs(path)
+	if err != nil {
+		return 0, err
+	}
+	for {
+		if st, err := os.Stat(path); err == nil {
+			// GetDiskFreeSpaceEx takes a directory: an existing file (a
+			// published sidecar, say) anchors at its parent instead of
+			// failing, which callers read as unknown free space.
+			if !st.IsDir() {
+				path = filepath.Dir(path)
+			}
+			break
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return 0, err
+		}
+		parent := filepath.Dir(path)
+		if parent == path {
+			break
+		}
+		path = parent
+	}
+	p, err := windows.UTF16PtrFromString(path)
+	if err != nil {
+		return 0, err
+	}
+	var total uint64
+	if err := windows.GetDiskFreeSpaceEx(p, nil, &total, nil); err != nil {
+		return 0, err
+	}
+	return total, nil
 }
 
 func closeMappedIndex(idx *Index) {

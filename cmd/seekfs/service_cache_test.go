@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -1083,4 +1084,32 @@ func syntheticServiceVolumeIndexForCacheTests() *serviceVolumeIndex {
 	vol.pathTermCache = make(map[string]postingCacheEntry)
 	vol.extCache = make(map[string]postingCacheEntry)
 	return vol
+}
+
+// Trigram name postings are cached as ID-sorted lists; the filename planner
+// rank-sorts its candidates in place, so handing out the cached slice let a
+// search reorder the cache and break later sorted intersections.
+func TestNameTrigramPostingCacheStaysSortedAfterSearch(t *testing.T) {
+	idx := randomCorpusIndex(59, randomCorpusParams{Records: 240})
+	vol := newServiceVolumeIndex("trigram-cache.gsi", idx)
+	vol.rebuildNameTrigramsLocked()
+	opts := queryOptions{Query: "md 020", Limit: 25}
+	want, err := searchCompactWithCache(idx, opts, false, vol.pathCache, vol.nameTermCandidates)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for key, entry := range vol.termCache {
+		if !sort.IntsAreSorted(entry.ids) {
+			t.Fatalf("cached posting %q reordered by search: %v", key, entry.ids)
+		}
+	}
+	negative := opts
+	negative.Query = "md 020 !no-such-term-xq9"
+	got, err := searchCompactWithCache(idx, negative, false, vol.pathCache, vol.nameTermCandidates)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !sameOrderedStrings(pathsOf(got), pathsOf(want)) {
+		t.Fatalf("negated miss changed results: %v, want %v", pathsOf(got), pathsOf(want))
+	}
 }

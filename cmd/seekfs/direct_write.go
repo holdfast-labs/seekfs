@@ -499,7 +499,7 @@ func buildDirect(ctx context.Context, opts directBuildOptions) (stats directBuil
 	stats.Records = recordCount
 	stats.SpoolBytes = spoolBytes
 	stats.FinalIDRule = "ascending-frn; duplicate-frn-rejected"
-	stats.SpoolSchema = "u64 frn,parent_frn; u32 mode; i64 size,mod_unix; u32 name_bytes,path_bytes; utf8 name,path"
+	stats.SpoolSchema = "u64 frn,parent_frn; u32 mode; i64 size,mod_unix; u32 name_bytes,path_bytes; u16 seq; utf8 name,path"
 	tokenPath := filepath.Join(opts.SpoolDir, "direct-name-table.tmp")
 	owned = append(owned, tokenPath)
 	t0 = time.Now()

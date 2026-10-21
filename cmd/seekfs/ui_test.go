@@ -530,3 +530,40 @@ func TestIsServiceTimeoutErrorMapping(t *testing.T) {
 		t.Fatal("missing-pipe error must not classify as a service timeout")
 	}
 }
+
+func TestUIResultCarriesContentSnippet(t *testing.T) {
+	got := uiResultFromJSON(jsonResult{Path: `C:\src\main.go`, Snippet: "func needle() {}"})
+	if got.Snippet != "func needle() {}" || got.Name != "main.go" {
+		t.Fatalf("uiResultFromJSON = %+v; want the snippet and name carried", got)
+	}
+}
+
+func TestUIFuzzyMessageNamesCorrection(t *testing.T) {
+	if got := uiFuzzyMessage(serviceResponse{FuzzyCorrection: "receive"}); got != "Showing results for receive" {
+		t.Fatalf("message = %q", got)
+	}
+	if got := uiFuzzyMessage(serviceResponse{Fuzzy: true}); got != "showing close matches" {
+		t.Fatalf("message = %q", got)
+	}
+	if got := uiFuzzyMessage(serviceResponse{}); got != "" {
+		t.Fatalf("message = %q; want empty", got)
+	}
+}
+
+func TestUIContentStatusFromHealth(t *testing.T) {
+	if uiContentStatusFrom(nil) != nil {
+		t.Fatal("no content health must yield no UI content status")
+	}
+	got := uiContentStatusFrom(&contentHealth{State: contentStateIndexing, BuildDone: 5, BuildTotal: 10, FoldError: "disk full", BuildPhase: contentBuildPhaseScanning})
+	if got.State != contentStateIndexing || got.BuildDone != 5 || got.BuildTotal != 10 || got.Error != "disk full" || got.BuildPhase != contentBuildPhaseScanning {
+		t.Fatalf("uiContentStatusFrom = %+v", got)
+	}
+	dropped := uiContentStatusFrom(&contentHealth{State: contentStateDegraded, ScopeDropped: 12345, ScopeDroppedBytes: 6789, BudgetBytes: 2 << 30})
+	if dropped.ScopeDropped != 12345 || dropped.ScopeDroppedBytes != 6789 || dropped.BudgetBytes != 2<<30 {
+		t.Fatalf("uiContentStatusFrom dropped = %+v", dropped)
+	}
+	reserved := uiContentStatusFrom(&contentHealth{State: contentStateDegraded, ScopeDropped: 12, ReserveBytes: 20 << 30})
+	if reserved.ScopeDropped != 12 || reserved.ReserveBytes != 20<<30 {
+		t.Fatalf("uiContentStatusFrom reserve = %+v", reserved)
+	}
+}

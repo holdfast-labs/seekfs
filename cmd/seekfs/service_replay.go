@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"golang.org/x/sys/windows"
@@ -10,6 +11,23 @@ import (
 	"strings"
 	"time"
 )
+
+// walkWatcherDebounce coalesces burst notifications (editor saves, build
+// outputs) before a walk-volume rebuild. A package var so tests can shorten
+// it; 50 ms is enough to merge a save burst while keeping a rename visible
+// in well under 100 ms plus the re-walk itself.
+var walkWatcherDebounce = 50 * time.Millisecond
+
+// walkWatcherMetaDebounce is the coalescing wait for metadata-only
+// notifications (writes, attribute touches: no name changed) — longer
+// than the name path so save bursts merge, short enough that size:/dm:
+// filters, sorts, and content re-extraction lag a single edit by well
+// under a second plus the re-walk. The refresh itself is still a full
+// re-walk: per-record Size/ModUnix feed filters, size/modified sorts
+// (load-built rank vectors), --recent, and the content walk reconcile
+// fingerprints together, and only a rebuild refreshes all of them.
+// Continuous churn serializes on walkMu regardless of this value.
+var walkWatcherMetaDebounce = 500 * time.Millisecond
 
 func validateUSNCheckpoint(vol *serviceVolumeIndex, journal usnJournalDataV0) error {
 	if vol.journalID != 0 && vol.journalID != journal.UsnJournalID {
@@ -155,6 +173,18 @@ func (s *goSearchService) rebuildWalkVolumeInPlace(vol *serviceVolumeIndex, reas
 	s.startBackgroundNameTrigramBuilds([]*serviceVolumeIndex{vol})
 	s.startBackgroundNameIdentityBuilds([]*serviceVolumeIndex{vol})
 	serviceLog("rebuilt walk index db=%s entries=%d reason=%s", vol.dbPath, loaded.entryCount(), reason)
+	// The rescan renumbered every record ID: the content resolver was rebound
+	// by the replace above, and the content diff must now follow — files the
+	// watcher noticed changed on disk are new/changed keys here. A rebind
+	// that joined nothing (roots changed) left content stale; reschedule so
+	// it re-attaches or rebuilds instead of sticking.
+	if vol.content != nil && vol.contentCoord != nil {
+		if vol.content.stateOf() == contentStateStale {
+			s.ensureContentBuild(vol)
+		} else {
+			s.contentReconcileWalkVolume(vol, true)
+		}
+	}
 	return nil
 }
 
@@ -223,6 +253,10 @@ func (s *goSearchService) rebuildVolumeInPlace(vol *serviceVolumeIndex) error {
 	s.startBackgroundNameTrigramBuilds([]*serviceVolumeIndex{vol})
 	s.startBackgroundNameIdentityBuilds([]*serviceVolumeIndex{vol})
 	serviceLog("rebuilt stale index volume=%s db=%s entries=%d", rebuilt.volume, rebuilt.dbPath, rebuilt.index.entryCount())
+	// WP1e/PB4: content must self-heal after a filename rebuild (a journal
+	// reset invalidated the FRN-keyed content index). Re-attach a still-valid
+	// sidecar, or schedule the background content rebuild.
+	s.featuresVolumeReady(vol)
 	return nil
 }
 
@@ -295,18 +329,86 @@ func (s *goSearchService) watchWalkRoot(vol *serviceVolumeIndex, root string) {
 				continue
 			}
 		}
-		reason := "watch-change"
-		if bytesReturned == 0 {
-			reason = "watch-overflow"
-		}
+		reason, debounce := walkRebuildPlan(buffer[:bytesReturned], bytesReturned == 0)
 		select {
 		case <-s.stop:
 			return
-		case <-time.After(250 * time.Millisecond):
+		case <-time.After(debounce):
 		}
 		if err := s.rebuildWalkVolumeInPlace(vol, reason); err != nil {
 			serviceLog("walk watcher rebuild error root=%s db=%s err=%v", root, vol.dbPath, err)
 		}
+	}
+}
+
+// walkNotifyClass is the verdict on one ReadDirectoryChangesW batch: what
+// the watcher must do about it.
+type walkNotifyClass int
+
+const (
+	// walkNotifyUnknown means the buffer could not be proven to be
+	// metadata-only (empty batch, truncation, bad offsets, unknown
+	// actions). It fails SAFE: the caller rebuilds, exactly as if a name
+	// had changed.
+	walkNotifyUnknown walkNotifyClass = iota
+	// walkNotifyName means at least one entry adds, removes, or renames.
+	walkNotifyName
+	// walkNotifyMeta means every entry is metadata-only (modified:
+	// writes, attribute or timestamp touches) with no name change.
+	walkNotifyMeta
+)
+
+// walkClassifyNotify inspects a ReadDirectoryChangesW buffer and reports
+// whether it carries a name change. Each entry is a
+// FILE_NOTIFY_INFORMATION record: NextEntryOffset (u32), Action (u32),
+// FileNameLength (u32), then the UTF-16 name. Only the action field is
+// inspected, so malformed names cannot mislead the verdict; any framing
+// doubt reports Unknown, and Unknown rebuilds.
+func walkClassifyNotify(buf []byte) walkNotifyClass {
+	off := 0
+	for {
+		if len(buf)-off < 12 {
+			return walkNotifyUnknown
+		}
+		next := int(binary.LittleEndian.Uint32(buf[off:]))
+		action := binary.LittleEndian.Uint32(buf[off+4:])
+		switch action {
+		case 1, 2, 4, 5:
+			return walkNotifyName
+		case 3:
+			// Modified: keep scanning for a name action later in the batch.
+		default:
+			// Not a documented action (0, or a future addition): fail
+			// safe — a rename must never be mistaken for a write.
+			return walkNotifyUnknown
+		}
+		if next == 0 {
+			return walkNotifyMeta
+		}
+		if next < 12 || off+next >= len(buf) {
+			return walkNotifyUnknown
+		}
+		off += next
+	}
+}
+
+// walkRebuildPlan maps one watcher batch to its rebuild reason and
+// debounce. Name changes and anything doubtful (overflow, garbled
+// framing) rebuild fast; metadata-only batches rebuild on the longer
+// meta debounce so write bursts coalesce — the refresh itself is still
+// a full re-walk either way, because Size/ModUnix feed filters, sorts,
+// recency, and the content reconcile fingerprints together.
+func walkRebuildPlan(batch []byte, overflow bool) (string, time.Duration) {
+	if overflow {
+		return "watch-overflow", walkWatcherDebounce
+	}
+	switch walkClassifyNotify(batch) {
+	case walkNotifyName:
+		return "watch-change", walkWatcherDebounce
+	case walkNotifyMeta:
+		return "watch-meta", walkWatcherMetaDebounce
+	default:
+		return "watch-unknown", walkWatcherDebounce
 	}
 }
 
@@ -339,8 +441,31 @@ func (vol *serviceVolumeIndex) applyUSNChanges(changes []usnChange) {
 			lastChange[change.FRN] = i
 		}
 	}
+	// Changes that actually apply to the indexed set: own-artifact churn is
+	// consumed below and must not reach the content coordinator either, or the
+	// content store would feed its own writes back. Built only when content is
+	// enabled so the default replay path pays nothing.
+	var applied []usnChange
+	if vol.contentCoord != nil || vol.featureFeed != nil {
+		applied = make([]usnChange, 0, len(changes))
+	}
+	// Snapshot watermark floor: a fresh scan (MFT or USN enum) records
+	// idx.Checkpoint = journal.NextUsn, so every journal record below
+	// baseCheckpoint is already reflected in the base. The record AT it is the
+	// first post-scan change (NextUsn is the next record's USN) and must apply;
+	// after a fold the checkpoint is the last applied USN, so re-applying that
+	// one is the historical, harmless behavior. The index keys records by the 48-bit MFT
+	// record number only (fileReferenceRecordNumber), so a DELETE or RENAME_OLD
+	// for a *previous occupant* of a reused record number is indistinguishable
+	// from one for the current occupant; re-applying it after a rescan would
+	// tombstone the live record and cascade its whole subtree. Refuse changes
+	// below the floor instead of relying on the batch/head USN alone.
+	floor := vol.baseCheckpoint
 	for i, change := range changes {
 		if change.FRN == 0 {
+			continue
+		}
+		if change.USN > 0 && floor > 0 && change.USN < floor {
 			continue
 		}
 		// Changes inside directories that hold seekfs's own artifacts (the
@@ -357,7 +482,29 @@ func (vol *serviceVolumeIndex) applyUSNChanges(changes []usnChange) {
 			}
 			continue
 		}
-		vol.recordOverlayChange(change, i == lastChange[change.FRN] && change.Reason&usnReasonNeedsInfoRefresh != 0)
+		// Identity check, independent of the watermark: a nonzero known sequence
+		// that differs from the event's means a different occupant of the reused
+		// MFT record. Compare by inequality because NTFS sequences wrap at 16
+		// bits. A delayed delete/rename-old/data/info event for the old occupant
+		// is consumed and ignored; a create/rename-new is the replacement, so
+		// forget the old record and its subtree before applying the new one.
+		// Either sequence being 0 means unknown, which keeps today's behavior.
+		replaced := false
+		if seqDiffers(vol.knownFRNSeq(change.FRN), change.Seq) {
+			if !seqReplacementReason(change.Reason) {
+				if change.USN > vol.checkpoint {
+					vol.checkpoint = change.USN
+				}
+				continue
+			}
+			vol.forgetReusedOccupant(change.FRN)
+			replaced = true
+		}
+		refresh := i == lastChange[change.FRN] && change.Reason&usnReasonNeedsInfoRefresh != 0
+		vol.recordOverlayChange(change, refresh || replaced, replaced)
+		if vol.contentCoord != nil || vol.featureFeed != nil {
+			applied = append(applied, change)
+		}
 		if change.USN > vol.checkpoint {
 			vol.checkpoint = change.USN
 		}
@@ -366,6 +513,10 @@ func (vol *serviceVolumeIndex) applyUSNChanges(changes []usnChange) {
 	vol.dirty = true
 	vol.publishDirSizeDelta()
 	vol.publishSnapshot()
+	// Content search consumes the same applied change stream as the record
+	// overlay (own-artifact churn already excluded). Nil unless the feature is
+	// enabled, so the default path is untouched.
+	vol.observeFeatureChanges(applied)
 }
 
 // filterOwnedReplayChanges drops changes that fall inside directories holding
@@ -473,7 +624,56 @@ func (vol *serviceVolumeIndex) retireOwnedDir(frn uint64) {
 	vol.ownedDirMu.Unlock()
 }
 
-func (vol *serviceVolumeIndex) recordOverlayChange(change usnChange, refreshInfo bool) {
+// seqDiffers reports whether two known NTFS sequence values identify different
+// occupants. A 0 on either side means unknown and never counts as a mismatch.
+// The comparison is inequality, not ordering: the 16-bit sequence wraps.
+func seqDiffers(a, b uint16) bool {
+	return a != 0 && b != 0 && a != b
+}
+
+// seqReplacementReason reports whether an event installs a new occupant of a
+// record rather than referring to the current one.
+func seqReplacementReason(reason uint32) bool {
+	return reason&(usnReasonFileCreate|usnReasonRenameNew) != 0
+}
+
+// knownFRNSeq returns the current sequence for a file reference: the newest
+// overlay slot wins over the base record. 0 means unknown.
+func (vol *serviceVolumeIndex) knownFRNSeq(frn uint64) uint16 {
+	if vol == nil || frn == 0 {
+		return 0
+	}
+	if vol.overlay != nil {
+		if slot, ok := vol.overlay.byFRN[frn]; ok && slot >= 0 && int(slot) < len(vol.overlay.records) {
+			if s := vol.overlay.records[slot].Seq; s != 0 {
+				return s
+			}
+		}
+	}
+	if id, ok := vol.idForFRN(frn); ok {
+		return vol.index.recordSeq(id)
+	}
+	return 0
+}
+
+// forgetReusedOccupant removes the previous occupant's whole identity before a
+// replacement is applied: its base subtree is tombstoned and overlay-only
+// descendants are cascade-deleted. The live overlay slot for frn itself is left
+// alone; the replacement appends a newer one.
+func (vol *serviceVolumeIndex) forgetReusedOccupant(frn uint64) {
+	if vol == nil || frn == 0 {
+		return
+	}
+	if vol.overlay == nil {
+		vol.overlay = newOverlaySegment()
+	}
+	for _, baseID := range vol.baseIDsForFRN(frn) {
+		vol.tombstoneBaseSubtree(baseID)
+	}
+	vol.cascadeOverlayDelete(frn)
+}
+
+func (vol *serviceVolumeIndex) recordOverlayChange(change usnChange, refreshInfo bool, replaced bool) {
 	if vol == nil {
 		return
 	}
@@ -489,7 +689,7 @@ func (vol *serviceVolumeIndex) recordOverlayChange(change usnChange, refreshInfo
 	beforeSize := vol.effectiveAccountingSize(change.FRN)
 	oldParent := vol.effectiveParentFRN(change.FRN)
 	if change.Reason&usnReasonFileDelete != 0 {
-		rec := CompactRecord{FRN: change.FRN, ParentFRN: change.ParentFRN, Name: change.Name, Deleted: true}
+		rec := CompactRecord{FRN: change.FRN, ParentFRN: change.ParentFRN, Name: change.Name, Deleted: true, Seq: change.Seq}
 		// Only directories can have descendants, so the O(overlay) cascade
 		// below is skipped when the deleted FRN is PROVABLY a plain file:
 		// some record for it exists (base or prior live overlay slot) and
@@ -500,8 +700,15 @@ func (vol *serviceVolumeIndex) recordOverlayChange(change usnChange, refreshInfo
 		// correctness wins. This keeps mass file-delete churn (e.g. a
 		// node_modules removal WITH per-child USN records) at O(deletes)
 		// on the apply path instead of O(deletes x overlay).
-		baseID, hasBase := vol.idForFRN(change.FRN)
-		provenFile := hasBase && vol.index.compactRecord(baseID).Mode&uint32(os.ModeDir) == 0
+		baseIDs := vol.baseIDsForFRN(change.FRN)
+		hasBase := len(baseIDs) > 0
+		provenFile := hasBase
+		for _, baseID := range baseIDs {
+			if vol.index.compactRecord(baseID).Mode&uint32(os.ModeDir) != 0 {
+				provenFile = false
+				break
+			}
+		}
 		if slot, ok := overlay.byFRN[change.FRN]; ok && slot >= 0 && int(slot) < len(overlay.records) {
 			prev := overlay.records[slot]
 			if rec.Name == "" {
@@ -521,7 +728,7 @@ func (vol *serviceVolumeIndex) recordOverlayChange(change usnChange, refreshInfo
 		slot := int32(len(overlay.records))
 		overlay.byFRN[change.FRN] = slot
 		overlay.records = append(overlay.records, rec)
-		if hasBase {
+		for _, baseID := range baseIDs {
 			vol.tombstoneBaseSubtree(baseID)
 		}
 		if !provenFile {
@@ -541,22 +748,30 @@ func (vol *serviceVolumeIndex) recordOverlayChange(change usnChange, refreshInfo
 		Parent:    -1,
 		Name:      change.Name,
 		Mode:      modeFromAttrs(change.Attr),
+		Seq:       change.Seq,
 	}
 	vol.index.CompactAttrs = true
-	if baseID, ok := vol.idForFRN(change.FRN); ok {
-		overlay.shadowed.add(int32(baseID))
-		base := vol.index.compactRecord(baseID)
-		if rec.Name == "" {
-			rec.Name = base.Name
+	if baseIDs := vol.baseIDsForFRN(change.FRN); len(baseIDs) > 0 {
+		for _, baseID := range baseIDs {
+			overlay.shadowed.add(int32(baseID))
 		}
-		if rec.ParentFRN == 0 {
-			rec.ParentFRN = base.ParentFRN
+		// A replacement must not inherit the previous occupant's name, parent,
+		// size, or timestamp. Only fall back to base metadata for an in-place
+		// update of the same occupant.
+		if !replaced {
+			base := vol.index.compactRecord(baseIDs[0])
+			if rec.Name == "" {
+				rec.Name = base.Name
+			}
+			if rec.ParentFRN == 0 {
+				rec.ParentFRN = base.ParentFRN
+			}
+			// A USN record carries neither size nor timestamp.  Preserve the base
+			// values so a rename or modify does not report a zero size; the live
+			// refresh below replaces them when the change affects file data.
+			rec.Size = base.Size
+			rec.ModUnix = base.ModUnix
 		}
-		// A USN record carries neither size nor timestamp.  Preserve the base
-		// values so a rename or modify does not report a zero size; the live
-		// refresh below replaces them when the change affects file data.
-		rec.Size = base.Size
-		rec.ModUnix = base.ModUnix
 	}
 	slot := int32(len(overlay.records))
 	overlay.byFRN[change.FRN] = slot

@@ -24,7 +24,7 @@ func (vol *serviceVolumeIndex) extensionShapedPathTermCandidates(pq parsedQuery)
 	if vol == nil || vol.index == nil || !pq.MatchPath || pq.CaseSensitive ||
 		pq.Under != "" || len(pq.Dirs) > 0 || len(pq.Regexps) > 0 ||
 		len(pq.OrGroups) > 0 || len(pq.NotGroups) > 0 ||
-		pq.Type != "" || pq.HasModAfter || pq.Exists ||
+		pq.Type != "" || pq.HasModAfter || pq.lateVerified() ||
 		len(pq.Exts) > 0 || len(pq.Globs) > 0 ||
 		len(pq.SizeFilters) > 0 || len(pq.DateFilters) > 0 || len(pq.AttrFilters) > 0 ||
 		pq.CWDBias != "" || pq.RootBias != "" ||
@@ -105,12 +105,12 @@ func (vol *serviceVolumeIndex) extensionShapedPathTopCandidates(pq parsedQuery) 
 	if vol == nil || vol.index == nil || !pq.MatchPath || pq.CountOnly || pq.Limit <= 0 ||
 		pq.CaseSensitive || pq.Under != "" || len(pq.Dirs) > 0 || len(pq.Regexps) > 0 ||
 		len(pq.OrGroups) > 0 || len(pq.NotGroups) > 0 ||
-		pq.Type != "" || pq.HasModAfter || pq.Exists ||
+		pq.Type != "" || pq.HasModAfter || pq.lateVerified() ||
 		pq.SortColumn != "" ||
 		len(pq.Exts) > 0 || len(pq.Globs) > 0 ||
 		len(pq.SizeFilters) > 0 || len(pq.DateFilters) > 0 || len(pq.AttrFilters) > 0 ||
 		pq.CWDBias != "" || pq.RootBias != "" ||
-		countNonVolumeTerms(pq.Terms) != 1 {
+		countNonVolumeTerms(pq.Terms) != 1 || pq.hiddenBlocksTruncation() {
 		return nil, false
 	}
 	term := ""
@@ -192,12 +192,12 @@ func (vol *serviceVolumeIndex) bareExtensionMultiPathTopCandidates(pq parsedQuer
 	if vol == nil || vol.index == nil || !pq.MatchPath || pq.CountOnly || pq.Limit <= 0 ||
 		pq.CaseSensitive || pq.Under != "" || len(pq.Dirs) > 0 || len(pq.Regexps) > 0 ||
 		len(pq.OrGroups) > 0 || len(pq.NotGroups) > 0 ||
-		pq.Type != "" || pq.HasModAfter || pq.Exists ||
+		pq.Type != "" || pq.HasModAfter || pq.lateVerified() ||
 		pq.SortColumn != "" ||
 		len(pq.Exts) > 0 || len(pq.Globs) > 0 ||
 		len(pq.SizeFilters) > 0 || len(pq.DateFilters) > 0 || len(pq.AttrFilters) > 0 ||
 		pq.CWDBias != "" || pq.RootBias != "" ||
-		countNonVolumeTerms(pq.Terms) < 2 {
+		countNonVolumeTerms(pq.Terms) < 2 || pq.hiddenBlocksTruncation() {
 		return nil, false
 	}
 	hasAnchor := false
@@ -482,8 +482,14 @@ func (vol *serviceVolumeIndex) pathPlanTermPostingLimited(term string, pq parsed
 	if vol == nil || vol.index == nil || pq.CountOnly || pq.Limit <= 0 || !pq.MatchPath ||
 		pq.Under != "" || pq.Type != "" || pq.CaseSensitive || pq.CWDBias != "" || pq.RootBias != "" ||
 		len(pq.Exts) > 0 || len(pq.Dirs) > 0 || len(pq.Globs) > 0 || len(pq.Regexps) > 0 ||
-		len(pq.OrGroups) > 0 || len(pq.NotGroups) > 0 || pq.HasModAfter || pq.Exists ||
+		len(pq.OrGroups) > 0 || len(pq.NotGroups) > 0 || pq.HasModAfter || pq.lateVerified() ||
 		countNonVolumeTerms(pq.Terms) != 1 || term == "" || strings.ContainsAny(term, `\/*?[]:`) {
+		return nil, false
+	}
+	if vol.pathTermSatisfiedByVolume(term) {
+		// The volume prefix alone satisfies the term, so name/subtree
+		// sources below are incomplete by construction. Decline so the
+		// verified scan decides.
 		return nil, false
 	}
 	roots := vol.pathTermRootIDs(term)

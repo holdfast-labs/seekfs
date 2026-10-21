@@ -46,6 +46,70 @@ db_paths = ["F:\\seekfs_c.gsi", "F:\\seekfs_f.gsi"]
 This parser intentionally supports only the simple string, integer, and string
 array forms used by `seekfs`.
 
+## Optional features
+
+Use the plugin CLI to select and configure optional features:
+
+```powershell
+seekfs plugin list
+seekfs plugin add content
+seekfs plugin doctor content --wait
+seekfs plugin config content --root F:\work --git=false
+```
+
+Plugin settings are written to `plugin.toml` beside the service's `seekfs.toml`;
+the plugin CLI leaves core config intact and applies changes live. Legacy
+`[features.<name>]` and `[content]` settings remain supported. Other compatible
+executables can be registered with `plugin add NAME --command <absolute-path>`.
+See [FEATURES.md](FEATURES.md) for configuration,
+query syntax, limits and the companion protocol. `seekfs loaded --json` reports
+feature health independently of filename-search health.
+
+## Content scope
+
+Content search is on by default. In `auto` mode the service-owned content
+build indexes, in priority order, detected Git worktrees, configured roots,
+known folders (Documents, Desktop, Downloads), and finally the rest of the
+volume, until the disk reserve or an explicit budget stops it. Excludes, Git
+ignore rules and the built-in dependency/cache/build-output/binary skips still
+apply. These `[content]` keys tune it
+(`[content."E:"]` overrides one volume):
+
+```toml
+[content]
+mode = "auto"            # auto | explicit | off
+roots = ["E:\\work"]
+exclude = ["E:\\work\\scratch"]
+exts = [".go", ".md"]    # optional verbatim allowlist; unset means sniff
+git = true               # follow worktree .gitignore rules
+system_excludes = true
+budget_bytes = 1073741824  # explicit cap on the final index size (projected)
+```
+
+File selection is ripgrep-style by default: every file the scope admits is
+opened and its head sniffed (NUL in the first 8 KiB means binary, like
+ripgrep; BOM/UTF-16 text is still indexed). Only known-binary extensions
+(images, archives, media, objects, fonts, legacy OLE documents) are rejected
+without opening. Set `exts` to opt back into a verbatim extension allowlist.
+Files that sniff binary are tallied as `binary` in the `.gsx` policy and in
+`loaded --json` — expected rejections, never drops.
+
+There is no default `budget_bytes`: the build indexes everything selected
+and stops only when the build's projected peak disk use (the compressed text
+spool plus the index) would push the sidecar's volume below a free-space
+reserve of 10 GiB, shared by selection and the write-time
+guard, monotonic (allowance 0 at or below the reserve, with drops counted).
+Only an explicit value joins the sidecar
+identity. Large corpora build as folder shards (past 64 MiB of text), each
+capped at the 4 GiB per-file sidecar cap, so indexing everything stays
+memory-bounded and safe. Environment overrides are
+`SEEKFS_CONTENT_SCOPE`, `SEEKFS_CONTENT_ROOTS`,
+`SEEKFS_CONTENT_EXCLUDE`, and `SEEKFS_CONTENT_BUDGET_BYTES`. When a limit
+truncates a build, health reports the exact dropped files/bytes and the
+enforced limit (`scope_dropped`, `scope_dropped_bytes`, plus `budget_bytes`
+or `reserve_bytes` in `loaded --json`); raise `budget_bytes` to index the
+rest, or free disk space past the reserve.
+
 ## Editing Config
 
 Use `seekfs config` so agents and users do not need to locate the file manually:
@@ -58,6 +122,14 @@ Use `seekfs config` so agents and users do not need to locate the file manually:
 .\seekfs.exe config set dbs = '["F:\\seekfs_c.gsi", "F:\\seekfs_f.gsi"]'
 .\seekfs.exe config get dbs
 ```
+
+## Desktop app settings
+
+The desktop app reads and changes the service's volume and content settings
+over the service pipe (CLI: `seekfs settings get`, `seekfs settings set --json
+<file>`). The same `seekfs.toml` and `plugin.toml` files are used, and changes
+apply live. See [SETTINGS_API.md](SETTINGS_API.md) for the request and response
+contract.
 
 ## Build tuning (name trigrams)
 
@@ -74,6 +146,19 @@ exist for low-memory or unusual environments; the defaults are fine otherwise.
 | `SEEKFS_GRAM_MERGE_WORKERS` | Parallel merge workers | `GOMAXPROCS`, capped at 8 |
 | `SEEKFS_GRAM_MERGE_FANIN` | Maximum runs merged per pass (minimum 2) | `32` |
 
+## Build tuning (content)
+
+Content builds scale with the machine when idle and yield when it is not:
+extraction runs on `NumCPU` workers (capped at 16), dropping to 1 while the
+user is actively querying or the machine is on battery; tokenize, run-sort
+and shard assembly parallelize under the same adaptive count. These
+environment variables exist for unusual environments; the defaults are fine
+otherwise.
+
+| Variable | Meaning | Default |
+| --- | --- | --- |
+| `SEEKFS_CONTENT_IOPRIORITY` | `low` always opens content files with the Low disk-priority hint; any other value never does; unset means adaptive (Low only while the user is active or on battery, normal priority for an idle build) | adaptive |
+
 ## Runtime tuning (service)
 
 These knobs tune the resident service and query engine. Leave them unset unless
@@ -86,7 +171,7 @@ only accept the literal `1`.
 
 | Variable | Meaning | Default |
 | --- | --- | --- |
-| `SEEKFS_MEMORY_MODE` | `lowmem` (aliases `mmap`, `low-memory`) keeps indexes memory-mapped and drops the heaviest resident view; empty keeps everything resident | empty |
+| `SEEKFS_MEMORY_MODE` | `lowmem` (aliases `mmap`, `low-memory`) keeps indexes memory-mapped and drops the heaviest resident view; the `service` subcommand defaults to `lowmem` when unset/empty, other commands keep everything resident; set `resident` to force resident mode | empty (= `lowmem` for `service`) |
 | `SEEKFS_NAME_MEMO` | `0`, `false`, `no`, or `off` disables distinct-name query memoization and deferred rank materialization; low-memory mode also disables it | enabled |
 | `SEEKFS_GO_MEM_LIMIT_MB` | Go runtime soft memory limit, in MiB | runtime default |
 | `SEEKFS_IDLE_RELEASE_SECONDS` | Idle time before the service runs a GC and returns unused memory to the OS | `900` |
@@ -122,6 +207,7 @@ for `SEEKFS_SUBTREE_INTERVALS` and `SEEKFS_NAME_ORDER` flip off, while
 | `SEEKFS_NAME_TRIGRAM_MAX_RECORDS` | Record cap above which name trigrams are not built at startup; ignored in low-memory mode or when `SEEKFS_NAME_TRIGRAMS` is set explicitly | `20000000` |
 | `SEEKFS_SELF_NAME_GRAMS` | Selective/complete name gram sections for filename queries | on |
 | `SEEKFS_GLOBAL_PLANNER` | Force the global multi-volume planner | off (the `ui` launcher sets `1`) |
+| `SEEKFS_CONTENT_GLOBAL_LANE` | Compound content + selective-filename lane (`content:` plus `ext:`/`dir:`/`under:` and friends): drives the filename side and verifies content inline instead of materializing the content candidate superset | on (`0` forces the per-volume content path) |
 
 ### Persistence diagnostics
 

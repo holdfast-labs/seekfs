@@ -25,13 +25,13 @@ func readIndexWithReaderAt(r io.Reader, ra io.ReaderAt, size int64) (*Index, err
 	}
 	sectionTableOffset := uint64(0)
 	if header.Magic != indexMagic {
-		return nil, errors.New("unsupported index format: only the v9 index format is supported")
+		return nil, errors.New("unsupported index format: only the v9/v10 index formats are supported")
 	}
 	if err := binary.Read(r, binary.LittleEndian, &sectionTableOffset); err != nil {
 		return nil, err
 	}
-	if header.Version != indexVersion {
-		return nil, fmt.Errorf("unsupported index version %d: only v9 indexes are supported", header.Version)
+	if !indexVersionSupported(int(header.Version)) {
+		return nil, fmt.Errorf("unsupported index version %d: only v9/v10 indexes are supported", header.Version)
 	}
 	if header.EntryCount > uint64(^uint(0)>>1) || header.RootCount > uint64(^uint(0)>>1) {
 		return nil, errors.New("index too large")
@@ -132,6 +132,13 @@ func readIndexWithReaderAt(r io.Reader, ra io.ReaderAt, size int64) (*Index, err
 		}
 		if sectionTableOffset != 0 {
 			idx.Derived = readDerivedSectionsFromReaderAt(ra, size, sectionTableOffset, int(header.EntryCount))
+		}
+		// A v10 index persists the NTFS sequence per record in the SEQN
+		// section; a v9 index has none and every record's Seq stays 0.
+		if seqs := idx.Derived.FRNSeq; len(seqs) == len(idx.Records) {
+			for i := range seqs {
+				idx.Records[i].Seq = seqs[i]
+			}
 		}
 		return idx, nil
 	}
@@ -871,6 +878,84 @@ func populatePersistenceFRNs(vol *serviceVolumeIndex, idx *Index) {
 	sortFRNIndexEntries(vol.frns, vol.frnRecordIDs)
 }
 
+// buildPersistenceSeqs returns the per-record-id NTFS sequence column, or nil
+// when no record carries a sequence (walk sources and v9-upgraded indexes), so
+// the SEQN section is never written empty. A persisted FRNSeq column is
+// authoritative; otherwise the in-memory records are scanned.
+func buildPersistenceSeqs(idx *Index) []uint16 {
+	if idx == nil || !idx.Compact {
+		return nil
+	}
+	recordCount := idx.compactRecordCount()
+	if recordCount == 0 {
+		return nil
+	}
+	if seqs := idx.Derived.FRNSeq; len(seqs) == recordCount {
+		for _, s := range seqs {
+			if s != 0 {
+				return seqs
+			}
+		}
+		return nil
+	}
+	seqs := make([]uint16, recordCount)
+	any := false
+	for id := 0; id < recordCount; id++ {
+		if s := idx.compactRecord(id).Seq; s != 0 {
+			seqs[id] = s
+			any = true
+		}
+	}
+	if !any {
+		return nil
+	}
+	return seqs
+}
+
+// recordSeq returns the NTFS sequence for a base record id. The persisted SEQN
+// column wins (it is the only copy in low-memory/mmapped mode); otherwise the
+// in-memory record carries it. 0 means unknown.
+func (idx *Index) recordSeq(id int) uint16 {
+	if idx == nil || id < 0 {
+		return 0
+	}
+	if id < len(idx.Derived.FRNSeq) {
+		if s := idx.Derived.FRNSeq[id]; s != 0 {
+			return s
+		}
+	}
+	if id < len(idx.Records) {
+		return idx.Records[id].Seq
+	}
+	return 0
+}
+
+// seqColumn returns the per-record-id sequence column for joins, or nil when no
+// record carries one (walk sources and v9-upgraded indexes).
+func (idx *Index) seqColumn() []uint16 {
+	if idx == nil {
+		return nil
+	}
+	if len(idx.Derived.FRNSeq) > 0 {
+		return idx.Derived.FRNSeq
+	}
+	if len(idx.Records) == 0 {
+		return nil
+	}
+	seqs := make([]uint16, len(idx.Records))
+	any := false
+	for i := range idx.Records {
+		if idx.Records[i].Seq != 0 {
+			seqs[i] = idx.Records[i].Seq
+			any = true
+		}
+	}
+	if !any {
+		return nil
+	}
+	return seqs
+}
+
 func buildDerivedSectionBlobs(idx *Index, nameTokens []string) []indexSectionBlob {
 	out := make([]indexSectionBlob, 0, 16)
 	_ = forEachDerivedSection(idx, nameTokens, func(section indexSectionBlob) error {
@@ -908,7 +993,11 @@ func forEachDerivedSection(idx *Index, nameTokens []string, emit func(indexSecti
 	}
 	vol.queryIndex.nameOrder, vol.queryIndex.nameRank = nameOrder, nameRank
 	persistTrace("name-rank-ready")
-	if err := emitSection(indexSectionRANK, encodeUint32Section(nameOrder, nameRank)); err != nil {
+	// Rank sections persist the order alone; the rank-by-id vector is the
+	// exact inverse and is rebuilt at load (see decodeRankSection), halving
+	// the six rank sections. The in-memory rank stays live for the posting
+	// bounds built below.
+	if err := emitSection(indexSectionRANK, encodeUint32Section(nameOrder)); err != nil {
 		return err
 	}
 	vol.queryIndex.nameOrder = nil
@@ -931,7 +1020,7 @@ func forEachDerivedSection(idx *Index, nameTokens []string, emit func(indexSecti
 		vol.queryIndex.sizeOrder, vol.queryIndex.sizeRank = order, rank
 		sizeRank = rank
 		persistTrace("size-rank-ready")
-		if err := emitSection(indexSectionSRNK, encodeUint32Section(order, rank)); err != nil {
+		if err := emitSection(indexSectionSRNK, encodeUint32Section(order)); err != nil {
 			return err
 		}
 		vol.queryIndex.sizeOrder = nil
@@ -945,7 +1034,7 @@ func forEachDerivedSection(idx *Index, nameTokens []string, emit func(indexSecti
 		vol.queryIndex.modOrder, vol.queryIndex.modRank = order, rank
 		modRank = rank
 		persistTrace("modified-rank-ready")
-		if err := emitSection(indexSectionMRNK, encodeUint32Section(order, rank)); err != nil {
+		if err := emitSection(indexSectionMRNK, encodeUint32Section(order)); err != nil {
 			return err
 		}
 		vol.queryIndex.modOrder = nil
@@ -959,7 +1048,7 @@ func forEachDerivedSection(idx *Index, nameTokens []string, emit func(indexSecti
 		vol.queryIndex.extOrder, vol.queryIndex.extRank = order, rank
 		extRank = rank
 		persistTrace("extension-rank-ready")
-		if err := emitSection(indexSectionERNK, encodeUint32Section(order, rank)); err != nil {
+		if err := emitSection(indexSectionERNK, encodeUint32Section(order)); err != nil {
 			return err
 		}
 		vol.queryIndex.extOrder = nil
@@ -972,7 +1061,7 @@ func forEachDerivedSection(idx *Index, nameTokens []string, emit func(indexSecti
 		vol.queryIndex.typeOrder, vol.queryIndex.typeRank = order, rank
 		typeRank = rank
 		persistTrace("type-rank-ready")
-		if err := emitSection(indexSectionTRNK, encodeUint32Section(order, rank)); err != nil {
+		if err := emitSection(indexSectionTRNK, encodeUint32Section(order)); err != nil {
 			return err
 		}
 		vol.queryIndex.typeOrder = nil
@@ -985,7 +1074,7 @@ func forEachDerivedSection(idx *Index, nameTokens []string, emit func(indexSecti
 		vol.queryIndex.pathOrder, vol.queryIndex.pathRank = order, rank
 		pathRank = rank
 		persistTrace("path-rank-ready")
-		if err := emitSection(indexSectionPRNK, encodeUint32Section(order, rank)); err != nil {
+		if err := emitSection(indexSectionPRNK, encodeUint32Section(order)); err != nil {
 			return err
 		}
 		vol.queryIndex.pathOrder = nil
@@ -1041,8 +1130,11 @@ func forEachDerivedSection(idx *Index, nameTokens []string, emit func(indexSecti
 	if err := emitSection(indexSectionCHLD, encodeUint32Section(vol.childOffsets, vol.childIDs, vol.rootIDs)); err != nil {
 		return err
 	}
+	// The subtree start array is the exact inverse of the subtree order
+	// and is rebuilt at load (see decodeDerivedSection); persisting it
+	// would store the same permutation twice.
 	if err := emitSubtree(
-		vol.subtreeStart, vol.subtreeEnd, vol.subtreeOrder,
+		vol.subtreeEnd, vol.subtreeOrder,
 		vol.subtreeSizeRank, vol.subtreeModRank, vol.subtreeExtRank,
 		vol.subtreeTypeRank, vol.subtreePathRank,
 	); err != nil {
@@ -1058,6 +1150,11 @@ func forEachDerivedSection(idx *Index, nameTokens []string, emit func(indexSecti
 		return err
 	}
 	vol.frns, vol.frnRecordIDs = nil, nil
+	if seqs := buildPersistenceSeqs(idx); len(seqs) > 0 {
+		if err := emitSection(indexSectionSEQN, encodeSeqSection(seqs)); err != nil {
+			return err
+		}
+	}
 	if err := emitSection(indexSectionLOWR, encodeLowerSection(nameTokens)); err != nil {
 		return err
 	}
@@ -1205,6 +1302,10 @@ func derivedSectionInfo(derived indexDerivedSections) ([]string, int) {
 		sections = append(sections, "FRNS")
 		bytes += 8*len(derived.FRNs) + 4*len(derived.FRNRecordIDs)
 	}
+	if len(derived.FRNSeq) > 0 {
+		sections = append(sections, "SEQN")
+		bytes += 2 * len(derived.FRNSeq)
+	}
 	if len(derived.LowerOffs) > 0 || len(derived.LowerBlob) > 0 {
 		sections = append(sections, "LOWR")
 		bytes += 6*len(derived.LowerOffs) + len(derived.LowerBlob)
@@ -1276,6 +1377,18 @@ func encodeFRNSection(frns []uint64, ids []uint32) []byte {
 	return buf.Bytes()
 }
 
+// encodeSeqSection writes the per-record-id NTFS sequence column: a uint32
+// count followed by that many little-endian uint16 values.
+func encodeSeqSection(seqs []uint16) []byte {
+	if len(seqs) == 0 {
+		return nil
+	}
+	var buf bytes.Buffer
+	_ = binary.Write(&buf, binary.LittleEndian, uint32(len(seqs)))
+	_ = binary.Write(&buf, binary.LittleEndian, seqs)
+	return buf.Bytes()
+}
+
 func encodeLowerSection(nameTokens []string) []byte {
 	if len(nameTokens) == 0 {
 		return nil
@@ -1315,13 +1428,25 @@ func encodeLowerSection(nameTokens []string) []byte {
 	return buf.Bytes()
 }
 
+// attrPostingMagic marks the delta-varint PATR layout ("PTR2"). A legacy
+// raw-u32 section never starts with this word (it would be a 1.3-billion
+// entry first part), so the decoder tells the two framings apart.
+const attrPostingMagic = 0x50545232
+
+// encodeAttrPostingSection serializes the per-attribute-bit record-ID lists.
+// Attribute lists are sorted record IDs with small gaps (an attribute covers
+// a large slice of the corpus), so delta-varint encoding roughly halves the
+// section versus the legacy raw-u32 parts. Layout: magic u32, part count
+// u32, then per part {count u32, encoded length u32, delta bytes}. Empty
+// input still encodes as nil (the section is omitted), matching history.
 func encodeAttrPostingSection(attrBits map[uint32][]uint32) []byte {
 	if len(attrBits) == 0 {
 		return nil
 	}
-	parts := make([][]uint32, 0, len(queryAttrBits()))
+	bits := queryAttrBits()
+	parts := make([][]uint32, 0, len(bits))
 	hasAny := false
-	for _, bit := range queryAttrBits() {
+	for _, bit := range bits {
 		ids := uniqueSortedUint32s(append([]uint32(nil), attrBits[bit]...))
 		if len(ids) > 0 {
 			hasAny = true
@@ -1331,10 +1456,22 @@ func encodeAttrPostingSection(attrBits map[uint32][]uint32) []byte {
 	if !hasAny {
 		return nil
 	}
-	return encodeUint32Section(parts...)
+	var buf bytes.Buffer
+	_ = binary.Write(&buf, binary.LittleEndian, uint32(attrPostingMagic))
+	_ = binary.Write(&buf, binary.LittleEndian, uint32(len(parts)))
+	for _, ids := range parts {
+		enc := encodeDeltaUvarint32(ids)
+		_ = binary.Write(&buf, binary.LittleEndian, uint32(len(ids)))
+		_ = binary.Write(&buf, binary.LittleEndian, uint32(len(enc)))
+		buf.Write(enc)
+	}
+	return buf.Bytes()
 }
 
 func decodeAttrPostingSection(data []byte) map[uint32][]uint32 {
+	if len(data) >= 8 && binary.LittleEndian.Uint32(data[:]) == attrPostingMagic {
+		return decodeAttrPostingSectionDelta(data)
+	}
 	parts := decodeUint32Section(data, len(queryAttrBits()))
 	if len(parts) != len(queryAttrBits()) {
 		return nil
@@ -1346,6 +1483,52 @@ func decodeAttrPostingSection(data []byte) map[uint32][]uint32 {
 		}
 	}
 	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// decodeAttrPostingSectionDelta decodes the magic-marked delta-varint
+// layout, yielding the same sorted unique ID lists the legacy form holds.
+// Any framing error yields nil (treated as a missing section, exactly like
+// a legacy section that fails its part-count check today).
+func decodeAttrPostingSectionDelta(data []byte) map[uint32][]uint32 {
+	bits := queryAttrBits()
+	off := 8
+	partCount := int(binary.LittleEndian.Uint32(data[4:]))
+	if partCount != len(bits) {
+		return nil
+	}
+	out := make(map[uint32][]uint32, partCount)
+	for _, bit := range bits {
+		if off+8 > len(data) {
+			return nil
+		}
+		count := int(binary.LittleEndian.Uint32(data[off:]))
+		encLen := int(binary.LittleEndian.Uint32(data[off+4:]))
+		off += 8
+		if count < 0 || encLen < 0 || off+encLen < off || off+encLen > len(data) {
+			return nil
+		}
+		if count == 0 {
+			if encLen != 0 {
+				return nil
+			}
+			continue
+		}
+		ids := decodeDeltaUvarint32(data[off:off+encLen], count)
+		if len(ids) != count {
+			return nil
+		}
+		for j := 1; j < len(ids); j++ {
+			if ids[j] <= ids[j-1] {
+				return nil
+			}
+		}
+		off += encLen
+		out[bit] = ids
+	}
+	if off != len(data) || len(out) == 0 {
 		return nil
 	}
 	return out

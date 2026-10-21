@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -50,15 +51,15 @@ func readIndexMMap(mapped *mappedIndexFile) (*Index, error) {
 	}
 	sectionTableOffset := uint64(0)
 	if header.Magic != indexMagic {
-		return nil, errors.New("unsupported index format: only the v9 index format is supported")
+		return nil, errors.New("unsupported index format: only the v9/v10 index format is supported")
 	}
 	if len(data) < headerSize+8 {
 		return nil, errors.New("invalid mapped v9 index")
 	}
 	sectionTableOffset = binary.LittleEndian.Uint64(data[headerSize:])
 	headerSize += 8
-	if header.Version != indexVersion {
-		return nil, fmt.Errorf("unsupported index version %d: only v9 indexes are supported", header.Version)
+	if !indexVersionSupported(int(header.Version)) {
+		return nil, fmt.Errorf("unsupported index version %d: only v9/v10 indexes are supported", header.Version)
 	}
 	if header.Compact == 0 {
 		return nil, errors.New("mmap low-memory mode requires compact index")
@@ -206,35 +207,17 @@ func decodeDerivedSection(out *indexDerivedSections, tag uint32, section []byte,
 	}
 	switch tag {
 	case indexSectionRANK:
-		parts := decodeUint32Section(section, 2)
-		if len(parts) == 2 {
-			out.NameOrder, out.NameRank = parts[0], parts[1]
-		}
+		out.NameOrder, out.NameRank = decodeRankSection(section, recordCount)
 	case indexSectionSRNK:
-		parts := decodeUint32Section(section, 2)
-		if len(parts) == 2 {
-			out.SizeOrder, out.SizeRank = parts[0], parts[1]
-		}
+		out.SizeOrder, out.SizeRank = decodeRankSection(section, recordCount)
 	case indexSectionMRNK:
-		parts := decodeUint32Section(section, 2)
-		if len(parts) == 2 {
-			out.ModOrder, out.ModRank = parts[0], parts[1]
-		}
+		out.ModOrder, out.ModRank = decodeRankSection(section, recordCount)
 	case indexSectionERNK:
-		parts := decodeUint32Section(section, 2)
-		if len(parts) == 2 {
-			out.ExtOrder, out.ExtRank = parts[0], parts[1]
-		}
+		out.ExtOrder, out.ExtRank = decodeRankSection(section, recordCount)
 	case indexSectionTRNK:
-		parts := decodeUint32Section(section, 2)
-		if len(parts) == 2 {
-			out.TypeOrder, out.TypeRank = parts[0], parts[1]
-		}
+		out.TypeOrder, out.TypeRank = decodeRankSection(section, recordCount)
 	case indexSectionPRNK:
-		parts := decodeUint32Section(section, 2)
-		if len(parts) == 2 {
-			out.PathOrder, out.PathRank = parts[0], parts[1]
-		}
+		out.PathOrder, out.PathRank = decodeRankSection(section, recordCount)
 	case indexSectionCHLD:
 		parts := decodeUint32Section(section, 3)
 		if len(parts) == 3 {
@@ -249,6 +232,20 @@ func decodeDerivedSection(out *indexDerivedSections, tag uint32, section []byte,
 			out.SubtreePathRank = parts[7]
 			break
 		}
+		// Compact 7-part form: the start array is the exact inverse of
+		// the order and is rebuilt here (writers omitted it; see
+		// forEachDerivedSection). A corrupt order drops the whole
+		// section, like a framing failure today.
+		parts = decodeUint32Section(section, 7)
+		if len(parts) == 7 {
+			if start := invertRankOrder(parts[1], recordCount); start != nil {
+				out.SubtreeStart, out.SubtreeEnd, out.SubtreeOrder = start, parts[0], parts[1]
+				out.SubtreeSizeRank, out.SubtreeModRank = parts[2], parts[3]
+				out.SubtreeExtRank, out.SubtreeTypeRank = parts[4], parts[5]
+				out.SubtreePathRank = parts[6]
+			}
+			break
+		}
 		parts = decodeUint32Section(section, 3)
 		if len(parts) == 3 {
 			out.SubtreeStart, out.SubtreeEnd, out.SubtreeOrder = parts[0], parts[1], parts[2]
@@ -258,6 +255,8 @@ func decodeDerivedSection(out *indexDerivedSections, tag uint32, section []byte,
 	case indexSectionFRNS:
 		frns, ids := decodeFRNSection(section)
 		out.FRNs, out.FRNRecordIDs = frns, ids
+	case indexSectionSEQN:
+		out.FRNSeq = decodeSeqSection(section)
 	case indexSectionLOWR:
 		out.LowerBlob, out.LowerOffs, out.LowerLens = decodeLowerSection(section)
 	case indexSectionPATR:
@@ -298,6 +297,48 @@ func finalizeDerivedSections(out *indexDerivedSections) {
 			out.Postings[tag] = posting
 		}
 	}
+}
+
+// decodeRankSection decodes one rank-family section in either on-disk form:
+// the historical 2-part (order, rank) layout, or the compact 1-part layout
+// carrying the order alone, with the rank rebuilt as its exact inverse (see
+// invertRankOrder). Writers emit the compact form, halving the six rank
+// sections; the 2-part form stays readable so older indexes load without a
+// rebuild. A corrupt section yields nils, exactly like a 2-part section
+// that fails its framing check today.
+func decodeRankSection(data []byte, recordCount int) (order, rank []uint32) {
+	if parts := decodeUint32Section(data, 2); len(parts) == 2 {
+		return parts[0], parts[1]
+	}
+	parts := decodeUint32Section(data, 1)
+	if len(parts) != 1 {
+		return nil, nil
+	}
+	rank = invertRankOrder(parts[0], recordCount)
+	if rank == nil {
+		return nil, nil
+	}
+	return parts[0], rank
+}
+
+// invertRankOrder rebuilds the rank-by-id vector as the exact inverse of an
+// order vector: order holds live record IDs in rank order, so rank[id] is
+// id's position, and records absent from the order (deleted) keep rank 0 —
+// bit-identical to the rank array the builders used to persist. recordCount
+// sizes the output; a value out of range yields nil instead of an
+// out-of-bounds index.
+func invertRankOrder(order []uint32, recordCount int) []uint32 {
+	if recordCount < 0 || len(order) > recordCount {
+		return nil
+	}
+	rank := make([]uint32, recordCount)
+	for pos, id := range order {
+		if id >= uint32(recordCount) {
+			return nil
+		}
+		rank[id] = uint32(pos)
+	}
+	return rank
 }
 
 func decodeUint32Section(data []byte, parts int) [][]uint32 {
@@ -356,6 +397,21 @@ func decodeFRNSection(data []byte) ([]uint64, []uint32) {
 	return frns, ids
 }
 
+// decodeSeqSection decodes the SEQN section: a uint32 count then that many
+// little-endian uint16 sequence values (one per record id). A framing failure
+// yields nil, so a corrupt column reads back as "unknown" instead of garbage.
+func decodeSeqSection(data []byte) []uint16 {
+	if len(data) < 4 {
+		return nil
+	}
+	count := int(binary.LittleEndian.Uint32(data[:4]))
+	bytesLen := count * 2
+	if count < 0 || bytesLen/2 != count || 4+bytesLen != len(data) {
+		return nil
+	}
+	return mappedUint16Slice(data[4:])
+}
+
 func decodeLowerSection(data []byte) ([]byte, []uint32, []uint16) {
 	if len(data) < 8 {
 		return nil, nil, nil
@@ -378,7 +434,21 @@ func decodeLowerSection(data []byte) ([]byte, []uint32, []uint16) {
 	if off+blobLen < off || off+blobLen > len(data) {
 		return nil, nil, nil
 	}
-	return data[off : off+blobLen], offs, lens
+	blob := data[off : off+blobLen]
+	// Every writer emits offsets that are either SameAsName or a live blob
+	// range (see encodeLowerSection and the direct LOWR writer). Anything
+	// else is a corrupt section (older direct builds interleaved the table);
+	// discard it so token-addressed reads fall back to exact decoding
+	// instead of serving garbage postings.
+	for i, tokenOff := range offs {
+		if tokenOff == packedLowerSameAsName {
+			continue
+		}
+		if end := uint64(tokenOff) + uint64(lens[i]); end > uint64(len(blob)) {
+			return nil, nil, nil
+		}
+	}
+	return blob, offs, lens
 }
 
 func mappedUint16Slice(data []byte) []uint16 {
@@ -438,7 +508,7 @@ func decodePostingSection(data []byte) mappedPostingSection {
 	if off+blockBlobLen < off || off+blockBlobLen > len(data) {
 		return mappedPostingSection{}
 	}
-	section := mappedPostingSection{EntryCount: entryCount, BlockCount: blockCount, Bytes: len(data), Data: data}
+	section := mappedPostingSection{EntryCount: entryCount, BlockCount: blockCount, Bytes: len(data), Data: data, identity: nextPostingSectionIdentity()}
 	if keyBlobLen == 0 {
 		return section
 	}
@@ -475,8 +545,32 @@ func postingBlockCacheMaxBytes() int64 {
 	return mb * 1024 * 1024
 }
 
+func (c *postingBlockLRU) maxBytes() int64 {
+	c.limitOnce.Do(func() { c.limit = postingBlockCacheMaxBytes() })
+	return c.limit
+}
+
+// clear drops every decoded posting block. Decodes are pure functions of
+// the mmapped sections, so the next query re-decodes on demand; the idle
+// memory release calls this to return the (up to 128 MiB default) heap
+// cache to the OS without changing any result.
+func (c *postingBlockLRU) clear() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.items = nil
+	c.ll.Init()
+	c.bytes = 0
+}
+
+// liveBytes reports the heap bytes currently held by cached blocks.
+func (c *postingBlockLRU) liveBytes() int64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.bytes
+}
+
 func (c *postingBlockLRU) get(key postingBlockCacheKey) ([]uint32, bool) {
-	maxBytes := postingBlockCacheMaxBytes()
+	maxBytes := c.maxBytes()
 	if maxBytes <= 0 {
 		return nil, false
 	}
@@ -495,7 +589,7 @@ func (c *postingBlockLRU) get(key postingBlockCacheKey) ([]uint32, bool) {
 }
 
 func (c *postingBlockLRU) add(key postingBlockCacheKey, ids []uint32) {
-	maxBytes := postingBlockCacheMaxBytes()
+	maxBytes := c.maxBytes()
 	if maxBytes <= 0 || len(ids) == 0 {
 		return
 	}
@@ -536,9 +630,10 @@ func (section mappedPostingSection) postingBlockCacheKey(blockIndex int) (postin
 		return postingBlockCacheKey{}, false
 	}
 	return postingBlockCacheKey{
-		base:  uintptr(unsafe.Pointer(unsafe.SliceData(section.Data))),
-		bytes: len(section.Data),
-		block: blockIndex,
+		identity: section.identity,
+		base:     uintptr(unsafe.Pointer(unsafe.SliceData(section.Data))),
+		bytes:    len(section.Data),
+		block:    blockIndex,
 	}, true
 }
 
@@ -1068,7 +1163,7 @@ func decodeGramPostingIndex(data []byte, recordCount int) *compressedTrigramInde
 		gramUnionComplete:  unionComplete,
 		gramSize:           3,
 		recordCount:        recordCount,
-		mappedGrams:        &mappedPostingSection{EntryCount: entryCount, BlockCount: blockCount, Bytes: len(data), Data: data},
+		mappedGrams:        &mappedPostingSection{EntryCount: entryCount, BlockCount: blockCount, Bytes: len(data), Data: data, identity: nextPostingSectionIdentity()},
 	}
 	if omittedCount > 0 {
 		ti.omitted = make(map[uint32]struct{}, omittedCount)
@@ -1124,16 +1219,29 @@ func loadConfig(path string) (appConfig, error) {
 		path = findDefaultConfig()
 	}
 	if path == "" {
-		return appConfig{}, nil
+		cfg := appConfig{PluginPath: filepath.Join(filepath.Dir(defaultConfigPath()), "plugin.toml")}
+		var err error
+		cfg.Plugins, err = loadPluginDefinitions(cfg.PluginPath)
+		return cfg, err
 	}
-	data, err := os.ReadFile(path)
+	data, err := readConfigFile(path)
 	if err != nil {
 		return appConfig{}, err
 	}
 	cfg := appConfig{}
+	section := ""
 	for _, line := range strings.Split(string(data), "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
+			inner := strings.TrimSpace(line[1 : len(line)-1])
+			if strings.HasPrefix(inner, "features.") {
+				section = inner
+			} else {
+				section = parseContentConfigSection(inner)
+			}
 			continue
 		}
 		parts := strings.SplitN(line, "=", 2)
@@ -1142,6 +1250,18 @@ func loadConfig(path string) (appConfig, error) {
 		}
 		key := strings.TrimSpace(parts[0])
 		value := strings.TrimSpace(parts[1])
+		if section != "" {
+			if strings.HasPrefix(section, "features.") {
+				if err := applyFeatureConfig(&cfg, strings.TrimPrefix(section, "features."), key, value); err != nil {
+					return appConfig{}, err
+				}
+				continue
+			}
+			if section != "ignore" {
+				applyContentScopeConfig(&cfg, section, key, value)
+			}
+			continue
+		}
 		switch key {
 		case "db", "db_path":
 			if s := parseTOMLString(value); s != "" {
@@ -1168,7 +1288,30 @@ func loadConfig(path string) (appConfig, error) {
 			cfg.SeekFSDir = parseTOMLString(value)
 		case "remote_addr":
 			cfg.RemoteAddr = parseTOMLString(value)
+		case "content_scope":
+			cfg.Content.Mode = parseTOMLString(value)
+		case "content_roots":
+			cfg.Content.Roots = append(cfg.Content.Roots, parseTOMLStringArray(value)...)
+		case "content_exclude":
+			cfg.Content.Exclude = append(cfg.Content.Exclude, parseTOMLStringArray(value)...)
+		case "content_budget_bytes":
+			var n int64
+			if _, err := fmt.Sscanf(value, "%d", &n); err == nil {
+				cfg.Content.BudgetBytes = n
+			}
 		}
+	}
+	if err := validateFeatureConfig(cfg.Features); err != nil {
+		return appConfig{}, err
+	}
+	absolute, err := filepath.Abs(path)
+	if err != nil {
+		return appConfig{}, err
+	}
+	cfg.PluginPath = filepath.Join(filepath.Dir(absolute), "plugin.toml")
+	cfg.Plugins, err = loadPluginDefinitions(cfg.PluginPath)
+	if err != nil {
+		return appConfig{}, err
 	}
 	return cfg, nil
 }

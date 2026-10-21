@@ -1,0 +1,164 @@
+package main
+
+import (
+	"bytes"
+	"math/rand"
+	"testing"
+)
+
+func accentVolume(t *testing.T, texts ...string) *serviceVolumeIndex {
+	files := make([]contentFixtureFile, len(texts))
+	for i, text := range texts {
+		files[i] = contentFixtureFile{frn: uint64(i + 2), name: string(rune('a'+i)) + ".txt", text: text}
+	}
+	return newContentQueryVolume(t, files)
+}
+
+func TestContentAccentFoldTermAndPhrase(t *testing.T) {
+	vol := accentVolume(t, "résumé", "RÉSUMÉ", "café au lait")
+	for _, q := range []string{"content:resume", "content:\"cafe au lait\""} {
+		got, err := contentServiceSearch(t, vol, q, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := 2
+		if q == "content:\"cafe au lait\"" {
+			want = 1
+		}
+		if len(got) != want {
+			t.Fatalf("%s hits=%d want=%d", q, len(got), want)
+		}
+	}
+}
+
+func TestContentAccentFoldSubstring(t *testing.T) {
+	vol := accentVolume(t, "résumé")
+	trace := &searchTrace{}
+	got, err := searchServiceVolumes([]*serviceVolumeIndex{vol}, queryOptions{Query: "content:sume", Limit: 20, Trace: trace}, false)
+	if err != nil || len(got) != 1 {
+		t.Fatalf("search=%d err=%v", len(got), err)
+	}
+	n, ok, err := countServiceVolumes([]*serviceVolumeIndex{vol}, queryOptions{Query: "content:sume", Trace: &searchTrace{}})
+	if err != nil || !ok || n != len(got) {
+		t.Fatalf("count=%d ok=%v err=%v search=%d", n, ok, err, len(got))
+	}
+	if trace.DiskCapped || trace.ContentIncomplete {
+		t.Fatalf("unexpected cap/incomplete: %+v", trace)
+	}
+}
+
+func TestContentAccentFoldSmartAccent(t *testing.T) {
+	vol := accentVolume(t, "café", "cafe")
+	got, err := contentServiceSearch(t, vol, "content:café", false)
+	if err != nil || len(got) != 1 || got[0].Path == "" {
+		t.Fatalf("got=%v err=%v", namesOf(got), err)
+	}
+}
+
+func TestContentAccentFoldCaseTrue(t *testing.T) {
+	vol := accentVolume(t, "résumé")
+	got, err := contentServiceSearch(t, vol, "case:true content:resume", false)
+	if err != nil || len(got) != 0 {
+		t.Fatalf("got=%v err=%v", namesOf(got), err)
+	}
+}
+
+func TestContentAccentFoldNFD(t *testing.T) {
+	vol := accentVolume(t, "re\u0301sume\u0301")
+	for _, q := range []string{"content:resume", "content:résumé"} {
+		got, err := contentServiceSearch(t, vol, q, false)
+		if err != nil || len(got) != 1 {
+			t.Fatalf("%s: got=%v err=%v", q, namesOf(got), err)
+		}
+	}
+}
+
+func TestContentAccentFoldSnippetSpan(t *testing.T) {
+	vol := accentVolume(t, "xx café yy")
+	got, err := contentServiceSearch(t, vol, "content:cafe", false)
+	if err != nil || len(got) != 1 || got[0].Snippet == "" || got[0].Snippet == "xx cafe yy" {
+		t.Fatalf("snippet=%q err=%v", got[0].Snippet, err)
+	}
+	pqOpts := queryOptions{Query: "content:cafe"}
+	pq, _ := parseQuery(pqOpts)
+	lines := contentMatchingLines([]byte("xx café yy\n"), newContentLeafMatcher(pq), contentPositiveLeaves(pq), 10, 0, 0)
+	if len(lines) != 1 || lines[0].Text != "xx café yy" {
+		t.Fatalf("lines=%+v", lines)
+	}
+}
+
+func TestContentAccentFoldRegexUnchanged(t *testing.T) {
+	vol := accentVolume(t, "résumé")
+	got, err := contentServiceSearch(t, vol, "content:/resume/", false)
+	if err != nil || len(got) != 0 {
+		t.Fatalf("regex should remain accent-sensitive: got=%v err=%v", namesOf(got), err)
+	}
+}
+
+// content~ and --lines see the accent-folded words too: a fuzzy query finds
+// and prints an accented spelling within the distance.
+func TestContentAccentFoldFuzzyLines(t *testing.T) {
+	selected := true
+	servicePluginContentSelection.Store(&selected)
+	t.Cleanup(func() { servicePluginContentSelection.Store(nil) })
+	pq, err := parseQuery(queryOptions{Query: "content~:resume"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := contentMatchingLines([]byte("my résumé\nnothing\nresumes here\n"), newContentLeafMatcher(pq), contentPositiveLeaves(pq), 10, 0, 0)
+	if len(lines) != 2 || lines[0].Line != 1 || lines[1].Line != 3 {
+		t.Fatalf("fuzzy accent lines = %+v; want lines 1 and 3", lines)
+	}
+}
+
+func accentFoldParityInputs() []string {
+	inputs := []string{
+		"", "plain ascii MUTEX_", "café CAFÉ Café", "e\u0301 decomposed É",
+		"STRASSE straße ẞ", "İstanbul ı I", "ＦＵＬＬ　ｗｉｄｔｈ", "日本語テスト",
+		"Ελληνικά ΣΊΣΥΦΟΣ", "Кириллица ЁЖ", "עברית", "العربية", "हिन्दी देवनागरी",
+		"한국어 조선말", "emoji \U0001F600 x", "mixed é\u0308\u0301 marks",
+		"bad \xff\xfe utf8 \xc3", "© 2026 The Chromium Authors — ™",
+		"Å Ω K \u212a \u2126", "ǅ ǆ ǲ", "ﬁ ﬀ ligatures",
+	}
+	rng := rand.New(rand.NewSource(20261015))
+	alphabet := []rune("aZ_ 9éÉİıßẞ日ΣЁ\u0301\u0308\u212aＡ\U0001F600ǅ©")
+	for i := 0; i < 2000; i++ {
+		rs := make([]rune, 1+rng.Intn(40))
+		for j := range rs {
+			rs[j] = alphabet[rng.Intn(len(alphabet))]
+		}
+		inputs = append(inputs, string(rs))
+	}
+	return inputs
+}
+
+// contentFoldAccent's per-rune fast path must stay byte-identical to the
+// whole-string foldAccentLower that v12 sidecars were built with, or indexed
+// terms/grams would stop matching their queries.
+func TestContentFoldAccentMatchesWholeStringFold(t *testing.T) {
+	for _, in := range accentFoldParityInputs() {
+		want := foldAccentLower(in)
+		if got := string(contentFoldAccent([]byte(in))); got != want {
+			t.Fatalf("contentFoldAccent(%q) = %q; want %q", in, got, want)
+		}
+	}
+}
+
+// contentFoldAccentAppend is the verify path's buffer-reusing fold: appending
+// into a scratch buffer (dst[:0], x) must be byte-identical to
+// contentFoldAccent(x), including when dst carries reused capacity.
+func TestContentFoldAccentAppendMatchesContentFoldAccent(t *testing.T) {
+	scratch := make([]byte, 0, 128)
+	for _, in := range accentFoldParityInputs() {
+		src := []byte(in)
+		want := contentFoldAccent(src)
+		got := contentFoldAccentAppend(scratch[:0], src)
+		if !bytes.Equal(got, want) {
+			t.Fatalf("contentFoldAccentAppend(scratch[:0], %q) = %q; want %q", in, got, want)
+		}
+		if got = contentFoldAccentAppend(nil, src); !bytes.Equal(got, want) {
+			t.Fatalf("contentFoldAccentAppend(nil, %q) = %q; want %q", in, got, want)
+		}
+		scratch = got // reuse whatever capacity the append left
+	}
+}

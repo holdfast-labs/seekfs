@@ -14,6 +14,12 @@ func (vol *serviceVolumeIndex) boundedPathTermPlanSource(term string) ([]int, bo
 		strings.ContainsAny(term, `\/*?[]:`) || len(term) < 3 {
 		return nil, false
 	}
+	if vol.pathTermSatisfiedByVolume(term) {
+		// Volume-satisfied terms (UNC volume substrings) match every path;
+		// the gram-emptiness proof and bounded sources below only see names
+		// and would falsely empty or underfill the plan.
+		return nil, false
+	}
 	// A term whose required filename grams are proven absent by the complete
 	// name-gram metadata (PNGR counts complete, or the PNGC companion) cannot
 	// match anything: return a proven empty source so the plan marks itself
@@ -319,13 +325,13 @@ func (vol *serviceVolumeIndex) broadPathScanCandidates(pq parsedQuery) ([]int, b
 			if rec.Deleted {
 				continue
 			}
-			if vol.index.compactPathContainsAll(i, terms) {
+			if vol.index.compactPathContainsAllFolded(i, terms, pq) {
 				out = append(out, i)
 			}
 		}
 		out = vol.withRecentCandidates(out, 0, func(rec CompactRecord) bool {
 			id, ok := vol.idForFRN(rec.FRN)
-			return ok && vol.index.compactPathContainsAll(id, terms)
+			return ok && vol.index.compactPathContainsAllFolded(id, terms, pq)
 		})
 		sortCandidateIDs(out, pq, vol.index, vol.rankForQuery(pq))
 		return capBroadCandidates(out, pq), true
@@ -350,7 +356,7 @@ func (vol *serviceVolumeIndex) broadPathScanCandidates(pq parsedQuery) ([]int, b
 				if rec.Deleted {
 					continue
 				}
-				if vol.index.compactPathContainsAll(i, terms) {
+				if vol.index.compactPathContainsAllFolded(i, terms, pq) {
 					local = append(local, i)
 				}
 			}
@@ -372,7 +378,7 @@ func (vol *serviceVolumeIndex) broadPathScanCandidates(pq parsedQuery) ([]int, b
 	}
 	out = vol.withRecentCandidates(out, 0, func(rec CompactRecord) bool {
 		id, ok := vol.idForFRN(rec.FRN)
-		return ok && vol.index.compactPathContainsAll(id, terms)
+		return ok && vol.index.compactPathContainsAllFolded(id, terms, pq)
 	})
 	sortCandidateIDs(out, pq, vol.index, vol.rankForQuery(pq))
 	return capBroadCandidates(out, pq), true
@@ -395,19 +401,20 @@ func (vol *serviceVolumeIndex) boundedScanCandidatesFiltered(pq parsedQuery, fil
 	if vol == nil || vol.index == nil {
 		return nil, false
 	}
-	if filter != nil && filter.members == nil && filter.source.hasPosting {
+	if filter != nil && filter.bits == nil && filter.source.hasPosting {
 		ids := filter.source.posting.materialize()
-		filter.members = make(map[int]struct{}, len(ids))
+		nf := newBoundedScanMembershipFilter(vol.index.compactRecordCount())
 		for _, id := range ids {
-			filter.members[int(id)] = struct{}{}
+			nf.add(int(id))
 		}
+		filter.bits, filter.count, filter.n = nf.bits, nf.count, nf.n
 	}
 	// Name-memo lane: the full ordered scan with bit checks instead of
 	// per-candidate path verification. Hidden exclusion does not apply on
 	// this floor (callers without snapshots filter afterwards), matching
 	// the legacy contract exactly.
 	if ids, ok := vol.memoScanAll(pq, hiddenBaseIDs{}, filter); ok {
-		return ids, true
+		return vol.contentAfterSlice(ids, pq.contentAfter), true
 	}
 	recordCount := vol.index.compactRecordCount()
 	if recordCount == 0 {
@@ -415,19 +422,92 @@ func (vol *serviceVolumeIndex) boundedScanCandidatesFiltered(pq parsedQuery, fil
 	}
 	order := vol.orderForQuery(pq)
 	limit := pq.Limit
-	canStopAtLimit := !pq.CountOnly && limit > 0 && pq.RootBias == "" && pq.CWDBias == ""
+	contentQuery := queryHasAnyContentLeaf(pq)
+	var contentMatcher *contentLeafMatcher
+	if contentQuery {
+		contentMatcher = newContentLeafMatcher(pq)
+	}
+	// Bias re-ranks the verified candidates: the bias root's subtree moves to
+	// the front, in scan order, and the caller re-applies the same stable bias
+	// to the candidate slice. The scan can therefore still stop once it has the
+	// top of the biased order -- the root's matches first, then the rest -- so
+	// it only needs to defer the non-root matches it has already collected.
+	// A post-verify relevance sort is the one order the caller cannot rebuild
+	// from a prefix, so it keeps the full candidate set. contentFullCandidates
+	// selects the historical full-candidate arm for differential testing, which
+	// must scan before re-ranking. A pending overlay hidden set also disables
+	// the early stop for every query shape: scanCandidateMatches sees the base
+	// record only, so a hidden base match would fill the page and the caller's
+	// verify loop would drop it, under-filling the result with no way to
+	// recover. The guard is the caller's captured hidden set (threaded through
+	// pq), so the scan and the verify loop drop exactly the same records; it is
+	// a cheap length check and is evaluated last, so the common no-overlay path
+	// pays nothing.
+	biased := pq.RootBias != "" || pq.CWDBias != ""
+	canStopAtLimit := !pq.CountOnly && limit > 0 &&
+		(!biased || (!pq.contentFullCandidates && pq.SortColumn != "relevance")) &&
+		pq.hidden.empty()
+	// A v2 resume starts the scan after the last emitted record: locate it in
+	// the scan order once, then walk only the remaining candidates.
+	scanStart := 0
+	if contentQuery && pq.contentAfter != nil {
+		scanStart = vol.contentAfterScanStart(order, recordCount, pq.contentAfter)
+		pq.contentAfter.skip = scanStart
+	}
 	if canStopAtLimit {
+		biasRoot := ""
+		if biased {
+			biasRoot = firstNonEmpty(pq.CWDBias, pq.RootBias)
+		}
+		// A content scan that may stop at the page fans out to an ordered
+		// parallel walk: the feeder streams record order, workers verify,
+		// and the merger emits the first limit matches in order, stopping
+		// there like the serial walk (over-verification past an early
+		// limit is bounded by the channel buffer plus one job per
+		// worker). Biased queries keep the serial deferred-partition
+		// walk, and name/scalar scans keep theirs; both are unchanged.
+		if contentQuery && contentMatcher != nil && biasRoot == "" &&
+			contentParallelWorkers() > 1 &&
+			compactUint32OrderLen(order, recordCount) >= contentParallelVerifyMinIDs {
+			return vol.boundedScanCandidatesParallel(pq, order, recordCount, limit, filter, contentMatcher)
+		}
 		out := make([]int, 0, min(limit, 1024))
+		var deferred []int
 		cache := make(map[int]string)
-		for pos := 0; pos < compactUint32OrderLen(order, recordCount); pos++ {
+		visited := 0
+		for pos := scanStart; pos < compactUint32OrderLen(order, recordCount); pos++ {
 			if pos&1023 == 0 && queryCanceled(pq) {
 				return nil, false
+			}
+			// A content scan can walk the whole volume when matches are sparse,
+			// so it is bounded in visited records and in path-cache size. On
+			// reaching the budget, return what was found and say it is
+			// incomplete rather than scan forever. The non-content path is
+			// unchanged (both checks are gated on contentQuery).
+			if contentQuery && visited >= contentScanVisitBudgetOf(pq) {
+				pq.Trace.setContentIncomplete()
+				break
+			}
+			if contentQuery {
+				cache = boundPathCache(cache)
 			}
 			id := compactUint32OrderAt(order, pos)
 			if filter != nil && !filter.contains(id) {
 				continue
 			}
-			if _, ok := compactCandidateEntryIfMatch(vol.index, pq, id, cache, true, false); !ok {
+			if contentQuery {
+				visited++
+			}
+			if !scanCandidateMatches(vol, vol.index, pq, id, cache, contentMatcher) {
+				continue
+			}
+			if biasRoot != "" && !pathUnder(vol.index.reconstructCompactPathCached(id, cache), biasRoot) {
+				// Outside the biased subtree: every root match precedes it, so
+				// hold it until the root's matches are exhausted (or the page
+				// fills without it).
+				if len(deferred) < limit {
+					deferred = append(deferred, id)
+				}
 				continue
 			}
 			out = append(out, id)
@@ -435,7 +515,57 @@ func (vol *serviceVolumeIndex) boundedScanCandidatesFiltered(pq parsedQuery, fil
 				return out, true
 			}
 		}
+		if len(out) < limit {
+			out = append(out, deferred...)
+			if len(out) > limit {
+				out = out[:limit]
+			}
+		}
 		return out, true
+	}
+
+	if contentQuery {
+		// A count, or a biased scan whose caller re-ranks after verification,
+		// cannot stop early, and content verification drops candidates, so
+		// materialize the whole matching set up to the memory budget. Past
+		// either budget the superset is incomplete: mark it rather than
+		// silently truncate. A sparse-match scan can visit the whole volume
+		// while producing few matches, so the visited-record budget is enforced
+		// independently of the match budget, and the path memo is reset past a
+		// fixed cap to keep memory O(budget).
+		budget := contentCandidateBudgetOf(pq)
+		visitBudget := contentScanVisitBudgetOf(pq)
+		out := make([]int, 0, min(recordCount, 1024))
+		cache := make(map[int]string)
+		visited := 0
+		incomplete := false
+		for pos := 0; pos < compactUint32OrderLen(order, recordCount); pos++ {
+			if pos&1023 == 0 && queryCanceled(pq) {
+				return nil, false
+			}
+			if visited >= visitBudget {
+				incomplete = true
+				break
+			}
+			id := compactUint32OrderAt(order, pos)
+			if filter != nil && !filter.contains(id) {
+				continue
+			}
+			visited++
+			cache = boundPathCache(cache)
+			if _, ok := compactCandidateEntryIfMatchIn(vol, vol.index, pq, id, cache, true, false, contentMatcher); !ok {
+				continue
+			}
+			if len(out) >= budget {
+				incomplete = true
+				break
+			}
+			out = append(out, id)
+		}
+		if incomplete {
+			pq.Trace.setContentIncomplete()
+		}
+		return vol.contentAfterSlice(out, pq.contentAfter), true
 	}
 
 	workers := min(max(1, recordCountWorkers(recordCount)), 16)
@@ -500,6 +630,182 @@ func (vol *serviceVolumeIndex) boundedScanCandidatesFiltered(pq parsedQuery, fil
 	return out, true
 }
 
+// boundedScanCandidatesParallel is the parallel form of the bounded scan's
+// early-stop walk (canStopAtLimit without bias): the first limit matches in
+// scan order, verified across workers. The feeder is the only goroutine
+// that walks the order (applying the membership pre-filter and the
+// visited-record budget, marking the trace incomplete past it); workers
+// run the full scan predicate; the merger emits in order and stops at the
+// limit. Proven identical to the serial walk by
+// TestContentParallelScanMatchesSerial across shapes x limits.
+func (vol *serviceVolumeIndex) boundedScanCandidatesParallel(pq parsedQuery, order []uint32, recordCount, limit int, filter *boundedScanMembershipFilter, matcher *contentLeafMatcher) ([]int, bool) {
+	orderLen := compactUint32OrderLen(order, recordCount)
+	workers := contentParallelWorkers()
+	if workers < 2 || orderLen == 0 || limit <= 0 {
+		return nil, false
+	}
+	visitBudget := contentScanVisitBudgetOf(pq)
+	quit := make(chan struct{})
+	var quitOnce sync.Once
+	stop := func() { quitOnce.Do(func() { close(quit) }) }
+	type scanJob struct {
+		seq uint64
+		pos int
+	}
+	type scanResult struct {
+		seq      uint64
+		id       int
+		ok       bool
+		verified bool
+	}
+	work := make(chan scanJob, 64)
+	out := make(chan scanResult, 64)
+	var wg sync.WaitGroup
+	defer func() {
+		stop()
+		wg.Wait()
+	}()
+	var visited atomic.Int64
+	var canceled atomic.Bool
+	startPos := 0
+	if pq.contentAfter != nil {
+		startPos = pq.contentAfter.skip
+	}
+	// Feeder: the only goroutine that walks the order.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		defer close(work)
+		var seq uint64
+		for pos := startPos; pos < orderLen; pos++ {
+			if pos&1023 == 0 && queryCanceled(pq) {
+				canceled.Store(true)
+				return
+			}
+			id := compactUint32OrderAt(order, pos)
+			if filter != nil && !filter.contains(id) {
+				continue
+			}
+			if visited.Add(1) > int64(visitBudget) {
+				pq.Trace.setContentIncomplete()
+				return
+			}
+			select {
+			case work <- scanJob{seq: seq, pos: pos}:
+				seq++
+			case <-quit:
+				return
+			}
+		}
+	}()
+	// Workers: verify only; no ordering, no limits here.
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			localCache := make(map[int]string)
+			var done int
+			for {
+				select {
+				case job, ok := <-work:
+					if !ok {
+						return
+					}
+					done++
+					if done&1023 == 0 && queryCanceled(pq) {
+						canceled.Store(true)
+						return
+					}
+					id := compactUint32OrderAt(order, job.pos)
+					localCache = boundPathCache(localCache)
+					res := scanResult{seq: job.seq, id: id, verified: true}
+					candidatePQ := pq
+					var candidateState atomic.Bool
+					candidatePQ.contentVerifyState = &candidateState
+					if pq.Trace != nil && pq.Trace.deadlineReached() {
+						pq.Trace.markBudgetExceeded()
+						res.verified = false
+					} else {
+						if contentVerifyParallelTestHook != nil {
+							used := int64(0)
+							if pq.Trace != nil && pq.Trace.disk != nil {
+								used = pq.Trace.disk.used.Load()
+							}
+							contentVerifyParallelTestHook(int(job.seq), id, "scan-start", used, false, pq.Trace.stopDiskVerify())
+						}
+						if scanCandidateMatches(vol, vol.index, candidatePQ, id, localCache, matcher) {
+							res.ok = true
+						}
+						if contentVerifyParallelTestHook != nil {
+							used := int64(0)
+							if pq.Trace != nil && pq.Trace.disk != nil {
+								used = pq.Trace.disk.used.Load()
+							}
+							contentVerifyParallelTestHook(int(job.seq), id, "scan-done", used, res.ok, pq.Trace.stopDiskVerify())
+						}
+					}
+					if candidateState.Load() {
+						res.verified = false
+					}
+					select {
+					case out <- res:
+					case <-quit:
+						return
+					}
+				case <-quit:
+					return
+				}
+			}
+		}()
+	}
+	// Closer: once the feeder and every worker are done, no more results.
+	go func() {
+		wg.Wait()
+		close(out)
+	}()
+	// Merger (this goroutine): emit in scan order, stopping at exactly
+	// the limit like the serial walk.
+	ids := make([]int, 0, min(limit, 1024))
+	pending := make(map[uint64]scanResult)
+	var expect uint64
+	emit := func() bool {
+		for limit <= 0 || len(ids) < limit {
+			res, ok := pending[expect]
+			if !ok {
+				return true
+			}
+			delete(pending, expect)
+			if !res.verified {
+				// A later worker may finish after an earlier rank reached the
+				// disk cap/deadline. Emit only the contiguous verified frontier.
+				// Record it so an overlay merge keeps the partial page a prefix
+				// (see mergeOverlayMatches).
+				if pq.Trace != nil && vol.index != nil {
+					rec := vol.index.compactRecord(res.id)
+					pq.Trace.recordContentFrontier(compactEntryFromRecord(vol.index, res.id, rec, make(map[int]string), true), pq)
+				}
+				return false
+			}
+			expect++
+			if res.ok {
+				ids = append(ids, res.id)
+			}
+		}
+		return false
+	}
+	for res := range out {
+		pending[res.seq] = res
+		if !emit() {
+			return ids, true
+		}
+	}
+	emit()
+	if canceled.Load() {
+		return nil, false
+	}
+	return ids, true
+}
+
 func (vol *serviceVolumeIndex) boundedScanCandidatesHiddenTop(pq parsedQuery, hidden hiddenBaseIDs, limit int) ([]int, bool) {
 	if vol == nil || vol.index == nil || limit <= 0 {
 		return nil, false
@@ -507,22 +813,87 @@ func (vol *serviceVolumeIndex) boundedScanCandidatesHiddenTop(pq parsedQuery, hi
 	return vol.boundedScanHiddenTop(pq, hidden, limit, nil)
 }
 
+// boundedScanSearchCandidates is the top-N floor for single-volume searches:
+// cheap exact-superset pre-filters (ext posting, dir subtree, required regex
+// literal runs, trigram exact-empty) narrow the scan, and the scan itself
+// stops at the limit in scan order. It mirrors the global bounded lane's
+// per-volume logic, so order and exactness match the exhaustive scan the
+// verify loop would otherwise truncate to the same limit. Count queries,
+// biased queries (whose downstream re-ranking needs the full set), and
+// content queries (whose inline verification needs its own budgets) keep the
+// exhaustive floor.
+func (vol *serviceVolumeIndex) boundedScanSearchCandidates(pq parsedQuery) ([]int, bool) {
+	if vol == nil || vol.index == nil || pq.CountOnly || pq.Limit <= 0 ||
+		pq.RootBias != "" || pq.CWDBias != "" || queryHasAnyContentLeaf(pq) {
+		return vol.boundedScanCandidates(pq)
+	}
+	// Posting-derived pre-filters describe base records; uncommitted
+	// recent/trigram-recent additions are merged by the scan itself, so only
+	// filter when there is nothing uncommitted to miss (mirrors
+	// plainTermNameTrigramExactEmpty's recentIDs gate).
+	if len(vol.recentIDs) == 0 && len(vol.nameTrigramRecent) == 0 {
+		var filter *boundedScanMembershipFilter
+		exactEmpty, filterOK := vol.boundedScanPrefilter(pq, &filter)
+		if exactEmpty {
+			return []int{}, true
+		}
+		if filterOK {
+			return vol.boundedScanCandidatesHiddenTopFiltered(pq, pq.hidden, pq.Limit, filter)
+		}
+	}
+	return vol.boundedScanCandidatesHiddenTop(pq, pq.hidden, pq.Limit)
+}
+
 // boundedScanMembershipFilter pre-filters the bounded name/id-order scan to a
 // selective ext/glob-ext posting so broad queries with a cheap extension filter
 // do not walk every record.  The scan order is unchanged (id order when the
 // resident name order is absent, name order otherwise), so the top-N semantics
 // of boundedScanCandidatesHiddenTop are preserved exactly.
+//
+// Membership is a bitset over record IDs, not a map: the scan probes every
+// position, so a map lookup per position dominates the check it guards. A
+// bitset probe is a bounds check plus one word load.
 type boundedScanMembershipFilter struct {
-	source  candidatePlanSource
-	members map[int]struct{}
+	source candidatePlanSource
+	bits   []uint64
+	count  int
+	n      int
+}
+
+func newBoundedScanMembershipFilter(recordCount int) *boundedScanMembershipFilter {
+	return &boundedScanMembershipFilter{
+		bits: make([]uint64, (recordCount+63)/64),
+		n:    recordCount,
+	}
+}
+
+func (f *boundedScanMembershipFilter) add(id int) {
+	if f == nil || id < 0 || id >= f.n {
+		return
+	}
+	w := id / 64
+	b := uint64(1) << uint(id%64)
+	if f.bits[w]&b == 0 {
+		f.bits[w] |= b
+		f.count++
+	}
+}
+
+func (f *boundedScanMembershipFilter) len() int {
+	if f == nil {
+		return 0
+	}
+	return f.count
 }
 
 func (f *boundedScanMembershipFilter) contains(id int) bool {
-	if f == nil || f.members == nil {
+	if f == nil || f.bits == nil {
 		return true
 	}
-	_, ok := f.members[id]
-	return ok
+	if id < 0 || id >= f.n {
+		return false
+	}
+	return f.bits[id/64]&(uint64(1)<<uint(id%64)) != 0
 }
 
 // boundedScanCandidatesHiddenTopFiltered is boundedScanCandidatesHiddenTop with
@@ -534,12 +905,13 @@ func (vol *serviceVolumeIndex) boundedScanCandidatesHiddenTopFiltered(pq parsedQ
 	if vol == nil || vol.index == nil || limit <= 0 {
 		return nil, false
 	}
-	if filter != nil && filter.members == nil && filter.source.hasPosting {
+	if filter != nil && filter.bits == nil && filter.source.hasPosting {
 		ids := filter.source.posting.materialize()
-		filter.members = make(map[int]struct{}, len(ids))
+		nf := newBoundedScanMembershipFilter(vol.index.compactRecordCount())
 		for _, id := range ids {
-			filter.members[int(id)] = struct{}{}
+			nf.add(int(id))
 		}
+		filter.bits, filter.count, filter.n = nf.bits, nf.count, nf.n
 	}
 	return vol.boundedScanHiddenTop(pq, hidden, limit, filter)
 }
@@ -739,11 +1111,11 @@ func (vol *serviceVolumeIndex) planPlainTermPathFilter(pq parsedQuery) (filter *
 	if best == nil || len(best) > serviceComponentMultiTermScanMaxIDs {
 		return nil, false, false
 	}
-	members := make(map[int]struct{}, len(best))
+	filter = newBoundedScanMembershipFilter(vol.index.compactRecordCount())
 	for _, id := range best {
-		members[id] = struct{}{}
+		filter.add(id)
 	}
-	return &boundedScanMembershipFilter{members: members}, false, true
+	return filter, false, true
 }
 
 // plainTermMayOccurInPathPrefix protects name-only trigram proofs from path
@@ -757,6 +1129,19 @@ func (vol *serviceVolumeIndex) plainTermMayOccurInPathPrefix(term string) bool {
 		return true
 	}
 	return len(vol.index.Roots) > 0 && containsFoldASCII(vol.index.Roots[0], term)
+}
+
+// pathTermSatisfiedByVolume reports whether term holds on every reconstructed
+// path through the volume prefix alone, mirroring compactPathContainsTerm's
+// volume check (the record-name chain check there is the constraining part).
+// Such a term is vacuous as a candidate source: any name/posting-derived
+// subset misses the volume-only matches, so sourcing lanes must skip it when
+// choosing multi-term drivers, or decline single-term drivers and let the
+// verified scan decide. Verification still re-checks the term (vacuously
+// true), so skipping only widens candidates, never results.
+func (vol *serviceVolumeIndex) pathTermSatisfiedByVolume(term string) bool {
+	return vol != nil && vol.index != nil && vol.index.Volume != "" && term != "" &&
+		containsFoldASCII(vol.index.Volume, term)
 }
 
 // plainTermPostingWorthBuilding reports whether intersecting a term's name
@@ -795,6 +1180,13 @@ func (vol *serviceVolumeIndex) plainTermPostingWorthBuilding(term string) bool {
 // scan runs.
 func (vol *serviceVolumeIndex) boundedScanPrefilter(pq parsedQuery, filter **boundedScanMembershipFilter) (exactEmpty, filterOK bool) {
 	if vol == nil || vol.index == nil || pq.CaseSensitive {
+		return false, false
+	}
+	if vol.accentUnionActive(pq) {
+		// Gram-absence proofs and posting membership filters read unfolded
+		// bytes: mark-stripping can create adjacencies (x+mark+y+z folds to
+		// xyz) that unfolded proofs cannot disprove, and postings miss
+		// accent names. Run the unfiltered scan; its verifier folds.
 		return false, false
 	}
 	if vol.plainTermNameTrigramExactEmpty(pq) {
@@ -948,7 +1340,7 @@ func (vol *serviceVolumeIndex) planRegexLiteralFilter(pq parsedQuery) (filter *b
 	if len(disjuncts) == 0 {
 		return nil, false, false
 	}
-	members := make(map[int]struct{}, 64)
+	filter = newBoundedScanMembershipFilter(vol.index.compactRecordCount())
 	kept := 0
 	for _, runs := range disjuncts {
 		hasUsable := false
@@ -981,11 +1373,11 @@ func (vol *serviceVolumeIndex) planRegexLiteralFilter(pq parsedQuery) (filter *b
 			// exact superset of the match set.
 			continue
 		}
-		if len(members)+len(best) > serviceComponentMultiTermScanMaxIDs {
+		if filter.len()+len(best) > serviceComponentMultiTermScanMaxIDs {
 			return nil, false, false
 		}
 		for _, id := range best {
-			members[id] = struct{}{}
+			filter.add(id)
 		}
 		kept++
 	}
@@ -994,7 +1386,7 @@ func (vol *serviceVolumeIndex) planRegexLiteralFilter(pq parsedQuery) (filter *b
 		// this volume.
 		return nil, true, true
 	}
-	return &boundedScanMembershipFilter{members: members}, false, true
+	return filter, false, true
 }
 
 // planDirSubtreeFilter builds a membership pre-filter for `type:dir <term>`
@@ -1009,7 +1401,7 @@ func (vol *serviceVolumeIndex) planDirSubtreeFilter(pq parsedQuery) (*boundedSca
 		len(pq.Terms) != 1 || len(pq.Exts) != 0 || len(pq.Globs) != 0 ||
 		len(pq.Dirs) != 0 || len(pq.Regexps) != 0 || len(pq.OrGroups) != 0 || len(pq.NotGroups) != 0 ||
 		len(pq.SizeFilters) != 0 || len(pq.DateFilters) != 0 || len(pq.AttrFilters) != 0 ||
-		pq.Under != "" || pq.HasModAfter || pq.Exists {
+		pq.Under != "" || pq.HasModAfter || pq.lateVerified() {
 		return nil, false
 	}
 	term := ""
@@ -1045,7 +1437,7 @@ func (vol *serviceVolumeIndex) planDirSubtreeFilter(pq parsedQuery) (*boundedSca
 	if total == 0 {
 		return nil, false
 	}
-	members := make(map[int]struct{}, total)
+	filter := newBoundedScanMembershipFilter(vol.index.compactRecordCount())
 	for _, root := range roots {
 		if root < 0 || root >= len(vol.subtreeStart) || root >= len(vol.subtreeEnd) {
 			continue
@@ -1055,8 +1447,8 @@ func (vol *serviceVolumeIndex) planDirSubtreeFilter(pq parsedQuery) (*boundedSca
 			continue
 		}
 		for _, id32 := range vol.subtreeOrder[start:end] {
-			members[int(id32)] = struct{}{}
+			filter.add(int(id32))
 		}
 	}
-	return &boundedScanMembershipFilter{members: members}, true
+	return filter, true
 }

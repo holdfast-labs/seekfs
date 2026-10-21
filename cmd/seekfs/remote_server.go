@@ -102,27 +102,42 @@ type remoteDBSummary struct {
 // here are ever sent to a remote caller; everything else in the internal
 // serviceResponse is private by default.
 type remoteResponse struct {
-	OK              bool                `json:"ok"`
-	Message         string              `json:"message,omitempty"`
-	Count           int                 `json:"count,omitempty"`
-	SearchMS        float64             `json:"search_ms,omitempty"`
-	Source          string              `json:"source,omitempty"`
-	EligibleVolumes []string            `json:"eligible_volumes,omitempty"`
-	Health          string              `json:"health,omitempty"`
-	HealthMessage   string              `json:"health_message,omitempty"`
-	Version         string              `json:"version,omitempty"`
-	Commit          string              `json:"commit,omitempty"`
-	Date            string              `json:"date,omitempty"`
-	BuildFlavor     string              `json:"build_flavor,omitempty"`
-	Entries         int                 `json:"entries,omitempty"`
-	Loading         bool                `json:"loading,omitempty"`
-	Fuzzy           bool                `json:"fuzzy,omitempty"`
-	Complete        *bool               `json:"complete,omitempty"`
-	Results         []string            `json:"results,omitempty"`
-	Rows            []remoteResultRow   `json:"rows,omitempty"`
-	DBs             []remoteDBSummary   `json:"dbs,omitempty"`
-	WatchVolumes    []watchVolumeCursor `json:"watch_volumes,omitempty"`
-	WatchEvents     []watchDeltaEvent   `json:"watch_events,omitempty"`
+	OK              bool                 `json:"ok"`
+	Message         string               `json:"message,omitempty"`
+	Count           int                  `json:"count,omitempty"`
+	SearchMS        float64              `json:"search_ms,omitempty"`
+	Source          string               `json:"source,omitempty"`
+	EligibleVolumes []string             `json:"eligible_volumes,omitempty"`
+	Health          string               `json:"health,omitempty"`
+	HealthMessage   string               `json:"health_message,omitempty"`
+	Version         string               `json:"version,omitempty"`
+	Commit          string               `json:"commit,omitempty"`
+	Date            string               `json:"date,omitempty"`
+	BuildFlavor     string               `json:"build_flavor,omitempty"`
+	Entries         int                  `json:"entries,omitempty"`
+	Loading         bool                 `json:"loading,omitempty"`
+	Fuzzy           bool                 `json:"fuzzy,omitempty"`
+	FuzzyCorrection string               `json:"fuzzy_correction,omitempty"`
+	Complete        *bool                `json:"complete,omitempty"`
+	Content         *remoteContentHealth `json:"content,omitempty"`
+	Results         []string             `json:"results,omitempty"`
+	Rows            []remoteResultRow    `json:"rows,omitempty"`
+	DBs             []remoteDBSummary    `json:"dbs,omitempty"`
+	WatchVolumes    []watchVolumeCursor  `json:"watch_volumes,omitempty"`
+	WatchEvents     []watchDeltaEvent    `json:"watch_events,omitempty"`
+}
+
+// remoteContentHealth is the coarse, public projection of content query health.
+// Internal detail (build/fold error text, counts, sidecar sizes) stays private;
+// a remote caller gets only the trust-relevant flags, so a degraded or
+// divergent content answer is visible off-box instead of only inside Complete.
+type remoteContentHealth struct {
+	State           string   `json:"state,omitempty"`
+	Partial         bool     `json:"partial,omitempty"`
+	Incomplete      bool     `json:"incomplete,omitempty"`
+	Stale           bool     `json:"content_stale,omitempty"`
+	CountDivergent  bool     `json:"count_divergent,omitempty"`
+	DegradedVolumes []string `json:"degraded_volumes,omitempty"`
 }
 
 // remoteResultRow is the public projection of a jsonResult row.  It carries the
@@ -225,6 +240,43 @@ func (rs *remoteLoopbackServer) close() {
 	}
 	<-rs.done
 	rs.wg.Wait()
+}
+
+// closeBounded is the shutdown-path close: it stops the listener, cancels all
+// in-flight work, and waits up to d for the connections to finish. On timeout
+// it returns anyway (a wedged request must not hold SCM stop); process exit
+// reclaims the connections. New requests are refused once shutdown begins, so
+// no wg.Add can race the wait below.
+func (rs *remoteLoopbackServer) closeBounded(d time.Duration) {
+	close(rs.stop)
+	if rs.ln != nil {
+		rs.ln.Close()
+	}
+	rs.mu.Lock()
+	conns := make([]*remoteConn, 0, len(rs.conns))
+	for rc := range rs.conns {
+		conns = append(conns, rc)
+	}
+	rs.mu.Unlock()
+	for _, rc := range conns {
+		rc.shutdown()
+	}
+	drained := make(chan struct{})
+	go func() {
+		for _, rc := range conns {
+			rc.waitInFlight()
+		}
+		<-rs.done
+		rs.wg.Wait()
+		close(drained)
+	}()
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-drained:
+	case <-timer.C:
+		serviceLog("service shutdown: remote connections did not drain in %s; exiting anyway", d)
+	}
 }
 
 // remoteRequestState tracks one in-flight remote request for connection-scoped
@@ -581,21 +633,32 @@ func readRemoteFramePayload(r *bufio.Reader) ([]byte, error) {
 // reasons) stay private by default.
 func remoteResponseFromService(resp serviceResponse, countOnly bool) remoteResponse {
 	out := remoteResponse{
-		OK:          resp.OK,
-		Message:     genericRemoteMessage(resp.Message),
-		Count:       resp.Count,
-		SearchMS:    resp.SearchMS,
-		Source:      remoteSearchSource(resp.Source, countOnly),
-		Health:      resp.Health,
-		Version:     resp.Version,
-		Commit:      resp.Commit,
-		Date:        resp.Date,
-		BuildFlavor: resp.BuildFlavor,
-		Entries:     resp.Entries,
-		Loading:     resp.Loading,
-		Fuzzy:       resp.Fuzzy,
-		Complete:    resp.Complete,
-		Results:     resp.Results,
+		OK:              resp.OK,
+		Message:         genericRemoteMessage(resp.Message),
+		Count:           resp.Count,
+		SearchMS:        resp.SearchMS,
+		Source:          remoteSearchSource(resp.Source, countOnly),
+		Health:          resp.Health,
+		Version:         resp.Version,
+		Commit:          resp.Commit,
+		Date:            resp.Date,
+		BuildFlavor:     resp.BuildFlavor,
+		Entries:         resp.Entries,
+		Loading:         resp.Loading,
+		Fuzzy:           resp.Fuzzy,
+		FuzzyCorrection: resp.FuzzyCorrection,
+		Complete:        resp.Complete,
+		Results:         resp.Results,
+	}
+	if resp.Content != nil {
+		out.Content = &remoteContentHealth{
+			State:           resp.Content.State,
+			Partial:         resp.Content.Partial,
+			Incomplete:      resp.Content.Incomplete,
+			Stale:           resp.Content.Stale,
+			CountDivergent:  resp.Content.CountDivergent,
+			DegradedVolumes: resp.Content.DegradedVolumes,
+		}
 	}
 	// EligibleVolumes are public volume labels (C:, F:), safe to expose.
 	out.EligibleVolumes = resp.EligibleVolumes

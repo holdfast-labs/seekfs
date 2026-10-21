@@ -126,6 +126,28 @@ function Invoke-Tests {
         go test '-coverprofile=coverage.out' '-covermode=atomic' ./...
     }
 
+    # Soak tier: the genuinely long differential matrices and strict perf
+    # budgets run reduced by default (see the "Test tiers" section in
+    # docs/BENCHMARKS.md). CI sets SEEKFS_TEST_SOAK=1 and runs the full
+    # versions here so no coverage is lost to the default-tier speedup.
+    Invoke-Native 'go test (soak tier, cmd/seekfs)' {
+        $env:SEEKFS_TEST_SOAK = '1'
+        try {
+            go test '-timeout=40m' '-run=TestContentGlobalLaneScopeDifferential|TestSeededQueryOracleMatrix|TestPNGCAugmentFixtureMeasurement|TestPNGCAugmentLegacyNoMetadataUsesBoundedDiscovery|TestNameGramExternalSpillsMatchInMemory|TestSelectiveWithCompanionMatchesInMemory' ./cmd/seekfs
+        } finally {
+            Remove-Item Env:\SEEKFS_TEST_SOAK -ErrorAction SilentlyContinue
+        }
+    }
+
+    Invoke-Native 'go test (soak tier, cmd/seekfs-native)' {
+        $env:SEEKFS_TEST_SOAK = '1'
+        try {
+            go test '-timeout=40m' '-run=TestHeadlessFrameCost' ./cmd/seekfs-native
+        } finally {
+            Remove-Item Env:\SEEKFS_TEST_SOAK -ErrorAction SilentlyContinue
+        }
+    }
+
     Write-Step 'coverage total'
     Write-Host "  $((go tool cover '-func=coverage.out' | Select-Object -Last 1))"
 

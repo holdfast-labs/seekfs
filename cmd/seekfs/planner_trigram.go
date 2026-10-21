@@ -21,7 +21,7 @@ func (vol *serviceVolumeIndex) filenameTrigramCandidates(pq parsedQuery) ([]int,
 	if vol == nil || vol.index == nil || (trigrams == nil && vol.index.Derived.SelfNameTrigrams == nil) || pq.CaseSensitive ||
 		pq.MatchPath || pq.Under != "" || pq.Type != "" ||
 		len(pq.Dirs) > 0 || len(pq.Regexps) > 0 ||
-		len(pq.OrGroups) > 0 || len(pq.NotGroups) > 0 || pq.HasModAfter || pq.Exists ||
+		len(pq.OrGroups) > 0 || len(pq.NotGroups) > 0 || pq.HasModAfter || pq.lateVerified() ||
 		pq.CWDBias != "" || pq.RootBias != "" {
 		return nil, false
 	}
@@ -212,7 +212,7 @@ func (vol *serviceVolumeIndex) componentTrigramCandidates(pq parsedQuery) ([]int
 	}
 	if pq.CaseSensitive || !pq.MatchPath || len(pq.Terms) == 0 || pq.Under != "" || pq.Type != "" ||
 		len(pq.Exts) > 0 || len(pq.Globs) > 0 || len(pq.Dirs) > 0 || len(pq.Regexps) > 0 ||
-		len(pq.OrGroups) > 0 || len(pq.NotGroups) > 0 || pq.HasModAfter || pq.Exists ||
+		len(pq.OrGroups) > 0 || len(pq.NotGroups) > 0 || pq.HasModAfter || pq.lateVerified() ||
 		pq.CWDBias != "" || pq.RootBias != "" {
 		pq.Trace.setDecline("component-trigram:unsupported-query")
 		return nil, false
@@ -290,8 +290,8 @@ func (vol *serviceVolumeIndex) nameTrigramPathNameTopCandidates(pq parsedQuery) 
 		!pq.MatchPath || pq.CountOnly || pq.Limit <= 0 || len(pq.Terms) == 0 ||
 		pq.Under != "" || pq.Type != "" || len(pq.Exts) > 0 || len(pq.Globs) > 0 ||
 		len(pq.Dirs) > 0 || len(pq.Regexps) > 0 || len(pq.OrGroups) > 0 ||
-		len(pq.NotGroups) > 0 || pq.HasModAfter || pq.Exists ||
-		pq.CWDBias != "" || pq.RootBias != "" || countNonVolumeTerms(pq.Terms) != 1 {
+		len(pq.NotGroups) > 0 || pq.HasModAfter || pq.lateVerified() ||
+		pq.CWDBias != "" || pq.RootBias != "" || countNonVolumeTerms(pq.Terms) != 1 || pq.hiddenBlocksTruncation() {
 		pq.Trace.replaceDecline("path-name-trigram-top:unsupported-query")
 		return nil, false
 	}
@@ -471,7 +471,9 @@ func (vol *serviceVolumeIndex) nameNgramNameTermPosting(term string, trigrams *c
 		if entry, ok := vol.termCache[cacheKey]; ok {
 			if vol.cacheStampValid(entry.gen) {
 				vol.termMu.Unlock()
-				return vol.withRecentCandidates(entry.ids, entry.gen, func(rec CompactRecord) bool {
+				// Callers rank-sort candidate lists in place; never hand
+				// out the cached slice itself.
+				return vol.withRecentCandidates(append([]int(nil), entry.ids...), entry.gen, func(rec CompactRecord) bool {
 					id, ok := vol.idForFRN(rec.FRN)
 					return ok && vol.nameTrigramCandidateMatches(id, term)
 				}), true
@@ -492,7 +494,7 @@ func (vol *serviceVolumeIndex) nameNgramNameTermPosting(term string, trigrams *c
 	out := vol.verifyNameTrigramCandidateIDs(ids, term)
 	out = uniqueSortedInts(out)
 	vol.cacheNamePosting(cacheKey, out)
-	return vol.withNameTrigramRecentCandidates(out, term), true
+	return vol.withNameTrigramRecentCandidates(append([]int(nil), out...), term), true
 }
 
 func (vol *serviceVolumeIndex) nameTrigramRecentMatches(term string) []int {

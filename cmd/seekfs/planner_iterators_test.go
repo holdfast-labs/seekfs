@@ -12,6 +12,112 @@ import (
 	"time"
 )
 
+// buildUnderScopedTestVolume builds a blink-like tree: an under scope that is
+// itself a term root (satisfied-drop), in-scope term roots, and out-of-scope
+// lookalikes that must never leak into under-scoped results.
+func buildUnderScopedTestVolume(t *testing.T) *serviceVolumeIndex {
+	t.Helper()
+	dir := uint32(os.ModeDir)
+	idx := &Index{Source: "usn", Volume: "C:", Compact: true, Records: []CompactRecord{
+		{FRN: 1, ParentFRN: 1, Parent: -1, Name: ".", Mode: dir},
+		{FRN: 2, ParentFRN: 1, Parent: 0, Name: "blink", Mode: dir},
+		{FRN: 3, ParentFRN: 2, Parent: 1, Name: "renderer", Mode: dir},
+		{FRN: 4, ParentFRN: 2, Parent: 1, Name: "core", Mode: dir},
+		{FRN: 5, ParentFRN: 3, Parent: 2, Name: "frame.cc"},
+		{FRN: 6, ParentFRN: 3, Parent: 2, Name: "core_util.cc"},
+		{FRN: 7, ParentFRN: 2, Parent: 1, Name: "render_host.cc"},
+		{FRN: 8, ParentFRN: 2, Parent: 1, Name: "blink_main.cc"},
+		{FRN: 9, ParentFRN: 1, Parent: 0, Name: "base", Mode: dir},
+		{FRN: 10, ParentFRN: 9, Parent: 8, Name: "render.cc"},
+		{FRN: 11, ParentFRN: 9, Parent: 8, Name: "blinkutil.cc"},
+	}}
+	buildOrders(idx)
+	vol := newServiceVolumeIndex("under-scoped.gsi", idx)
+	vol.buildCompactChildren()
+	vol.buildSubtreeRanges()
+	vol.rootIDs = []uint32{0}
+	vol.queryIndex = &residentQueryIndex{components: map[string][]uint32{
+		"blink": {1}, "render": {2}, "core": {3},
+	}}
+	vol.rebuildNameTrigramsLocked()
+	return vol
+}
+
+func TestUnderScopedPathQueriesMatchOracle(t *testing.T) {
+	vol := buildUnderScopedTestVolume(t)
+	volumes := []*serviceVolumeIndex{vol}
+	queries := []struct {
+		query string
+		under string
+	}{
+		// "blink" is satisfied on the scope (under root is itself a blink
+		// root) and drops out; "render" drives from its in-scope roots.
+		{"blink render", `C:\blink`},
+		// Both terms scoped; out-of-scope render.cc/blinkutil.cc must not leak.
+		{"render core", `C:\blink`},
+		// Single satisfied term: the prefix is the scope itself.
+		{"blink", `C:\blink`},
+		// Unscoped term (no posting) keeps the legacy assembly.
+		{"blink xyzzy", `C:\blink`},
+		// Empty scope resolves nowhere: conjunction is empty.
+		{"blink render", `C:\nosuchdir`},
+	}
+	for _, tc := range queries {
+		opts := queryOptions{Query: tc.query, MatchPath: true, Under: tc.under, Limit: 20}
+		want, err := r5ExhaustivePlannerOracle(volumes, opts, false)
+		if err != nil {
+			t.Fatalf("oracle %q under %q: %v", tc.query, tc.under, err)
+		}
+		trace := &searchTrace{}
+		traced := opts
+		traced.Trace = trace
+		got, err := searchServiceVolumes(volumes, traced, false)
+		if err != nil {
+			t.Fatalf("planned %q under %q: %v trace=%+v", tc.query, tc.under, err, *trace)
+		}
+		if a, b := pathsOf(got), pathsOf(want); !sameOrderedStrings(a, b) {
+			t.Fatalf("search %q under %q got=%v want=%v trace=%+v", tc.query, tc.under, a, b, *trace)
+		}
+		wantCount, err := r5ExhaustivePlannerOracle(volumes, opts, true)
+		if err != nil {
+			t.Fatalf("oracle count %q under %q: %v", tc.query, tc.under, err)
+		}
+		gotCount, err := searchServiceVolumes(volumes, queryOptions{Query: tc.query, MatchPath: true, Under: tc.under, Limit: 20, Trace: &searchTrace{}}, true)
+		if err != nil {
+			t.Fatalf("planned count %q under %q: %v", tc.query, tc.under, err)
+		}
+		if len(gotCount) != len(wantCount) {
+			t.Fatalf("count %q under %q got=%d want=%d", tc.query, tc.under, len(gotCount), len(wantCount))
+		}
+	}
+	// The head query must actually take the scoped components lane (not a
+	// fallback with the same answers).
+	trace := &searchTrace{}
+	if _, err := searchServiceVolumes(volumes, queryOptions{Query: "blink render", MatchPath: true, Under: `C:\blink`, Limit: 20, Trace: trace}, false); err != nil {
+		t.Fatal(err)
+	}
+	if trace.PlannerMode != "global-components" {
+		t.Fatalf("planner mode = %q, want global-components (trace=%+v)", trace.PlannerMode, *trace)
+	}
+	// White-box: "blink" is satisfied on the scope (under root is itself a
+	// blink root) while "render" scopes to a small estimate.
+	underRoots, ok := globalUnderRoots(volumes, `C:\blink`)
+	if !ok || len(underRoots) == 0 {
+		t.Fatal("under scope did not resolve")
+	}
+	byVol := underLocalsByVolume(volumes, underRoots)
+	if _, satisfied, ok := scopedTermEstimate(volumes, byVol, "blink"); !ok || !satisfied {
+		t.Fatalf("blink estimate ok=%v satisfied=%v, want ok/satisfied", ok, satisfied)
+	}
+	est, satisfied, ok := scopedTermEstimate(volumes, byVol, "render")
+	if !ok || satisfied {
+		t.Fatalf("render estimate ok=%v satisfied=%v, want ok/unsatisfied", ok, satisfied)
+	}
+	if est == 0 || est > 100 {
+		t.Fatalf("render scoped estimate = %d, want a small positive bound", est)
+	}
+}
+
 func TestGlobalRecordIDOrdering(t *testing.T) {
 	cases := []struct {
 		a, b globalRecordID
@@ -146,6 +252,37 @@ func TestMappedComponentCoverageMergesNestedRootsAndHiddenSelfHits(t *testing.T)
 	count, verified := coverage.countLive(vol, func(id int) bool { return id == 3 })
 	if count != 4 || verified != 5 {
 		t.Fatalf("hidden count/verified = %d/%d, want 4/5", count, verified)
+	}
+}
+
+func TestMappedComponentCoverageIncludesPartialNameRoots(t *testing.T) {
+	idx := &Index{
+		Version: indexVersion, Source: "usn", Volume: "C:", Compact: true,
+		Records: []CompactRecord{
+			{FRN: 1, ParentFRN: 1, Parent: -1, Name: ".", Mode: uint32(os.ModeDir)},
+			{FRN: 2, ParentFRN: 1, Parent: 0, Name: "content", Mode: uint32(os.ModeDir)},
+			{FRN: 3, ParentFRN: 2, Parent: 1, Name: "a.txt"},
+			{FRN: 4, ParentFRN: 1, Parent: 0, Name: "main_content", Mode: uint32(os.ModeDir)},
+			{FRN: 5, ParentFRN: 4, Parent: 3, Name: "b.txt"},
+		},
+	}
+	buildOrders(idx)
+	vol := newServiceVolumeIndex("component-partial.gsi", idx)
+	vol.buildCompactChildren()
+	vol.buildSubtreeRanges()
+	vol.queryIndex = &residentQueryIndex{components: map[string][]uint32{"content": {1}, "main_content": {3}}}
+
+	coverage, ok := vol.buildMappedComponentCoverage("content", nil)
+	if !ok {
+		t.Fatal("mapped component coverage declined")
+	}
+	// content, a.txt, main_content, b.txt: "content" is a substring of every
+	// path under main_content, so its subtree belongs to the coverage.
+	if coverage.rootCount != 2 || coverage.cardinality != 4 {
+		t.Fatalf("coverage roots/cardinality = %d/%d, want 2/4", coverage.rootCount, coverage.cardinality)
+	}
+	if !coverage.contains(vol, 4) {
+		t.Fatal("main_content\\b.txt missing from content coverage")
 	}
 }
 

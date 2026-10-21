@@ -19,7 +19,7 @@ func (s *goSearchService) runStandalone() error {
 	if s.processMode == "" {
 		s.processMode = "standalone"
 	}
-	applyServiceRuntimeMemoryTuning()
+	applyServiceRuntimeMemoryTuning(s)
 	fmt.Fprintf(os.Stderr, "seekfs privileged service listening on %s\n", s.pipeName)
 	go func() {
 		defer func() {
@@ -36,6 +36,9 @@ func (s *goSearchService) runStandalone() error {
 }
 
 func (s *goSearchService) loadConfiguredIndexes() error {
+	s.initializeFeatures()
+	// Per-user usage-signal stores (frecency + query history) load lazily per
+	// caller SID; nothing to preload for the LocalSystem service itself.
 	s.indexMu.Lock()
 	s.loading = true
 	s.loadErr = ""
@@ -58,6 +61,9 @@ func (s *goSearchService) loadConfiguredIndexes() error {
 		return err
 	}
 	s.indexMu.Lock()
+	for _, vol := range volumes {
+		s.prepareFeatureVolume(vol)
+	}
 	s.indexes = indexes
 	s.volumes = volumes
 	s.loadErr = ""
@@ -68,10 +74,14 @@ func (s *goSearchService) loadConfiguredIndexes() error {
 	s.startBackgroundNameTrigramBuilds(volumes)
 	s.startBackgroundNameIdentityBuilds(volumes)
 	for _, vol := range volumes {
-		if vol.state == "ready" && vol.index.Compact && vol.index.Source == "usn" {
-			go s.replayVolumeLoop(vol)
-			go s.persistVolumeLoop(vol)
-		} else if vol.state == "ready" && vol.index.Source == "walk" {
+		if vol.needsBackgroundCatchUp() {
+			// The mmapped base + WAL overlay are already queryable (the
+			// swap above published them); drain the USN backlog behind
+			// serving queries instead of ahead of it.
+			go s.backgroundCatchUpVolume(vol)
+			continue
+		}
+		if vol.state == "ready" && vol.index.Source == "walk" {
 			s.startWalkWatchers(vol)
 		} else if vol.state == "stale" && vol.index != nil && vol.index.Compact && vol.index.Source == "usn" {
 			// A volume that started stale (failed startup rebuild, journal
@@ -80,6 +90,7 @@ func (s *goSearchService) loadConfiguredIndexes() error {
 			// backoff until it recovers.
 			go s.staleRecoveryLoop(vol)
 		}
+		s.featuresVolumeReady(vol)
 	}
 	go s.replayStallWatchdog()
 	serviceLog("loaded %d dbs entries=%d elapsed=%s", len(indexes), total, time.Since(start).Round(time.Millisecond))
@@ -158,18 +169,11 @@ func loadConfiguredVolume(dbPath string) (*Index, *serviceVolumeIndex, error) {
 			}
 		}
 	}
-	if err := catchUpServiceVolume(vol); err != nil {
-		serviceLog("startup catch-up skipped volume=%s db=%s err=%v", vol.volume, vol.dbPath, err)
-		if shouldRebuildStaleIndex(err) {
-			if rebuilt, rebuildErr := rebuildServiceVolumeIndex(vol); rebuildErr == nil {
-				serviceLog("startup stale rebuild complete volume=%s db=%s entries=%d", rebuilt.volume, rebuilt.dbPath, rebuilt.index.entryCount())
-				vol = rebuilt
-				idx = rebuilt.index
-			} else {
-				serviceLog("startup stale rebuild failed volume=%s db=%s err=%v", vol.volume, vol.dbPath, rebuildErr)
-			}
-		}
-	}
+	// USN catch-up deliberately runs after the base index is already
+	// serving queries (backgroundCatchUpVolume): replaying only what
+	// changed since the checkpoint can still take tens of seconds on a
+	// busy volume, and blocking the swap on it leaves every query (and
+	// the time-to-first-query) waiting behind the backlog.
 	if serviceLowMemoryMode() && idx.Compact && idx.MMapRecords == nil {
 		if mmapIdx, mmapErr := loadIndexMMap(dbPath); mmapErr == nil {
 			idx = mmapIdx
@@ -307,14 +311,19 @@ func ensureCompactIndexForService(idx *Index) {
 
 func newServiceVolumeIndex(dbPath string, idx *Index) *serviceVolumeIndex {
 	vol := &serviceVolumeIndex{
-		dbPath:      dbPath,
-		index:       idx,
-		volume:      idx.Volume,
-		journalID:   idx.JournalID,
-		checkpoint:  idx.Checkpoint,
-		state:       "ready",
-		pathCache:   make(map[int]string),
-		lastPersist: time.Now(),
+		dbPath:         dbPath,
+		index:          idx,
+		volume:         idx.Volume,
+		journalID:      idx.JournalID,
+		checkpoint:     idx.Checkpoint,
+		baseCheckpoint: idx.Checkpoint,
+		state:          "ready",
+		pathCache:      make(map[int]string),
+		lastPersist:    time.Now(),
+	}
+	if contentSearchEnabled() {
+		vol.content = newContentVolumeState(idx.Volume)
+		vol.contentCoord = newContentCoordinator(vol.content)
 	}
 	if idx.Compact && idx.Source == "usn" {
 		vol.ownedDirFRNs = ownedReplayDirFRNs(idx.Volume)
@@ -362,10 +371,38 @@ func newServiceVolumeIndex(dbPath string, idx *Index) *serviceVolumeIndex {
 		if vol.needsCompactChildrenBuild() {
 			vol.buildCompactChildren()
 		}
+	} else if idx.Compact {
+		// Walk indexes persist the same folder topology; without it every
+		// under: scope falls back to walking each candidate's parent chain.
+		vol.adoptDerivedTopology()
 	}
 	vol.overlay = newOverlaySegment()
 	vol.publishSnapshot()
 	return vol
+}
+
+// adoptDerivedTopology wires the persisted child graph and DFS subtree
+// intervals into the volume when they cover every record. Partial or stale
+// sections are ignored so the planner keeps its parent-walk fallback.
+func (vol *serviceVolumeIndex) adoptDerivedTopology() {
+	if vol == nil || vol.index == nil {
+		return
+	}
+	derived := vol.index.Derived
+	recordCount := vol.index.compactRecordCount()
+	if len(derived.ChildOffsets) == recordCount+1 && len(derived.ChildIDs) > 0 {
+		vol.childOffsets = derived.ChildOffsets
+		vol.childIDs = derived.ChildIDs
+		vol.rootIDs = derived.RootIDs
+	}
+	if len(derived.SubtreeStart) == recordCount && len(derived.SubtreeEnd) == recordCount && len(derived.SubtreeOrder) > 0 && len(derived.SubtreeOrder) <= recordCount {
+		vol.subtreeStart = derived.SubtreeStart
+		vol.subtreeEnd = derived.SubtreeEnd
+		vol.subtreeOrder = derived.SubtreeOrder
+	}
+	if len(derived.SubtreeBytes) == recordCount {
+		vol.subtreeBytes = derived.SubtreeBytes
+	}
 }
 
 func newOverlaySegment() *overlaySegment {
@@ -510,6 +547,37 @@ func (vol *serviceVolumeIndex) applyDerivedSections() {
 	}
 }
 
+// dedupeCompactRecordsByFRN removes duplicate-FRN records, keeping the last
+// occurrence in append order. FRN 0 is not an identity and is left alone.
+func dedupeCompactRecordsByFRN(records []CompactRecord) []CompactRecord {
+	if len(records) < 2 {
+		return records
+	}
+	last := make(map[uint64]int, len(records))
+	duplicate := false
+	for i := range records {
+		frn := records[i].FRN
+		if frn == 0 {
+			continue
+		}
+		if _, ok := last[frn]; ok {
+			duplicate = true
+		}
+		last[frn] = i
+	}
+	if !duplicate {
+		return records
+	}
+	out := records[:0]
+	for i := range records {
+		frn := records[i].FRN
+		if frn == 0 || last[frn] == i {
+			out = append(out, records[i])
+		}
+	}
+	return out
+}
+
 func sortFRNIndexEntries(frns []uint64, ids []uint32) {
 	if len(frns) <= 1 || len(frns) != len(ids) || sort.SliceIsSorted(frns, func(i, j int) bool {
 		return frns[i] < frns[j]
@@ -536,6 +604,46 @@ func (p frnIndexPairs) Less(i, j int) bool {
 func (p frnIndexPairs) Swap(i, j int) {
 	p.frns[i], p.frns[j] = p.frns[j], p.frns[i]
 	p.ids[i], p.ids[j] = p.ids[j], p.ids[i]
+}
+
+// needsBackgroundCatchUp reports whether the volume must drain the USN
+// journal forward from its checkpoint after startup. It mirrors the guard
+// inside catchUpServiceVolume: only compact USN volumes with a volume name
+// can replay. When true, loadConfiguredIndexes publishes the mmapped base +
+// WAL overlay for queries first and catch-up runs behind serving.
+func (vol *serviceVolumeIndex) needsBackgroundCatchUp() bool {
+	return vol != nil && vol.index != nil && vol.index.Compact && vol.index.Source == "usn" && vol.volume != ""
+}
+
+// backgroundCatchUpVolume drains the USN backlog for one volume after its
+// base index is already serving queries, then starts the same loops (or the
+// stale-recovery loop) and content attach the synchronous startup path used
+// to start. Queries served during the drain see the base + WAL overlay and
+// every batch publishes as it applies, so results converge on the live
+// journal instead of waiting behind it.
+func (s *goSearchService) backgroundCatchUpVolume(vol *serviceVolumeIndex) {
+	start := time.Now()
+	fromCheckpoint := vol.checkpoint
+	vol.state = "replaying"
+	if err := catchUpServiceVolume(vol); err != nil {
+		serviceLog("startup catch-up skipped volume=%s db=%s err=%v", vol.volume, vol.dbPath, err)
+		if shouldRebuildStaleIndex(err) {
+			if rebuildErr := s.rebuildVolumeInPlace(vol); rebuildErr == nil {
+				serviceLog("startup stale rebuild complete volume=%s db=%s entries=%d", vol.volume, vol.dbPath, vol.index.entryCount())
+			} else {
+				serviceLog("startup stale rebuild failed volume=%s db=%s err=%v", vol.volume, vol.dbPath, rebuildErr)
+			}
+		}
+	}
+	s.featuresVolumeReady(vol)
+	if vol.state == "ready" && vol.index.Compact && vol.index.Source == "usn" {
+		go s.replayVolumeLoop(vol)
+		go s.persistVolumeLoop(vol)
+	} else if vol.state == "stale" && vol.index != nil && vol.index.Compact && vol.index.Source == "usn" {
+		go s.staleRecoveryLoop(vol)
+	}
+	serviceLog("catch-up complete volume=%s db=%s replayed_usn=%d elapsed=%s state=%s",
+		vol.volume, vol.dbPath, vol.checkpoint-fromCheckpoint, time.Since(start).Round(time.Millisecond), vol.state)
 }
 
 func catchUpServiceVolume(vol *serviceVolumeIndex) error {
@@ -579,16 +687,19 @@ func catchUpServiceVolume(vol *serviceVolumeIndex) error {
 		}
 		// seekfs's own artifact churn is dropped before the WAL and the overlay
 		// so the checkpoint can advance past it (nextUSN below) without either
-		// growing from records that are never indexed.
+		// growing from records that are never indexed. The overlay publishes
+		// before the WAL fsync (same visibility-before-durability order as
+		// the live replay path); a crash before the WAL lands replays the
+		// same range from the journal.
 		changes = vol.filterOwnedReplayChanges(changes)
+		vol.applyUSNChanges(changes)
+		vol.checkpoint = nextUSN
+		vol.index.Checkpoint = nextUSN
 		if err := appendWAL(vol.dbPath, nextUSN, changes); err != nil {
 			vol.state = "stale"
 			vol.staleReason = err.Error()
 			return err
 		}
-		vol.applyUSNChanges(changes)
-		vol.checkpoint = nextUSN
-		vol.index.Checkpoint = nextUSN
 	}
 	if vol.dbPath != "" {
 		vol.dirty = true
@@ -612,6 +723,40 @@ func (vol *serviceVolumeIndex) idForFRN(frn uint64) (int, bool) {
 		return int(vol.frnRecordIDs[i]), true
 	}
 	return 0, false
+}
+
+// baseIDsForFRN returns every base record id that carries frn. A healthy index
+// has one; a base that folded an unshadowed replacement can carry a stale and a
+// live record with the same FRN, and every one of them must be shadowed or
+// tombstoned together.
+func (vol *serviceVolumeIndex) baseIDsForFRN(frn uint64) []int {
+	if vol == nil || frn == 0 {
+		return nil
+	}
+	var ids []int
+	if vol.frnToID != nil {
+		if id, ok := vol.frnToID[frn]; ok {
+			ids = append(ids, id)
+		}
+	}
+	lo := sort.Search(len(vol.frns), func(i int) bool { return vol.frns[i] >= frn })
+	for i := lo; i < len(vol.frns) && vol.frns[i] == frn; i++ {
+		if i >= len(vol.frnRecordIDs) {
+			break
+		}
+		id := int(vol.frnRecordIDs[i])
+		seen := false
+		for _, existing := range ids {
+			if existing == id {
+				seen = true
+				break
+			}
+		}
+		if !seen {
+			ids = append(ids, id)
+		}
+	}
+	return ids
 }
 
 func (vol *serviceVolumeIndex) addFRNID(frn uint64, id int) {
@@ -965,12 +1110,11 @@ func (s *goSearchService) replayVolumeOnce(vol *serviceVolumeIndex, buffer []byt
 		// the checkpoint must still cover the truncated tail (see above), while
 		// seekfs's own artifact churn must not reach the WAL or the overlay.
 		changes = vol.filterOwnedReplayChanges(changes)
-		if err := appendWAL(vol.dbPath, appliedCheckpoint, changes); err != nil {
-			vol.state = "stale"
-			vol.staleReason = err.Error()
-			vol.mu.Unlock()
-			return applied, err
-		}
+		// Publish before the WAL fsync: queries see the change as soon as
+		// the overlay snapshot lands, without waiting for the disk sync.
+		// Durability is preserved — the on-disk checkpoint only advances on
+		// fold, so a crash before the WAL lands replays the same USN range
+		// from the journal instead of losing it.
 		vol.applyUSNChanges(changes)
 		vol.checkpoint = appliedCheckpoint
 		vol.index.Checkpoint = appliedCheckpoint
@@ -983,6 +1127,12 @@ func (s *goSearchService) replayVolumeOnce(vol *serviceVolumeIndex, buffer []byt
 		vol.stallObservedCp = 0
 		vol.stallObservedAt = time.Time{}
 		vol.dirty = true
+		if err := appendWAL(vol.dbPath, appliedCheckpoint, changes); err != nil {
+			vol.state = "stale"
+			vol.staleReason = err.Error()
+			vol.mu.Unlock()
+			return applied, err
+		}
 		vol.mu.Unlock()
 		applied = true
 		fromUSN = appliedCheckpoint
@@ -1001,7 +1151,13 @@ func (s *goSearchService) persistVolumeLoop(vol *serviceVolumeIndex) {
 		}
 		select {
 		case <-s.stop:
-			s.persistVolumeIfDue(vol, true)
+			// No final blocking persist on shutdown: the fold plus the
+			// multi-gigabyte tmp write, commit and reload stalls SCM stop
+			// past its deadline (STOP_PENDING) when several volumes are
+			// due at once. The WAL holds every replayed batch, so
+			// durability is preserved without it; a persist killed
+			// mid-flight is safe (tmp + atomic rename, and the WAL rewrite
+			// keeps the post-snapshot frames for the next startup replay).
 			return
 		case <-ticker.C:
 			s.sweepStaleIndexTempFilesIfDue(time.Now())
@@ -1016,6 +1172,11 @@ func (s *goSearchService) persistVolumeIfDue(vol *serviceVolumeIndex, force bool
 	}
 	if !force && envBool("SEEKFS_DISABLE_BACKGROUND_PERSIST") {
 		return
+	}
+	vol.persistActive.Add(1)
+	defer vol.persistActive.Add(-1)
+	if !force && vol.contentSnapshotHold.Load() > 0 {
+		return // a content snapshot is copying this index; persist next tick
 	}
 	now := time.Now()
 	s.indexMu.RLock()
@@ -1135,7 +1296,7 @@ func (s *goSearchService) persistVolumeIfDue(vol *serviceVolumeIndex, force bool
 	// idempotent per batch).
 	seeded := 0
 	if replacement.index.Compact && replacement.index.Source == "usn" && vol.overlay != nil {
-		replacement.overlay = carryOverlayDelta(vol.overlay, snapshotWatermark, foldOverlay)
+		replacement.overlay = carryOverlayDelta(vol.overlay, snapshotWatermark, foldOverlay, vol.index, replacement)
 		seeded = int(replacement.overlay.watermark.Load())
 		if replacement.checkpoint < vol.checkpoint {
 			replacement.checkpoint = vol.checkpoint
@@ -1291,6 +1452,7 @@ func compactOverlayIndexLocked(vol *serviceVolumeIndex, foldOverlay *overlaySegm
 			rec := base.compactRecord(id)
 			if !rec.Deleted {
 				rec.Parent = -1
+				rec.Seq = base.recordSeq(id)
 				rec.Name = strings.Clone(rec.Name)
 				records = append(records, rec)
 			}
@@ -1309,6 +1471,7 @@ func compactOverlayIndexLocked(vol *serviceVolumeIndex, foldOverlay *overlaySegm
 				continue
 			}
 			rec.Parent = -1
+			rec.Seq = base.recordSeq(id)
 			rec.Name = strings.Clone(rec.Name)
 			records = append(records, rec)
 		}
@@ -1329,6 +1492,11 @@ func compactOverlayIndexLocked(vol *serviceVolumeIndex, foldOverlay *overlaySegm
 			records = append(records, rec)
 		}
 	}
+	// A base written by an older fold can carry a stale and a replacement
+	// record with the same FRN. Keep the last occurrence (the fold appends the
+	// replacement after the row it shadows) so the duplicate does not survive
+	// another persist.
+	records = dedupeCompactRecordsByFRN(records)
 	idByFRN := make(map[uint64]int32, len(records))
 	for i, rec := range records {
 		idByFRN[rec.FRN] = int32(i)
@@ -1393,7 +1561,14 @@ func copyOverlayBaseIDSet(set overlayBaseIDSet) overlayBaseIDSet {
 // Slot identity is preserved consistently within the rebased segment: byFRN
 // values shift by -from, and the per-call seen/path caches in overlayEntry
 // are always built against the same records slice.
-func carryOverlayDelta(live *overlaySegment, from int, foldOverlay *overlaySegment) *overlaySegment {
+//
+// Tombstone/shadow entries are BASE RECORD IDs against oldBase.  The fold
+// removes and reorders records, so the replacement base has a different ID
+// space; carrying the raw IDs would hide unrelated records there.  Each
+// surviving delta entry is remapped to the replacement base by FRN.  When
+// foldOverlay is nil no fold ran, so the live set is already in the current
+// ID space and is copied unchanged.
+func carryOverlayDelta(live *overlaySegment, from int, foldOverlay *overlaySegment, oldBase *Index, replacement *serviceVolumeIndex) *overlaySegment {
 	if live == nil {
 		return nil
 	}
@@ -1410,14 +1585,41 @@ func carryOverlayDelta(live *overlaySegment, from int, foldOverlay *overlaySegme
 			}
 		}
 		if foldOverlay != nil {
-			out.tombstone = overlayBaseIDSetDelta(live.tombstone, foldOverlay.tombstone)
-			out.shadowed = overlayBaseIDSetDelta(live.shadowed, foldOverlay.shadowed)
+			out.tombstone = remapOverlayDerivedIDs(oldBase, replacement,
+				overlayBaseIDSetDelta(live.tombstone, foldOverlay.tombstone))
+			out.shadowed = remapOverlayDerivedIDs(oldBase, replacement,
+				overlayBaseIDSetDelta(live.shadowed, foldOverlay.shadowed))
 		} else {
 			out.tombstone = copyOverlayBaseIDSet(live.tombstone)
 			out.shadowed = copyOverlayBaseIDSet(live.shadowed)
 		}
 	}
 	out.watermark.Store(int32(len(out.records)))
+	return out
+}
+
+// remapOverlayDerivedIDs translates base-record IDs in set from oldBase's ID
+// space to replacement's ID space by FRN.  An old ID whose record no longer
+// exists in the replacement base is dropped: there is no record left to hide,
+// and the raw numeric ID would name an unrelated record.
+func remapOverlayDerivedIDs(oldBase *Index, replacement *serviceVolumeIndex, set overlayBaseIDSet) overlayBaseIDSet {
+	if oldBase == nil || replacement == nil || set.len() == 0 {
+		return set
+	}
+	out := overlayBaseIDSet{}
+	for _, id32 := range set.ids {
+		id := int(id32)
+		if id < 0 || id >= oldBase.compactRecordCount() {
+			continue
+		}
+		frn := oldBase.compactRecord(id).FRN
+		if frn == 0 {
+			continue
+		}
+		if newID, ok := replacement.idForFRN(frn); ok {
+			out.add(int32(newID))
+		}
+	}
 	return out
 }
 

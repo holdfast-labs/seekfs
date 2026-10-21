@@ -17,9 +17,17 @@ import (
 )
 
 type serviceResponse struct {
-	OK                       bool                `json:"ok"`
-	Message                  string              `json:"message,omitempty"`
-	Fuzzy                    bool                `json:"fuzzy,omitempty"`
+	PluginAPI    int             `json:"plugin_api,omitempty"`
+	PluginConfig string          `json:"plugin_config,omitempty"`
+	Plugins      []pluginStatus  `json:"plugins,omitempty"`
+	Features     []featureHealth `json:"features,omitempty"`
+	OK           bool            `json:"ok"`
+	Message      string          `json:"message,omitempty"`
+	Fuzzy        bool            `json:"fuzzy,omitempty"`
+	// FuzzyCorrection names the corrected content word(s) when a zero-result
+	// `content:` query was retried with typo-tolerant corrections, so the UI
+	// can say "Showing results for receive".
+	FuzzyCorrection          string              `json:"fuzzy_correction,omitempty"`
 	PID                      int                 `json:"pid,omitempty"`
 	Executable               string              `json:"executable,omitempty"`
 	ExecutableHash           string              `json:"executable_hash,omitempty"`
@@ -64,12 +72,51 @@ type serviceResponse struct {
 	Declines                 []traceDecline      `json:"declines,omitempty"`
 	Fallback                 string              `json:"fallback,omitempty"`
 	Complete                 *bool               `json:"complete,omitempty"`
-	Results                  []string            `json:"results,omitempty"`
-	Rows                     []jsonResult        `json:"rows,omitempty"`
-	DBs                      []dbInfo            `json:"dbs,omitempty"`
-	Runtime                  *runtimeMemoryInfo  `json:"runtime,omitempty"`
-	Health                   string              `json:"health,omitempty"`
-	HealthMessage            string              `json:"health_message,omitempty"`
+	// ContentStale marks a content answer served from the previous base while
+	// a rebuild runs. Such an answer is verified against disk, so it can miss
+	// files changed since that base but never invents a match; Complete is
+	// false alongside it.
+	ContentStale   bool     `json:"content_stale,omitempty"`
+	Results        []string `json:"results,omitempty"`
+	BudgetExceeded bool     `json:"budget_exceeded,omitempty"`
+	// ContentBudgetDeadlineUnix and ContentDiskVerifyRemaining let the CLI's
+	// optional --lines enrichment share the query's absolute time deadline and
+	// exact remaining per-query read cap. A zero deadline means explicitly
+	// unbounded time; a non-nil remaining value of zero means no reads remain.
+	ContentBudgetDeadlineUnix  int64              `json:"content_budget_deadline_unix,omitempty"`
+	ContentDiskVerifyRemaining *int               `json:"content_disk_verify_remaining,omitempty"`
+	Rows                       []jsonResult       `json:"rows,omitempty"`
+	DBs                        []dbInfo           `json:"dbs,omitempty"`
+	Runtime                    *runtimeMemoryInfo `json:"runtime,omitempty"`
+	Health                     string             `json:"health,omitempty"`
+	HealthMessage              string             `json:"health_message,omitempty"`
+	Content                    *contentHealth     `json:"content,omitempty"`
+	// Recent carries the `recent` op rows (most recently opened files, newest
+	// first). Only set on the recent command.
+	Recent []recentFileJSON `json:"recent,omitempty"`
+	// Governor reports which content-build governor signals are live in
+	// this process vs unavailable, so "no user activity" is never confused
+	// with "cannot see user activity" (notably input in session 0).
+	Governor   *governorHealth `json:"governor,omitempty"`
+	NextCursor string          `json:"next_cursor,omitempty"`
+	// CursorRestarted reports that a content cursor v2 could not resume
+	// (identity change, missing record, or delta change) and the request
+	// answered from offset zero instead. CursorRestartReason names why.
+	CursorRestarted     bool             `json:"cursor_restarted,omitempty"`
+	CursorRestartReason string           `json:"cursor_restart_reason,omitempty"`
+	Settings            *serviceSettings `json:"settings,omitempty"`
+}
+
+// redactContentText clears local-only matched content text (snippets) from the
+// response rows. A non-local transport calls this at the command boundary so a
+// future projection cannot leak document text even if it forgets to strip it.
+func (r *serviceResponse) redactContentText() {
+	if r == nil {
+		return
+	}
+	for i := range r.Rows {
+		r.Rows[i].Snippet = ""
+	}
 }
 
 // servicePrincipal describes the caller of a service command and the
@@ -368,7 +415,11 @@ type residentMemoryInfo struct {
 	FRNOverlayEntries int   `json:"frn_overlay_entries,omitempty"`
 	NameIdentityBytes int64 `json:"name_identity_bytes,omitempty"`
 	NameMemoBytes     int64 `json:"name_memo_bytes,omitempty"`
-	KnownBytes        int64 `json:"known_bytes,omitempty"`
+	// CacheBytes tallies the idle-releasable per-volume query caches
+	// (term/path-term/ext/under posting lists). The global decoded
+	// posting-block cache is reported on the runtime snapshot instead.
+	CacheBytes int64 `json:"cache_bytes,omitempty"`
+	KnownBytes int64 `json:"known_bytes,omitempty"`
 }
 
 type runtimeMemoryInfo struct {
@@ -382,6 +433,9 @@ type runtimeMemoryInfo struct {
 	NumGC             uint32  `json:"num_gc"`
 	GCCPUFraction     float64 `json:"gc_cpu_fraction,omitempty"`
 	GoMemLimitBytes   int64   `json:"go_mem_limit_bytes,omitempty"`
+	// BlockCacheBytes is the heap held by the global decoded posting-block
+	// cache (default cap 128 MiB); cleared by the idle release path.
+	BlockCacheBytes int64 `json:"block_cache_bytes,omitempty"`
 }
 
 type goSearchService struct {
@@ -390,13 +444,17 @@ type goSearchService struct {
 	processMode string
 	stop        chan struct{}
 	stopOnce    sync.Once
-	dbs         []string
-	indexes     []*Index
-	volumes     []*serviceVolumeIndex
-	loading     bool
-	loadErr     string
-	indexMu     sync.RWMutex
-	requestSeq  atomic.Int64
+	// shutdownOnce guards the bounded shutdown sequence so the SCM stop
+	// handler and servePrivileged never run the teardown twice.
+	shutdownOnce sync.Once
+	dbs          []string
+	configPath   string
+	indexes      []*Index
+	volumes      []*serviceVolumeIndex
+	loading      bool
+	loadErr      string
+	indexMu      sync.RWMutex
+	requestSeq   atomic.Int64
 	// lastTempSweep holds the unix-nano time of the last stale index temp sweep,
 	// so the periodic sweep runs once per interval no matter how many volume
 	// loops call it.
@@ -406,6 +464,64 @@ type goSearchService struct {
 	// empty (disabled) by default.
 	remoteAddr string
 	remoteSrv  *remoteLoopbackServer
+	// contentLocks holds the advisory `.gsx.lock` locks this service owns for
+	// the volumes it has attached or built, keyed by the `.gsx` path. They are
+	// held for the volume's lifetime so a concurrent `content-index -db` fails
+	// fast rather than clobbering the service's sidecar (M10). Bounded by the
+	// distinct sidecar paths; released at process exit.
+	contentLocksMu sync.Mutex
+	contentLocks   map[string]*contentVolumeLock
+	// contentLockWarned marks sidecar paths whose lock acquisition failed and
+	// has not yet succeeded, so the bounded retry (drain tick) logs once instead
+	// of flooding while another process holds the lock.
+	contentLockWarned map[string]bool
+	// contentCfg is the resolved seekfs.toml, used to derive the per-volume
+	// content scope for the service-owned build.
+	contentCfg   appConfig
+	featuresOnce sync.Once
+	features     atomic.Pointer[serviceFeatures]
+	// contentForceRestart makes the next plugin apply restart content even
+	// when the plugin definitions are unchanged (per-volume scope edits).
+	contentForceRestart atomic.Bool
+	pluginSettings      atomic.Pointer[pluginSettings]
+	pluginUpdateMu      sync.Mutex
+	pluginQueueMu       sync.Mutex
+	pluginPending       map[string]pluginDefinition
+	pluginApplying      atomic.Bool
+	pluginErrorMu       sync.Mutex
+	pluginError         string
+	// settingsVolumeMu guards the pending/error state of settings-driven
+	// volume builds. Builds run in the background so settings-set returns
+	// before a multi-minute USN index build completes.
+	settingsVolumeMu    sync.Mutex
+	settingsVolumeTasks map[string]*settingsVolumeTask
+	settingsVolumeErrs  map[string]string
+}
+
+type settingsVolumeTask struct {
+	volume   string
+	db       string
+	cancel   chan struct{}
+	finished chan struct{}
+	mu       sync.Mutex
+	canceled bool
+}
+
+func (t *settingsVolumeTask) cancelNow() {
+	t.mu.Lock()
+	t.canceled = true
+	t.mu.Unlock()
+	select {
+	case <-t.cancel:
+	default:
+		close(t.cancel)
+	}
+}
+
+func (t *settingsVolumeTask) stopped() bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.canceled
 }
 
 // signalServiceStop closes the stop channel exactly once.  It is safe to call
@@ -427,6 +543,29 @@ type serviceVolumeIndex struct {
 	checkpoint  int64
 	state       string
 	staleReason string
+	// baseCheckpoint is the USN watermark of the persisted record index:
+	// the checkpoint the base record set is complete through. It trails
+	// `checkpoint` while an unfolded overlay is pending, so a service-owned
+	// content build (PF-3) can stamp a sidecar that matches exactly the
+	// records it walked; restart catch-up then replays the overlay changes.
+	baseCheckpoint int64
+	// content is the per-volume content-search state and coordinator. Both are
+	// nil unless content search is enabled by config or environment.
+	content           *contentVolumeState
+	contentCoord      *contentCoordinator
+	featureFeed       *featureChangeFeed
+	contentActivation atomic.Pointer[contentActivation]
+	contentTasksMu    sync.Mutex
+	contentTasks      int
+	contentTasksDone  chan struct{}
+	// contentBuildBusy serializes service-owned content builds: at most one
+	// runs per volume at a time, and it is left set for the whole build.
+	contentBuildBusy atomic.Bool
+	// contentBuildAttempts counts consecutive generation-change retries of a
+	// service-owned content build. An external ensureContentBuild resets it; the
+	// retry path increments it so a volume whose generation never settles gives
+	// up (degraded + BuildError) instead of spinning builds forever.
+	contentBuildAttempts atomic.Int32
 	// ownedDirFRNs holds the NTFS file references of directories that hold
 	// seekfs's own artifacts (the seekfs dir and the name-gram spool dir) for
 	// this volume.  USN changes whose ParentFRN is in this set are consumed
@@ -440,9 +579,15 @@ type serviceVolumeIndex struct {
 	ownedDynamicDirFRNs map[uint64]struct{}
 	ownedDirMu          sync.RWMutex
 
-	frnToID           map[uint64]int
-	frns              []uint64
-	frnRecordIDs      []uint32
+	frnToID      map[uint64]int
+	frns         []uint64
+	frnRecordIDs []uint32
+	// walkKeys is the cached content join column for walk-indexed volumes:
+	// the stable path-hash key of every live file record, sorted with
+	// record IDs parallel. Walk record FRNs are positional and renumber on
+	// every rescan, so content joins on these keys instead. Rebuilt whenever
+	// the index pointer moves; guarded by indexMu like the index itself.
+	walkKeys          *walkKeySet
 	children          map[uint64]map[int]struct{}
 	childOffsets      []uint32
 	childIDs          []uint32
@@ -477,6 +622,18 @@ type serviceVolumeIndex struct {
 	recentSeq         uint64
 	replayGen         atomic.Uint64
 	persistGen        atomic.Uint64
+	// contentSnapshotHold is held while a content build copies the record
+	// metadata it builds from. Background persists swap vol.index, which
+	// invalidates that copy; on a busy volume they come every few seconds, so
+	// without the hold a large snapshot never finishes and the build gives
+	// up. Persists skip their tick while it is held (the WAL keeps changes
+	// durable).
+	contentSnapshotHold atomic.Int32
+	// persistActive counts background persists in flight. A persist raises
+	// it before checking contentSnapshotHold and a snapshot raises the hold
+	// before waiting for it to drain, so a snapshot never overlaps a persist
+	// that started before it.
+	persistActive     atomic.Int32
 	underCache        map[int]postingCacheEntry
 	underRootCache    map[string]postingCacheEntry
 	dirty             bool
@@ -551,13 +708,25 @@ type postingCacheEntry struct {
 	gen uint64
 }
 
-func serviceLog(format string, args ...any) {
-	dir := filepath.Join(os.Getenv("ProgramData"), "seekfs")
+// serviceLog appends one line to service.log in the seekfs dir. The dir is
+// resolved through defaultSeekFSDir (SEEKFS_DIR-aware), so the test suite can
+// redirect it with SEEKFS_DIR instead of appending to the machine's real
+// %ProgramData%\seekfs\service.log. In production SEEKFS_DIR is unset and the
+// path is unchanged (%ProgramData%\seekfs\service.log).
+// serviceLogPath is the exact file serviceLog appends to. Tests assert this
+// path is not under the machine's ProgramData tree.
+func serviceLogPath() string {
+	dir := defaultSeekFSDir()
 	if dir == "" || dir == "seekfs" {
 		dir = filepath.Join(os.TempDir(), "seekfs")
 	}
-	_ = os.MkdirAll(dir, 0o755)
-	f, err := os.OpenFile(filepath.Join(dir, "service.log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	return filepath.Join(dir, "service.log")
+}
+
+func serviceLog(format string, args ...any) {
+	path := serviceLogPath()
+	_ = os.MkdirAll(filepath.Dir(path), 0o755)
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
 	if err != nil {
 		return
 	}

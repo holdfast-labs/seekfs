@@ -35,13 +35,13 @@ func TestGlobalMemoTopNParity(t *testing.T) {
 			pq := mustParsePrefilterQuery(t, opts)
 			t.Setenv("SEEKFS_NAME_MEMO", "0")
 			it := newGlobalIDSliceIterator(ids)
-			want, _, err := collectGlobalVerifiedTopN(&it, volumes, snapshots, pq, opts.Limit)
+			want, _, err := collectGlobalVerifiedTopN(&it, volumes, snapshots, pq, opts.Limit, nil)
 			if err != nil {
 				t.Fatal(err)
 			}
 			t.Setenv("SEEKFS_NAME_MEMO", "1")
 			it = newGlobalIDSliceIterator(ids)
-			got, _, err := collectGlobalVerifiedTopN(&it, volumes, snapshots, pq, opts.Limit)
+			got, _, err := collectGlobalVerifiedTopN(&it, volumes, snapshots, pq, opts.Limit, nil)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -70,7 +70,7 @@ func TestGlobalMemoTopNCancellation(t *testing.T) {
 	canceled := false
 	pq.Cancel = func() bool { return canceled }
 	it := &cancelAtEOFGlobalIterator{ids: []globalRecordID{{volume: 0, local: 2}}, canceled: &canceled}
-	if _, _, err := collectGlobalVerifiedTopN(it, volumes, nil, pq, 7); !errors.Is(err, errQueryCanceled) {
+	if _, _, err := collectGlobalVerifiedTopN(it, volumes, nil, pq, 7, nil); !errors.Is(err, errQueryCanceled) {
 		t.Fatalf("got %v want cancellation", err)
 	}
 }
@@ -96,7 +96,7 @@ func BenchmarkGlobalMemoDeferredMaterialization(b *testing.B) {
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
 				it := newGlobalIDSliceIterator(ids)
-				out, _, err := collectGlobalVerifiedTopN(&it, volumes, nil, pq, 20)
+				out, _, err := collectGlobalVerifiedTopN(&it, volumes, nil, pq, 20, nil)
 				if err != nil || len(out) != 20 {
 					b.Fatalf("results=%d err=%v", len(out), err)
 				}

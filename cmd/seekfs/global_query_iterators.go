@@ -1,6 +1,7 @@
 package main
 
 import (
+	"os"
 	"slices"
 	"sort"
 	"strings"
@@ -10,10 +11,31 @@ func globalPathTermIterator(volumes []*serviceVolumeIndex, term string) (globalI
 	if term == "" {
 		return nil, false
 	}
+	for _, vol := range volumes {
+		// A volume-satisfied term matches every path there; no posting side
+		// is complete for it. Decline so callers keep the verified scan.
+		if vol != nil && vol.index != nil && vol.pathTermSatisfiedByVolume(term) {
+			return nil, false
+		}
+	}
 	children := make([]globalIDIterator, 0, len(volumes))
 	for volumeIndex, vol := range volumes {
-		if vol == nil || vol.index == nil || !vol.pathComponentPostingAvailable(term) {
+		if vol == nil || vol.index == nil {
 			return nil, false
+		}
+		if !vol.pathComponentPostingAvailable(term) {
+			// No component posting for this term (typically a filename-only
+			// fragment): bridge it from the selective name trigram plus
+			// budgeted dir-subtree expansion. The bridge declines broad
+			// terms without materializing them, so callers keep their
+			// bounded-scan fallback exactly where they have it today.
+			ids, ok := vol.bridgePathTermIDs(term)
+			if !ok {
+				return nil, false
+			}
+			it := newGlobalRecordIterator(volumeIndex, ids)
+			children = append(children, &it)
+			continue
 		}
 		if len(volumes) == 1 && vol.index.compactRecordCount() > serviceResidentChildRangeMaxRecords &&
 			len(vol.subtreeOrder) == 0 && len(vol.childOffsets) > 0 {
@@ -65,6 +87,120 @@ func globalPathTermIterator(volumes []*serviceVolumeIndex, term string) (globalI
 	return newGlobalMergeIterator(children...), true
 }
 
+// bridgePathTermIDs serves a separator-free path term from the selective
+// filename trigram when no component posting exists for it.
+//
+// Path-contains-term is exactly {records whose own name contains term} union
+// {descendants of dirs whose name contains term}, so the complete trigram
+// name set plus the subtrees of the dirs among it is the exact candidate
+// set — no component index involved. It declines (false) instead of
+// materializing whenever selectivity cannot be shown cheaply: short or
+// non-ASCII terms, a declined trigram (broad/omitted grams), missing subtree
+// intervals (which would force a full-volume scan iterator), or a streamed
+// total past serviceComponentTrigramExpansionMaxIDs. Callers fall back to
+// their bounded scan on decline, exactly as before.
+func (vol *serviceVolumeIndex) bridgePathTermIDs(term string) ([]int, bool) {
+	if vol == nil || vol.index == nil || len(term) < 3 || !asciiOnlyString(term) || vol.pathTermSatisfiedByVolume(term) {
+		return nil, false
+	}
+	// Drive from names only (never MatchPath: the filename lane declines
+	// path-scoped queries). Extra predicates are enforced by the caller's
+	// verification; the trigram set is a complete superset for them.
+	namePQ := parsedQuery{Terms: []string{term}, Trace: &searchTrace{}}
+	nameIDs, ok := vol.filenameTrigramCandidates(namePQ)
+	if !ok {
+		return nil, false
+	}
+	budget := serviceComponentTrigramExpansionMaxIDs - len(nameIDs)
+	if budget < 0 {
+		return nil, false
+	}
+	seen := make(map[int]struct{}, len(nameIDs)+64)
+	for _, id := range nameIDs {
+		seen[id] = struct{}{}
+	}
+	for _, id := range nameIDs {
+		rec := vol.index.compactRecord(id)
+		if rec.Deleted || rec.Mode&uint32(os.ModeDir) == 0 {
+			continue
+		}
+		if !vol.subtreeIntervalValid(id) {
+			return nil, false
+		}
+		// Exact O(1) cardinality from the persisted interval; decline before
+		// materializing past budget. Overlaps with nameIDs or nested roots
+		// only over-count, which is decline-safe.
+		if n := vol.estimatedDescendantOrSelfCount(id); n > budget {
+			return nil, false
+		} else {
+			budget -= n
+		}
+		start, end := vol.subtreeStart[id], vol.subtreeEnd[id]
+		for pos := start; pos < end; pos++ {
+			child := int(vol.subtreeOrder[pos])
+			if child < 0 || child >= vol.index.compactRecordCount() {
+				return nil, false
+			}
+			if vol.index.compactRecord(child).Deleted {
+				continue
+			}
+			seen[child] = struct{}{}
+		}
+	}
+	out := make([]int, 0, len(seen))
+	for id := range seen {
+		out = append(out, id)
+	}
+	sort.Ints(out)
+	return out, true
+}
+
+// subtreeIntervalValid mirrors newGlobalSubtreeIterator's preconditions
+// without materializing: every root must resolve to a usable persisted
+// interval, otherwise expansion would fall back to a full-volume scan.
+func (vol *serviceVolumeIndex) subtreeIntervalValid(root int) bool {
+	return vol != nil && vol.index != nil &&
+		len(vol.subtreeOrder) > 0 && len(vol.subtreeStart) > 0 && len(vol.subtreeEnd) > 0 &&
+		root >= 0 && root < len(vol.subtreeStart) && root < len(vol.subtreeEnd) &&
+		vol.subtreeStart[root] != ^uint32(0) &&
+		vol.subtreeStart[root] <= vol.subtreeEnd[root] &&
+		int(vol.subtreeEnd[root]) <= len(vol.subtreeOrder)
+}
+
+// nameGramCountUpperBound bounds records whose name contains term using only
+// gram posting counts — no list materialization. It reports unknown (false)
+// when the gram index cannot bound the term, so callers keep their legacy
+// exact path instead of declining servable queries.
+func (vol *serviceVolumeIndex) nameGramCountUpperBound(term string) (int, bool) {
+	if vol == nil || vol.index == nil || len(term) < 3 || !asciiOnlyString(term) {
+		return 0, false
+	}
+	trigrams := vol.nameTrigramIndex()
+	if trigrams == nil && vol.index != nil {
+		trigrams = vol.index.Derived.SelfNameTrigrams
+	}
+	if trigrams == nil {
+		return 0, false
+	}
+	upper := -1
+	for _, gram := range trigrams.termGramKeys(strings.ToLower(term)) {
+		_, count, _, _, exactEmpty := vol.nameGramPosting(gram)
+		if exactEmpty {
+			return 0, true
+		}
+		if count <= 0 {
+			return 0, false
+		}
+		if upper < 0 || count < upper {
+			upper = count
+		}
+	}
+	if upper < 0 {
+		return 0, false
+	}
+	return upper, true
+}
+
 func sortGlobalPathProbeTerms(volumes []*serviceVolumeIndex, terms []string) []string {
 	probes := append([]string(nil), terms...)
 	sort.SliceStable(probes, func(i, j int) bool {
@@ -106,9 +242,313 @@ func estimateGlobalPathTerm(volumes []*serviceVolumeIndex, term string) int {
 			total += candidate.len()
 			continue
 		}
+		// No component posting: never materialize the full name-substring
+		// list blindly (it may be millions for common fragments). A trigram
+		// gram-count upper bound decides cheaply; the exact list is built
+		// only when the bound already fits the scan cap, so its allocation
+		// is bounded too. Terms the gram index cannot bound keep the legacy
+		// exact path when pathGrams exist (the iterator may still serve
+		// them), else decline without allocating.
+		if upper, boundOK := vol.nameGramCountUpperBound(term); boundOK {
+			if upper > serviceComponentMultiTermScanMaxIDs {
+				total += upper + 1
+				continue
+			}
+			total += len(vol.nameTermPosting(term))
+			continue
+		}
+		if vol.queryIndex == nil || vol.queryIndex.pathGrams == nil {
+			total += serviceComponentMultiTermScanMaxIDs + 1
+			continue
+		}
 		total += len(vol.nameTermPosting(term))
 	}
 	return total
+}
+
+// underScopedTerm is one probe term's verdict against the under roots: a
+// satisfied term holds on every under subtree and is omitted from the
+// conjunction (verification re-checks it), otherwise estimate bounds the
+// under-scoped side for probe ordering.
+type underScopedTerm struct {
+	term      string
+	satisfied bool
+	estimate  int
+}
+
+// underLocalsByVolume groups under roots per volume.
+func underLocalsByVolume(volumes []*serviceVolumeIndex, underRoots []globalRecordID) map[int][]int {
+	byVolume := make(map[int][]int)
+	for _, root := range underRoots {
+		if root.volume < 0 || root.volume >= len(volumes) {
+			continue
+		}
+		byVolume[root.volume] = append(byVolume[root.volume], root.local)
+	}
+	return byVolume
+}
+
+// localInUnderIntervals reports whether id sits in any of the under
+// subtrees. Subtree intervals nest or stay disjoint, so one interval probe
+// per under root decides membership exactly.
+func (vol *serviceVolumeIndex) localInUnderIntervals(id int, underLocals []int) bool {
+	if vol == nil || vol.index == nil || id < 0 || id >= len(vol.subtreeStart) {
+		return false
+	}
+	pos := vol.subtreeStart[id]
+	if pos == ^uint32(0) {
+		return false
+	}
+	for _, u := range underLocals {
+		if u < 0 || u >= len(vol.subtreeStart) || u >= len(vol.subtreeEnd) {
+			continue
+		}
+		if start, end := vol.subtreeStart[u], vol.subtreeEnd[u]; start != ^uint32(0) && start <= pos && pos < end {
+			return true
+		}
+	}
+	return false
+}
+
+// partitionTermRoots splits a term's component roots against one volume's
+// under locals. covered[i] reports whether underLocals[i] sits at or below
+// some root (the term then holds on that whole under subtree); inU holds the
+// roots strictly inside some under subtree; outside roots contribute nothing
+// under the scope and are dropped. ok=false declines scoping whenever an
+// interval cannot be trusted, so the caller keeps the legacy assembly.
+func partitionTermRoots(vol *serviceVolumeIndex, underLocals, roots []int) (inU []int, covered []bool, ok bool) {
+	covered = make([]bool, len(underLocals))
+	for _, u := range underLocals {
+		if !vol.subtreeIntervalValid(u) {
+			return nil, nil, false
+		}
+	}
+	for _, r := range roots {
+		if r < 0 || r >= len(vol.subtreeStart) || r >= len(vol.subtreeEnd) || vol.subtreeStart[r] == ^uint32(0) {
+			return nil, nil, false
+		}
+	}
+	for i, u := range underLocals {
+		uStart := vol.subtreeStart[u]
+		for _, r := range roots {
+			if r == u {
+				covered[i] = true
+				break
+			}
+			rStart, rEnd := vol.subtreeStart[r], vol.subtreeEnd[r]
+			if rStart <= uStart && uStart < rEnd {
+				covered[i] = true
+				break
+			}
+		}
+	}
+	for _, r := range roots {
+		// Roots at an under root are covered, not inside: their subtree is
+		// the scope itself, which the satisfied check already accounts for.
+		// Strictly inside: the root's whole subtree lies under the scope.
+		// (A file root can never strictly contain an under root, since
+		// interval starts are unique per record, so containment always
+		// means a true ancestor dir.) Anything else is outside the scope;
+		// disjoint intervals prove it contributes nothing under it.
+		atUnder := false
+		for _, u := range underLocals {
+			if r == u {
+				atUnder = true
+				break
+			}
+		}
+		if atUnder {
+			continue
+		}
+		for _, u := range underLocals {
+			uStart, uEnd := vol.subtreeStart[u], vol.subtreeEnd[u]
+			rStart, rEnd := vol.subtreeStart[r], vol.subtreeEnd[r]
+			if uStart <= rStart && rStart < uEnd && rEnd <= uEnd {
+				inU = append(inU, r)
+				break
+			}
+		}
+	}
+	if len(inU) > 1 {
+		sort.Ints(inU)
+		inU = uniqueSortedInts(inU)
+	}
+	return inU, covered, true
+}
+
+// scopedTermEstimate bounds one term's under-scoped side cardinality without
+// materializing it: exact name hits under the scope plus the in-scope root
+// intervals (overlaps only over-count, which declines conservatively).
+// satisfied reports the term holds on every under subtree of every volume.
+// ok=false declines scoping.
+func scopedTermEstimate(volumes []*serviceVolumeIndex, underByVolume map[int][]int, term string) (estimate int, satisfied bool, ok bool) {
+	if term == "" {
+		return 0, false, false
+	}
+	satisfied = true
+	for volumeIndex, vol := range volumes {
+		if vol == nil || vol.index == nil {
+			return 0, false, false
+		}
+		underLocals := underByVolume[volumeIndex]
+		if !vol.pathComponentPostingAvailable(term) {
+			return 0, false, false
+		}
+		if len(vol.subtreeOrder) == 0 || len(vol.subtreeStart) == 0 || len(vol.subtreeEnd) == 0 {
+			// No persisted subtree order: the legacy iterator serves the
+			// exact path posting instead; scoping declines to keep it.
+			return 0, false, false
+		}
+		roots := vol.pathTermRootIDs(term)
+		inU, covered, ok := partitionTermRoots(vol, underLocals, roots)
+		if !ok {
+			return 0, false, false
+		}
+		for _, c := range covered {
+			if !c {
+				satisfied = false
+			}
+		}
+		for _, id := range vol.nameTermPosting(term) {
+			if vol.localInUnderIntervals(id, underLocals) {
+				estimate++
+			}
+		}
+		for _, r := range inU {
+			estimate += int(vol.subtreeEnd[r] - vol.subtreeStart[r])
+		}
+		if estimate > serviceComponentMultiTermScanMaxIDs {
+			return 0, false, false
+		}
+	}
+	return estimate, satisfied, true
+}
+
+// scopedPathTermIterator materializes one term's under-scoped side per
+// volume: exact name hits under the scope plus the in-scope root subtrees.
+// It must agree with scopedTermEstimate (same partition); ok=false declines.
+func scopedPathTermIterator(volumes []*serviceVolumeIndex, underByVolume map[int][]int, term string) (globalIDIterator, bool) {
+	if term == "" {
+		return nil, false
+	}
+	children := make([]globalIDIterator, 0, len(volumes))
+	for volumeIndex, vol := range volumes {
+		if vol == nil || vol.index == nil {
+			return nil, false
+		}
+		underLocals := underByVolume[volumeIndex]
+		if !vol.pathComponentPostingAvailable(term) {
+			return nil, false
+		}
+		if len(vol.subtreeOrder) == 0 || len(vol.subtreeStart) == 0 || len(vol.subtreeEnd) == 0 {
+			return nil, false
+		}
+		roots := vol.pathTermRootIDs(term)
+		inU, _, ok := partitionTermRoots(vol, underLocals, roots)
+		if !ok {
+			return nil, false
+		}
+		ids := make([]int, 0, 64)
+		for _, id := range vol.nameTermPosting(term) {
+			if vol.localInUnderIntervals(id, underLocals) {
+				ids = append(ids, id)
+			}
+		}
+		if len(inU) > 0 {
+			sub := newGlobalSubtreeIterator(volumeIndex, vol, inU)
+			children = append(children, sub)
+		}
+		// An empty side is an exact empty conjunction contributor, not a
+		// decline: keep the empty record iterator so the intersection below
+		// stays empty exactly like the legacy assembly.
+		it := newGlobalRecordIterator(volumeIndex, ids)
+		children = append(children, &it)
+	}
+	return newGlobalMergeIterator(children...), true
+}
+
+// underScopedTermPrefix assembles the under/terms prefix of a component
+// query, consuming the plain terms (scoped sides drive the conjunction, so
+// the under subtree is never materialized then). It returns ok=false to keep
+// the legacy under-iterator assembly. A satisfied term holds on every under
+// subtree and is omitted: verification re-checks every term exactly, so
+// dropping it changes no result.
+func underScopedTermPrefix(volumes []*serviceVolumeIndex, pq parsedQuery, underRoots []globalRecordID) (globalIDIterator, bool) {
+	terms := pathPlanProbeTerms(nonVolumeTerms(pq.Terms))
+	if globalRegexLiteralSupported(pq) {
+		return nil, false
+	}
+	if len(underRoots) == 0 {
+		// Scope not in the index: the legacy under iterator is an empty
+		// merge, so the conjunction is empty without building term sides.
+		return newGlobalMergeIterator(), true
+	}
+	underByVolume := underLocalsByVolume(volumes, underRoots)
+	if len(terms) == 0 {
+		under, ok := globalUnderIterator(volumes, pq.Under)
+		if !ok {
+			return nil, false
+		}
+		return under, true
+	}
+	scoped := make([]underScopedTerm, 0, len(terms))
+	for _, term := range terms {
+		vacuousAll, vacuousAny := true, false
+		for _, vol := range volumes {
+			if vol == nil || vol.index == nil {
+				return nil, false
+			}
+			if vol.pathTermSatisfiedByVolume(term) {
+				vacuousAny = true
+			} else {
+				vacuousAll = false
+			}
+		}
+		if vacuousAll {
+			// Holds on every path on every volume; verification
+			// re-checks it, so it constrains nothing here.
+			continue
+		}
+		if vacuousAny {
+			// Mixed scope: no single scoped side is complete for this
+			// term. Decline so the legacy assembly (which declines
+			// vacuous terms itself) keeps the verified scan.
+			return nil, false
+		}
+		estimate, satisfied, ok := scopedTermEstimate(volumes, underByVolume, term)
+		if !ok {
+			return nil, false
+		}
+		scoped = append(scoped, underScopedTerm{term: term, satisfied: satisfied, estimate: estimate})
+	}
+	// Satisfied terms leave the conjunction; the survivors drive it.
+	remaining := scoped[:0]
+	for _, s := range scoped {
+		if !s.satisfied {
+			remaining = append(remaining, s)
+		}
+	}
+	scoped = remaining
+	if len(scoped) == 0 {
+		// Every term holds on all of the scope: the prefix is the scope
+		// itself, and verification re-checks the dropped terms.
+		under, ok := globalUnderIterator(volumes, pq.Under)
+		if !ok {
+			return nil, false
+		}
+		return under, true
+	}
+	sort.SliceStable(scoped, func(i, j int) bool { return scoped[i].estimate < scoped[j].estimate })
+	driver, ok := scopedPathTermIterator(volumes, underByVolume, scoped[0].term)
+	if !ok {
+		return nil, false
+	}
+	current := driver
+	for _, s := range scoped[1:] {
+		filtered := newGlobalPathTermFilterIterator(current, volumes, s.term)
+		current = &filtered
+	}
+	return current, true
 }
 
 func globalUnderIterator(volumes []*serviceVolumeIndex, under string) (globalIDIterator, bool) {
@@ -276,14 +716,24 @@ func globalComponentQueryIterator(volumes []*serviceVolumeIndex, pq parsedQuery,
 			current = newGlobalIntersectionIterator(current, next)
 		}
 	}
+	termsScoped := false
 	if pq.Under != "" {
-		under, ok := globalUnderIterator(volumes, pq.Under)
+		underRoots, ok := globalUnderRoots(volumes, pq.Under)
 		if !ok {
 			return nil, false
 		}
-		current = under
+		if prefix, ok := underScopedTermPrefix(volumes, pq, underRoots); ok {
+			current = prefix
+			termsScoped = true
+		} else {
+			under, ok := globalUnderIterator(volumes, pq.Under)
+			if !ok {
+				return nil, false
+			}
+			current = under
+		}
 	}
-	if terms := nonVolumeTerms(pq.Terms); len(terms) > 0 {
+	if terms := nonVolumeTerms(pq.Terms); len(terms) > 0 && !termsScoped {
 		probes := sortGlobalPathProbeTerms(volumes, pathPlanProbeTerms(terms))
 		if len(probes) == 0 {
 			return nil, false
@@ -383,7 +833,7 @@ func globalComponentQueryIterator(volumes []*serviceVolumeIndex, pq parsedQuery,
 
 func globalSimplePathORTerms(pq parsedQuery) ([]string, bool) {
 	if !pq.MatchPath || len(pq.OrGroups) != 1 || len(pq.NotGroups) != 0 || pq.Type != "" ||
-		pq.Under != "" || pq.Exists || pq.HasModAfter || len(pq.Exts) != 0 || len(pq.Dirs) != 0 ||
+		pq.Under != "" || pq.lateVerified() || pq.HasModAfter || len(pq.Exts) != 0 || len(pq.Dirs) != 0 ||
 		len(pq.Globs) != 0 || len(pq.Regexps) != 0 || len(pq.RegexTerms) != 0 || len(pq.Parents) != 0 ||
 		len(pq.SizeFilters) != 0 || len(pq.DateFilters) != 0 || len(pq.AttrFilters) != 0 ||
 		pq.CaseSensitive || len(pq.OrGroups[0]) == 0 {
@@ -399,7 +849,7 @@ func globalSimplePathORTerms(pq parsedQuery) ([]string, bool) {
 			len(alt.Dirs) != 0 || len(alt.Globs) != 0 || len(alt.Regexps) != 0 ||
 			len(alt.RegexTerms) != 0 || len(alt.Parents) != 0 || len(alt.Exts) != 0 ||
 			len(alt.SizeFilters) != 0 || len(alt.DateFilters) != 0 || len(alt.AttrFilters) != 0 ||
-			alt.Type != "" || alt.Under != "" || alt.Exists || alt.HasModAfter {
+			alt.Type != "" || alt.Under != "" || alt.lateVerified() || alt.HasModAfter {
 			return nil, false
 		}
 		terms = append(terms, altTerms[0])
@@ -467,7 +917,7 @@ func globalSimplePathORCount(volumes []*serviceVolumeIndex, pq parsedQuery) (int
 		}
 	}
 	merged := newGlobalMergeIterator(children...)
-	count, _, err := countGlobalVerifiedIterator(merged, volumes, nil, pq)
+	count, _, err := countGlobalVerifiedIterator(merged, volumes, nil, pq, nil)
 	return count, err == nil
 }
 
@@ -506,7 +956,7 @@ func globalComponentTopIDs(volumes []*serviceVolumeIndex, pq parsedQuery, limit 
 func globalExactPathComponentTerm(pq parsedQuery) (string, bool) {
 	terms := nonVolumeTerms(pq.Terms)
 	if !pq.MatchPath || len(terms) != 1 || pq.CaseSensitive ||
-		pq.Type != "" || pq.Under != "" || pq.Exists || pq.HasModAfter ||
+		pq.Type != "" || pq.Under != "" || pq.lateVerified() || pq.HasModAfter ||
 		len(pq.Exts) != 0 || len(pq.Dirs) != 0 || len(pq.Globs) != 0 ||
 		len(pq.Regexps) != 0 || len(pq.RegexTerms) != 0 || len(pq.Parents) != 0 ||
 		len(pq.SizeFilters) != 0 || len(pq.DateFilters) != 0 || len(pq.AttrFilters) != 0 ||

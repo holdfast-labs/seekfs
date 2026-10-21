@@ -1,0 +1,369 @@
+package main
+
+// WP7 differential: the compound content lane (filename-driven, content verified
+// inline) must return the same entries, order and count as the per-volume
+// content path for every in-scope query shape, single and multi volume. The lane
+// is a cost optimization; correctness is by construction (the filename selector
+// and the content leaves are both requirements), and this test proves it against
+// the content path.
+
+import (
+	"fmt"
+	"os"
+	"testing"
+)
+
+func contentGlobalLaneRecords(volume string) []contentVolRecord {
+	dirs := []string{"alpha", "beta"}
+	exts := []string{".txt", ".md", ".go"}
+	recs := make([]contentVolRecord, 0, 60)
+	for i := 0; i < 60; i++ {
+		name := fmt.Sprintf("doc-%03d%s", i, exts[i%3])
+		var body string
+		switch {
+		case i%5 == 0:
+			body = "the quick brown fox needle pelican synced the remote cache"
+		case i%3 == 0:
+			body = "needle in a haystack"
+		default:
+			body = "nothing to see here"
+		}
+		recs = append(recs, contentVolRecord{
+			frn:       uint64(1000 + i),
+			parent:    -1,
+			parentFRN: 1,
+			name:      name,
+			size:      int64(i) + 1,
+			modUnix:   int64(1_600_000_000 + i),
+			path:      volume + `\` + dirs[i%2] + `\` + name,
+			content:   body,
+		})
+	}
+	return recs
+}
+
+// contentGlobalLaneSearch runs one search with the lane forced on or off and
+// returns the entries (nil on error) and the trace.
+func contentGlobalLaneSearch(vols []*serviceVolumeIndex, query string, limit int, enabled bool) ([]Entry, *searchTrace) {
+	if enabled {
+		os.Setenv("SEEKFS_CONTENT_GLOBAL_LANE", "1")
+	} else {
+		os.Setenv("SEEKFS_CONTENT_GLOBAL_LANE", "0")
+	}
+	trace := &searchTrace{}
+	matches, err := searchServiceVolumes(vols, queryOptions{Query: query, Limit: limit, Trace: trace}, false)
+	if err != nil {
+		return nil, trace
+	}
+	return matches, trace
+}
+
+func contentGlobalLaneCount(vols []*serviceVolumeIndex, query string, enabled bool) (int, *searchTrace) {
+	if enabled {
+		os.Setenv("SEEKFS_CONTENT_GLOBAL_LANE", "1")
+	} else {
+		os.Setenv("SEEKFS_CONTENT_GLOBAL_LANE", "0")
+	}
+	trace := &searchTrace{}
+	n, ok, err := countServiceVolumes(vols, queryOptions{Query: query, Trace: trace})
+	if err != nil || !ok {
+		return -1, trace
+	}
+	return n, trace
+}
+
+func contentGlobalLaneScopes(t *testing.T) []struct {
+	name     string
+	vols     []*serviceVolumeIndex
+	eligible bool
+} {
+	t.Helper()
+	volC := newContentRecordVolume(t, "C:", contentGlobalLaneRecords("C:"))
+	volF := newContentRecordVolume(t, "F:", contentGlobalLaneRecords("F:"))
+	return []struct {
+		name     string
+		vols     []*serviceVolumeIndex
+		eligible bool
+	}{
+		{"single", []*serviceVolumeIndex{volC}, true},
+		{"multi", []*serviceVolumeIndex{volC, volF}, false},
+	}
+}
+
+func TestContentGlobalLaneMatchesContentPath(t *testing.T) {
+	t.Setenv("SEEKFS_CONTENT_SEARCH", "1")
+	engaged := []string{
+		"content:needle ext:.go",
+		"content:pelican ext:.txt",
+		`content:"quick brown fox" ext:.txt`,
+		"content:needle ext:.go sort:size",
+		"content:needle ext:.go sort:path",
+		"content:needle ext:.go size:>1",
+	}
+	// Shapes outside the lane's scope must decline to the content path and still
+	// return the content path's result.
+	declined := []string{
+		"content:needle",
+		"content:needle ext:.go sort:relevance",
+		"content:needle|dir:alpha",
+	}
+	for _, scope := range contentGlobalLaneScopes(t) {
+		for _, wantEngaged := range []bool{true, false} {
+			queries := declined
+			if wantEngaged {
+				queries = engaged
+			}
+			for _, q := range queries {
+				for _, limit := range []int{5, 100} {
+					t.Run(fmt.Sprintf("%s/engaged=%v/%s/limit=%d", scope.name, wantEngaged, q, limit), func(t *testing.T) {
+						want, _ := contentGlobalLaneSearch(scope.vols, q, limit, false)
+						got, laneTrace := contentGlobalLaneSearch(scope.vols, q, limit, true)
+						expectEngaged := wantEngaged && scope.eligible
+						didEngage := laneTrace.PlannerMode == "global-content-components"
+						if didEngage != expectEngaged {
+							t.Fatalf("%q: engaged=%v want %v (planner=%q)", q, didEngage, expectEngaged, laneTrace.PlannerMode)
+						}
+						if len(got) != len(want) {
+							t.Fatalf("%q: count diverged lane=%d content=%d", q, len(got), len(want))
+						}
+						for i := range want {
+							if got[i].Path != want[i].Path || got[i].FRN != want[i].FRN {
+								t.Fatalf("%q: element %d lane=%s#%d content=%s#%d", q, i, got[i].Path, got[i].FRN, want[i].Path, want[i].FRN)
+							}
+						}
+					})
+				}
+			}
+		}
+	}
+}
+
+func TestContentGlobalLaneCountMatchesContentPath(t *testing.T) {
+	t.Setenv("SEEKFS_CONTENT_SEARCH", "1")
+	engaged := []string{
+		"content:needle ext:.go",
+		"content:pelican ext:.txt",
+		"content:needle ext:.go size:>1",
+	}
+	declined := []string{"content:needle", "content:needle|dir:alpha"}
+	for _, scope := range contentGlobalLaneScopes(t) {
+		for _, q := range engaged {
+			t.Run(scope.name+"/engaged/"+q, func(t *testing.T) {
+				want, _ := contentGlobalLaneCount(scope.vols, q, false)
+				got, trace := contentGlobalLaneCount(scope.vols, q, true)
+				didEngage := trace.PlannerMode == "global-content-components"
+				if didEngage != scope.eligible {
+					t.Fatalf("%q: count lane engaged=%v want %v (planner=%q)", q, didEngage, scope.eligible, trace.PlannerMode)
+				}
+				if got != want {
+					t.Fatalf("%q: count lane=%d content=%d", q, got, want)
+				}
+				if scope.eligible {
+					matches, _ := contentGlobalLaneSearch(scope.vols, q, 1000, true)
+					if got != len(matches) {
+						t.Fatalf("%q: count %d != len(search) %d", q, got, len(matches))
+					}
+				}
+			})
+		}
+		for _, q := range declined {
+			t.Run(scope.name+"/declined/"+q, func(t *testing.T) {
+				want, _ := contentGlobalLaneCount(scope.vols, q, false)
+				got, trace := contentGlobalLaneCount(scope.vols, q, true)
+				if trace.PlannerMode == "global-content-components" {
+					t.Fatalf("%q: count lane engaged a declined shape", q)
+				}
+				if got != want {
+					t.Fatalf("%q: count diverged lane=%d content=%d", q, got, want)
+				}
+			})
+		}
+	}
+}
+
+// A content query with no filename selector stays on the content path; the lane
+// must decline it rather than answer it from a match-all filename iterator.
+func TestContentGlobalLaneDeclinesWithoutFilenameRoot(t *testing.T) {
+	t.Setenv("SEEKFS_CONTENT_SEARCH", "1")
+	t.Setenv("SEEKFS_CONTENT_GLOBAL_LANE", "1")
+	for _, scope := range contentGlobalLaneScopes(t) {
+		trace := &searchTrace{}
+		if _, err := searchServiceVolumes(scope.vols, queryOptions{Query: "content:needle", Limit: 10, Trace: trace}, false); err != nil {
+			t.Fatalf("content query: %v", err)
+		}
+		if trace.PlannerMode == "global-content-components" {
+			t.Fatalf("%s: lane engaged a content query with no filename selector", scope.name)
+		}
+	}
+}
+
+// A truncated catch-up leaves the volume usable but incomplete; the lane must
+// decline so the content path still marks the search incomplete and refuses the
+// count (errContentIncomplete).
+func TestContentGlobalLaneDeclinesWhenContentIncomplete(t *testing.T) {
+	t.Setenv("SEEKFS_CONTENT_SEARCH", "1")
+	vol := newContentRecordVolume(t, "C:", contentGlobalLaneRecords("C:"))
+	vol.content.markCatchUpIncomplete()
+	const q = "content:needle ext:.go"
+
+	want, _ := contentGlobalLaneSearch([]*serviceVolumeIndex{vol}, q, 100, false)
+	got, searchTrace := contentGlobalLaneSearch([]*serviceVolumeIndex{vol}, q, 100, true)
+	if searchTrace.PlannerMode == "global-content-components" {
+		t.Fatal("search lane engaged an incomplete content volume")
+	}
+	if len(got) != len(want) {
+		t.Fatalf("%q: search diverged lane=%d content=%d", q, len(got), len(want))
+	}
+
+	wantCount, _ := contentGlobalLaneCount([]*serviceVolumeIndex{vol}, q, false)
+	gotCount, countTrace := contentGlobalLaneCount([]*serviceVolumeIndex{vol}, q, true)
+	if countTrace.PlannerMode == "global-content-components" {
+		t.Fatal("count lane engaged an incomplete content volume")
+	}
+	if gotCount != wantCount {
+		t.Fatalf("%q: count diverged lane=%d content=%d", q, gotCount, wantCount)
+	}
+	if wantCount != -1 {
+		t.Fatalf("%q: incomplete content count was answered (%d); want refused (-1)", q, wantCount)
+	}
+}
+
+// WP7 ordering blocker: tied basenames within a volume order by record id in
+// the single-volume case, while the shared comparator only applies when the
+// merged set spans volumes. The lane must match the content path for both — a
+// multi-volume scope whose matches all fall in one volume keeps record-id order,
+// so a path tie-break (the naive rank sort) would drop/misorder the top entry at
+// a limit.
+func TestContentGlobalLaneOrderingTiesMatchContentPath(t *testing.T) {
+	t.Setenv("SEEKFS_CONTENT_SEARCH", "1")
+	// dup.go under two directories: distinct reconstructed paths but the same
+	// name (a rank tie under the default order), so a path tie-break would
+	// diverge from the content path's record-id tie-break.
+	volC := newContentRecordVolume(t, "C:", []contentVolRecord{
+		{frn: 900, parent: -1, parentFRN: 0, name: "zdir"},
+		{frn: 901, parent: -1, parentFRN: 0, name: "adir"},
+		{frn: 1000, parent: 0, parentFRN: 900, name: "dup.go", path: `C:\zdir\dup.go`, content: "needle alpha"},
+		{frn: 1001, parent: 1, parentFRN: 901, name: "dup.go", path: `C:\adir\dup.go`, content: "needle beta"},
+		{frn: 1002, parent: 0, parentFRN: 900, name: "other.go", path: `C:\zdir\other.go`, content: "needle gamma"},
+	})
+	for _, limit := range []int{1, 2, 3} {
+		t.Run(fmt.Sprintf("limit=%d", limit), func(t *testing.T) {
+			want, _ := contentGlobalLaneSearch([]*serviceVolumeIndex{volC}, "content:needle ext:.go", limit, false)
+			got, laneTrace := contentGlobalLaneSearch([]*serviceVolumeIndex{volC}, "content:needle ext:.go", limit, true)
+			if laneTrace.PlannerMode != "global-content-components" {
+				t.Fatalf("lane did not engage (planner=%q)", laneTrace.PlannerMode)
+			}
+			if len(got) != len(want) {
+				t.Fatalf("count diverged lane=%d content=%d", len(got), len(want))
+			}
+			for i := range want {
+				if got[i].Path != want[i].Path || got[i].FRN != want[i].FRN {
+					t.Fatalf("element %d lane=%s#%d content=%s#%d", i, got[i].Path, got[i].FRN, want[i].Path, want[i].FRN)
+				}
+			}
+		})
+	}
+}
+
+// M8: a multi-volume query with exactly one content-usable volume engages the
+// lane on that volume and surfaces the unusable one partial, never blocked.
+func TestContentGlobalLaneSkipsUnusableVolume(t *testing.T) {
+	t.Setenv("SEEKFS_CONTENT_SEARCH", "1")
+	volC := newContentRecordVolume(t, "C:", contentGlobalLaneRecords("C:"))
+	volF := newContentRecordVolume(t, "F:", contentGlobalLaneRecords("F:"))
+	volF.content = nil // F: has no usable content
+	vols := []*serviceVolumeIndex{volC, volF}
+	const q = "content:needle ext:.go"
+
+	want, _ := contentGlobalLaneSearch(vols, q, 100, false)
+	got, laneTrace := contentGlobalLaneSearch(vols, q, 100, true)
+	if laneTrace.PlannerMode != "global-content-components" {
+		t.Fatalf("lane did not engage (planner=%q)", laneTrace.PlannerMode)
+	}
+	if len(got) != len(want) {
+		t.Fatalf("count diverged lane=%d content=%d", len(got), len(want))
+	}
+	for i := range want {
+		if got[i].Path != want[i].Path || got[i].FRN != want[i].FRN {
+			t.Fatalf("element %d lane=%s#%d content=%s#%d", i, got[i].Path, got[i].FRN, want[i].Path, want[i].FRN)
+		}
+	}
+	if !laneTrace.ContentPartial {
+		t.Fatal("unusable volume not surfaced as partial")
+	}
+}
+
+// Broad-coverage differential over the existing 4,300-record corpus (two
+// volumes, many extensions/paths/names), across limits and sorts, to exercise
+// the lane beyond the tiny fixture before it could become the default route.
+func TestContentGlobalLaneLargeCorpusDifferential(t *testing.T) {
+	t.Setenv("SEEKFS_CONTENT_SEARCH", "1")
+	uncappedDiskVerify(t)
+	// Shared read-only pair (same records/constructor as the old per-test
+	// build); this test never mutates the volumes.
+	volC, volF := sharedBoundedFlatVolumes(t)
+	scopes := []struct {
+		name string
+		vols []*serviceVolumeIndex
+	}{
+		{"single", []*serviceVolumeIndex{volC}},
+		{"multi", []*serviceVolumeIndex{volC, volF}},
+	}
+	queries := []string{
+		"content:download ext:.go",
+		"content:download ext:.nrrd",
+		"content:pelican ext:.txt",
+		`content:"quick brown fox" ext:.md`,
+		"content:download ext:.go sort:size",
+		"content:download ext:.go sort:extension",
+		"content:download ext:.go sort:path",
+		"content:download ext:.go size:>100",
+	}
+	for _, scope := range scopes {
+		for _, q := range queries {
+			for _, limit := range []int{20, 5000} {
+				t.Run(fmt.Sprintf("%s/%s/limit=%d", scope.name, q, limit), func(t *testing.T) {
+					want, _ := contentGlobalLaneSearch(scope.vols, q, limit, false)
+					got, laneTrace := contentGlobalLaneSearch(scope.vols, q, limit, true)
+					// The selectivity gate admits only small filename
+					// sides: every matrix query carries one ext filter,
+					// so the lane engages single-volume exactly when
+					// that ext posting fits the scaled drive budget.
+					// Either way the result sets must match exactly.
+					didEngage := laneTrace.PlannerMode == "global-content-components"
+					est := contentLaneEstOver
+					if pq, err := parseQuery(queryOptions{Query: q}); err == nil {
+						if filters, ok := globalExtPostingFilters(pq); ok && len(filters) == 1 {
+							est = 0
+							for _, vol := range scope.vols {
+								posting, ok := vol.extPostingCountCandidate(filters[0].ext)
+								if !ok {
+									est = contentLaneEstOver
+									break
+								}
+								est += posting.len()
+							}
+						}
+					}
+					wantEngaged := scope.name == "single" && est <= contentLaneDriveBudget(limit)
+					if didEngage != wantEngaged {
+						t.Fatalf("%q: lane engaged=%v want %v (planner=%q)", q, didEngage, wantEngaged, laneTrace.PlannerMode)
+					}
+					if len(got) != len(want) {
+						t.Fatalf("%q: count diverged lane=%d content=%d", q, len(got), len(want))
+					}
+					for i := range want {
+						if got[i].Path != want[i].Path || got[i].FRN != want[i].FRN {
+							t.Fatalf("%q: element %d lane=%s#%d content=%s#%d", q, i, got[i].Path, got[i].FRN, want[i].Path, want[i].FRN)
+						}
+					}
+					wantCount, _ := contentGlobalLaneCount(scope.vols, q, false)
+					gotCount, _ := contentGlobalLaneCount(scope.vols, q, true)
+					if gotCount != wantCount {
+						t.Fatalf("%q: count lane=%d content=%d", q, gotCount, wantCount)
+					}
+				})
+			}
+		}
+	}
+}

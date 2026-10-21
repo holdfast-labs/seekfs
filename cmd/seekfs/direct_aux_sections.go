@@ -6,7 +6,6 @@ package main
 
 import (
 	"bufio"
-	"bytes"
 	"container/heap"
 	"context"
 	"encoding/binary"
@@ -693,53 +692,6 @@ func directWriteGramSectionStreaming(ctx context.Context, cw *countingWriter, po
 		*scratchHigh = scratch
 	}
 	return entry, directSectionReport{Name: name, Tag: entry.tag, Runs: 0, Bytes: int64(entry.length), ScratchBytes: scratch}, nil
-}
-
-func directEncodeLOWR(ctx context.Context, finalPath string) ([]byte, error) {
-	f, err := os.Open(finalPath)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-	r := bufio.NewReaderSize(f, 256*1024)
-	offs := make([]uint32, 0, 4096)
-	lens := make([]uint16, 0, 4096)
-	blob := bytes.NewBuffer(nil)
-	for {
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		default:
-		}
-		rec, readErr := readDirectSpoolRecord(r)
-		if errors.Is(readErr, io.EOF) {
-			break
-		}
-		if readErr != nil {
-			return nil, readErr
-		}
-		lower := strings.ToLower(rec.Name)
-		if len(lower) > int(^uint16(0)) {
-			return nil, errors.New("direct lower name too large")
-		}
-		lens = append(lens, uint16(len(lower)))
-		if lower == rec.Name {
-			offs = append(offs, packedLowerSameAsName)
-		} else {
-			if uint64(blob.Len())+uint64(len(lower)) > uint64(^uint32(0)) {
-				return nil, errors.New("direct lower blob too large")
-			}
-			offs = append(offs, uint32(blob.Len()))
-			_, _ = blob.WriteString(lower)
-		}
-	}
-	var out bytes.Buffer
-	_ = binary.Write(&out, binary.LittleEndian, uint32(len(offs)))
-	_ = binary.Write(&out, binary.LittleEndian, uint32(blob.Len()))
-	_ = binary.Write(&out, binary.LittleEndian, offs)
-	_ = binary.Write(&out, binary.LittleEndian, lens)
-	_, _ = out.Write(blob.Bytes())
-	return out.Bytes(), nil
 }
 
 // directAuxMaps carries every posting family collected in one spool pass so

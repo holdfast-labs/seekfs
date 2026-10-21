@@ -23,13 +23,17 @@ func cmdService(args []string) error {
 	configPath := fs.String("config", "", "optional seekfs.toml config path")
 	pipeName := fs.String("pipe", defaultServicePipe, "service named pipe")
 	sddl := fs.String("sddl", defaultServiceSDDL, "pipe security descriptor SDDL")
-	lowMemory := fs.Bool("lowmem", false, "run service in low-memory mmap mode")
+	lowMemory := fs.Bool("lowmem", false, "run service in low-memory mmap mode (on by default; SEEKFS_MEMORY_MODE=resident opts out)")
 	remoteAddr := fs.String("remote-addr", "", "loopback address for the Mode L transport (e.g. 127.0.0.1:0); empty disables it (default)")
 	fs.Var(&dbs, "db", "index database path to load for service search; repeatable")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	if *lowMemory {
+	// The installed/Windows service path (install/setup-service/launch) never
+	// passes -lowmem, so default the service to low-memory mmap mode here.
+	// An explicit SEEKFS_MEMORY_MODE (e.g. resident) is respected unless the
+	// -lowmem flag overrides it.
+	if v, ok := os.LookupEnv("SEEKFS_MEMORY_MODE"); *lowMemory || !ok || strings.TrimSpace(v) == "" {
 		_ = os.Setenv("SEEKFS_MEMORY_MODE", "lowmem")
 	}
 	cfg, err := loadConfig(*configPath)
@@ -53,7 +57,7 @@ func cmdService(args []string) error {
 	if isService {
 		processMode = "windows-service"
 	}
-	handler := &goSearchService{pipeName: *pipeName, sddl: *sddl, processMode: processMode, stop: make(chan struct{}), dbs: dbs, remoteAddr: *remoteAddr}
+	handler := &goSearchService{pipeName: *pipeName, sddl: *sddl, processMode: processMode, stop: make(chan struct{}), dbs: dbs, configPath: *configPath, remoteAddr: *remoteAddr, contentCfg: cfg}
 	if isService {
 		return svc.Run(serviceName, handler)
 	}
@@ -421,7 +425,70 @@ func cmdServiceInfo(args []string) error {
 	for _, db := range resp.DBs {
 		fmt.Printf("%s entries=%d source=%s volume=%s built_at=%s checkpoint=%d\n", db.Path, db.Entries, db.Source, db.Volume, db.BuiltAt, db.Checkpoint)
 	}
+	if resp.Content != nil {
+		fmt.Printf("content: %s\n", contentHealthSummary(resp.Content))
+	}
 	return nil
+}
+
+// contentHealthSummary renders one content-health line for `loaded`: the
+// state, and — when the scope budget truncated the corpus — the exact dropped
+// files and the enforced budget with the operator action.
+func contentHealthSummary(h *contentHealth) string {
+	if h == nil {
+		return "state=off"
+	}
+	var b strings.Builder
+	b.WriteString("state=" + h.State)
+	if h.Docs > 0 {
+		fmt.Fprintf(&b, " docs=%d", h.Docs)
+	}
+	if h.State == contentStateIndexing || h.State == contentStateReconciling {
+		if h.BuildPhase != "" {
+			fmt.Fprintf(&b, " phase=%s", h.BuildPhase)
+		}
+		if h.BuildTotal > 0 {
+			fmt.Fprintf(&b, " progress=%d/%d", h.BuildDone, h.BuildTotal)
+		}
+	}
+	if h.ScopeReconcile {
+		fmt.Fprintf(&b, " scope_reconcile_pending=%d", h.ScopeReconcilePending)
+	}
+	if h.ScopeDropped > 0 {
+		if h.ReserveBytes > 0 {
+			fmt.Fprintf(&b, " scope_dropped_files=%d scope_dropped_bytes=%d reserve=%s (free disk space below the reserve; free up space or set [features.content] budget_bytes)",
+				h.ScopeDropped, h.ScopeDroppedBytes, contentBudgetLabel(h.ReserveBytes))
+		} else {
+			fmt.Fprintf(&b, " scope_dropped_files=%d scope_dropped_bytes=%d budget=%s (raise [features.content] budget_bytes)",
+				h.ScopeDropped, h.ScopeDroppedBytes, contentBudgetLabel(h.BudgetBytes))
+		}
+	}
+	if h.BuildError != "" {
+		fmt.Fprintf(&b, " build_error=%s", h.BuildError)
+	}
+	if h.FoldError != "" {
+		fmt.Fprintf(&b, " fold_error=%s", h.FoldError)
+	}
+	return b.String()
+}
+
+// contentBudgetLabel renders a byte budget as "2 GiB" (or "unknown" when
+// unset) for the loaded/status and UI surfaces.
+func contentBudgetLabel(n int64) string {
+	if n <= 0 {
+		return "unknown"
+	}
+	units := []string{"B", "KiB", "MiB", "GiB", "TiB"}
+	v := float64(n)
+	u := 0
+	for v >= 1024 && u < len(units)-1 {
+		v /= 1024
+		u++
+	}
+	if v == float64(int64(v)) {
+		return fmt.Sprintf("%d %s", int64(v), units[u])
+	}
+	return fmt.Sprintf("%.1f %s", v, units[u])
 }
 
 func cmdDoctor(args []string) error {
@@ -572,6 +639,14 @@ func printConfigKey(cfg appConfig, key string) error {
 		fmt.Println(cfg.DefaultLimit)
 	case "output_format":
 		fmt.Println(cfg.OutputFormat)
+	case "content_scope":
+		fmt.Println(cfg.Content.Mode)
+	case "content_roots":
+		fmt.Println(formatStringArray(cfg.Content.Roots))
+	case "content_exclude":
+		fmt.Println(formatStringArray(cfg.Content.Exclude))
+	case "content_budget_bytes":
+		fmt.Println(cfg.Content.BudgetBytes)
 	default:
 		return fmt.Errorf("unknown config key %q", key)
 	}
@@ -579,7 +654,7 @@ func printConfigKey(cfg appConfig, key string) error {
 }
 
 func setConfigKey(path, key, value string) error {
-	allowed := map[string]bool{"dbs": true, "db_paths": true, "volumes": true, "service_pipe": true, "default_limit": true, "output_format": true, "seekfs_dir": true}
+	allowed := map[string]bool{"dbs": true, "db_paths": true, "volumes": true, "service_pipe": true, "default_limit": true, "output_format": true, "seekfs_dir": true, "content_scope": true, "content_roots": true, "content_exclude": true, "content_budget_bytes": true}
 	if !allowed[key] {
 		return fmt.Errorf("unknown config key %q", key)
 	}
@@ -603,7 +678,7 @@ func setConfigKey(path, key, value string) error {
 		lines = append(lines, key+" = "+formatted)
 	}
 	out := strings.TrimRight(strings.Join(lines, "\n"), "\n") + "\n"
-	return os.WriteFile(path, []byte(out), 0o644)
+	return writeFileAtomic(path, []byte(out))
 }
 
 func formatConfigValue(key, value string) string {
@@ -706,6 +781,9 @@ func waitForDoctor(pipeName string, timeout time.Duration) doctorResponse {
 		if resp.OK || time.Now().After(deadline) {
 			return resp
 		}
+		// probeDoctor opens the pipe, queries info, and runs a probe search:
+		// polling without pause spins CPU and pipe handles for minutes.
+		time.Sleep(500 * time.Millisecond)
 	}
 }
 
@@ -747,7 +825,11 @@ func callServiceOnce(pipeName string, req serviceRequest) (serviceResponse, erro
 	}
 	file := os.NewFile(uintptr(handle), pipeName)
 	defer file.Close()
-	return exchangeServiceJSON(file, req, serviceCallTimeout(req))
+	timeout := serviceClientTimeoutHook(req)
+	if timeout > 0 && req.ClientTimeoutMS <= 0 {
+		req.ClientTimeoutMS = int((timeout + time.Millisecond - 1) / time.Millisecond)
+	}
+	return exchangeServiceJSON(file, req, timeout)
 }
 
 func isTransientPipeError(err error) bool {
@@ -775,6 +857,11 @@ func serviceCallTimeout(req serviceRequest) time.Duration {
 		return 0
 	}
 }
+
+// serviceClientTimeoutHook is the injectable service wait. Tests shorten it to
+// prove the service settles an incomplete content answer before the client
+// gives up. Production leaves it at serviceCallTimeout.
+var serviceClientTimeoutHook = serviceCallTimeout
 
 func exchangeServiceJSON(conn io.ReadWriteCloser, req serviceRequest, timeout time.Duration) (serviceResponse, error) {
 	if timeout <= 0 {
@@ -855,7 +942,7 @@ func (s *goSearchService) Execute(args []string, r <-chan svc.ChangeRequest, cha
 	if s.processMode == "" {
 		s.processMode = "windows-service"
 	}
-	applyServiceRuntimeMemoryTuning()
+	applyServiceRuntimeMemoryTuning(s)
 	changes <- svc.Status{State: svc.StartPending}
 	done := make(chan struct{})
 	go func() {
@@ -878,8 +965,26 @@ func (s *goSearchService) Execute(args []string, r <-chan svc.ChangeRequest, cha
 		case svc.Interrogate:
 			changes <- req.CurrentStatus
 		case svc.Stop, svc.Shutdown:
-			changes <- svc.Status{State: svc.StopPending}
-			s.signalServiceStop()
+			// Bounded shutdown with SCM progress: report STOP_PENDING with
+			// a wait hint covering the whole stop, then bump the checkpoint
+			// as each teardown phase starts so SCM can tell a slow stop
+			// from a wedged one. shutdownService itself is deadline-bound;
+			// <-done adds only the bounded pipe-listener drain.
+			waitHint := uint32((serviceShutdownTimeout + serviceShutdownRemoteWait + serviceShutdownListenerWait + 2*time.Second).Milliseconds())
+			checkpoint := uint32(1)
+			sendStopPending := func() {
+				changes <- svc.Status{State: svc.StopPending, Accepts: svc.AcceptStop | svc.AcceptShutdown, CheckPoint: checkpoint, WaitHint: waitHint}
+			}
+			sendStopPending()
+			stopping := make(chan struct{})
+			go func() {
+				s.shutdownService(func(string) {
+					checkpoint++
+					sendStopPending()
+				})
+				close(stopping)
+			}()
+			<-stopping
 			<-done
 			return false, 0
 		}

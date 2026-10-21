@@ -2,8 +2,11 @@ package main
 
 import (
 	"container/heap"
+	"path/filepath"
+	"regexp"
 	"runtime"
 	"sort"
+	"strings"
 	"sync"
 )
 
@@ -185,7 +188,149 @@ func (vol *serviceVolumeIndex) nameOrderRanks() []uint32 {
 	return vol.queryIndex.nameRank
 }
 
+// contentRelevanceNoOffset marks a result whose matched content leaves are all
+// regexes (no reliable offset); at equal score it sorts after any result with a
+// real offset.
+var contentRelevanceNoOffset = int(^uint(0) >> 1)
+
+// contentRelevance is the minimal deterministic content ranking key: score is
+// the number of matched positive content leaves (AND leaves plus matched OR
+// alternatives); first is the earliest first-match offset among term/phrase
+// leaves, with name/path order as the final tie-break.
+type contentRelevance struct {
+	score int
+	first int
+}
+
+func contentRelevanceOf(vol *serviceVolumeIndex, entry Entry, pq parsedQuery, m *contentLeafMatcher, traces ...*searchTrace) contentRelevance {
+	rel := contentRelevance{first: contentRelevanceNoOffset}
+	if vol == nil || m == nil {
+		return rel
+	}
+	var trace *searchTrace
+	if len(traces) > 0 {
+		trace = traces[0]
+	}
+	text, ok := vol.contentTextForEntryTrace(&entry, trace)
+	if !ok {
+		return rel
+	}
+	var folded []byte
+	if !m.caseSensitive {
+		folded = contentFoldAccent(text)
+	}
+	matched := make([]bool, m.size)
+	for _, leaf := range m.leaves {
+		if leaf.Sym {
+			matched[leaf.LeafID] = m.sym[leaf.LeafID].defines(entry.Path, text)
+			continue
+		}
+		matched[leaf.LeafID] = m.match(text, folded, leaf)
+	}
+	rel.score, rel.first = contentScoreAt(entry, pq, pq.MatchPath, matched, text, folded, m)
+	return rel
+}
+
+// contentScoreAt counts matched positive content leaves using the SAME joint-OR
+// rule as entryMatchesContentAt: top-level positive leaves always count, and an
+// OR group contributes only the leaves of the alternative that satisfies the
+// group. A failing alternative does not inflate the score. text is the
+// case-preserving bytes; folded is its once-per-entry fold (nil for a
+// case-sensitive query), matched by the same case policy as the leaf.
+func contentScoreAt(entry Entry, pq parsedQuery, matchPath bool, matched []bool, text, folded []byte, m *contentLeafMatcher) (score, first int) {
+	first = contentRelevanceNoOffset
+	for _, leaf := range pq.Content {
+		if leaf.LeafID < 0 || leaf.LeafID >= len(matched) || !matched[leaf.LeafID] {
+			continue
+		}
+		score++
+		// Definition-line bonus: a file that defines an identifier-like
+		// term outranks files that only mention it (one extra point, the
+		// weight of one more matched leaf).
+		if sm := m.sym[leaf.LeafID]; sm != nil && !leaf.Sym && sm.defines(entry.Path, text) {
+			score++
+		}
+		if leaf.Kind == contentLeafRegex {
+			continue
+		}
+		if off := contentLeafFirstOffset(m.haystackFor(text, folded), m.needleOf(leaf)); off >= 0 && off < first {
+			first = off
+		}
+	}
+	for gi := range pq.OrGroups {
+		for ai := range pq.OrGroups[gi] {
+			alt := pq.OrGroups[gi][ai]
+			if !entryMatchesContentAt(entry, alt, matchPath || alt.MatchPath, matched) {
+				continue
+			}
+			s, f := contentScoreAt(entry, alt, matchPath || alt.MatchPath, matched, text, folded, m)
+			score += s
+			if f < first {
+				first = f
+			}
+			break
+		}
+	}
+	return score, first
+}
+
+// sortContentEntriesByRelevance orders a bounded content result set by the
+// relevance rule above, falling back to the existing name/path order. The
+// matcher is built once per query by the caller.
+func sortContentEntriesByRelevance(entries []Entry, volByPath map[string]*serviceVolumeIndex, pq parsedQuery, m *contentLeafMatcher) {
+	if len(entries) < 2 || m == nil {
+		return
+	}
+	rel := make([]contentRelevance, len(entries))
+	order := make([]int, len(entries))
+	for i := range entries {
+		rel[i] = contentRelevanceOf(volByPath[entries[i].Path], entries[i], pq, m, pq.Trace)
+		order[i] = i
+	}
+	// Relevance is optional ranking enrichment and may reread verified files.
+	// If the query budget stops that pass, keep the already-verified base order
+	// rather than sorting a mixture of complete and missing relevance keys.
+	if pq.Trace != nil && pq.Trace.contentIncomplete() {
+		return
+	}
+	defaultPQ := pq
+	defaultPQ.SortColumn = ""
+	// Tie-break equal scores by promotion (headers first): a class's header
+	// and its .cc both define it, the header is the definition a reader wants.
+	// The same rule covers symbol-named literal queries and regex-named ones.
+	promo := newContentPromotion(pq)
+	named := make([]int, len(entries))
+	for i := range entries {
+		named[i] = 2 - promo.tier(entries[i])
+	}
+	sort.SliceStable(order, func(a, b int) bool {
+		i, j := order[a], order[b]
+		if rel[i].score != rel[j].score {
+			return rel[i].score > rel[j].score
+		}
+		if named[i] != named[j] {
+			return named[i] > named[j]
+		}
+		if rel[i].first != rel[j].first {
+			return rel[i].first < rel[j].first
+		}
+		return compareSearchAllEntries(entries[i], entries[j], defaultPQ) < 0
+	})
+	sorted := make([]Entry, len(entries))
+	for k, i := range order {
+		sorted[k] = entries[i]
+	}
+	copy(entries, sorted)
+}
+
 func (vol *serviceVolumeIndex) rankForQuery(pq parsedQuery) []uint32 {
+	if pq.SortColumn == "relevance" && queryHasAnyContentLeaf(pq) {
+		// Content relevance is a post-verify key over the bounded result set
+		// (sortContentEntriesByRelevance); it is not expressible as an index-wide
+		// per-record rank without scanning every record, so no rank array is
+		// built here and candidate generation keeps the default order.
+		return nil
+	}
 	if pq.SortColumn == "size" {
 		if vol != nil && vol.queryIndex != nil && len(vol.queryIndex.sizeRank) > 0 {
 			return vol.queryIndex.sizeRank
@@ -272,4 +417,190 @@ func (vol *serviceVolumeIndex) orderForQuery(pq parsedQuery) []uint32 {
 		return vol.pathOrderForRank()
 	}
 	return vol.mappedOrCompactNameOrder()
+}
+
+// contentSymbolQueryKey returns the normalized identifier of a content query
+// that names one symbol (a single identifier-like positive term or sym:
+// leaf), or "" otherwise. Files named after the symbol (TabStripModel ->
+// tab_strip_model.h, Profile -> profile.h, Foo -> Foo.java) are almost always
+// where it is defined, so candidate ordering puts them first: a free,
+// no-disk signal that keeps the defining file inside the verify budget.
+func contentSymbolQueryKey(pq parsedQuery) string {
+	key := ""
+	for _, leaf := range pq.Content {
+		if leaf.Kind != contentLeafTerm || leaf.Fuzzy || (leaf.WholeWord && !leaf.Sym) || !contentLooksLikeIdentifier(leaf.Text) {
+			continue
+		}
+		if key != "" {
+			return "" // more than one identifier: no single symbol
+		}
+		key = contentNormalizeSymbolName(leaf.Text)
+	}
+	if len(key) < 3 {
+		return ""
+	}
+	return key
+}
+
+// contentNormalizeSymbolName lowercases and drops '_' and '-', so snake,
+// kebab and camel spellings of one name compare equal.
+func contentNormalizeSymbolName(s string) string {
+	b := make([]byte, 0, len(s))
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c == '_' || c == '-':
+			continue
+		case c >= 'A' && c <= 'Z':
+			c += 'a' - 'A'
+		}
+		b = append(b, c)
+	}
+	return string(b)
+}
+
+// contentPromotion is the default-order name promotion rule for one query.
+// A literal query that names one symbol promotes files named after it; a
+// pure-regex query promotes files whose name matches a positive regex leaf.
+// Both use the same tiers (0 = promoted header, 1 = promoted other, 2 = rest),
+// so candidate order, the merged overlay page, and the v2 cursor key cannot
+// disagree about where a row belongs.
+type contentPromotion struct {
+	symbolKey string
+	regexes   []*regexp.Regexp
+}
+
+// newContentPromotion compiles the promotion rule once per query. Callers pass
+// the result through row loops instead of rebuilding it per row.
+func newContentPromotion(pq parsedQuery) contentPromotion {
+	p := contentPromotion{symbolKey: contentSymbolQueryKey(pq)}
+	if p.symbolKey == "" && contentLeavesAllRegex(pq) {
+		p.regexes = contentRegexNameMatchers(pq)
+	}
+	return p
+}
+
+func (p contentPromotion) active() bool {
+	return p.symbolKey != "" || len(p.regexes) > 0
+}
+
+// tierForName returns the promotion tier of a file name.
+func (p contentPromotion) tierForName(name string) int {
+	if p.symbolKey != "" {
+		base := name
+		if dot := strings.IndexByte(base, '.'); dot > 0 {
+			base = base[:dot]
+		}
+		if len(base) >= len(p.symbolKey) && contentNormalizeSymbolName(base) == p.symbolKey {
+			if contentIsHeaderName(name) {
+				return 0
+			}
+			return 1
+		}
+		return 2
+	}
+	for _, re := range p.regexes {
+		if re.MatchString(name) {
+			if contentIsHeaderName(name) {
+				return 0
+			}
+			return 1
+		}
+	}
+	return 2
+}
+
+// tier returns the promotion tier of an Entry, using its base name when Name
+// is empty (overlay rows built from a path).
+func (p contentPromotion) tier(entry Entry) int {
+	name := entry.Name
+	if name == "" {
+		name = filepath.Base(entry.Path)
+	}
+	return p.tierForName(name)
+}
+
+func contentIsHeaderName(name string) bool {
+	switch strings.ToLower(filepath.Ext(name)) {
+	case ".h", ".hh", ".hpp", ".hxx":
+		return true
+	}
+	return false
+}
+
+// contentRegexNameMatchers compiles the positive regex leaves of a
+// case-folded content query.
+func contentRegexNameMatchers(pq parsedQuery) []*regexp.Regexp {
+	var out []*regexp.Regexp
+	for _, leaf := range contentPositiveLeaves(pq) {
+		if leaf.Kind != contentLeafRegex {
+			continue
+		}
+		// The name hint is deliberately case-folded even for a case-sensitive
+		// leaf: tab_strip_model.h is the likely definition of TabStripModel.
+		// A wrong hint only costs a verified read, never a wrong result.
+		pat := "(?i)" + leaf.Text
+		re, err := regexp.Compile(pat)
+		if err != nil {
+			continue
+		}
+		out = append(out, re)
+	}
+	return out
+}
+
+// promoteNamedCandidates stably moves promoted candidates (tier < 2) to the
+// front, headers first, keeping the relative order of both groups.
+func promoteNamedCandidates(ids []int, idx *Index, p contentPromotion) {
+	if !p.active() || idx == nil || len(ids) < 2 {
+		return
+	}
+	named := make([]int, 0, 4)
+	rest := ids[:0:0]
+	for _, id := range ids {
+		if p.tierForName(idx.compactNameAt(id)) < 2 {
+			named = append(named, id)
+		} else {
+			rest = append(rest, id)
+		}
+	}
+	if len(named) == 0 {
+		return
+	}
+	// C-family headers carry the type definitions; .cc/.cpp the members.
+	sort.SliceStable(named, func(i, j int) bool {
+		return contentIsHeaderName(idx.compactNameAt(named[i])) && !contentIsHeaderName(idx.compactNameAt(named[j]))
+	})
+	copy(ids, named)
+	copy(ids[len(named):], rest)
+}
+
+// promoteSymbolNamedCandidates is the symbol-only form used by tests and
+// hand-built callers.
+func promoteSymbolNamedCandidates(ids []int, idx *Index, key string) {
+	promoteNamedCandidates(ids, idx, contentPromotion{symbolKey: key})
+}
+
+// promoteNamedEntries is promoteNamedCandidates for a merged Entry slice.
+func promoteNamedEntries(entries []Entry, p contentPromotion) {
+	if !p.active() || len(entries) < 2 {
+		return
+	}
+	named := make([]Entry, 0, 4)
+	rest := make([]Entry, 0, len(entries))
+	for _, entry := range entries {
+		if p.tier(entry) < 2 {
+			named = append(named, entry)
+		} else {
+			rest = append(rest, entry)
+		}
+	}
+	if len(named) == 0 {
+		return
+	}
+	sort.SliceStable(named, func(i, j int) bool {
+		return contentIsHeaderName(named[i].Name) && !contentIsHeaderName(named[j].Name)
+	})
+	copy(entries, named)
+	copy(entries[len(named):], rest)
 }

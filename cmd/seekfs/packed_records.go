@@ -742,9 +742,20 @@ func (s *goSearchService) servePrivileged() {
 		}
 	}
 	<-s.stop
+	// Bounded teardown first (content activations cancelled, drains retired,
+	// mappings released best-effort). The SCM handler runs the same sequence
+	// with progress reporting; this covers standalone/test signal paths and
+	// is a no-op when the handler already drove it.
+	s.shutdownService(nil)
 	if s.remoteSrv != nil {
-		s.remoteSrv.close()
+		rs := s.remoteSrv
 		s.remoteSrv = nil
+		rs.closeBounded(serviceShutdownRemoteWait)
 	}
-	wg.Wait()
+	// The listeners exit when ConnectNamedPipe is interrupted via CloseHandle,
+	// but a wedged pipe must not hold SCM stop past its deadline: the process
+	// exit reclaims any stragglers.
+	if !waitWaitGroupTimeout(&wg, serviceShutdownListenerWait) {
+		serviceLog("service shutdown: pipe listeners did not drain in %s; exiting anyway", serviceShutdownListenerWait)
+	}
 }

@@ -40,7 +40,14 @@ func capBroadCandidates(ids []int, pq parsedQuery) []int {
 	}
 	if pq.Type != "" || len(pq.Exts) > 0 || len(pq.Globs) > 0 ||
 		len(pq.SizeFilters) > 0 || len(pq.DateFilters) > 0 || len(pq.AttrFilters) > 0 ||
-		len(pq.NotGroups) > 0 || pq.HasModAfter || pq.Exists {
+		len(pq.NotGroups) > 0 || pq.HasModAfter || pq.lateVerified() ||
+		// Name anchors, path globs, negated roots, quoted terms and
+		// case-sensitive matching all reject past the posting the scan
+		// verified (the accent union is a superset for the latter two),
+		// so truncating here would underfill the page.
+		len(pq.ExactTerms) > 0 || len(pq.Prefixes) > 0 || len(pq.Suffixes) > 0 ||
+		len(pq.PathGlobs) > 0 || len(pq.NotUnders) > 0 || len(pq.QuotedTerms) > 0 ||
+		pq.CaseSensitive {
 		return ids
 	}
 	if len(ids) <= pq.Limit {
@@ -87,36 +94,18 @@ func pathPlanProbeTerms(terms []string) []string {
 }
 
 func (vol *serviceVolumeIndex) namePlanTermPosting(term string) []int {
-	if strings.Contains(term, ".") {
-		if exact := vol.exactNameIDs(term); len(exact) > 0 {
-			return exact
-		}
-	}
+	// This posting is a REQUIRED plan source: it must be the complete
+	// substring set, never just the exact-name hits. An exact-name shortcut
+	// here underfills every query where an exact hit coexists with wider
+	// substring matches (e.g. `main.cc --exists` missing agent_main.cc).
 	return vol.nameTermPosting(term)
 }
 
 func (vol *serviceVolumeIndex) pathPlanTermPosting(term string) []int {
-	if strings.Contains(term, ".") {
-		if exact := vol.exactNameIDs(term); len(exact) > 0 {
-			out := make([]int, 0, len(exact))
-			for _, id := range exact {
-				if id < 0 || vol == nil || vol.index == nil || id >= vol.index.compactRecordCount() {
-					continue
-				}
-				rec := vol.index.compactRecord(id)
-				if rec.Deleted {
-					continue
-				}
-				if rec.Mode&uint32(os.ModeDir) == 0 {
-					out = append(out, id)
-					continue
-				}
-				out = append(out, vol.underDescendants(id)...)
-			}
-			sort.Ints(out)
-			return uniqueSortedInts(out)
-		}
-	}
+	// Required plan source: the complete path-substring set. pathTermPosting
+	// already covers exact-name hits (directly, plus descendant expansion of
+	// exact-name dirs via pathTermRootIDs), so an exact-name shortcut here
+	// would only underfill coexisting wider substring matches.
 	return vol.pathTermPosting(term)
 }
 
@@ -204,7 +193,7 @@ func attribMaskString(mask uint32) string {
 }
 
 func (vol *serviceVolumeIndex) limitedPathTermCandidates(pq parsedQuery) ([]int, bool) {
-	if vol == nil || vol.index == nil || !pq.MatchPath || countNonVolumeTerms(pq.Terms) != 1 {
+	if vol == nil || vol.index == nil || !pq.MatchPath || countNonVolumeTerms(pq.Terms) != 1 || pq.hiddenBlocksTruncation() {
 		return nil, false
 	}
 	for _, term := range pq.Terms {
@@ -223,12 +212,12 @@ func (vol *serviceVolumeIndex) limitedPathTermCandidates(pq parsedQuery) ([]int,
 
 func (vol *serviceVolumeIndex) limitedDottedPathScanCandidates(pq parsedQuery) ([]int, bool) {
 	if vol == nil || vol.index == nil || !pq.MatchPath || pq.CountOnly || pq.Limit <= 0 ||
-		pq.CaseSensitive || pq.Under != "" || pq.Type != "" || pq.HasModAfter || pq.Exists ||
+		pq.CaseSensitive || pq.Under != "" || pq.Type != "" || pq.HasModAfter || pq.lateVerified() ||
 		pq.CWDBias != "" || pq.RootBias != "" ||
 		len(pq.Exts) > 0 || len(pq.Dirs) > 0 || len(pq.Globs) > 0 || len(pq.Regexps) > 0 ||
 		len(pq.SizeFilters) > 0 || len(pq.DateFilters) > 0 || len(pq.AttrFilters) > 0 ||
 		len(pq.OrGroups) > 0 || len(pq.NotGroups) > 0 ||
-		countNonVolumeTerms(pq.Terms) != 1 {
+		countNonVolumeTerms(pq.Terms) != 1 || pq.hiddenBlocksTruncation() {
 		return nil, false
 	}
 	for _, term := range pq.Terms {
@@ -254,12 +243,12 @@ func (vol *serviceVolumeIndex) limitedDottedPathScanCandidates(pq parsedQuery) (
 func (vol *serviceVolumeIndex) pathDirectoryTermTopCandidates(pq parsedQuery) ([]int, bool) {
 	if vol == nil || vol.index == nil || !vol.hasDescendantIndex() ||
 		!pq.MatchPath || pq.CountOnly || pq.Limit <= 0 ||
-		pq.CaseSensitive || pq.Under != "" || pq.Type != "" || pq.HasModAfter || pq.Exists ||
+		pq.CaseSensitive || pq.Under != "" || pq.Type != "" || pq.HasModAfter || pq.lateVerified() ||
 		pq.CWDBias != "" || pq.RootBias != "" ||
 		len(pq.Exts) != 1 || len(pq.Dirs) > 0 || len(pq.Globs) > 0 || len(pq.Regexps) > 0 ||
 		len(pq.SizeFilters) > 0 || len(pq.DateFilters) > 0 || len(pq.AttrFilters) > 0 ||
 		len(pq.OrGroups) > 0 || len(pq.NotGroups) > 0 ||
-		countNonVolumeTerms(pq.Terms) != 1 {
+		countNonVolumeTerms(pq.Terms) != 1 || pq.hiddenBlocksTruncation() {
 		return nil, false
 	}
 	term := ""
@@ -270,6 +259,12 @@ func (vol *serviceVolumeIndex) pathDirectoryTermTopCandidates(pq parsedQuery) ([
 		}
 	}
 	if len(term) < 3 || strings.ContainsAny(term, `\/*?[]:`) {
+		return nil, false
+	}
+	if vol.pathTermSatisfiedByVolume(term) {
+		// Volume-only matches have no name hit or directory root here; both
+		// the exact-empty shortcut and the subtree walk below would miss
+		// them.
 		return nil, false
 	}
 	if vol.pathTermIsUsableExtensionCandidate(term) {

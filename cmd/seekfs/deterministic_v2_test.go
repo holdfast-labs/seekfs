@@ -22,6 +22,30 @@ type deterministicQueryCase struct {
 func TestDeterministicV2QueryMatrixAcrossEngineVariants(t *testing.T) {
 	cases := deterministicQueryCases()
 	normalVolumes := deterministicMultiVolumeCorpus(t, 42)
+	// The lowmem subtests below used to rebuild this same seed-42 corpus
+	// for every case (2 builds x 28 cases). Construction reads
+	// SEEKFS_MEMORY_MODE (lowmem packs records instead of building
+	// resident maps), so the pair is built once here under lowmem and
+	// reused read-only across the sequential subtests: same volumes, same
+	// queries, same assertions, minus the redundant rebuilds. The warm
+	// pair additionally carries the resident trigram build the old
+	// per-case code ran.
+	// t.Setenv cannot scope to these builds (it would leak lowmem into
+	// the normal-service subtests), so the env is set around the builds
+	// and restored immediately; the lowmem-* subtests still t.Setenv for
+	// their query paths as before.
+	prevMemMode, hadMemMode := os.LookupEnv("SEEKFS_MEMORY_MODE")
+	os.Setenv("SEEKFS_MEMORY_MODE", "lowmem")
+	lowmemColdVolumes := deterministicMultiVolumeCorpus(t, 42)
+	lowmemWarmVolumes := deterministicMultiVolumeCorpus(t, 42)
+	for _, vol := range lowmemWarmVolumes {
+		vol.rebuildNameTrigramsLocked()
+	}
+	if hadMemMode {
+		os.Setenv("SEEKFS_MEMORY_MODE", prevMemMode)
+	} else {
+		os.Unsetenv("SEEKFS_MEMORY_MODE")
+	}
 	oracle := func(tc deterministicQueryCase) []Entry {
 		t.Helper()
 		return deterministicFullScanAcrossVolumes(t, normalVolumes, tc)
@@ -58,7 +82,7 @@ func TestDeterministicV2QueryMatrixAcrossEngineVariants(t *testing.T) {
 
 			t.Run("lowmem-cold", func(t *testing.T) {
 				t.Setenv("SEEKFS_MEMORY_MODE", "lowmem")
-				volumes := deterministicMultiVolumeCorpus(t, 42)
+				volumes := lowmemColdVolumes
 				want := deterministicFullScanAcrossVolumes(t, volumes, tc)
 				trace := &searchTrace{}
 				got := deterministicServiceSearch(t, volumes, tc, trace, false)
@@ -68,10 +92,7 @@ func TestDeterministicV2QueryMatrixAcrossEngineVariants(t *testing.T) {
 
 			t.Run("lowmem-warm-trigram", func(t *testing.T) {
 				t.Setenv("SEEKFS_MEMORY_MODE", "lowmem")
-				volumes := deterministicMultiVolumeCorpus(t, 42)
-				for _, vol := range volumes {
-					vol.rebuildNameTrigramsLocked()
-				}
+				volumes := lowmemWarmVolumes
 				want := deterministicFullScanAcrossVolumes(t, volumes, tc)
 				trace := &searchTrace{}
 				got := deterministicServiceSearch(t, volumes, tc, trace, false)

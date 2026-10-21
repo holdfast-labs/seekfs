@@ -37,8 +37,14 @@ func (vol *serviceVolumeIndex) limitedSingleTermCandidates(pq parsedQuery) ([]in
 	if vol == nil || vol.index == nil || pq.CountOnly || pq.Limit <= 0 || pq.CaseSensitive ||
 		pq.Under != "" || pq.Type != "" || len(pq.Exts) > 0 || len(pq.Globs) > 0 ||
 		len(pq.Regexps) > 0 || len(pq.SizeFilters) > 0 || len(pq.DateFilters) > 0 || len(pq.AttrFilters) > 0 ||
-		len(pq.OrGroups) > 0 || len(pq.NotGroups) > 0 || pq.HasModAfter || pq.Exists ||
-		pq.CWDBias != "" || pq.RootBias != "" || pq.SortColumn != "" {
+		len(pq.OrGroups) > 0 || len(pq.NotGroups) > 0 || pq.HasModAfter || pq.lateVerified() ||
+		pq.CWDBias != "" || pq.RootBias != "" || pq.SortColumn != "" || pq.hiddenBlocksTruncation() ||
+		// The ordered scans below truncate at the limit before the entry
+		// gate runs: name anchors reject past the term, path globs and
+		// negated roots are invisible to them, and unfolded bytes miss
+		// accent matches. Decline all three so the page cannot underfill.
+		len(pq.ExactTerms)+len(pq.Prefixes)+len(pq.Suffixes) > 0 ||
+		needsPathVerification(pq) || vol.accentUnionActive(pq) {
 		return nil, false
 	}
 	if !pq.MatchPath && len(pq.Terms) == 1 && len(pq.Dirs) == 0 {
@@ -214,7 +220,7 @@ func (vol *serviceVolumeIndex) multiNameTermCandidates(terms []string) []int {
 
 func (vol *serviceVolumeIndex) plannerCandidates(pq parsedQuery) ([]int, bool) {
 	globExts, globsOK := simpleGlobExts(pq.Globs)
-	if vol == nil || vol.index == nil || vol.queryIndex == nil || pq.CaseSensitive || pq.Under != "" || pq.Exists || pq.HasModAfter || !globsOK {
+	if vol == nil || vol.index == nil || vol.queryIndex == nil || pq.CaseSensitive || pq.Under != "" || pq.lateVerified() || pq.HasModAfter || !globsOK {
 		return nil, false
 	}
 	strong := make([][]uint32, 0, len(pq.Terms)+len(pq.Exts)+len(globExts)+2)
@@ -314,6 +320,11 @@ func simpleGlobExts(globs []string) ([]string, bool) {
 	}
 	exts := make([]string, 0, len(globs))
 	for _, glob := range globs {
+		// Brace sets are OR over extensions (`*.{c,h}`); no single ext
+		// is required, so decline to the literal lane.
+		if strings.Contains(glob, "{") {
+			return nil, false
+		}
 		if !strings.HasPrefix(glob, "*.") || strings.Count(glob, "*") != 1 || strings.ContainsAny(strings.TrimPrefix(glob, "*."), `\/*?[]:`) {
 			return nil, false
 		}

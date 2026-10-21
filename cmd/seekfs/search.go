@@ -1,8 +1,11 @@
 package main
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"hash/fnv"
 	"io"
 	"os"
 	"path/filepath"
@@ -11,41 +14,92 @@ import (
 	"time"
 )
 
+type searchCursor struct {
+	Version int    `json:"v"`
+	Offset  int    `json:"o"`
+	Query   uint64 `json:"h"`
+}
+
+func queryOptionsHash(opts queryOptions) uint64 {
+	pq, _ := parseQuery(opts)
+	key := struct {
+		Query, Under, Path, Sort, CWDBias, RootBias, Near, Current, Recent, ModifiedAfter string
+		CaseSensitive, Fuzzy                                                              bool
+	}{
+		opts.Query, opts.Under, fmt.Sprint(opts.MatchPath || queryLooksLoosePathScoped(opts.Query)), pq.SortColumn, opts.CWDBias, opts.RootBias, opts.Near, opts.Current, opts.Recent, opts.ModifiedAfter, opts.CaseSensitive, opts.Fuzzy}
+	b, _ := json.Marshal(key)
+	h := fnv.New64a()
+	_, _ = h.Write(b)
+	return h.Sum64()
+}
+
+func encodeSearchCursor(opts queryOptions, offset int) string {
+	b, _ := json.Marshal(searchCursor{Version: 1, Offset: offset, Query: queryOptionsHash(opts)})
+	return base64.RawURLEncoding.EncodeToString(b)
+}
+
+func decodeSearchCursor(token string, opts queryOptions) (int, error) {
+	b, err := base64.RawURLEncoding.DecodeString(token)
+	if err != nil {
+		return 0, errors.New("malformed cursor")
+	}
+	var c searchCursor
+	if err = json.Unmarshal(b, &c); err != nil || c.Version != 1 || c.Offset < 0 {
+		return 0, errors.New("malformed cursor")
+	}
+	if c.Query != queryOptionsHash(opts) {
+		return 0, errors.New("cursor does not match this query")
+	}
+	return c.Offset, nil
+}
+
 func serviceRequestFromOptions(opts queryOptions, countOnly bool) serviceRequest {
 	return serviceRequest{
-		Command:       "search",
-		Query:         opts.Query,
-		MatchPath:     opts.MatchPath || queryLooksLoosePathScoped(opts.Query),
-		Limit:         opts.Limit,
-		CountOnly:     countOnly,
-		Under:         opts.Under,
-		Exists:        opts.Exists,
-		CWDBias:       opts.CWDBias,
-		RootBias:      opts.RootBias,
-		Recent:        opts.Recent,
-		ModifiedAfter: opts.ModifiedAfter,
-		CaseSensitive: opts.CaseSensitive,
-		Fuzzy:         opts.Fuzzy,
-		DeadlineUnix:  opts.DeadlineUnix,
-		RequestSeq:    opts.RequestSeq,
+		Command:                 "search",
+		Query:                   opts.Query,
+		MatchPath:               opts.MatchPath || queryLooksLoosePathScoped(opts.Query),
+		Limit:                   opts.Limit,
+		CountOnly:               countOnly,
+		Under:                   opts.Under,
+		Exists:                  opts.Exists,
+		CWDBias:                 opts.CWDBias,
+		RootBias:                opts.RootBias,
+		Near:                    opts.Near,
+		Current:                 opts.Current,
+		Recent:                  opts.Recent,
+		ModifiedAfter:           opts.ModifiedAfter,
+		CaseSensitive:           opts.CaseSensitive,
+		Fuzzy:                   opts.Fuzzy,
+		DeadlineUnix:            opts.DeadlineUnix,
+		RequestSeq:              opts.RequestSeq,
+		BudgetMS:                opts.BudgetMS,
+		BudgetDisabled:          opts.BudgetDisabled,
+		ContentDiskVerifyBudget: opts.ContentDiskVerifyBudget,
+		Cursor:                  opts.Cursor,
 	}
 }
 
 func requestToOptionsFromService(req serviceRequest) queryOptions {
 	return queryOptions{
-		Query:         req.Query,
-		MatchPath:     req.MatchPath,
-		Limit:         req.Limit,
-		Under:         req.Under,
-		Exists:        req.Exists,
-		CWDBias:       req.CWDBias,
-		RootBias:      req.RootBias,
-		Recent:        req.Recent,
-		ModifiedAfter: req.ModifiedAfter,
-		CaseSensitive: req.CaseSensitive,
-		Fuzzy:         req.Fuzzy,
-		DeadlineUnix:  req.DeadlineUnix,
-		RequestSeq:    req.RequestSeq,
+		Query:                   req.Query,
+		MatchPath:               req.MatchPath,
+		Limit:                   req.Limit,
+		Under:                   req.Under,
+		Exists:                  req.Exists,
+		CWDBias:                 req.CWDBias,
+		RootBias:                req.RootBias,
+		Near:                    req.Near,
+		Current:                 req.Current,
+		Recent:                  req.Recent,
+		ModifiedAfter:           req.ModifiedAfter,
+		CaseSensitive:           req.CaseSensitive,
+		Fuzzy:                   req.Fuzzy,
+		DeadlineUnix:            req.DeadlineUnix,
+		RequestSeq:              req.RequestSeq,
+		BudgetMS:                req.BudgetMS,
+		BudgetDisabled:          req.BudgetDisabled,
+		ContentDiskVerifyBudget: req.ContentDiskVerifyBudget,
+		Cursor:                  req.Cursor,
 	}
 }
 
@@ -181,6 +235,7 @@ func entryToJSON(entry Entry) jsonResult {
 		Volume:      filepath.VolumeName(entry.Path),
 		IsDir:       entry.Mode&uint32(os.ModeDir) != 0,
 		IndexSource: entry.IndexSource,
+		Snippet:     entry.Snippet,
 	}
 	if result.Name == "" {
 		result.Name = filepath.Base(result.Path)
@@ -194,12 +249,22 @@ func entryToJSON(entry Entry) jsonResult {
 }
 
 func searchAll(indexes []*Index, opts queryOptions, countOnly bool) ([]Entry, error) {
+	if pq, err := parseQuery(opts); err == nil && queryHasFeatureLeaf(pq) {
+		return nil, fmt.Errorf("feature queries require the resident seekfs service")
+	}
+	if pq, err := parseQuery(opts); err == nil && queryHasAnyContentLeaf(pq) {
+		// Content is only queryable through the service's FRN-keyed volumes;
+		// a direct-index search has no content resolver. Refuse rather than
+		// silently ignore the content leaf.
+		return nil, contentUnavailableError()
+	}
 	if len(indexes) == 1 {
 		matches, err := search(indexes[0], opts, countOnly)
 		if err != nil {
 			return nil, err
 		}
-		return filterImplicitUnderExisting(matches, opts, countOnly), nil
+		matches = filterImplicitUnderExisting(matches, opts, countOnly)
+		return applySignalReorderDirect(matches, opts, countOnly), nil
 	}
 	limit := normalizedLimit(opts.Limit, countOnly)
 	results := make([]Entry, 0, min(limit, 1024))
@@ -226,7 +291,20 @@ func searchAll(indexes []*Index, opts queryOptions, countOnly bool) ([]Entry, er
 	if !countOnly && limit > 0 && len(results) > limit {
 		results = results[:limit]
 	}
-	return results, nil
+	return applySignalReorderDirect(results, opts, countOnly), nil
+}
+
+// applySignalReorderDirect reorders a direct (local-index) result page within
+// match-quality bands. Counts and errors pass through untouched.
+func applySignalReorderDirect(results []Entry, opts queryOptions, countOnly bool) []Entry {
+	if countOnly || len(results) < 2 {
+		return results
+	}
+	pq, err := parseQuery(opts)
+	if err != nil {
+		return results
+	}
+	return applySignalReorderWithStore(results, pq, signalStoreFromOpts(opts))
 }
 
 func entriesSpanMultipleVolumes(entries []Entry) bool {
@@ -355,9 +433,53 @@ func entryTypeRank(entry Entry) int {
 }
 
 func searchServiceVolumes(volumes []*serviceVolumeIndex, opts queryOptions, countOnly bool) ([]Entry, error) {
+	if opts.Trace == nil {
+		opts.Trace = &searchTrace{}
+	}
+	if opts.parsedOverride == nil {
+		opts, _ = contentFuzzyExpandQuery(volumes, opts)
+	}
+	matches, err := searchServiceVolumesInner(volumes, opts, countOnly)
+	if opts.Trace != nil {
+		opts.Trace.publishDiskBudget()
+	}
+	if err != nil || countOnly || len(matches) < 2 {
+		return matches, err
+	}
+	// Usage/git/proximity signals reorder the exact-tier page within
+	// match-quality bands only (rank_blend.go); with no signals the page
+	// returns untouched, so base order and every existing test are intact.
+	// The store is the caller's per-user store (service) or the current
+	// user's (direct), so one user's history never reorders another's.
+	pq, perr := parseQuery(opts)
+	if perr != nil {
+		return matches, err
+	}
+	return applySignalReorderWithStore(matches, pq, signalStoreFromOpts(opts)), err
+}
+
+func searchServiceVolumesInner(volumes []*serviceVolumeIndex, opts queryOptions, countOnly bool) ([]Entry, error) {
 	pq, err := parseQuery(opts)
 	if err != nil {
 		return nil, err
+	}
+	if opts.Trace != nil {
+		opts.Trace.DiskVerifyBudget = contentDiskVerifyBudgetForPage(pq, opts, countOnly)
+		// Resolve the per-query disk reservation now, before any verify worker
+		// starts: the exact cap is shared atomic state (see contentDiskBudget).
+		opts.Trace.initDiskBudget()
+		// The wall-clock bound is a content-only concern: the deadline is read
+		// solely by disk verification, so arm it only for content queries and
+		// leave name-only searches byte-identical to the unbounded path.
+		if queryHasAnyContentLeaf(pq) {
+			opts.Trace.armContentDeadline(opts.BudgetMS, opts.BudgetDisabled)
+		}
+	}
+	if countOnly {
+		markCountDivergent(opts, pq)
+	}
+	if queryHasFeatureLeaf(pq) {
+		return nil, fmt.Errorf("feature queries require the service feature dispatcher")
 	}
 	if pq.Impossible {
 		opts.Trace.setPlannerMode("impossible-query")
@@ -376,6 +498,27 @@ func searchServiceVolumes(volumes []*serviceVolumeIndex, opts queryOptions, coun
 	}
 	volumes = prioritizeServiceVolumesForPathTerms(volumes, opts)
 	opts.Trace.setEligibleVolumes(volumes)
+	if contentGlobalLaneEnabled() && queryHasPositiveContentLeaf(pq) {
+		snapshot := newGlobalQuerySnapshot(volumes, opts.Trace)
+		if matches, handled, err := searchServiceVolumesGlobalContentComponentsSnapshot(snapshot, opts, countOnly, pq); handled {
+			return matches, err
+		}
+	}
+	if queryHasAnyContentLeaf(pq) {
+		// Content has its own candidate + post-filter path. It runs on every
+		// content-usable volume; an unusable volume degrades the result rather
+		// than bricking the whole service, but if none is usable the query is
+		// refused instead of reported as no matches. A query that remains
+		// answerable without content still gets the unusable volume's filename
+		// matches (PF-7b); an unanswerable one skips it.
+		usable, skipped := contentUsableVolumes(volumes, pq)
+		if len(usable) == 0 && !filenameAnswerable(pq) {
+			return nil, contentUnavailableError()
+		}
+		markContentQueryDegraded(opts.Trace, skipped)
+		markContentQueryIncomplete(opts.Trace, usable)
+		return searchContentServiceVolumes(volumes, opts, countOnly, pq)
+	}
 	snapshot := newGlobalQuerySnapshot(volumes, opts.Trace)
 	if matches, handled, err := searchServiceVolumesGlobalExtOnlySnapshot(snapshot, opts, countOnly); handled {
 		return matches, err
@@ -393,7 +536,7 @@ func searchServiceVolumes(volumes []*serviceVolumeIndex, opts queryOptions, coun
 		return matches, err
 	}
 	if len(volumes) > 1 {
-		return nil, globalMultiVolumePlannerDeclineError(opts)
+		return nil, globalMultiVolumePlannerDeclineError(opts, volumes)
 	}
 	if len(volumes) == 1 {
 		if opts.Trace != nil && strings.HasPrefix(opts.Trace.Decline, "global-") {
@@ -408,12 +551,11 @@ func searchServiceVolumes(volumes []*serviceVolumeIndex, opts queryOptions, coun
 		pathCache := make(map[int]string)
 		hidden := vol.snapshotHiddenBaseIDs()
 		candidateFn := vol.nameTermCandidates
+		// Top-N/limited lanes decline via hiddenBlocksTruncation when hidden
+		// is non-empty, so the candidate set stays complete and the verify
+		// loop cannot underfill the page. No lane needs a nil bypass anymore.
 		if vol.hasActiveOverlay() && !countOnly {
-			if hidden.empty() {
-				candidateFn = vol.overlayAwareNameTermCandidates
-			} else {
-				candidateFn = nil
-			}
+			candidateFn = vol.overlayAwareNameTermCandidates
 		}
 		baseOpts := opts
 		if vol.hasActiveOverlay() && !countOnly {
@@ -438,7 +580,7 @@ func searchServiceVolumes(volumes []*serviceVolumeIndex, opts queryOptions, coun
 				opts.Trace.OverlayBaseWindow = baseOpts.Limit
 			}
 		}
-		matches, err := searchCompactWithCacheHidden(vol.index, baseOpts, countOnly, pathCache, candidateFn, hidden)
+		matches, err := searchCompactWithCacheHidden(vol.index, baseOpts, countOnly, pathCache, candidateFn, hidden, nil)
 		matches = vol.mergeOverlayMatches(matches, opts, countOnly, pathCache)
 		vol.trimSearchCachesLocked()
 		if locked {
@@ -471,6 +613,12 @@ func (vol *serviceVolumeIndex) mergeOverlayMatches(base []Entry, opts queryOptio
 	if vol == nil {
 		return base
 	}
+	if opts.contentCount != nil {
+		// Count mode: the compact scan tallied base matches in place and
+		// countContentVolume adds the overlay count (where cancellation is
+		// surfaced). Materializing entries here would defeat that.
+		return base
+	}
 	snap := vol.snap.Load()
 	if snap == nil || len(snap.records) == 0 {
 		return base
@@ -480,8 +628,22 @@ func (vol *serviceVolumeIndex) mergeOverlayMatches(base []Entry, opts queryOptio
 		return base
 	}
 	limit := normalizedLimit(opts.Limit, countOnly)
+	if queryHasAnyContentLeaf(pq) {
+		// Inline content verification owns the per-volume limit already;
+		// truncating the merged set here would drop a true match that the
+		// caller's post-merge limit has not yet considered.
+		limit = 0
+	}
 	overlay := vol.overlayRankedMatches(snap, pq, pathCache)
+	if resume := pq.contentAfter; resume != nil && resume.pageLimit > 0 && resume.overlay != nil {
+		// The hidden-overlay v2 resume computed the same ranked overlay list
+		// before base verification so it could stop at the provable page.
+		overlay = resume.overlay
+	}
 	if !countOnly {
+		if queryHasAnyContentLeaf(pq) {
+			return vol.mergeContentOverlayMatches(base, overlay, pq, opts.Trace)
+		}
 		merged := make([]Entry, 0, len(base)+len(overlay))
 		merged = append(merged, base...)
 		for _, item := range overlay {
@@ -490,6 +652,23 @@ func (vol *serviceVolumeIndex) mergeOverlayMatches(base []Entry, opts queryOptio
 		sort.SliceStable(merged, func(i, j int) bool {
 			return compareSearchAllEntries(merged[i], merged[j], pq) < 0
 		})
+		// When the base pass stopped at an unverified candidate, the union is
+		// only a prefix up to that candidate's rank. Drop every merged entry
+		// (base or overlay) sorting at or after the recorded frontier so the
+		// partial page stays a rank prefix of the complete result. A complete
+		// query, a base-only query (no overlay merge), and relevance ordering
+		// are unchanged.
+		if opts.Trace != nil && opts.Trace.contentFrontierSet &&
+			opts.Trace.contentIncomplete() && pq.SortColumn != "relevance" {
+			frontier := opts.Trace.contentFrontier
+			kept := merged[:0]
+			for _, e := range merged {
+				if compareSearchAllEntries(e, frontier, pq) < 0 {
+					kept = append(kept, e)
+				}
+			}
+			merged = kept
+		}
 		if limit > 0 && len(merged) > limit {
 			merged = merged[:limit]
 		}
@@ -497,6 +676,99 @@ func (vol *serviceVolumeIndex) mergeOverlayMatches(base []Entry, opts queryOptio
 	}
 	out := vol.mergeRankedOverlayEntries(base, overlay, limit, countOnly, pq)
 	return out
+}
+
+// mergeContentOverlayMatches merges a verified base page with the matching
+// overlay rows without leaving the base's rank order. Base rows are already a
+// verified prefix in rank order (symbol-promoted for the default sort), so a
+// name/path re-sort would both lose the promotion and compare base rows against
+// a frontier they never had to pass.
+func (vol *serviceVolumeIndex) mergeContentOverlayMatches(base []Entry, overlay []rankedOverlayEntry, pq parsedQuery, trace *searchTrace) []Entry {
+	if len(overlay) == 0 {
+		// Nothing from the overlay matched: the base page is already the exact
+		// rank-ordered prefix. Keep it verbatim (no re-sort, no frontier cut).
+		return base
+	}
+	if pq.SortColumn == "relevance" {
+		// Relevance is re-sorted over the whole result set in content_verify.go;
+		// preserve the historical intermediate order.
+		merged := make([]Entry, 0, len(base)+len(overlay))
+		merged = append(merged, base...)
+		for _, item := range overlay {
+			merged = append(merged, item.entry)
+		}
+		sort.SliceStable(merged, func(i, j int) bool {
+			return compareSearchAllEntries(merged[i], merged[j], pq) < 0
+		})
+		return merged
+	}
+	if pq.SortColumn != "" {
+		// An explicit sort ranks by the Entry fields, and compareSearchAllEntries
+		// owns the tie-break. The rank merge below only applies to the default
+		// name order: its overlay rank is exact for that order, while the
+		// explicit-sort ranks locate only the first row of a sort value.
+		merged := make([]Entry, 0, len(base)+len(overlay))
+		merged = append(merged, base...)
+		for _, item := range overlay {
+			merged = append(merged, item.entry)
+		}
+		sort.SliceStable(merged, func(i, j int) bool {
+			return compareSearchAllEntries(merged[i], merged[j], pq) < 0
+		})
+		// A partial base page covers only the comparator prefix up to the
+		// first unverified candidate; drop overlay rows at or after it.
+		if trace != nil && trace.contentFrontierSet && trace.contentIncomplete() {
+			frontier := trace.contentFrontier
+			kept := merged[:0]
+			for _, e := range merged {
+				if compareSearchAllEntries(e, frontier, pq) < 0 {
+					kept = append(kept, e)
+				}
+			}
+			merged = kept
+		}
+		return merged
+	}
+	if trace != nil && trace.contentFrontierSet && trace.contentIncomplete() {
+		// Base rows are already verified up to the frontier. Only overlay rows
+		// ranking at or after it must be dropped to keep the partial page a
+		// rank prefix.
+		// A default-order frontier inside the symbol-promoted group ranks
+		// before every unpromoted row, so only promoted overlay rows can
+		// precede it.
+		frontierRank := vol.baseEntryRank(trace.contentFrontier, pq)
+		promo := contentPromotion{}
+		if pq.SortColumn == "" {
+			promo = newContentPromotion(pq)
+		}
+		frontierPromoted := promo.tier(trace.contentFrontier) < 2
+		kept := overlay[:0]
+		for _, item := range overlay {
+			promoted := promo.tier(item.entry) < 2
+			switch {
+			case promoted && !frontierPromoted:
+				kept = append(kept, item)
+			case promoted == frontierPromoted && item.rank < frontierRank:
+				kept = append(kept, item)
+			}
+		}
+		overlay = kept
+	}
+	rankedBase := base
+	if pq.SortColumn == "" && len(base) > 1 {
+		// The default content candidates were symbol-promoted before
+		// verification. Restore the plain rank order for the merge; promotion
+		// is re-applied to the merged page below.
+		rankedBase = append([]Entry(nil), base...)
+		sort.SliceStable(rankedBase, func(i, j int) bool {
+			return vol.baseEntryRank(rankedBase[i], pq) < vol.baseEntryRank(rankedBase[j], pq)
+		})
+	}
+	merged := vol.mergeRankedOverlayEntries(rankedBase, overlay, 0, false, pq)
+	if pq.SortColumn == "" {
+		promoteNamedEntries(merged, newContentPromotion(pq))
+	}
+	return merged
 }
 
 func (vol *serviceVolumeIndex) overlayRankedMatches(snap *volumeSnapshot, pq parsedQuery, pathCache map[int]string) []rankedOverlayEntry {
@@ -513,13 +785,17 @@ func (vol *serviceVolumeIndex) overlayRankedMatches(snap *volumeSnapshot, pq par
 		return nil
 	}
 	latest := latestOverlaySlotsByFRN(records)
+	var contentMatcher *contentLeafMatcher
+	if queryHasAnyContentLeaf(pq) {
+		contentMatcher = newContentLeafMatcher(pq)
+	}
 	overlay := make([]rankedOverlayEntry, 0, len(records))
 	for slot := 0; slot < len(records); slot++ {
 		entry, ok := vol.overlayEntry(records, latest, slot, map[int32]struct{}{}, pathCache)
 		if !ok {
 			continue
 		}
-		if entryMatches(entry, pq, pq.MatchPath) {
+		if entryMatchesWithContentMatcher(vol, entry, pq, pq.MatchPath, contentMatcher) {
 			overlay = append(overlay, rankedOverlayEntry{entry: entry, rank: vol.overlayEntryRank(entry, pq)})
 		}
 	}
@@ -552,6 +828,23 @@ func (vol *serviceVolumeIndex) overlayRankedMatches(snap *volumeSnapshot, pq par
 		}
 		return overlay[i].rank < overlay[j].rank
 	})
+	// A v2 resume re-evaluates the overlay against the current snapshot. Rows
+	// whose page key is at or before the last emitted row are already on an
+	// earlier page and must not be emitted again. A row published between
+	// pages that sorts before the cursor is therefore skipped for the rest of
+	// the walk; a file renamed across the cursor can be missed. The divergence
+	// is bounded and never duplicates a path within the returned pages.
+	if resume := pq.contentAfter; resume != nil && resume.Key != nil {
+		promo := newContentPromotion(pq)
+		kept := overlay[:0]
+		for _, item := range overlay {
+			cmp := vol.contentCursorOverlayKey(item, pq, promo).compare(*resume.Key)
+			if cmp > 0 || (resume.Inclusive && cmp == 0) {
+				kept = append(kept, item)
+			}
+		}
+		overlay = kept
+	}
 	return overlay
 }
 

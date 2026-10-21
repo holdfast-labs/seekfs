@@ -1,4 +1,6 @@
-const { normalizeLiveQuery } = window.SeekfsQuery;
+const { normalizeLiveQuery, toContentQuery, contentHighlightTerms, highlightSegments } = window.SeekfsQuery;
+
+const CONTENT_MODE_KEY = "seekfs.contentMode";
 const { debounce, formatSize, formatDate, escapeHtml, sortSupported } = window.SeekfsUtil;
 
 const state = {
@@ -9,6 +11,8 @@ const state = {
   lastClicked: -1,
   sort: "",
   lastQuery: "",
+  contentMode: localStorage.getItem(CONTENT_MODE_KEY) === "1",
+  highlight: [],
 };
 
 const els = {
@@ -24,6 +28,8 @@ const els = {
   health: document.getElementById("health"),
   clear: document.getElementById("clear"),
   count: document.getElementById("count"),
+  contentToggle: document.getElementById("content-toggle"),
+  contentStatus: document.getElementById("content-status"),
 };
 
 function setEmpty(title, sub) {
@@ -276,7 +282,7 @@ function renderRows(rows) {
     tr.setAttribute("aria-selected", "false");
     tr.setAttribute("aria-current", "false");
     tr.innerHTML = `
-      <td>${iconImg(row)}${escapeHtml(row.name || "")}</td>
+      <td>${iconImg(row)}${escapeHtml(row.name || "")}${snippetHtml(row.snippet)}</td>
       <td class="path-cell">${escapeHtml(row.dir || row.path || "")}</td>
       <td class="size-cell">${escapeHtml(formatSize(row))}</td>
       <td class="date-cell">${escapeHtml(formatDate(row.modified))}</td>
@@ -289,6 +295,69 @@ function renderRows(rows) {
   applySelectionClasses();
   els.empty.style.display = rows.length ? "none" : "block";
   updateSelectedFooter();
+}
+
+// snippetHtml renders a content match line under the file name, with the
+// searched terms highlighted.
+function snippetHtml(snippet) {
+  if (!snippet) return "";
+  const parts = highlightSegments(snippet, state.highlight)
+    .map((seg) => (seg.match ? `<mark>${escapeHtml(seg.text)}</mark>` : escapeHtml(seg.text)))
+    .join("");
+  return `<div class="snippet">${parts}</div>`;
+}
+
+function applyContentMode() {
+  if (!els.contentToggle) return;
+  els.contentToggle.setAttribute("aria-pressed", state.contentMode ? "true" : "false");
+  els.query.placeholder = state.contentMode ? "Search inside files" : "Search";
+}
+
+function setContentMode(on) {
+  state.contentMode = on;
+  localStorage.setItem(CONTENT_MODE_KEY, on ? "1" : "0");
+  applyContentMode();
+  if (!on && els.contentStatus) els.contentStatus.textContent = "";
+  searchNow();
+}
+
+// contentStatusText describes the content index behind a content query.
+function contentStatusText(content) {
+  if (!content || !content.state) return "";
+  if (content.state === "indexing") {
+    const pct = content.build_total ? Math.floor((100 * (content.build_done || 0)) / content.build_total) : 0;
+    if (content.build_phase) return `Indexing contents (${content.build_phase}) ${pct}%`;
+    return `Indexing contents ${pct}%`;
+  }
+  if (content.state === "reconciling") {
+    const pct = content.build_total ? Math.floor((100 * (content.build_done || 0)) / content.build_total) : 0;
+    return `Reconciling contents ${pct}%`;
+  }
+  if (content.error) return `Contents: ${content.error}`;
+  if (content.scope_dropped) {
+    if (content.reserve_bytes) {
+      return `${content.scope_dropped.toLocaleString()} files not indexed (disk reserve ${formatBudgetBytes(content.reserve_bytes)}) — free up space or set [features.content] budget_bytes`;
+    }
+    return `${content.scope_dropped.toLocaleString()} files not indexed (budget ${formatBudgetBytes(content.budget_bytes)}) — raise [features.content] budget_bytes`;
+  }
+  if (content.incomplete || content.partial) return "Contents: partial results";
+  if (content.state === "ready") return content.docs ? `${content.docs.toLocaleString()} files indexed` : "";
+  return `Contents ${content.state}`;
+}
+
+// formatBudgetBytes renders a byte budget as "2 GiB" (unknown when unset), so
+// the scope-dropped footer names the exact enforced budget.
+function formatBudgetBytes(n) {
+  if (!n) return "unknown";
+  const units = ["B", "KiB", "MiB", "GiB", "TiB"];
+  let v = n;
+  let u = 0;
+  while (v >= 1024 && u < units.length - 1) {
+    v /= 1024;
+    u += 1;
+  }
+  const text = Number.isInteger(v) ? v.toString() : v.toFixed(1);
+  return `${text} ${units[u]}`;
 }
 
 function rowFromEvent(event) {
@@ -462,7 +531,7 @@ function onDocumentMouseDown(event) {
   if (event.button !== 0) return;
   const target = event.target;
   if (target && target.closest) {
-    if (target.closest(".searchbar") || target.closest("thead") || target.closest("#menu") || target.closest(".footer")) {
+    if (target.closest(".prompt-wrap") || target.closest(".top") || target.closest("thead") || target.closest("#menu") || target.closest(".footer")) {
       return;
     }
   }
@@ -594,7 +663,9 @@ function buildQueryWithSort(rawQuery) {
 
 async function searchNow() {
   const rawQuery = els.query.value.trim();
-  const query = normalizeLiveQuery(buildQueryWithSort(rawQuery));
+  const typed = state.contentMode ? toContentQuery(rawQuery) : rawQuery;
+  const query = normalizeLiveQuery(buildQueryWithSort(typed));
+  state.highlight = contentHighlightTerms(typed);
   state.lastQuery = rawQuery;
   const seq = ++state.seq;
   hideMenu();
@@ -631,6 +702,7 @@ async function searchNow() {
 function handleSearchResponse(response) {
   if (!response || response.seq !== state.seq) return;
   if ((response.message || "").toLowerCase() === "query superseded") return;
+  if (els.contentStatus) els.contentStatus.textContent = contentStatusText(response.content);
   if (!response.ok) {
     renderRows([]);
     setCount(0);
@@ -641,7 +713,9 @@ function handleSearchResponse(response) {
   renderRows(response.results || []);
   const count = response.count || (response.results || []).length;
   setCount(count);
-  els.summary.textContent = `${count.toLocaleString()} items  |  ${response.elapsed_ms} ms`;
+  let summary = `${count.toLocaleString()} items  |  ${response.elapsed_ms} ms`;
+  if (response.fuzzy_correction) summary += `  |  Showing results for ${response.fuzzy_correction}`;
+  els.summary.textContent = summary;
   setEmpty("No matches", "");
 }
 
@@ -1183,6 +1257,21 @@ document.addEventListener("keydown", (event) => {
     return;
   }
 });
+
+if (els.contentToggle) {
+  els.contentToggle.addEventListener("click", () => {
+    setContentMode(!state.contentMode);
+    els.query.focus();
+  });
+}
+document.addEventListener("keydown", (event) => {
+  if (event.ctrlKey && event.shiftKey && (event.key === "F" || event.key === "f")) {
+    event.preventDefault();
+    setContentMode(!state.contentMode);
+    els.query.focus();
+  }
+});
+applyContentMode();
 
 setTimeout(refreshStatus, 150);
 setInterval(refreshStatus, 10000);

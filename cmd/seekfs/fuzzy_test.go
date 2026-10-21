@@ -1,6 +1,8 @@
 package main
 
 import (
+	"fmt"
+	"math/rand"
 	"strings"
 	"testing"
 )
@@ -156,6 +158,7 @@ func buildFuzzyTestVolume(t *testing.T) *serviceVolumeIndex {
 		".", // root record
 		"tonic.txt",
 		"tonicwater.txt",
+		"tonicwater.txtx",
 		"sonic.txt",
 		"ironic.txt",
 		"totally-unrelated.log",
@@ -365,6 +368,30 @@ func TestTryMultiTermFuzzyRewriteEndToEnd(t *testing.T) {
 	}
 }
 
+func TestTryMultiTermFuzzyRewriteInteriorTypos(t *testing.T) {
+	vol := buildMultiTermFuzzyTestVolume(t)
+	volumes := []*serviceVolumeIndex{vol}
+	// Wrong and missing letters inside "report": no deletion variant of
+	// either typo is a substring of any name.
+	for _, query := range []string{"repirt notes", "reprt notes"} {
+		opts := queryOptions{Query: query, Limit: 10}
+		matches, err := searchServiceVolumes(volumes, opts, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(matches) != 0 {
+			t.Fatalf("%q: exact search unexpectedly matched %v", query, matches)
+		}
+		fuzzied := false
+		if !tryMultiTermFuzzyRewrite(volumes, &opts, &matches, &fuzzied) || !fuzzied {
+			t.Fatalf("%q: expected a rewrite", query)
+		}
+		if len(matches) != 1 || matches[0].Name != "q4-report-notes.pdf" {
+			t.Fatalf("%q: rewrite results = %v, want q4-report-notes.pdf", query, matches)
+		}
+	}
+}
+
 func TestAppendFuzzyServiceMatchesGoldenRanking(t *testing.T) {
 	vol := buildFuzzyTestVolume(t)
 	opts := queryOptions{Query: "tonics~", Limit: 10}
@@ -412,16 +439,72 @@ func TestAppendFuzzyServiceMatchesAutoFiresOnZeroResults(t *testing.T) {
 	}
 }
 
+func TestAppendFuzzyServiceMatchesInteriorSubstitutionAndOmission(t *testing.T) {
+	vol := buildFuzzyTestVolume(t)
+
+	// Neither typo contains a deletion variant that is a substring of
+	// "tonicwater.txt"; only the pigeonhole pieces reach it.
+	// "tonicwaxter.txt" has the same length as "tonicwater.txtx", but the
+	// whole name it mistypes is "tonicwater.txt" (like BUImLD.gn vs BUILD.gni).
+	for _, query := range []string{"tonicwaser.txt", "tonicwter.txt", "tonicwaxter.txt"} {
+		opts := queryOptions{Query: query, Limit: 10}
+		matches, added := appendFuzzyServiceMatches([]*serviceVolumeIndex{vol}, opts, nil)
+		if !added || len(matches) == 0 {
+			t.Fatalf("%q: expected fuzzy results", query)
+		}
+		if matches[0].Name != "tonicwater.txt" {
+			t.Fatalf("%q: top fuzzy result = %q, want tonicwater.txt", query, matches[0].Name)
+		}
+	}
+}
+
+func TestFuzzyLetterMaskMisses(t *testing.T) {
+	term := fuzzyLetterMask("relese")
+	if got := fuzzyLetterMaskMisses(term, fuzzyLetterMask("release.md")); got != 0 {
+		t.Fatalf("release.md misses = %d, want 0", got)
+	}
+	if got := fuzzyLetterMaskMisses(fuzzyLetterMask("relaase"), fuzzyLetterMask("release")); got != 0 {
+		t.Fatalf("release misses for relaase = %d, want 0", got)
+	}
+	if got := fuzzyLetterMaskMisses(fuzzyLetterMask("build.gn"), fuzzyLetterMask("main.cc")); got != 5 {
+		t.Fatalf("main.cc misses for build.gn = %d, want 5", got)
+	}
+}
+
+func TestFuzzyPigeonholePieces(t *testing.T) {
+	cases := []struct {
+		term string
+		tau  int
+		want []string
+	}{
+		{"relese", 1, []string{"rel", "ese"}},
+		{"relaase", 1, []string{"rel", "aase"}},
+		{"tonic", 1, []string{"nic", "ton", "oni"}},
+		{"reprt", 1, []string{"prt", "rep", "epr"}},
+		{"render_frame", 2, []string{"rend", "er_f", "rame"}},
+		{"tonicwter", 2, []string{"ton", "icw", "ter"}},
+		{"tonicwat", 2, []string{"toni", "cwat"}},
+	}
+	for _, tc := range cases {
+		got := fuzzyPigeonholePieces(tc.term, tc.tau)
+		if strings.Join(got, "|") != strings.Join(tc.want, "|") {
+			t.Fatalf("fuzzyPigeonholePieces(%q, %d) = %q, want %q", tc.term, tc.tau, got, tc.want)
+		}
+	}
+}
+
 func TestAppendFuzzyServiceMatchesKeepsExactResultsFirst(t *testing.T) {
 	vol := buildFuzzyTestVolume(t)
 
-	// Simulate a partial exact result set (below the auto-fuzzy threshold):
-	// fuzzy entries must be appended strictly after every exact entry.
+	// Explicitly marked partial exact sets still top up (the marker is the
+	// user asking for close matches); unmarked partial sets never auto-top,
+	// so their rows stay exact-only. Fuzzy entries must be appended strictly
+	// after every exact entry.
 	exact := []Entry{{Path: `Q:\exact-tonic.txt`, Name: "exact-tonic.txt"}}
-	opts := queryOptions{Query: "tonics", Limit: 10}
+	opts := queryOptions{Query: "tonics~", Limit: 10}
 	matches, added := appendFuzzyServiceMatches([]*serviceVolumeIndex{vol}, opts, exact)
 	if !added {
-		t.Fatal("partial result set below threshold should trigger the fuzzy tier")
+		t.Fatal("explicitly marked partial result set should trigger the fuzzy tier")
 	}
 	for i, m := range matches {
 		if i < len(exact) {
@@ -455,6 +538,279 @@ func TestAppendFuzzyServiceMatchesDeclinesMultiTermAndShortTerms(t *testing.T) {
 	optsCase := queryOptions{Query: "tonics~", CaseSensitive: true, Limit: 10}
 	if _, added := appendFuzzyServiceMatches([]*serviceVolumeIndex{vol}, optsCase, nil); added {
 		t.Fatal("case-sensitive fuzzy queries must be declined")
+	}
+}
+
+// fuzzyNameDistanceWindows is the original per-window implementation, kept
+// as an oracle for the single-pass DP in fuzzyNameDistance.
+func fuzzyNameDistanceWindows(nameLower, term string, tau int) (dist int, prefix bool, windowPos int, ok bool) {
+	nameRunes := []rune(nameLower)
+	termRunes := []rune(term)
+	lt, ln := len(termRunes), len(nameRunes)
+	if ln == 0 {
+		return tau + 1, false, 0, false
+	}
+	best := tau + 1
+	prefixBest := false
+	bestStart := ln
+	end := min(ln-lt+tau, ln)
+	for start := 0; start <= end; start++ {
+		maxWidth := min(lt+tau, ln-start)
+		minWidth := max(lt-tau, 1)
+		for width := minWidth; width <= maxWidth; width++ {
+			d := damerauLevenshteinBounded(nameRunes[start:start+width], termRunes, tau)
+			atPrefix := start == 0
+			if d < best || (d == best && start < bestStart) {
+				if d < best {
+					best = d
+					prefixBest = atPrefix
+				}
+				bestStart = start
+			} else if d == best && atPrefix {
+				prefixBest = true
+			}
+		}
+	}
+	if best > tau {
+		return best, false, bestStart, false
+	}
+	return best, prefixBest, bestStart, true
+}
+
+func TestFuzzyNameDistanceMatchesWindowOracle(t *testing.T) {
+	rng := rand.New(rand.NewSource(1))
+	word := func(n int) string {
+		b := make([]byte, n)
+		for i := range b {
+			b[i] = "abcd."[rng.Intn(5)]
+		}
+		return string(b)
+	}
+	for i := 0; i < 20000; i++ {
+		name := word(1 + rng.Intn(14))
+		term := word(3 + rng.Intn(6))
+		tau := 1 + rng.Intn(2)
+		gd, gp, gw, gok := fuzzyNameDistance(name, term, tau)
+		wd, wp, ww, wok := fuzzyNameDistanceWindows(name, term, tau)
+		if gok != wok || (gok && (gd != wd || gp != wp || gw != ww)) {
+			t.Fatalf("fuzzyNameDistance(%q, %q, %d) = %d/%v/%d/%v, oracle %d/%v/%d/%v",
+				name, term, tau, gd, gp, gw, gok, wd, wp, ww, wok)
+		}
+	}
+}
+
+func TestFuzzyDistanceScratchMatchesWrapper(t *testing.T) {
+	// The scratch (buffer-reuse + ASCII fast path + length prefilter) entry
+	// must agree with the allocating wrapper on every shape, including
+	// non-ASCII names, empty inputs, and the short-name decline. One scratch
+	// is reused across the whole corpus, so this also catches buffer aliasing
+	// between consecutive candidates.
+	names := []string{
+		"", "a", "ab", "chrome.exe", "browser_test.cc", "BUILD.gn",
+		"render_frame_sink_manager.cc", "x", "chrom", "chromebook",
+		"sodanco.txt", "Só Danço mix.mp3", "ｃｈｒｏｍｅ.txt", "mmm",
+		"a_b-c.d", "repeatedrepeatedrepeatedname",
+	}
+	terms := []string{"", "a", "chorme", "broswer", "chrome", "chrmae", "doccumnet", "sodanco", "mmm", "build"}
+	var sc fuzzyDistanceScratch
+	for _, name := range names {
+		for _, term := range terms {
+			for _, tau := range []int{1, 2} {
+				termRunes := []rune(term)
+				gd, gp, gw, gok := fuzzyNameDistance(name, term, tau)
+				sd, sp, sw, sok := fuzzyNameDistanceScratch(name, termRunes, asciiOnlyString(term), tau, &sc)
+				if gok != sok || (gok && (gd != sd || gp != sp || gw != sw)) {
+					t.Fatalf("scratch(%q, %q, %d) = %d/%v/%d/%v, wrapper %d/%v/%d/%v",
+						name, term, tau, sd, sp, sw, sok, gd, gp, gw, gok)
+				}
+				// The scratch must also agree with the window oracle on
+				// non-degenerate inputs (empty terms never reach fuzzy
+				// search: terms under 3 runes are declined up front, and
+				// the oracle disagrees with the wrapper there).
+				if term != "" {
+					wd, wp, ww, wok := fuzzyNameDistanceWindows(name, term, tau)
+					if gok != wok || (gok && (gd != wd || gp != wp || gw != ww)) {
+						t.Fatalf("wrapper(%q, %q, %d) = %d/%v/%d/%v, oracle %d/%v/%d/%v",
+							name, term, tau, gd, gp, gw, gok, wd, wp, ww, wok)
+					}
+				}
+			}
+		}
+	}
+}
+
+func TestFuzzyDistanceScratchRandomVsOracle(t *testing.T) {
+	// The banded scratch DP must agree with the unbanded per-window oracle
+	// on larger inputs too (long names, tau 2), sharing one scratch across
+	// all calls to also cover buffer growth and rotation staleness.
+	rng := rand.New(rand.NewSource(7))
+	alpha := "abcdefg._-xyz"
+	word := func(n int) string {
+		b := make([]byte, n)
+		for i := range b {
+			b[i] = alpha[rng.Intn(len(alpha))]
+		}
+		return string(b)
+	}
+	var sc fuzzyDistanceScratch
+	for i := 0; i < 5000; i++ {
+		name := word(1 + rng.Intn(40))
+		term := word(3 + rng.Intn(10))
+		tau := 1 + rng.Intn(2)
+		termRunes := []rune(term)
+		sd, sp, sw, sok := fuzzyNameDistanceScratch(name, termRunes, asciiOnlyString(term), tau, &sc)
+		wd, wp, ww, wok := fuzzyNameDistanceWindows(name, term, tau)
+		if sok != wok || (sok && (sd != wd || sp != wp || sw != ww)) {
+			t.Fatalf("scratch(%q, %q, %d) = %d/%v/%d/%v, oracle %d/%v/%d/%v",
+				name, term, tau, sd, sp, sw, sok, wd, wp, ww, wok)
+		}
+	}
+}
+
+func TestDamerauBoundedReuseMatchesWrapper(t *testing.T) {
+	pairs := [][2]string{
+		{"", ""}, {"a", ""}, {"", "abc"}, {"kitten", "sitting"},
+		{"chrome", "chorme"}, {"chrome", "chrmae"}, {"abcdef", "abcfed"},
+		{"sodanco", "sodanco"}, {" Tocantins", "tocantins"},
+	}
+	var sc fuzzyDistanceScratch
+	for _, p := range pairs {
+		a, b := []rune(p[0]), []rune(p[1])
+		for _, max := range []int{0, 1, 2, 3} {
+			want := damerauLevenshteinBounded(a, b, max)
+			got := damerauLevenshteinBoundedReuse(a, b, max, &sc)
+			if got != want {
+				t.Fatalf("reuse(%q, %q, %d) = %d, want %d", p[0], p[1], max, got, want)
+			}
+		}
+	}
+}
+
+// TestAppendFuzzyCollectsPastEnoughBoundary pins the collection-cap
+// semantics: the in-flight variant always over-collects past the
+// need*fuzzyCollectFactor cap, and that tail participates in the final
+// sort. Stopping mid-variant would change which survivors reach a small
+// top-N. The fixture lines up 30 equidistant typo matches with ranks
+// opposing id order, so a mid-variant cutoff picks the wrong winner.
+func TestAppendFuzzyCollectsPastEnoughBoundary(t *testing.T) {
+	idx := &Index{Source: "usn", Volume: "Q:", Compact: true, DBPath: ""}
+	add := func(name string) {
+		idx.Records = append(idx.Records, CompactRecord{
+			FRN:       uint64(len(idx.Records) + 10),
+			ParentFRN: uint64(10),
+			Parent:    0,
+			Name:      name,
+		})
+	}
+	add(".")
+	// Insertion order opposes name order: ids ascend while names descend,
+	// so collection order and rank order disagree.
+	for i := 29; i >= 0; i-- {
+		add(fmt.Sprintf("unittest_%02d.txt", i))
+	}
+	buildOrders(idx)
+	vol := newServiceVolumeIndex("", idx)
+	vol.volume = "Q:"
+	vol.rebuildNameTrigramsLocked()
+	volumes := []*serviceVolumeIndex{vol}
+	opts := queryOptions{Query: "unitest", Limit: 1}
+	// Independent expectation: every file is a distance-1 survivor, so the
+	// winner is the rank-minimum under the full ranking keys.
+	pq, err := parseQuery(opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pqNoTerms := pq
+	pqNoTerms.Terms = nil
+	rankVec := vol.rankForQuery(pqNoTerms)
+	term := "unitest"
+	termRunes := []rune(term)
+	var sc fuzzyDistanceScratch
+	bestRank := -1
+	bestPath := ""
+	n := vol.index.compactRecordCount()
+	for id := 0; id < n; id++ {
+		rec := vol.index.compactRecord(id)
+		if rec.Deleted {
+			continue
+		}
+		nameLower := foldFuzzyText(strings.ToLower(rec.Name))
+		dist, _, _, ok := fuzzyNameDistanceScratch(nameLower, termRunes, true, 1, &sc)
+		if !ok || dist == 0 {
+			continue
+		}
+		var rank uint64
+		if id < len(rankVec) {
+			rank = uint64(rankVec[id])
+		}
+		if bestRank < 0 || rank < uint64(bestRank) {
+			bestRank = int(rank)
+			bestPath = rec.Name
+		}
+	}
+	if bestPath == "" {
+		t.Fatal("no distance-1 survivors in fixture")
+	}
+	matches, added := appendFuzzyServiceMatches(volumes, opts, nil)
+	if !added || len(matches) != 1 {
+		t.Fatalf("added=%v matches=%v, want exactly one fuzzy winner", added, len(matches))
+	}
+	if matches[0].Name != bestPath {
+		t.Fatalf("winner = %q, want rank-minimum %q", matches[0].Name, bestPath)
+	}
+}
+
+func TestScoreFuzzyRefsParallelMatchesSerial(t *testing.T) {
+	// Parallel scoring must merge deterministically: repeating the fixture
+	// ids past the parallel threshold has to score every repetition exactly
+	// like the small (serial) run. Needs GOMAXPROCS > 1 to exercise the
+	// parallel path; the serial path is always correct by construction.
+	vol := buildFuzzyTestVolume(t)
+	pq, err := parseQuery(queryOptions{Query: "tonics", Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pqNoTerms := pq
+	pqNoTerms.Terms = nil
+	rankVec := vol.rankForQuery(pqNoTerms)
+	term := "tonics"
+	termRunes := []rune(term)
+	termMask := fuzzyLetterMask(term)
+	base := []int{1, 2, 3, 4, 5, 6}
+	var scSerial, scParallel fuzzyDistanceScratch
+	serial := scoreFuzzyRefs(vol, rankVec, base, termRunes, true, termMask, 1, &scSerial)
+	if len(serial) != len(base) {
+		t.Fatalf("serial scores = %d, want %d", len(serial), len(base))
+	}
+	big := make([]int, 0, 2*fuzzyParallelScoreMinIDs)
+	for len(big) < 2*fuzzyParallelScoreMinIDs {
+		big = append(big, base...)
+	}
+	parallel := scoreFuzzyRefs(vol, rankVec, big, termRunes, true, termMask, 1, &scParallel)
+	for i, s := range parallel {
+		if want := serial[i%len(base)]; s != want {
+			t.Fatalf("parallel score[%d] (id %d) = %+v, want %+v", i, big[i], s, want)
+		}
+	}
+}
+
+func TestFuzzyBestWindowAtReuseMatchesWrapper(t *testing.T) {
+	names := []string{"chrome.exe", "browser_test.cc", "render_frame.cc", "ab", "xochromey"}
+	terms := []string{"chorme", "broswer", "frame", "ab"}
+	var sc fuzzyDistanceScratch
+	for _, name := range names {
+		for _, term := range terms {
+			for _, tau := range []int{1, 2} {
+				for _, start := range []int{0, 1, 3} {
+					want := fuzzyBestWindowAt(name, term, start, tau)
+					got := fuzzyBestWindowAtReuse([]rune(name), []rune(term), start, tau, &sc)
+					if got != want {
+						t.Fatalf("reuse(%q, %q, start=%d, %d) = %q, want %q",
+							name, term, start, tau, got, want)
+					}
+				}
+			}
+		}
 	}
 }
 

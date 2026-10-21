@@ -18,7 +18,8 @@
 
       <section class="prompt-wrap" role="search">
         <span class="prompt-glyph" aria-hidden="true">&gt;</span>
-        <input id="query" class="prompt-input" type="search" autocomplete="off" spellcheck="false" autofocus aria-label="Search files" />
+        <input id="query" class="prompt-input" type="search" autocomplete="off" spellcheck="false" autofocus aria-label="Search files" placeholder="Search files" />
+        <button id="content-toggle" class="prompt-toggle" type="button" aria-pressed="false" title="Search inside files (Ctrl+Shift+F)">Contents</button>
         <button id="clear" class="prompt-clear" type="button" aria-label="Clear search" hidden>×</button>
         <kbd class="prompt-kbd" title="Focus search">Ctrl K</kbd>
       </section>
@@ -49,6 +50,7 @@
       <footer class="footer">
         <span id="summary" class="summary">Ready</span>
         <span id="selected" class="selected-path"></span>
+        <span id="content-status" class="content-status"></span>
         <span class="footer-right">
           <span id="count" class="count">0</span>
           <span id="health" class="health" title="">

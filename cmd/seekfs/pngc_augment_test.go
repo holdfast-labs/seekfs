@@ -12,7 +12,30 @@ import (
 	"path/filepath"
 	"runtime"
 	"testing"
+	"unsafe"
 )
+
+// TestTotalRamBytesProbesPhysicalMemory pins the MEMORYSTATUSEX interop the
+// content block-cache sizing depends on: the struct must be 64 bytes (a
+// padded 72-byte struct makes GlobalMemoryStatusEx fail, silently dropping
+// every default cache cap to the 64 MiB fallback) and the probe must report
+// a plausible physical size on a real machine.
+func TestTotalRamBytesProbesPhysicalMemory(t *testing.T) {
+	if got := unsafe.Sizeof(memoryStatusEx{}); got != 64 {
+		t.Fatalf("sizeof(memoryStatusEx) = %d; want 64 (Win32 MEMORYSTATUSEX)", got)
+	}
+	total, err := totalRAMBytes()
+	if err != nil {
+		t.Fatalf("totalRAMBytes: %v", err)
+	}
+	const (
+		minPlausible = 512 << 20
+		maxPlausible = 16 << 50
+	)
+	if total < minPlausible || total > maxPlausible {
+		t.Fatalf("totalRAMBytes = %d; want within [512 MiB, 16 PiB]", total)
+	}
+}
 
 func TestPNGCAugmentPreservesSectionsAndQueryParity(t *testing.T) {
 	t.Setenv("SEEKFS_LOW_MEMORY_TRIGRAM_MAX_POSTING", "1")
@@ -146,7 +169,15 @@ func TestPNGCAugmentRejectsCorruptionDuplicateAndCleansUp(t *testing.T) {
 func TestPNGCAugmentFixtureMeasurement(t *testing.T) {
 	t.Setenv("SEEKFS_LOW_MEMORY_TRIGRAM_MAX_POSTING", "1")
 	t.Setenv("SEEKFS_SELF_NAME_GRAMS", "0")
-	for _, records := range []int{50_000, 200_000, 500_000} {
+	// The 200k/500k sizes measure the same properties as 50k at scale;
+	// they run in the soak tier (CI) while the default tier keeps 50k.
+	sizes := []int{50_000}
+	if testSoakEnabled() {
+		sizes = []int{50_000, 200_000, 500_000}
+	} else {
+		t.Logf("soak sizes skipped (SEEKFS_TEST_SOAK=1 runs 200k/500k in CI)")
+	}
+	for _, records := range sizes {
 		t.Run(fmt.Sprintf("records-%d", records), func(t *testing.T) {
 			dir := t.TempDir()
 			source := filepath.Join(dir, "source.gsi")
@@ -255,9 +286,17 @@ func TestPNGCAugmentStreamingRejectsSpoolCorruptionAndWriteFailure(t *testing.T)
 func TestPNGCAugmentLegacyNoMetadataUsesBoundedDiscovery(t *testing.T) {
 	t.Setenv("SEEKFS_LOW_MEMORY_TRIGRAM_MAX_POSTING", "1")
 	t.Setenv("SEEKFS_SELF_NAME_GRAMS", "0")
+	// MAX_POSTING=1 forces the bounded discovery path at any scale, so a
+	// 100k index asserts the same properties as 500k; the full 500k runs
+	// in the soak tier (CI).
+	legacyRecords := 100_000
+	if testSoakEnabled() {
+		legacyRecords = 500_000
+	}
+	t.Logf("legacy augment fixture: %d records (soak=%v)", legacyRecords, testSoakEnabled())
 	dir := t.TempDir()
 	source := filepath.Join(dir, "legacy.gsi")
-	if err := saveIndex(source, dottedPathBenchmarkIndex(500_000)); err != nil {
+	if err := saveIndex(source, dottedPathBenchmarkIndex(legacyRecords)); err != nil {
 		t.Fatal(err)
 	}
 	if err := stripPNGRMetadataForTest(source); err != nil {
@@ -312,7 +351,7 @@ func TestPNGCAugmentLegacyNoMetadataUsesBoundedDiscovery(t *testing.T) {
 		}
 	}
 	gotPNGC := data[pngc.offset : pngc.offset+pngc.length]
-	idx := dottedPathBenchmarkIndex(500_000)
+	idx := dottedPathBenchmarkIndex(legacyRecords)
 	selective := buildSelectiveNameTrigramIndex(idx, 1)
 	rankedSource := mustLoadMappedIndex(t, source)
 	defer closeMappedIndex(rankedSource)

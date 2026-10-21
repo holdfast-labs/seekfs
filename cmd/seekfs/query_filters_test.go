@@ -232,9 +232,20 @@ func TestPathFilterEnablesPathMatching(t *testing.T) {
 }
 
 func TestGlobalBoundedScanBudgetGate(t *testing.T) {
+	// The gate under test reads only vol.index.compactRecordCount(); the
+	// 40M case must NOT materialize 40M records (gigabytes of commit plus
+	// the constructor's pack/sort passes, ~44s on this box). A bare
+	// MMapRecords count reports the size with no backing allocation, and
+	// the gate never dereferences record storage, so the asserted budget
+	// math is identical.
 	vol := func(records int) *serviceVolumeIndex {
-		idx := &Index{Source: "usn", Volume: "C:", Compact: true, Records: make([]CompactRecord, records)}
-		return newServiceVolumeIndex("budget.gsi", idx)
+		idx := &Index{Source: "usn", Volume: "C:", Compact: true}
+		if records >= 1_000_000 {
+			idx.MMapRecords = &MMapRecords{count: records}
+		} else {
+			idx.Records = make([]CompactRecord, records)
+		}
+		return &serviceVolumeIndex{index: idx}
 	}
 	now := time.Now()
 	if !globalBoundedScanBudgetOK(nil, parsedQuery{}, 3) {
@@ -611,6 +622,53 @@ func TestUnderSearchFiltersStaleFilesystemEntriesByDefault(t *testing.T) {
 	}
 	if len(countMatches) != 1 {
 		t.Fatalf("count matches = %+v, want indexed count behavior unchanged", countMatches)
+	}
+}
+
+// TestCountUnderDivergenceFlagged pins the CountDivergent marker: like its
+// content twin, it is set on potential (Under/Exists shapes, where search
+// stat-filters stale entries and counts do not), never on plain counts or
+// searches.
+func TestCountUnderDivergenceFlagged(t *testing.T) {
+	records := []CompactRecord{
+		{FRN: 1, ParentFRN: 1, Parent: -1, Name: ".", Mode: modeFromAttrs(fileAttributeDir)},
+		{FRN: 2, ParentFRN: 1, Parent: 0, Name: "scope", Mode: modeFromAttrs(fileAttributeDir)},
+		{FRN: 3, ParentFRN: 2, Parent: 1, Name: "run_pipeline.bat", Mode: modeFromAttrs(fileAttributeArchive)},
+	}
+	idx := &Index{Source: "usn", Volume: "F:", Roots: []string{`F:\`}, Compact: true, Records: records}
+	buildOrders(idx)
+	vol := newServiceVolumeIndex("divergence.gsi", idx)
+	vol.rebuildNameTrigramsLocked()
+	volumes := []*serviceVolumeIndex{vol}
+
+	underTrace := &searchTrace{}
+	n, ok, err := countServiceVolumes(volumes, queryOptions{Query: "run_pipeline", Under: `F:\scope`, Limit: 20, Trace: underTrace})
+	if err != nil || !ok || n != 1 {
+		t.Fatalf("under count = %d ok=%v err=%v, want 1 true nil", n, ok, err)
+	}
+	if !underTrace.CountDivergent {
+		t.Fatal("count under scope did not set CountDivergent")
+	}
+	searchTr := &searchTrace{}
+	if _, err := searchServiceVolumes(volumes, queryOptions{Query: "run_pipeline", Under: `F:\scope`, Limit: 20, Trace: searchTr}, false); err != nil {
+		t.Fatal(err)
+	}
+	if searchTr.CountDivergent {
+		t.Fatal("scoped search set CountDivergent; only counts diverge")
+	}
+	existsTrace := &searchTrace{}
+	if _, _, err := countServiceVolumes(volumes, queryOptions{Query: "run_pipeline", Exists: true, Limit: 20, Trace: existsTrace}); err != nil {
+		t.Fatal(err)
+	}
+	if !existsTrace.CountDivergent {
+		t.Fatal("count with Exists did not set CountDivergent")
+	}
+	plainTrace := &searchTrace{}
+	if _, _, err := countServiceVolumes(volumes, queryOptions{Query: "run_pipeline", Limit: 20, Trace: plainTrace}); err != nil {
+		t.Fatal(err)
+	}
+	if plainTrace.CountDivergent {
+		t.Fatal("plain count set CountDivergent without Under/Exists")
 	}
 }
 

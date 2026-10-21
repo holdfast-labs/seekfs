@@ -62,7 +62,10 @@ func (vol *serviceVolumeIndex) nameGramUnionUsesExtra(term string) bool {
 // name check keeps the posting source conservative.
 func (vol *serviceVolumeIndex) completeFilenameTopPosting(term string, limit int, pq parsedQuery) ([]int, bool) {
 	if vol == nil || vol.index == nil || limit <= 0 || pq.CountOnly || len(vol.recentIDs) > 0 ||
-		len(pq.Dirs) > 0 || len(pq.Globs) > 0 || len(pq.Regexps) > 0 {
+		len(pq.Dirs) > 0 || len(pq.Globs) > 0 || len(pq.Regexps) > 0 || vol.accentUnionActive(pq) {
+		// The rank-order walk below reads unfolded gram bytes; with
+		// foldable names it would truncate before accent matches.
+		// Decline so an exhaustive source answers instead.
 		return nil, false
 	}
 	if len(pq.Exts) == 1 {
@@ -277,6 +280,10 @@ func (vol *serviceVolumeIndex) completeFilenameRankedPosting(term string, limit 
 	h := make(extRankMaxHeap, 0, limit)
 	decoded, skipped, verified := 0, 0, 0
 	decodedBlocks := make(map[[2]int]struct{}, len(its))
+	// The driver gram's IDs are checked against the stored lowercase name
+	// directly: recordMatchesNonPath verifies the full term anyway, and one
+	// substring test is cheaper than a block search per remaining gram.
+	lowerTerm := strings.ToLower(term)
 	prefetchBytes, prefetchRanges, prefetchPages, prefetchStopped := prefetchPostingBlockRefs(its[0], refs, queryPostingPrefetchBytes(), func() bool { return queryCanceled(pq) })
 	if prefetchStopped {
 		return nil, false
@@ -309,29 +316,11 @@ func (vol *serviceVolumeIndex) completeFilenameRankedPosting(term string, limit 
 			decoded++
 		}
 		for _, id32 := range ids {
-			matched := true
-			for i := 1; i < len(its); i++ {
-				found, valid, blockIndex, didDecode := its[i].containsID(id32)
-				if didDecode {
-					key := [2]int{i, blockIndex}
-					if _, seen := decodedBlocks[key]; !seen {
-						decodedBlocks[key] = struct{}{}
-						decoded++
-					}
-				}
-				if !valid {
-					return nil, false
-				}
-				if !found {
-					matched = false
-					break
-				}
-			}
-			if !matched {
-				continue
-			}
 			id := int(id32)
 			if id < 0 || id >= vol.index.compactRecordCount() {
+				continue
+			}
+			if !strings.Contains(vol.index.compactLowerNameAt(id), lowerTerm) {
 				continue
 			}
 			verified++
@@ -605,6 +594,12 @@ func (vol *serviceVolumeIndex) completeMultiTermNameGramCandidates(terms []strin
 // It retains only one decoded posting block at a time.
 func (vol *serviceVolumeIndex) completeFilenameCountPosting(term string, pq parsedQuery) (int, bool) {
 	if vol == nil || vol.index == nil || len(vol.recentIDs) > 0 {
+		return 0, false
+	}
+	// The gram-intersection count reads unfolded bytes with no per-record
+	// verification: name anchors narrow beyond the term, and the accent
+	// union would add folded matches. Decline both so counts stay exact.
+	if len(pq.ExactTerms)+len(pq.Prefixes)+len(pq.Suffixes) > 0 || vol.accentUnionActive(pq) {
 		return 0, false
 	}
 	// The posting intersection counts name matches only; scalar predicates

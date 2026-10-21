@@ -15,8 +15,9 @@ func globalExtOnlySupported(pq parsedQuery) bool {
 	extFilters, ok := globalExtPostingFilters(pq)
 	if !ok || len(extFilters) != 1 || len(nonVolumeTerms(pq.Terms)) != 0 || len(pq.Dirs) != 0 ||
 		len(pq.Regexps) != 0 || len(pq.RegexTerms) != 0 ||
-		len(pq.Parents) != 0 || pq.Under != "" || pq.Exists || pq.HasModAfter || len(pq.SizeFilters) != 0 ||
+		len(pq.Parents) != 0 || pq.Under != "" || pq.lateVerified() || pq.HasModAfter || len(pq.SizeFilters) != 0 ||
 		len(pq.DateFilters) != 0 || len(pq.AttrFilters) != 0 || len(pq.OrGroups) != 0 || len(pq.NotGroups) != 0 ||
+		queryHasAnyContentLeaf(pq) || needsPathVerification(pq) ||
 		pq.CaseSensitive {
 		return false
 	}
@@ -24,6 +25,102 @@ func globalExtOnlySupported(pq parsedQuery) bool {
 	// full entry afterwards, and the top-N posting paths filter (or
 	// decline) by type before truncating.
 	return pq.Type == "" || pq.Type == "file" || pq.Type == "dir"
+}
+
+// globalExtSortedTopN serves single-volume sorted ext: queries without
+// materializing the whole posting: posting records are verified at the
+// record level (exact for ext-lane shapes, which admit no path predicates),
+// the top-N by rank is heap-selected, and only the winners are materialized
+// into entries. Ranks are unique per live record, so the heap winners are
+// exactly the records a full verify-sort-truncate would keep; any
+// verification surprise falls back to that path (ok=false). Multi-volume
+// queries and overlay-active volumes keep the existing path (global order
+// there compares entries, not local ranks).
+func globalExtSortedTopN(snapshot globalQuerySnapshot, pq parsedQuery, extFilter globalExtFilter, limit int, trace *searchTrace) ([]Entry, bool) {
+	if limit <= 0 || len(snapshot.volumes) != 1 ||
+		globalSnapshotsHaveHidden(snapshot.overlays) || globalSnapshotsHaveOverlayRecords(snapshot.overlays) {
+		return nil, false
+	}
+	vol := snapshot.volumes[0]
+	if vol == nil || vol.index == nil {
+		return nil, false
+	}
+	if err := checkQueryCapabilities(pq, vol.index); err != nil {
+		return nil, false
+	}
+	volumePQ := pq
+	dropSatisfiedVolumeTerms(&volumePQ, vol.index.Volume)
+	if queryNeedsPath(volumePQ) {
+		return nil, false
+	}
+	ids, ok := globalExtPostingIDs(snapshot.volumes, extFilter.ext, 0, trace)
+	if !ok {
+		return nil, false
+	}
+	rankOf := candidateRanker(vol.index, vol.rankForQuery(volumePQ))
+	h := make(candidateRankMaxHeap, 0, min(limit, len(ids)))
+	for _, id := range ids {
+		if id.volume != 0 || id.local < 0 || id.local >= vol.index.compactRecordCount() {
+			continue
+		}
+		rec := vol.index.compactRecord(id.local)
+		if rec.Deleted || !vol.recordMatchesNonPath(id.local, rec, volumePQ) {
+			continue
+		}
+		item := candidateRankItem{id: id.local, rank: rankOf(id.local)}
+		if len(h) < limit {
+			heap.Push(&h, item)
+			continue
+		}
+		if item.rank < h[0].rank {
+			h[0] = item
+			heap.Fix(&h, 0)
+		}
+	}
+	if len(h) == 0 {
+		setGlobalExtTrace(trace, pq, extFilter, len(ids))
+		return []Entry{}, true
+	}
+	winners := make([]int, len(h))
+	for i := range h {
+		winners[i] = h[i].id
+	}
+	sortIDsByRank(winners, rankOf)
+	pathCache := make(map[int]string)
+	skipVerify := compactCandidateCanSkipEntryMatches(volumePQ, true)
+	ranked := make([]globalRankedEntry, 0, len(winners))
+	for _, id := range winners {
+		entry, ok := compactCandidateEntryIfMatchIn(vol, vol.index, volumePQ, id, pathCache, true, skipVerify, nil)
+		if !ok {
+			// Record-level verification promised a match; a drop here
+			// means the shape evolved past the lane's contract, so let
+			// the exhaustive path decide instead of underfilling.
+			return nil, false
+		}
+		ranked = append(ranked, globalRankedEntry{entry: entry, rank: rankOf(id), volume: 0, tie: entry.Path})
+	}
+	sortGlobalRankedEntries(ranked, pq)
+	if len(ranked) > limit {
+		ranked = ranked[:limit]
+	}
+	setGlobalExtTrace(trace, pq, extFilter, len(ids))
+	return globalRankedEntriesToEntries(ranked), true
+}
+
+func setGlobalExtTrace(trace *searchTrace, pq parsedQuery, extFilter globalExtFilter, candidates int) {
+	if trace == nil {
+		return
+	}
+	trace.setPlannerMode("global-ext")
+	trace.addTerm(traceTerm{
+		Term:      extFilter.ext,
+		Kind:      "extension",
+		Source:    "global:" + extFilter.source,
+		CountHint: candidates,
+		Exact:     true,
+	})
+	trace.setSource("global:"+extFilter.source, candidates)
+	trace.setComplete(true)
 }
 
 func globalExtDefaultSupported(pq parsedQuery) bool {
@@ -57,7 +154,7 @@ func globalComponentDefaultHasRoot(pq parsedQuery) bool {
 		len(pq.Dirs) != 0 || len(pq.Parents) != 0 || pq.Under != "" || len(pq.AttrFilters) != 0 ||
 		globalRegexLiteralSupported(pq) ||
 		(extOK && len(extFilters) != 0 &&
-			(pq.Type != "" || pq.Exists || pq.HasModAfter || len(pq.SizeFilters) != 0 || len(pq.DateFilters) != 0)) {
+			(pq.Type != "" || pq.lateVerified() || pq.HasModAfter || len(pq.SizeFilters) != 0 || len(pq.DateFilters) != 0)) {
 		return true
 	}
 	// Validate every alternative in every OR group, matching the per-group
@@ -178,10 +275,17 @@ func globalComponentQuerySupported(pq parsedQuery, terms []string) bool {
 // regexes keep the components/literal lane so the persisted per-volume regex
 // candidates continue to serve them.
 func globalComponentQuerySupportedMulti(pq parsedQuery, terms []string, multi bool) bool {
-	minTerms := 2
-	if queryHasExplicitPathTerm(pq.Raw) || globalComponentVolumeAnchored(pq) {
-		minTerms = 1
+	if queryHasAnyContentLeaf(pq) {
+		// The components lane verifies only name/path; a content query must
+		// route through the content candidate + post-filter path.
+		return false
 	}
+	// Single plain terms are admitted: the probe estimate (capped, never
+	// materializing past the scan cap) and the iterator's own budgeted
+	// expansion decline broad terms, so selectivity — not term count —
+	// decides. Previously minTerms was 2 here, forcing every selective
+	// single-term path query into a full scan.
+	minTerms := 1
 	if len(pq.OrGroups) != 0 || len(pq.NotGroups) != 0 {
 		minTerms = 1
 	}
@@ -271,7 +375,7 @@ func queryIsPureSubstringRegex(pq parsedQuery) bool {
 		len(pq.Terms) != 0 || len(pq.Exts) != 0 || len(pq.Globs) != 0 || len(pq.Dirs) != 0 ||
 		len(pq.Parents) != 0 || len(pq.OrGroups) != 0 || len(pq.NotGroups) != 0 ||
 		len(pq.SizeFilters) != 0 || len(pq.DateFilters) != 0 || len(pq.AttrFilters) != 0 ||
-		pq.Type != "" || pq.Under != "" || pq.Exists || pq.HasModAfter ||
+		pq.Type != "" || pq.Under != "" || pq.lateVerified() || pq.HasModAfter ||
 		pq.RootBias != "" || pq.CWDBias != "" {
 		return false
 	}
@@ -368,7 +472,7 @@ func compareGlobalVerifiedEntries(a, b globalRankedEntry, pq parsedQuery, global
 // the requested top-N entries. Boolean branches stay lazy: OR sources merge
 // their posting iterators and NOT advances the exclusion iterator with
 // SeekGE, while this verifier owns the only bounded result heap.
-func collectGlobalVerifiedTopN(it globalIDIterator, volumes []*serviceVolumeIndex, snapshots []*volumeSnapshot, pq parsedQuery, limit int) ([]globalRankedEntry, int, error) {
+func collectGlobalVerifiedTopN(it globalIDIterator, volumes []*serviceVolumeIndex, snapshots []*volumeSnapshot, pq parsedQuery, limit int, matcher *contentLeafMatcher) ([]globalRankedEntry, int, error) {
 	if it == nil || limit <= 0 {
 		return nil, 0, nil
 	}
@@ -403,11 +507,11 @@ func collectGlobalVerifiedTopN(it globalIDIterator, volumes []*serviceVolumeInde
 			dropSatisfiedVolumeTerms(&volumePQs[i], vol.index.Volume)
 		}
 	}
-	if out, verified, ok, err := collectGlobalMemoTopN(ids, volumes, snapshots, volumePQs, rankers, ranksComplete, pq, limit); ok {
+	if out, verified, ok, err := collectGlobalMemoTopN(ids, volumes, snapshots, volumePQs, rankers, ranksComplete, pq, limit, matcher); ok {
 		return out, verified, err
 	}
 	if len(ids) < 2*serviceTrigramParallelVerifyMinIDs {
-		out, verified, canceled := collectGlobalVerifiedTopNRange(ids, volumes, snapshots, volumePQs, rankers, pq, limit, global, nil)
+		out, verified, canceled := collectGlobalVerifiedTopNRange(ids, volumes, snapshots, volumePQs, rankers, pq, limit, global, nil, matcher)
 		if canceled {
 			return nil, verified, errQueryCanceled
 		}
@@ -415,7 +519,7 @@ func collectGlobalVerifiedTopN(it globalIDIterator, volumes []*serviceVolumeInde
 	}
 	workers := min(runtime.GOMAXPROCS(0), max(1, len(ids)/serviceTrigramParallelVerifyMinIDs))
 	if workers <= 1 {
-		out, verified, canceled := collectGlobalVerifiedTopNRange(ids, volumes, snapshots, volumePQs, rankers, pq, limit, global, nil)
+		out, verified, canceled := collectGlobalVerifiedTopNRange(ids, volumes, snapshots, volumePQs, rankers, pq, limit, global, nil, matcher)
 		if canceled {
 			return nil, verified, errQueryCanceled
 		}
@@ -434,7 +538,7 @@ func collectGlobalVerifiedTopN(it globalIDIterator, volumes []*serviceVolumeInde
 		wg.Add(1)
 		go func(w, start, end int) {
 			defer wg.Done()
-			items, verified, canceled := collectGlobalVerifiedTopNRange(ids[start:end], volumes, snapshots, volumePQs, rankers, pq, limit, global, &stopped)
+			items, verified, canceled := collectGlobalVerifiedTopNRange(ids[start:end], volumes, snapshots, volumePQs, rankers, pq, limit, global, &stopped, matcher)
 			results[w].items = items
 			results[w].verified = verified
 			if canceled {
@@ -478,8 +582,9 @@ func collectGlobalVerifiedTopN(it globalIDIterator, volumes []*serviceVolumeInde
 // collectGlobalVerifiedTopNRange verifies one slice of candidate IDs with
 // worker-local path caches and a bounded heap. It is the serial whole-slice
 // path as well as the per-worker parallel path; stopped, when non-nil, is
-// shared across workers for prompt cancellation.
-func collectGlobalVerifiedTopNRange(ids []globalRecordID, volumes []*serviceVolumeIndex, snapshots []*volumeSnapshot, volumePQs []parsedQuery, rankers []func(int) int, pq parsedQuery, limit int, global bool, stopped *atomic.Bool) ([]globalRankedEntry, int, bool) {
+// shared across workers for prompt cancellation. The matcher threads through
+// to content-aware verification (nil keeps the pure name/scalar behavior).
+func collectGlobalVerifiedTopNRange(ids []globalRecordID, volumes []*serviceVolumeIndex, snapshots []*volumeSnapshot, volumePQs []parsedQuery, rankers []func(int) int, pq parsedQuery, limit int, global bool, stopped *atomic.Bool, matcher *contentLeafMatcher) ([]globalRankedEntry, int, bool) {
 	h := &globalVerifiedTopHeap{pq: pq, global: global}
 	heap.Init(h)
 	pathCaches := make([]map[int]string, len(volumes))
@@ -508,7 +613,8 @@ func collectGlobalVerifiedTopNRange(ids []globalRecordID, volumes []*serviceVolu
 		if pathCaches[id.volume] == nil {
 			pathCaches[id.volume] = make(map[int]string)
 		}
-		entry, ok := compactCandidateEntryIfMatch(vol.index, volumePQs[id.volume], id.local, pathCaches[id.volume], true, false)
+		pathCaches[id.volume] = boundPathCache(pathCaches[id.volume])
+		entry, ok := compactCandidateEntryIfMatchIn(vol, vol.index, volumePQs[id.volume], id.local, pathCaches[id.volume], true, false, matcher)
 		verified++
 		if !ok {
 			continue
@@ -528,7 +634,135 @@ func collectGlobalVerifiedTopNRange(ids []globalRecordID, volumes []*serviceVolu
 	return out, verified, false
 }
 
-func countGlobalVerifiedIterator(it globalIDIterator, volumes []*serviceVolumeIndex, snapshots []*volumeSnapshot, pq parsedQuery) (int, int, error) {
+// collectGlobalPathDeferredTopN verifies component-iterator candidates without
+// building entries, sorts the lightweight survivors by rank, then materializes
+// entries in rank order (path-tied groups ordered by path, exactly like the
+// full verify-sort-truncate) until the limit fills, applying the exact
+// entryMatches gate on the way. It returns ok=false whenever the shape is not
+// a single volume without overlay records, so callers keep the entry-building
+// verifier there: multi-volume and overlay order compares entries, not local
+// ranks.
+//
+// The record-level precheck is a strict SUPERSET of the entry gate (it only
+// ever admits extra candidates, which the final gate drops): scalar/type/ext
+// checks are exact on the record, path terms and dirs reuse the established
+// parent-chain walk, and everything else (regexps, globs, parents, exists,
+// OR/NOT groups, under) passes through to the final gate. Looseness only
+// costs sort slots, never correctness.
+func collectGlobalPathDeferredTopN(it globalIDIterator, volumes []*serviceVolumeIndex, snapshots []*volumeSnapshot, pq parsedQuery, limit int) ([]globalRankedEntry, int, bool, error) {
+	if it == nil || limit <= 0 || len(volumes) != 1 || globalSnapshotsHaveOverlayRecords(snapshots) {
+		return nil, 0, false, nil
+	}
+	vol := volumes[0]
+	if vol == nil || vol.index == nil {
+		return nil, 0, false, nil
+	}
+	ids, canceled := collectGlobalIteratorCancelable(it, 0, func() bool { return queryCanceled(pq) })
+	if canceled {
+		return nil, 0, false, errQueryCanceled
+	}
+	volumePQ := pq
+	volumePQ.Terms = append([]string(nil), pq.Terms...)
+	dropSatisfiedVolumeTerms(&volumePQ, vol.index.Volume)
+	rankOf := candidateRanker(vol.index, vol.rankForQuery(pq))
+	type lightID struct {
+		id   int
+		rank int
+	}
+	lights := make([]lightID, 0, min(len(ids), limit*16))
+	termsOK := queryPathTermPrecheckSafe(volumePQ)
+	for pos, id := range ids {
+		if pos&1023 == 0 && queryCanceled(pq) {
+			return nil, 0, false, errQueryCanceled
+		}
+		if globalHiddenContains(snapshots, id) || id.volume != 0 || id.local < 0 || id.local >= vol.index.compactRecordCount() {
+			continue
+		}
+		rec := vol.index.compactRecord(id.local)
+		if rec.Deleted {
+			continue
+		}
+		if !compactRecordPrecheck(rec, volumePQ, volumePQ.MatchPath) {
+			continue
+		}
+		if termsOK && !vol.index.compactPathContainsAllFolded(id.local, volumePQ.Terms, volumePQ) {
+			continue
+		}
+		matched := true
+		for _, dir := range volumePQ.Dirs {
+			if dir == "" || !asciiOnlyString(dir) {
+				// Undecidable cheaply; the final gate decides.
+				continue
+			}
+			if !vol.index.compactPathContainsTermFolded(id.local, dir, volumePQ.CaseSensitive || foldOffKillSwitch) {
+				matched = false
+				break
+			}
+		}
+		if !matched {
+			continue
+		}
+		for _, sf := range volumePQ.SizeFilters {
+			if !sf.matches(rec.Size) {
+				matched = false
+				break
+			}
+		}
+		if !matched {
+			continue
+		}
+		for _, df := range volumePQ.DateFilters {
+			if !df.matches(rec.ModUnix) {
+				matched = false
+				break
+			}
+		}
+		if !matched {
+			continue
+		}
+		for _, leaf := range volumePQ.Features {
+			if _, ok := leaf.matches[rec.FRN]; !ok {
+				matched = false
+				break
+			}
+		}
+		if !matched {
+			continue
+		}
+		lights = append(lights, lightID{id: id.local, rank: rankOf(id.local)})
+	}
+	sort.Slice(lights, func(i, j int) bool { return lights[i].rank < lights[j].rank })
+	pathCache := make(map[int]string)
+	verified := 0
+	out := make([]globalRankedEntry, 0, limit)
+	for i := 0; i < len(lights) && len(out) < limit; {
+		j := i + 1
+		for j < len(lights) && lights[j].rank == lights[i].rank {
+			j++
+		}
+		group := make([]globalRankedEntry, 0, j-i)
+		for _, light := range lights[i:j] {
+			pathCache = boundPathCache(pathCache)
+			entry, ok := compactCandidateEntryIfMatchIn(vol, vol.index, volumePQ, light.id, pathCache, true, false, nil)
+			verified++
+			if !ok {
+				continue
+			}
+			group = append(group, globalRankedEntry{entry: entry, rank: light.rank, volume: 0, tie: entry.Path})
+		}
+		sort.Slice(group, func(a, b int) bool { return group[a].tie < group[b].tie })
+		for _, item := range group {
+			if len(out) >= limit {
+				break
+			}
+			out = append(out, item)
+		}
+		i = j
+	}
+	return out, verified, true, nil
+}
+
+func countGlobalVerifiedIterator(it globalIDIterator, volumes []*serviceVolumeIndex, snapshots []*volumeSnapshot, pq parsedQuery, matcher *contentLeafMatcher) (int, int, error) {
 	if it == nil {
 		return 0, 0, nil
 	}
@@ -545,7 +779,7 @@ func countGlobalVerifiedIterator(it globalIDIterator, volumes []*serviceVolumeIn
 		}
 	}
 	if len(ids) < 2*serviceTrigramParallelVerifyMinIDs {
-		count, verified, canceled := countGlobalVerifiedRange(ids, volumes, snapshots, volumePQs, pq, nil)
+		count, verified, canceled := countGlobalVerifiedRange(ids, volumes, snapshots, volumePQs, pq, nil, matcher)
 		if canceled {
 			return 0, verified, errQueryCanceled
 		}
@@ -553,7 +787,7 @@ func countGlobalVerifiedIterator(it globalIDIterator, volumes []*serviceVolumeIn
 	}
 	workers := min(runtime.GOMAXPROCS(0), max(1, len(ids)/serviceTrigramParallelVerifyMinIDs))
 	if workers <= 1 {
-		count, verified, canceled := countGlobalVerifiedRange(ids, volumes, snapshots, volumePQs, pq, nil)
+		count, verified, canceled := countGlobalVerifiedRange(ids, volumes, snapshots, volumePQs, pq, nil, matcher)
 		if canceled {
 			return 0, verified, errQueryCanceled
 		}
@@ -572,7 +806,7 @@ func countGlobalVerifiedIterator(it globalIDIterator, volumes []*serviceVolumeIn
 		wg.Add(1)
 		go func(w, start, end int) {
 			defer wg.Done()
-			count, verified, canceled := countGlobalVerifiedRange(ids[start:end], volumes, snapshots, volumePQs, pq, &stopped)
+			count, verified, canceled := countGlobalVerifiedRange(ids[start:end], volumes, snapshots, volumePQs, pq, &stopped, matcher)
 			results[w].count = count
 			results[w].verified = verified
 			if canceled {
@@ -594,8 +828,9 @@ func countGlobalVerifiedIterator(it globalIDIterator, volumes []*serviceVolumeIn
 
 // countGlobalVerifiedRange counts one slice of candidate IDs with
 // worker-local path caches. It is the serial whole-slice path as well as
-// the per-worker parallel path.
-func countGlobalVerifiedRange(ids []globalRecordID, volumes []*serviceVolumeIndex, snapshots []*volumeSnapshot, volumePQs []parsedQuery, pq parsedQuery, stopped *atomic.Bool) (int, int, bool) {
+// the per-worker parallel path. The matcher threads through to content-aware
+// verification (nil keeps the pure name/scalar behavior).
+func countGlobalVerifiedRange(ids []globalRecordID, volumes []*serviceVolumeIndex, snapshots []*volumeSnapshot, volumePQs []parsedQuery, pq parsedQuery, stopped *atomic.Bool, matcher *contentLeafMatcher) (int, int, bool) {
 	pathCaches := make([]map[int]string, len(volumes))
 	count, verified := 0, 0
 	for _, id := range ids {
@@ -615,7 +850,8 @@ func countGlobalVerifiedRange(ids []globalRecordID, volumes []*serviceVolumeInde
 		if pathCaches[id.volume] == nil {
 			pathCaches[id.volume] = make(map[int]string)
 		}
-		_, ok := compactCandidateEntryIfMatch(vol.index, volumePQs[id.volume], id.local, pathCaches[id.volume], true, false)
+		pathCaches[id.volume] = boundPathCache(pathCaches[id.volume])
+		_, ok := compactCandidateEntryIfMatchIn(vol, vol.index, volumePQs[id.volume], id.local, pathCaches[id.volume], true, false, matcher)
 		verified++
 		if ok {
 			count++

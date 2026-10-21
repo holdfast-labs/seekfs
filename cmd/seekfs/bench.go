@@ -3,6 +3,7 @@ package main
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -195,27 +196,57 @@ func percentile(sorted []float64, p float64) float64 {
 }
 
 type serviceRequest struct {
-	Command       string              `json:"command"`
-	Volume        string              `json:"volume,omitempty"`
-	DB            string              `json:"db,omitempty"`
-	Query         string              `json:"query,omitempty"`
-	MatchPath     bool                `json:"match_path,omitempty"`
-	Limit         int                 `json:"limit,omitempty"`
-	CountOnly     bool                `json:"count_only,omitempty"`
-	Under         string              `json:"under,omitempty"`
-	Exists        bool                `json:"exists,omitempty"`
-	CWDBias       string              `json:"cwd_bias,omitempty"`
-	RootBias      string              `json:"root_bias,omitempty"`
-	Recent        string              `json:"recent,omitempty"`
-	ModifiedAfter string              `json:"modified_after,omitempty"`
-	CaseSensitive bool                `json:"case_sensitive,omitempty"`
-	Fuzzy         bool                `json:"fuzzy,omitempty"`
-	DeadlineUnix  int64               `json:"deadline_unix,omitempty"`
-	RequestSeq    int64               `json:"request_seq,omitempty"`
-	SinceVolumes  []watchVolumeCursor `json:"since_volumes,omitempty"`
-	Baseline      bool                `json:"baseline,omitempty"`
+	Command      string `json:"command"`
+	PluginConfig string `json:"plugin_config,omitempty"`
+	Volume       string `json:"volume,omitempty"`
+	DB           string `json:"db,omitempty"`
+	Query        string `json:"query,omitempty"`
+	MatchPath    bool   `json:"match_path,omitempty"`
+	Limit        int    `json:"limit,omitempty"`
+	CountOnly    bool   `json:"count_only,omitempty"`
+	Under        string `json:"under,omitempty"`
+	Exists       bool   `json:"exists,omitempty"`
+	CWDBias      string `json:"cwd_bias,omitempty"`
+	RootBias     string `json:"root_bias,omitempty"`
+	// Near is the proximity anchor for search (CLI --near / near: token).
+	Near string `json:"near,omitempty"`
+	// Current is the demotion path for search (CLI --current).
+	Current string `json:"current,omitempty"`
+	// Path + OpenQuery carry the `open` command (recorded access event for
+	// Path, attributed to normalized query OpenQuery when non-empty).
+	Path          string `json:"path,omitempty"`
+	OpenQuery     string `json:"open_query,omitempty"`
+	Recent        string `json:"recent,omitempty"`
+	ModifiedAfter string `json:"modified_after,omitempty"`
+	CaseSensitive bool   `json:"case_sensitive,omitempty"`
+	Fuzzy         bool   `json:"fuzzy,omitempty"`
+	DeadlineUnix  int64  `json:"deadline_unix,omitempty"`
+	RequestSeq    int64  `json:"request_seq,omitempty"`
+	BudgetMS      int    `json:"budget_ms,omitempty"`
+	// BudgetDisabled carries an explicit "no wall-clock content bound"
+	// (--budget 0). Omission also leaves the historical time-unbounded default.
+	BudgetDisabled bool `json:"budget_disabled,omitempty"`
+	// ContentDiskVerifyBudget carries the CLI --content-verify-budget override
+	// to the resident service; 0 keeps the service default.
+	ContentDiskVerifyBudget int                 `json:"content_disk_verify_budget,omitempty"`
+	SinceVolumes            []watchVolumeCursor `json:"since_volumes,omitempty"`
+	Baseline                bool                `json:"baseline,omitempty"`
+	// InputUnixNano carries the `input-heartbeat` op: the UI's session
+	// GetLastInputInfo-derived last-input time as unix nanos (UTC). The
+	// service treats the freshest report as its input signal; zero/negative
+	// values are rejected.
+	InputUnixNano int64 `json:"input_unix_nano,omitempty"`
 	// CancelOverride is a transport-injected cancellation predicate used by the
 	// remote transport for connection-scoped cancellation.  It never crosses
 	// the wire and is never set from client-supplied input.
 	CancelOverride func() bool `json:"-"`
+	Cursor         string      `json:"cursor,omitempty"`
+	// ClientTimeoutMS is the caller's own wait for this request. The service
+	// arms an implicit content deadline just before it, so a slow content
+	// count/search settles as an incomplete partial answer instead of the
+	// client timing out on work nobody reads. Zero keeps the historical
+	// behavior (no implicit client bound).
+	ClientTimeoutMS int `json:"client_timeout_ms,omitempty"`
+	// Settings carries the settings-set patch (or settings-get has none).
+	Settings json.RawMessage `json:"settings,omitempty"`
 }

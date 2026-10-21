@@ -40,7 +40,7 @@ results, not screen recordings or speed benchmarks. [Video sources and exports](
 ## Get started
 
 1. Download and extract [the latest Windows zip](https://github.com/holdfast-labs/seekfs/releases/latest).
-   It includes `seekfs.exe` and `seekfs-ui.exe`.
+   It includes `seekfs.exe`, `seekfs-native.exe` and `seekfs-ui.exe`.
 2. In an **administrator PowerShell** in the extracted folder, create a resident
    index for your NTFS volume:
 
@@ -48,7 +48,7 @@ results, not screen recordings or speed benchmarks. [Video sources and exports](
    .\seekfs.exe index-volumes -volume C: -launch
    ```
 
-3. Open `seekfs-ui.exe`, or query from the terminal:
+3. Open `seekfs-native.exe` (the desktop app), or query from the terminal:
 
    ```powershell
    .\seekfs.exe search main
@@ -67,6 +67,46 @@ For a small CLI-only trial without a full-volume index:
 .\seekfs.exe search -db .\docs.gsi report
 .\seekfs.exe count -db .\docs.gsi report
 ```
+
+## Desktop app
+
+`seekfs-native.exe` is the primary desktop app: a native, GPU-rendered
+window built with Gio. It talks to the resident service and has a
+Finder/Explorer-style layout: a sidebar of favorites, volumes and saved
+searches; Details, Icons and grouped views; a preview pane; the Explorer
+context menu; drag-out; rename; and Recycle Bin delete. It follows the system
+light/dark theme and accent color, and the Contents toggle searches inside
+files with highlighted snippets.
+
+`seekfs-ui.exe` is the previous web-view UI. It stays in the release zip for
+now.
+
+```powershell
+go build -ldflags=-H=windowsgui -o seekfs-native.exe ./cmd/seekfs-native
+.\seekfs-native.exe                 # uses the default service pipe
+.\seekfs-native.exe -pipe \\.\pipe\<name>
+```
+
+`SEEKFS_NATIVE_PRESENTER=dxgi` switches from the default GDI presentation path
+(GPU render, then a GDI copy, which works on every display setup) to Gio's
+swapchain. Local UI preferences live in `%APPDATA%\seekfs\native.json`.
+
+The gear button (or `Ctrl+,`) opens Settings. It has three sections:
+
+- **Drives** lists every local volume with its file system, used/free space,
+  entry count and state, and stages an "Index this drive" change per volume.
+- **Content search** edits the master switch, mode (Automatic / Only chosen
+  folders / Off), roots and exclusions (native folder picker), `.gitignore`
+  and system-folder toggles, the size budget and an optional extension
+  allowlist. A drive selector at the top edits per-drive overrides.
+- **Search** sets the local defaults: Contents mode, preview pane, view mode
+  and sort order.
+
+Apply sends only changed fields over the service pipe. If the service refuses
+the write as non-elevated, the app runs `seekfs.exe settings set --json
+<file>` with a UAC prompt and then reloads the settings. Validation errors
+appear next to the named field. A drive that starts indexing shows a
+non-blocking notice while it builds.
 
 ## Search your way
 

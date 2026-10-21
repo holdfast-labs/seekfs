@@ -48,7 +48,14 @@ func TestNameGramExternalMatchesInMemory(t *testing.T) {
 // TestNameGramExternalSpillsMatchInMemory forces many small spills and checks
 // the merge still reproduces the in-memory output.
 func TestNameGramExternalSpillsMatchInMemory(t *testing.T) {
-	idx := dottedPathBenchmarkIndex(50_000)
+	// 8KB spills flush many times even at 20k records; the 50k scale runs
+	// in the soak tier (CI) with the same assertions.
+	spillRecords := 20_000
+	if testSoakEnabled() {
+		spillRecords = 50_000
+	}
+	t.Logf("spill fixture: %d records (soak=%v)", spillRecords, testSoakEnabled())
+	idx := dottedPathBenchmarkIndex(spillRecords)
 	prev := gramExternalSpillBytes
 	gramExternalSpillBytes = 8 << 10
 	t.Cleanup(func() { gramExternalSpillBytes = prev })

@@ -2,6 +2,7 @@ package main
 
 import (
 	"cmp"
+	"container/heap"
 	"os"
 	"path/filepath"
 	"slices"
@@ -412,7 +413,7 @@ func globalAttrIDs(volumes []*serviceVolumeIndex, filters []uint32) ([]globalRec
 }
 
 func entriesFromGlobalIDs(volumes []*serviceVolumeIndex, ids []globalRecordID, pq parsedQuery) ([]Entry, error) {
-	ranked, err := rankedEntriesFromGlobalIDs(volumes, ids, pq)
+	ranked, err := rankedEntriesFromGlobalIDs(volumes, ids, pq, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -420,6 +421,10 @@ func entriesFromGlobalIDs(volumes []*serviceVolumeIndex, ids []globalRecordID, p
 }
 
 func countVerifiedGlobalIDs(volumes []*serviceVolumeIndex, ids []globalRecordID, pq parsedQuery) (int, error) {
+	return countVerifiedGlobalIDsContent(volumes, ids, pq, nil)
+}
+
+func countVerifiedGlobalIDsContent(volumes []*serviceVolumeIndex, ids []globalRecordID, pq parsedQuery, matcher *contentLeafMatcher) (int, error) {
 	pathCaches := make([]map[int]string, len(volumes))
 	count := 0
 	for _, id := range ids {
@@ -436,16 +441,73 @@ func countVerifiedGlobalIDs(volumes []*serviceVolumeIndex, ids []globalRecordID,
 		if pathCaches[id.volume] == nil {
 			pathCaches[id.volume] = make(map[int]string)
 		}
+		pathCaches[id.volume] = boundPathCache(pathCaches[id.volume])
 		volumePQ := pq
 		dropSatisfiedVolumeTerms(&volumePQ, vol.index.Volume)
-		if _, ok := compactCandidateEntryIfMatch(vol.index, volumePQ, id.local, pathCaches[id.volume], true, false); ok {
+		if _, ok := compactCandidateEntryIfMatchIn(vol, vol.index, volumePQ, id.local, pathCaches[id.volume], true, false, matcher); ok {
 			count++
 		}
 	}
 	return count, nil
 }
 
-func rankedEntriesFromGlobalIDs(volumes []*serviceVolumeIndex, ids []globalRecordID, pq parsedQuery) ([]globalRankedEntry, error) {
+// rankedEntriesFromGlobalIDsTopN is rankedEntriesFromGlobalIDs that
+// materializes only the top-N by rank instead of every candidate. Candidate
+// ID sets from posting lanes are already exact (substring-verified,
+// subtree-intersected, hidden-filtered), so verification of the winners is
+// a formality: any winner that still drops (a predicate outside the lane's
+// contract, a raced delete) falls back to the exhaustive path instead of
+// underfilling. Multi-volume queries and overlay-active volumes keep the
+// exhaustive path (global order there compares entries, not local ranks).
+func rankedEntriesFromGlobalIDsTopN(volumes []*serviceVolumeIndex, ids []globalRecordID, pq parsedQuery, matcher *contentLeafMatcher, snapshots []*volumeSnapshot, limit int) ([]globalRankedEntry, bool, error) {
+	if limit <= 0 || len(volumes) != 1 || len(ids) <= limit ||
+		globalSnapshotsHaveHidden(snapshots) || globalSnapshotsHaveOverlayRecords(snapshots) {
+		return nil, false, nil
+	}
+	vol := volumes[0]
+	if vol == nil || vol.index == nil {
+		return nil, false, nil
+	}
+	volumePQ := pq
+	dropSatisfiedVolumeTerms(&volumePQ, vol.index.Volume)
+	if queryNeedsPath(volumePQ) {
+		return nil, false, nil
+	}
+	rankOf := candidateRanker(vol.index, vol.rankForQuery(volumePQ))
+	h := make(candidateRankMaxHeap, 0, limit)
+	for _, id := range ids {
+		if id.volume != 0 || id.local < 0 || id.local >= vol.index.compactRecordCount() {
+			continue
+		}
+		item := candidateRankItem{id: id.local, rank: rankOf(id.local)}
+		if len(h) < limit {
+			heap.Push(&h, item)
+			continue
+		}
+		if item.rank < h[0].rank {
+			h[0] = item
+			heap.Fix(&h, 0)
+		}
+	}
+	winners := make([]int, len(h))
+	for i := range h {
+		winners[i] = h[i].id
+	}
+	sortIDsByRank(winners, rankOf)
+	pathCache := make(map[int]string)
+	skipVerify := compactCandidateCanSkipEntryMatches(volumePQ, matcher == nil)
+	ranked := make([]globalRankedEntry, 0, len(winners))
+	for _, id := range winners {
+		entry, ok := compactCandidateEntryIfMatchIn(vol, vol.index, volumePQ, id, pathCache, true, skipVerify, matcher)
+		if !ok {
+			return nil, false, nil
+		}
+		ranked = append(ranked, globalRankedEntry{entry: entry, rank: rankOf(id), volume: 0, tie: entry.Path})
+	}
+	return ranked, true, nil
+}
+
+func rankedEntriesFromGlobalIDs(volumes []*serviceVolumeIndex, ids []globalRecordID, pq parsedQuery, matcher *contentLeafMatcher) ([]globalRankedEntry, error) {
 	pathCaches := make([]map[int]string, len(volumes))
 	rankers := make([]func(int) int, len(volumes))
 	for i, vol := range volumes {
@@ -468,9 +530,10 @@ func rankedEntriesFromGlobalIDs(volumes []*serviceVolumeIndex, ids []globalRecor
 		if pathCaches[id.volume] == nil {
 			pathCaches[id.volume] = make(map[int]string)
 		}
+		pathCaches[id.volume] = boundPathCache(pathCaches[id.volume])
 		volumePQ := pq
 		dropSatisfiedVolumeTerms(&volumePQ, vol.index.Volume)
-		entry, ok := compactCandidateEntryIfMatch(vol.index, volumePQ, id.local, pathCaches[id.volume], true, compactCandidateCanSkipEntryMatches(volumePQ, true))
+		entry, ok := compactCandidateEntryIfMatchIn(vol, vol.index, volumePQ, id.local, pathCaches[id.volume], true, compactCandidateCanSkipEntryMatches(volumePQ, matcher == nil), matcher)
 		if ok {
 			rank := int(^uint(0) >> 1)
 			if rankers[id.volume] != nil {
@@ -493,6 +556,7 @@ func globalRankedEntriesToEntries(ranked []globalRankedEntry) []Entry {
 func mergeGlobalOverlayEntries(volumes []*serviceVolumeIndex, snapshots []*volumeSnapshot, base []globalRankedEntry, pq parsedQuery, limit int) []globalRankedEntry {
 	if len(snapshots) == 0 {
 		sortGlobalRankedEntries(base, pq)
+		base = dedupeGlobalRankedEntries(base)
 		if limit > 0 && len(base) > limit {
 			return base[:limit]
 		}
@@ -513,6 +577,7 @@ func mergeGlobalOverlayEntries(volumes []*serviceVolumeIndex, snapshots []*volum
 		}
 	}
 	sortGlobalRankedEntries(out, pq)
+	out = dedupeGlobalRankedEntries(out)
 	if limit > 0 && len(out) > limit {
 		out = out[:limit]
 	}
@@ -786,14 +851,15 @@ func (it *globalPathTermFilterIterator) contains(id globalRecordID) bool {
 		}
 	}
 	if it.fast[id.volume] {
-		// PCMP represents exact directory components.  For a filtered
-		// candidate, walk only its parent chain instead of copying the full
-		// root posting (Users can have millions of descendants).
+		// For a filtered candidate, walk only its parent chain instead of
+		// copying the full root posting (Users can have millions of
+		// descendants). Path terms are substrings, so an ancestor named
+		// "main_content" satisfies "content" just like an exact component.
 		if strings.Contains(vol.index.compactLowerNameAt(id.local), it.term) {
 			return true
 		}
 		for current := id.local; current >= 0 && current < vol.index.compactRecordCount(); {
-			if current != id.local && strings.EqualFold(vol.index.compactLowerNameAt(current), it.term) {
+			if current != id.local && strings.Contains(vol.index.compactLowerNameAt(current), it.term) {
 				return true
 			}
 			rec := vol.index.compactRecord(current)

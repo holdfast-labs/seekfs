@@ -45,6 +45,10 @@ type UIApp struct {
 	serviceStart atomic.Bool
 	servicePID   atomic.Int64
 	serviceSince atomic.Int64
+	// lastQuery remembers the most recent search query so Open can attribute
+	// the usage signal (frecency + query-history combo) to it. Best-effort:
+	// a pick is usually opened right after the search that led to it.
+	lastQuery atomic.Value // string
 }
 
 type UISearchRequest struct {
@@ -63,6 +67,66 @@ type UISearchResponse struct {
 	ElapsedMS int64      `json:"elapsed_ms"`
 	Results   []UIResult `json:"results"`
 	Message   string     `json:"message,omitempty"`
+	// Content summarizes the content index for a query that searched file
+	// contents, so the UI can say whether results are complete.
+	Content *UIContentStatus `json:"content,omitempty"`
+	// FuzzyCorrection names the corrected content word(s) when a zero-result
+	// `content:` query was retried with typo-tolerant corrections, so the UI
+	// can say "Showing results for receive".
+	FuzzyCorrection string `json:"fuzzy_correction,omitempty"`
+}
+
+// UIContentStatus is the part of the service's content health the UI shows.
+// ScopeDropped/ScopeDroppedBytes/BudgetBytes/ReserveBytes let the footer name
+// an exact, actionable budget truncation instead of a vague "partial results".
+type UIContentStatus struct {
+	State             string `json:"state,omitempty"`
+	Docs              int    `json:"docs,omitempty"`
+	BuildDone         int    `json:"build_done,omitempty"`
+	BuildTotal        int    `json:"build_total,omitempty"`
+	BuildPhase        string `json:"build_phase,omitempty"`
+	Partial           bool   `json:"partial,omitempty"`
+	Incomplete        bool   `json:"incomplete,omitempty"`
+	Stale             bool   `json:"content_stale,omitempty"`
+	ScopeDropped      int    `json:"scope_dropped,omitempty"`
+	ScopeDroppedBytes int64  `json:"scope_dropped_bytes,omitempty"`
+	BudgetBytes       int64  `json:"budget_bytes,omitempty"`
+	ReserveBytes      int64  `json:"reserve_bytes,omitempty"`
+	Error             string `json:"error,omitempty"`
+}
+
+// uiFuzzyMessage summarizes a fuzzy result for the UI summary bar. A content
+// typo correction names the corrected word(s); a filename close match keeps
+// the historical text.
+func uiFuzzyMessage(resp serviceResponse) string {
+	if resp.FuzzyCorrection != "" {
+		return "Showing results for " + resp.FuzzyCorrection
+	}
+	if resp.Fuzzy {
+		return "showing close matches"
+	}
+	return ""
+}
+
+func uiContentStatusFrom(h *contentHealth) *UIContentStatus {
+	if h == nil {
+		return nil
+	}
+	return &UIContentStatus{
+		State:             h.State,
+		Docs:              h.Docs,
+		BuildDone:         h.BuildDone,
+		BuildTotal:        h.BuildTotal,
+		BuildPhase:        h.BuildPhase,
+		Partial:           h.Partial,
+		Incomplete:        h.Incomplete,
+		Stale:             h.Stale,
+		ScopeDropped:      h.ScopeDropped,
+		ScopeDroppedBytes: h.ScopeDroppedBytes,
+		BudgetBytes:       h.BudgetBytes,
+		ReserveBytes:      h.ReserveBytes,
+		Error:             firstNonEmpty(h.BuildError, h.FoldError),
+	}
 }
 
 type UIResult struct {
@@ -73,6 +137,8 @@ type UIResult struct {
 	Size     int64  `json:"size,omitempty"`
 	Modified string `json:"modified,omitempty"`
 	Exists   bool   `json:"exists"`
+	// Snippet is the matching line of a content query, when there is one.
+	Snippet string `json:"snippet,omitempty"`
 }
 
 type UIStatus struct {
@@ -132,6 +198,7 @@ func cmdDefault(args []string) error {
 
 func (a *UIApp) startup(ctx context.Context) {
 	a.ctx = ctx
+	a.startInputHeartbeatLoop()
 	warmUpShellContextMenus()
 }
 
@@ -228,21 +295,20 @@ func (a *UIApp) search(req UISearchRequest, seq int64) UISearchResponse {
 		return UISearchResponse{OK: false, Seq: seq, Query: query, ElapsedMS: elapsed, Message: err.Error()}
 	}
 	if !resp.OK {
-		return UISearchResponse{OK: false, Seq: seq, Query: query, ElapsedMS: elapsed, Message: resp.Message}
+		return UISearchResponse{OK: false, Seq: seq, Query: query, ElapsedMS: elapsed, Message: resp.Message, Content: uiContentStatusFrom(resp.Content)}
 	}
 	results := uiResultsFromServiceResponse(resp)
-	message := ""
-	if resp.Fuzzy {
-		message = "showing close matches"
-	}
+	message := uiFuzzyMessage(resp)
 	return UISearchResponse{
-		OK:        true,
-		Seq:       seq,
-		Query:     query,
-		Count:     len(results),
-		ElapsedMS: elapsed,
-		Message:   message,
-		Results:   results,
+		OK:              true,
+		Seq:             seq,
+		Query:           query,
+		Count:           len(results),
+		ElapsedMS:       elapsed,
+		Message:         message,
+		Results:         results,
+		Content:         uiContentStatusFrom(resp.Content),
+		FuzzyCorrection: resp.FuzzyCorrection,
 	}
 }
 
@@ -519,6 +585,7 @@ func upsertEnv(env []string, key, value string) []string {
 
 func (a *UIApp) searchServiceUI(query string, req UISearchRequest, limit int, seq int64) (serviceResponse, error) {
 	serviceQuery, matchPath := normalizeUIQueryForService(query, req.MatchPath)
+	a.lastQuery.Store(serviceQuery)
 	opts := queryOptions{
 		Query:      serviceQuery,
 		MatchPath:  matchPath,
@@ -577,6 +644,7 @@ func uiResultFromJSON(row jsonResult) UIResult {
 		IsDir:    row.IsDir,
 		Modified: row.Modified,
 		Exists:   true,
+		Snippet:  row.Snippet,
 	}
 	if result.Name == "" {
 		result.Name = filepath.Base(row.Path)
@@ -717,7 +785,23 @@ func normalizePrefixedEverythingValue(neg, value string) []string {
 }
 
 func (a *UIApp) Open(path string) error {
-	return shellOpen("", path, "", "")
+	err := shellOpen("", path, "", "")
+	// Report the usage signal so opened results rank higher next time.
+	// Best-effort: async, short timeout, errors ignored, never blocks Open.
+	a.reportOpenSignal(path)
+	return err
+}
+
+// reportOpenSignal records an `open` event with the service for path,
+// attributed to the most recent UI query for the combo boost.
+func (a *UIApp) reportOpenSignal(path string) {
+	if a == nil || a.pipeName == "" || strings.TrimSpace(path) == "" {
+		return
+	}
+	query, _ := a.lastQuery.Load().(string)
+	go func() {
+		_, _ = callServiceWithTimeout(a.pipeName, serviceRequest{Command: "open", Path: path, OpenQuery: query}, 2*time.Second)
+	}()
 }
 
 func (a *UIApp) Reveal(path string) error {
