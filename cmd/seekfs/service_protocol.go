@@ -37,6 +37,7 @@ type serviceResponse struct {
 	BuildFlavor              string              `json:"build_flavor,omitempty"`
 	PipeName                 string              `json:"pipe_name,omitempty"`
 	ProcessMode              string              `json:"process_mode,omitempty"`
+	Elevated                 bool                `json:"elevated,omitempty"` // service token is elevated/SYSTEM; raw volume reads need it
 	Entries                  int                 `json:"entries,omitempty"`
 	Loading                  bool                `json:"loading,omitempty"`
 	Count                    int                 `json:"count,omitempty"`
@@ -330,11 +331,18 @@ func serviceInfoResponseFor(resp serviceResponse, pipeName, processMode string) 
 	resp.BuildFlavor = serviceBuildFlavor()
 	resp.PipeName = pipeName
 	resp.ProcessMode = processMode
+	resp.Elevated = serviceProcessElevated()
 	if exe, err := os.Executable(); err == nil {
 		resp.Executable = exe
 		resp.ExecutableHash = executableContentHash(exe)
 	}
 	return resp
+}
+
+// currentProcessElevated reports whether this process token is elevated.
+// LocalSystem tokens report elevated too.
+func currentProcessElevated() bool {
+	return windows.GetCurrentProcessToken().IsElevated()
 }
 
 func executableContentHash(path string) string {

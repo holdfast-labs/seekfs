@@ -212,6 +212,9 @@ func settingsVolumeList(infos []settingsVolumeInfo, volumes []*serviceVolumeInde
 			entry.Entries = vol.index.entryCount()
 		}
 		entry.State = settingsVolumeState(vol, loading)
+		if entry.State == "error" {
+			entry.Error = settingsVolumeErrorMessage(vol.staleReason, serviceProcessElevated())
+		}
 	}
 	for volume, override := range overrides {
 		entry := byVolume[volume]
@@ -559,7 +562,7 @@ func (s *goSearchService) runSettingsVolumeBuild(task *settingsVolumeTask) {
 		if s.settingsVolumeErrs == nil {
 			s.settingsVolumeErrs = make(map[string]string)
 		}
-		s.settingsVolumeErrs[task.volume] = err.Error()
+		s.settingsVolumeErrs[task.volume] = settingsVolumeErrorMessage(err.Error(), serviceProcessElevated())
 		s.settingsVolumeMu.Unlock()
 		s.finishSettingsVolumeTask(task)
 		return
@@ -575,6 +578,19 @@ func (s *goSearchService) runSettingsVolumeBuild(task *settingsVolumeTask) {
 		serviceLog("settings volume config volume=%s err=%v", task.volume, writeErr)
 	}
 	s.finishSettingsVolumeTask(task)
+}
+
+// serviceProcessElevated is a test hook for currentProcessElevated.
+var serviceProcessElevated = currentProcessElevated
+
+// settingsVolumeErrorMessage is the per-drive message the apps show. An
+// unelevated service cannot open the raw volume, so say that instead of a
+// bare "Access is denied".
+func settingsVolumeErrorMessage(reason string, elevated bool) string {
+	if elevated || reason == "" {
+		return reason
+	}
+	return "the seekfs service is not running as administrator, so it cannot read this drive (" + reason + ")"
 }
 
 // finishSettingsVolumeTask releases the service-stop watcher.
@@ -1124,6 +1140,9 @@ func runSettingsSet(args []string, out io.Writer) (err error) {
 	var raw json.RawMessage
 	if err := json.Unmarshal(data, &raw); err != nil {
 		return fmt.Errorf("settings JSON: %w", err)
+	}
+	if err := ensureSettingsServiceElevated(*pipe, raw); err != nil {
+		return err
 	}
 	resp, err = callService(*pipe, serviceRequest{Command: "settings-set", Settings: raw})
 	if err != nil {

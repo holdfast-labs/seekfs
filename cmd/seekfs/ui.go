@@ -553,36 +553,6 @@ func uiDBArgs(dbs []string) string {
 	return strings.Join(parts, " ")
 }
 
-func uiServiceArgs(pipeName string, dbs []string) []string {
-	args := []string{"service", "-lowmem", "-pipe", pipeName, "-sddl", defaultServiceSDDL}
-	for _, db := range dbs {
-		args = append(args, "-db", db)
-	}
-	return args
-}
-
-func configureUIServiceEnvironment(cmd *exec.Cmd) {
-	env := os.Environ()
-	env = upsertEnv(env, "SEEKFS_MEMORY_MODE", "lowmem")
-	env = upsertEnv(env, "SEEKFS_STARTUP_WORKERS", "1")
-	// The UI is the primary interface for the v9 engine; always run the
-	// service against memory-mapped indexes with the global planner so v9
-	// volumes stay at low RSS regardless of how the UI was launched.
-	env = upsertEnv(env, "SEEKFS_GLOBAL_PLANNER", "1")
-	cmd.Env = env
-}
-
-func upsertEnv(env []string, key, value string) []string {
-	prefix := key + "="
-	for i, item := range env {
-		if strings.HasPrefix(item, prefix) {
-			env[i] = prefix + value
-			return env
-		}
-	}
-	return append(env, prefix+value)
-}
-
 func (a *UIApp) searchServiceUI(query string, req UISearchRequest, limit int, seq int64) (serviceResponse, error) {
 	serviceQuery, matchPath := normalizeUIQueryForService(query, req.MatchPath)
 	a.lastQuery.Store(serviceQuery)

@@ -330,7 +330,7 @@ func (u *UI) applySettingsAsync(patch *serviceSettings, canWrite bool) {
 		return
 	}
 	if err == nil && elevationDecision(canWrite, &resp) {
-		if eerr := runElevatedSettings(patch); eerr != nil {
+		if eerr := runElevatedSettings(patch, u.client.PipeName); eerr != nil {
 			u.postSettings(serviceResponse{}, eerr)
 			return
 		}
@@ -684,6 +684,18 @@ func (u *UI) layoutDriveRow(gtx layout.Context, p *settingsPanelState, v volumeD
 							}
 							return layout.Inset{Top: Dp(2)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
 								return label(u.th, Sp(11), free, s.Muted).Layout(gtx)
+							})
+						}),
+						layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+							// The service's build failure reason; without it
+							// the row only says "Error".
+							if state != "error" || v.Error == "" {
+								return layout.Dimensions{}
+							}
+							return layout.Inset{Top: Dp(2)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+								l := label(u.th, Sp(11), v.Error, s.Error)
+								l.MaxLines = 3
+								return l.Layout(gtx)
 							})
 						}),
 					)

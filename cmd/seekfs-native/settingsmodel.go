@@ -38,6 +38,7 @@ type serviceVolume struct {
 	FreeBytes  int64  `json:"free_bytes,omitempty"`
 	Entries    int64  `json:"entries,omitempty"`
 	State      string `json:"state,omitempty"`
+	Error      string `json:"error,omitempty"`
 }
 
 // serviceContent mirrors [content] plus per-drive overrides. Every field is a
@@ -73,6 +74,7 @@ type volumeDraft struct {
 	TotalBytes int64
 	FreeBytes  int64
 	Entries    int64
+	Error      string
 }
 
 type contentDraft struct {
@@ -159,6 +161,7 @@ func draftFromService(s serviceSettings) settingsDraft {
 			TotalBytes: v.TotalBytes,
 			FreeBytes:  v.FreeBytes,
 			Entries:    v.Entries,
+			Error:      v.Error,
 		})
 	}
 	if c := s.Content; c != nil {

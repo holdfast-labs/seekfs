@@ -225,6 +225,15 @@ GOMAXPROCS=2, peak disk 0.56x extracted. Limit-20 warm/first: rare literal
 
 ## Smaller follow-ups
 
+- **Native first-run "Error" on added drives: FIXED 2026-10-21, pending merge**
+  (`fix/settings-apply-error`). seekfs-native starts its sibling service
+  unelevated; UAC elevated only the `settings set` helper, so the drive build ran
+  in the unelevated service and failed with "Access is denied", and the drive
+  row hid the reason. The elevated helper now restarts an unelevated standalone
+  sibling elevated before a drive add; `info` reports `elevated`; the row shows
+  the error text. Owner check: on a machine without the installed service, open
+  seekfs-native, tick a drive, Apply, approve UAC, and confirm it indexes.
+
 - **Whole-drive coverage, build peak: CLOSED 2026-10-15** (`content/stream-postings`
   NOTES.md). Spooling posting runs instead of text: raw runs are ~1.02x of text
   (worse than the 0.27x text spool). Dropping the per-group spool reframe

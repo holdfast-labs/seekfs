@@ -79,7 +79,17 @@ change. `volumes` entries need only `volume` and `indexed`.
   failure: `ok: false` with a message naming the field; nothing is written.
 - A non-elevated caller gets `ok: false`, `message: "settings-set requires an
   elevated caller"`. The app then runs `seekfs.exe settings set --json <file>`
-  elevated (UAC), which sends the same request.
+  elevated (UAC), which sends the same request (with `--pipe` when the app uses
+  a non-default pipe).
+- A drive build reads the raw volume, so the service itself must run elevated
+  (or as SYSTEM); `info` reports this as `elevated: true`. The desktop apps
+  start their sibling standalone service unelevated, so when an elevated
+  `settings set` adds a drive and the target is an unelevated standalone
+  service from the same `seekfs.exe`, the helper restarts that service
+  elevated (same `service -lowmem -pipe ... -sddl ...` command) and waits for
+  it before sending the write. The installed Windows service is never
+  restarted. If an unelevated service still attempts a build, the drive's
+  `error` says the service is not running as administrator.
 
 ## CLI
 

@@ -55,8 +55,9 @@ func settingsHelperPath() (string, error) {
 }
 
 // runElevatedSettings writes patch to a temp file and runs the elevated CLI
-// helper. It waits for the helper to exit and reports a non-zero status.
-func runElevatedSettings(patch *serviceSettings) error {
+// helper against pipeName. It waits for the helper to exit and reports a
+// non-zero status.
+func runElevatedSettings(patch *serviceSettings, pipeName string) error {
 	helper, err := settingsHelperPath()
 	if err != nil {
 		return err
@@ -90,7 +91,7 @@ func runElevatedSettings(patch *serviceSettings) error {
 
 	verb, _ := syscall.UTF16PtrFromString("runas")
 	file, _ := syscall.UTF16PtrFromString(helper)
-	params, _ := syscall.UTF16PtrFromString("settings set --json " + quoteArg(name) + " --result " + quoteArg(resultName))
+	params, _ := syscall.UTF16PtrFromString(elevatedSettingsArgs(name, resultName, pipeName))
 	dir, _ := syscall.UTF16PtrFromString(filepath.Dir(helper))
 	sei := shellExecuteInfo{
 		CbSize:       uint32(unsafe.Sizeof(shellExecuteInfo{})),
@@ -129,6 +130,16 @@ func runElevatedSettings(patch *serviceSettings) error {
 		return fmt.Errorf("elevated settings helper exited with code %d", code)
 	}
 	return nil
+}
+
+// elevatedSettingsArgs is the helper command line. The pipe is passed so a
+// service on a non-default pipe receives the write.
+func elevatedSettingsArgs(patchPath, resultPath, pipeName string) string {
+	args := "settings set --json " + quoteArg(patchPath) + " --result " + quoteArg(resultPath)
+	if pipeName != "" {
+		args += " --pipe " + quoteArg(pipeName)
+	}
+	return args
 }
 
 // quoteArg quotes a path for the Windows command line.

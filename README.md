@@ -104,9 +104,12 @@ The gear button (or `Ctrl+,`) opens Settings. It has three sections:
 
 Apply sends only changed fields over the service pipe. If the service refuses
 the write as non-elevated, the app runs `seekfs.exe settings set --json
-<file>` with a UAC prompt and then reloads the settings. Validation errors
-appear next to the named field. A drive that starts indexing shows a
-non-blocking notice while it builds.
+<file>` with a UAC prompt and then reloads the settings. When the app started
+its own service (no installed Windows service), adding a drive through that
+prompt also restarts the service as administrator, since reading a drive
+needs it. Validation errors appear next to the named field, and a drive whose
+build failed shows the reason under its name. A drive that starts indexing
+shows a non-blocking notice while it builds.
 
 ## Search your way
 

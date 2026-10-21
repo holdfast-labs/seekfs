@@ -304,3 +304,23 @@ func TestSettingsSizeFormatting(t *testing.T) {
 
 func boolPtr(v bool) *bool    { return &v }
 func strPtr(v string) *string { return &v }
+
+func TestSettingsDraftKeepsVolumeError(t *testing.T) {
+	var resp serviceResponse
+	body := `{"ok":true,"settings":{"volumes":[{"volume":"D:","indexed":false,"state":"error","error":"Access is denied."}]}}`
+	if err := json.Unmarshal([]byte(body), &resp); err != nil {
+		t.Fatal(err)
+	}
+	m := newSettingsModel(*resp.Settings)
+	if len(m.draft.Volumes) != 1 || m.draft.Volumes[0].State != "error" || m.draft.Volumes[0].Error != "Access is denied." {
+		t.Fatalf("draft volumes = %+v", m.draft.Volumes)
+	}
+	m.setDriveIndexed("D:", true)
+	patch, err := json.Marshal(m.patch())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(patch), "error") {
+		t.Fatalf("patch carries the read-only error field: %s", patch)
+	}
+}
