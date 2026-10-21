@@ -60,8 +60,8 @@ try {
 # Native Gio desktop UI. Gio loads the window/title-bar icon from icon group
 # resource id 1 (gioui.org/app iconID), unlike Wails' 3, hence -group 1.
 # Its manifest (comctl32 v6 + per-monitor-v2 DPI,
-// asInvoker) and icon are regenerated deterministically into
-// cmd/seekfs-native/rsrc.syso, which is also committed for dev builds.
+# asInvoker) and icon are regenerated deterministically into
+# cmd/seekfs-native/rsrc.syso, which is also committed for dev builds.
 $NativePkg = Join-Path $Root "cmd\seekfs-native"
 $NativeSyso = Join-Path $NativePkg "rsrc.syso"
 $NativeIcon = Join-Path $UiPkg "ui_frontend\assets\seekfs.ico"
