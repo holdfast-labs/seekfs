@@ -8,7 +8,10 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
+
+	"golang.org/x/sys/windows/svc/mgr"
 )
 
 // settings_service_elevate.go: the desktop apps start a standalone sibling
@@ -164,4 +167,102 @@ func stopServiceProcess(pid int, pipe string) error {
 		time.Sleep(100 * time.Millisecond)
 	}
 	return errors.New("stopped service still answers on its pipe")
+}
+
+// Test hook.
+var settingsInstallService = installAppWindowsService
+
+const appServiceReadyTimeout = 2 * time.Minute
+
+// installAppWindowsService registers this executable as the seekfs Windows
+// service for the desktop apps and starts it: LocalSystem, delayed automatic
+// start, and no -db flags, so the service follows the configured drive list
+// (drives added later in Settings survive a restart). A standalone sibling on
+// the pipe is stopped first so the service can own the pipe. An existing
+// seekfs service is reconfigured in place rather than deleted and recreated.
+func installAppWindowsService(pipe string) error {
+	exe, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	if info, err := callService(pipe, serviceRequest{Command: "info"}); err == nil {
+		if strings.EqualFold(info.ProcessMode, "windows-service") {
+			return nil
+		}
+		if !strings.EqualFold(info.ProcessMode, "standalone") || !samePath(info.Executable, exe) {
+			return fmt.Errorf("another seekfs process (%s) is using %s; stop it and try again", firstNonEmpty(info.Executable, "unknown"), pipe)
+		}
+		if err := stopServiceProcess(info.PID, pipe); err != nil {
+			return err
+		}
+	}
+	if err := configureAppWindowsService(exe, appServiceArgs(pipe)); err != nil {
+		return err
+	}
+	if err := startWindowsService(); err != nil {
+		return fmt.Errorf("start the seekfs service: %w", err)
+	}
+	deadline := time.Now().Add(appServiceReadyTimeout)
+	for {
+		resp, err := callServiceOnce(pipe, serviceRequest{Command: "info"})
+		if err == nil && strings.EqualFold(resp.ProcessMode, "windows-service") {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			if err == nil {
+				err = fmt.Errorf("pipe answered as %q", resp.ProcessMode)
+			}
+			return fmt.Errorf("the seekfs service did not start: %w", err)
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+}
+
+// appServiceArgs is the installed service command line for the apps. Unlike
+// "seekfs install", it never pins -db paths.
+func appServiceArgs(pipe string) []string {
+	return []string{"service", "-pipe", pipe, "-sddl", defaultServiceSDDL}
+}
+
+func configureAppWindowsService(exe string, args []string) error {
+	m, err := mgr.Connect()
+	if err != nil {
+		return err
+	}
+	defer m.Disconnect()
+	const description = "Indexes file names (and optionally contents) for seekfs search."
+	s, err := m.OpenService(serviceName)
+	if err != nil {
+		s, err = m.CreateService(serviceName, exe, mgr.Config{
+			DisplayName:      "seekfs indexing service",
+			Description:      description,
+			StartType:        mgr.StartAutomatic,
+			DelayedAutoStart: true,
+		}, args...)
+		if err != nil {
+			return fmt.Errorf("install the seekfs service: %w", err)
+		}
+		s.Close()
+		return nil
+	}
+	defer s.Close()
+	if err := stopServiceIfExists(); err != nil {
+		return err
+	}
+	cfg, err := s.Config()
+	if err != nil {
+		return err
+	}
+	cmdline := syscall.EscapeArg(exe)
+	for _, arg := range args {
+		cmdline += " " + syscall.EscapeArg(arg)
+	}
+	cfg.BinaryPathName = cmdline
+	cfg.StartType = mgr.StartAutomatic
+	cfg.DelayedAutoStart = true
+	cfg.Description = description
+	if err := s.UpdateConfig(cfg); err != nil {
+		return fmt.Errorf("update the seekfs service: %w", err)
+	}
+	return nil
 }

@@ -153,3 +153,78 @@ func TestStopServiceProcessRefusesSelf(t *testing.T) {
 		t.Fatal("stopServiceProcess stopped the current process")
 	}
 }
+
+// "settings set --install-service" installs the Windows service before the
+// write and does not also restart the sibling elevated.
+func TestSettingsCLISetInstallServiceRunsBeforeWrite(t *testing.T) {
+	preservePluginSelection(t)
+	t.Setenv("SEEKFS_CONTENT_SEARCH", "0")
+	useSyntheticSettingsVolumes(t)
+	useSettingsIndexStub(t, func(volume string) (*Index, error) {
+		return nil, errors.New("stub build")
+	})
+	configPath := settingsTestConfig(t, "default_limit = 10\n")
+	s := settingsTestService(t, configPath, nil)
+	s.processMode = "standalone"
+	pipeName := startSettingsTestService(t, s)
+
+	prevService, prevHelper, prevRestart, prevInstall := serviceProcessElevated, settingsHelperElevated, settingsRestartService, settingsInstallService
+	t.Cleanup(func() {
+		serviceProcessElevated, settingsHelperElevated, settingsRestartService, settingsInstallService = prevService, prevHelper, prevRestart, prevInstall
+	})
+	serviceProcessElevated = func() bool { return false }
+	settingsHelperElevated = func() bool { return true }
+	settingsRestartService = func(serviceResponse, string) error {
+		t.Error("install path also restarted the sibling")
+		return nil
+	}
+	var installs []string
+	settingsInstallService = func(pipe string) error {
+		installs = append(installs, pipe)
+		return nil
+	}
+
+	patch := filepath.Join(t.TempDir(), "drive.json")
+	if err := os.WriteFile(patch, []byte(`{"volumes":[{"volume":"F:","indexed":true}]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, _ = runCLICaptured(t, []string{"settings", "set", "--json", patch, "--pipe", pipeName, "--install-service"})
+	if len(installs) != 1 || installs[0] != pipeName {
+		t.Fatalf("installs = %v, want [%s]", installs, pipeName)
+	}
+
+	settingsInstallService = func(string) error { return errors.New("access denied by SCM") }
+	result := filepath.Join(t.TempDir(), "result.json")
+	_, err := runCLICaptured(t, []string{"settings", "set", "--json", patch, "--pipe", pipeName, "--install-service", "--result", result})
+	if err == nil || !strings.Contains(err.Error(), "access denied by SCM") {
+		t.Fatalf("install failure err = %v", err)
+	}
+	data, rerr := os.ReadFile(result)
+	if rerr != nil || !strings.Contains(string(data), "access denied by SCM") {
+		t.Fatalf("result file = %q, %v; want the install error for the app", data, rerr)
+	}
+}
+
+func TestSettingsGetReportsServiceMode(t *testing.T) {
+	preservePluginSelection(t)
+	useSyntheticSettingsVolumes(t)
+	configPath := settingsTestConfig(t, "default_limit = 10\n")
+	s := settingsTestService(t, configPath, nil)
+	s.processMode = "windows-service"
+	resp := callSettingsCommand(t, s, serviceCapabilities{ReadOnly: true}, serviceRequest{Command: "settings-get"})
+	if !resp.OK || resp.Settings == nil || resp.Settings.ServiceMode != "windows-service" {
+		t.Fatalf("settings-get = %+v", resp.Settings)
+	}
+}
+
+func TestAppServiceArgsDoNotPinDBs(t *testing.T) {
+	args := appServiceArgs(defaultServicePipe)
+	for _, a := range args {
+		if a == "-db" {
+			t.Fatalf("app service args pin dbs: %v", args)
+		}
+	}
+	if args[0] != "service" || args[2] != defaultServicePipe {
+		t.Fatalf("args = %v", args)
+	}
+}

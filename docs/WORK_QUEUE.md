@@ -231,8 +231,14 @@ GOMAXPROCS=2, peak disk 0.56x extracted. Limit-20 warm/first: rare literal
   in the unelevated service and failed with "Access is denied", and the drive
   row hid the reason. The elevated helper now restarts an unelevated standalone
   sibling elevated before a drive add; `info` reports `elevated`; the row shows
-  the error text. Owner check: on a machine without the installed service, open
-  seekfs-native, tick a drive, Apply, approve UAC, and confirm it indexes.
+  the error text. Onboarding: Settings > Drives offers "Install the seekfs
+  service" (checked on first run); Apply runs the helper with
+  `--install-service` (auto-start LocalSystem service, no pinned `-db`). Owner
+  check: on a machine without the installed service, open seekfs-native, tick
+  a drive, Apply, approve UAC; confirm `sc qc seekfs` shows AUTO_START, the
+  drive indexes, and it is still current after a reboot. Follow-ups: no
+  uninstall button; `seekfs install` still pins `-db` (drives added in
+  Settings are lost on restart for CLI-installed services).
 
 - **Whole-drive coverage, build peak: CLOSED 2026-10-15** (`content/stream-postings`
   NOTES.md). Spooling posting runs instead of text: raw runs are ~1.02x of text

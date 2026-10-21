@@ -20,13 +20,18 @@ const (
 	contentModeOff      = "off"
 
 	gbBytes = int64(1) << 30
+
+	serviceModeWindowsService = "windows-service"
 )
 
 // serviceSettings is the "settings" object in settings-get/settings-set.
 type serviceSettings struct {
-	CanWrite bool            `json:"can_write,omitempty"`
-	Volumes  []serviceVolume `json:"volumes,omitempty"`
-	Content  *serviceContent `json:"content,omitempty"`
+	CanWrite bool `json:"can_write,omitempty"`
+	// ServiceMode is read-only: "windows-service" when the installed
+	// service answers, "standalone" for a sibling service.
+	ServiceMode string          `json:"service_mode,omitempty"`
+	Volumes     []serviceVolume `json:"volumes,omitempty"`
+	Content     *serviceContent `json:"content,omitempty"`
 }
 
 type serviceVolume struct {
@@ -129,14 +134,15 @@ type contentValues struct {
 }
 
 type settingsModel struct {
-	canWrite bool
-	base     settingsDraft
-	draft    settingsDraft
-	history  []settingsDraft
+	canWrite    bool
+	serviceMode string
+	base        settingsDraft
+	draft       settingsDraft
+	history     []settingsDraft
 }
 
 func newSettingsModel(s serviceSettings) *settingsModel {
-	m := &settingsModel{canWrite: s.CanWrite}
+	m := &settingsModel{canWrite: s.CanWrite, serviceMode: s.ServiceMode}
 	m.base = draftFromService(s)
 	m.draft = m.base.clone()
 	return m
@@ -281,6 +287,25 @@ func (m *settingsModel) reset() {
 func (m *settingsModel) hasChanges() bool { return len(m.patch().allFields()) > 0 }
 
 // setDriveIndexed stages an indexed/unindexed change for one volume.
+// serviceInstalled reports that the installed Windows service answers.
+func (m *settingsModel) serviceInstalled() bool {
+	return m.serviceMode == serviceModeWindowsService
+}
+
+// offerServiceInstallByDefault pre-checks "Install the seekfs service" on
+// first run: no installed service and no indexed drive yet.
+func (m *settingsModel) offerServiceInstallByDefault() bool {
+	if m.serviceInstalled() {
+		return false
+	}
+	for _, v := range m.base.Volumes {
+		if v.Indexed {
+			return false
+		}
+	}
+	return true
+}
+
 func (m *settingsModel) setDriveIndexed(volume string, indexed bool) {
 	for i := range m.draft.Volumes {
 		if m.draft.Volumes[i].Volume != volume {

@@ -17,9 +17,12 @@ import (
 // serviceSettings is the settings payload shared by settings-get and
 // settings-set. The desktop app reads it to render the indexing controls.
 type serviceSettings struct {
-	CanWrite bool                `json:"can_write"`
-	Volumes  []settingsVolume    `json:"volumes"`
-	Content  settingsContentInfo `json:"content"`
+	CanWrite bool `json:"can_write"`
+	// ServiceMode is the service's process mode: "windows-service" for the
+	// installed service, "standalone" otherwise.
+	ServiceMode string              `json:"service_mode,omitempty"`
+	Volumes     []settingsVolume    `json:"volumes"`
+	Content     settingsContentInfo `json:"content"`
 }
 
 type settingsVolume struct {
@@ -148,9 +151,10 @@ func (s *goSearchService) currentServiceSettings(caps serviceCapabilities) servi
 
 	cfg := s.contentConfig()
 	settings := serviceSettings{
-		CanWrite: caps.Mutate,
-		Volumes:  settingsVolumeList(settingsVolumeEnumeration(), volumes, loading, s.settingsVolumeStateOverrides()),
-		Content:  settingsContentFromConfig(cfg),
+		CanWrite:    caps.Mutate,
+		ServiceMode: s.processMode,
+		Volumes:     settingsVolumeList(settingsVolumeEnumeration(), volumes, loading, s.settingsVolumeStateOverrides()),
+		Content:     settingsContentFromConfig(cfg),
 	}
 	return settings
 }
@@ -590,7 +594,7 @@ func settingsVolumeErrorMessage(reason string, elevated bool) string {
 	if elevated || reason == "" {
 		return reason
 	}
-	return "the seekfs service is not running as administrator, so it cannot read this drive (" + reason + ")"
+	return "The seekfs service is not running as administrator, so it cannot read this drive (" + reason + ")"
 }
 
 // finishSettingsVolumeTask releases the service-stop watcher.
@@ -1067,7 +1071,7 @@ func cmdSettings(args []string) error {
 	case "set":
 		return runSettingsSet(args[1:], os.Stdout)
 	case "help", "-h", "--help":
-		fmt.Fprintln(os.Stdout, "seekfs settings get [--json]\nseekfs settings set --json <file>")
+		fmt.Fprintln(os.Stdout, "seekfs settings get [--json]\nseekfs settings set --json <file> [--install-service]")
 		return nil
 	default:
 		return fmt.Errorf("unknown settings command %q; use get or set", args[0])
@@ -1114,6 +1118,7 @@ func runSettingsSet(args []string, out io.Writer) (err error) {
 	pipe := fs.String("pipe", defaultServicePipe, "resident service pipe")
 	jsonPath := fs.String("json", "", "settings JSON file")
 	resultPath := fs.String("result", "", "write the service response JSON here (for the elevated app helper)")
+	installService := fs.Bool("install-service", false, "first install and start seekfs as an automatic Windows service on --pipe (elevated)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -1141,7 +1146,11 @@ func runSettingsSet(args []string, out io.Writer) (err error) {
 	if err := json.Unmarshal(data, &raw); err != nil {
 		return fmt.Errorf("settings JSON: %w", err)
 	}
-	if err := ensureSettingsServiceElevated(*pipe, raw); err != nil {
+	if *installService {
+		if err := settingsInstallService(*pipe); err != nil {
+			return err
+		}
+	} else if err := ensureSettingsServiceElevated(*pipe, raw); err != nil {
 		return err
 	}
 	resp, err = callService(*pipe, serviceRequest{Command: "settings-set", Settings: raw})

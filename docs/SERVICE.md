@@ -1,5 +1,14 @@
 # Service Setup
 
+## Install from the desktop app
+
+On first run, `seekfs-native.exe` opens Settings > Drives with "Install the
+seekfs service (recommended)" checked. Tick the drives to index and click
+Apply: one UAC prompt installs the `seekfs` service (LocalSystem, delayed
+automatic start, following the configured drive list), starts it, and starts
+indexing. The app itself stays unelevated. Without the service, the app runs
+its own service for the session; see docs/SETTINGS_API.md.
+
 ## Install
 
 Build the binary first:

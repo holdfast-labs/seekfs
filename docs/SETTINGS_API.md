@@ -90,8 +90,27 @@ change. `volumes` entries need only `volume` and `indexed`.
   it before sending the write. The installed Windows service is never
   restarted. If an unelevated service still attempts a build, the drive's
   `error` says the service is not running as administrator.
+- `settings-get` also returns `service_mode` (`windows-service` or
+  `standalone`), so the app can offer to install the Windows service.
+
+### Installing the service from the app
+
+`seekfs settings set --json <file> --install-service` (run elevated by the app)
+first makes the installed Windows service own the pipe, then sends the write:
+
+- If the installed service already answers on the pipe, nothing is installed.
+- A standalone sibling from the same `seekfs.exe` is stopped; any other process
+  on the pipe is an error.
+- The `seekfs` service is created (or an existing one reconfigured in place)
+  as LocalSystem, delayed automatic start, command
+  `seekfs.exe service -pipe <pipe> -sddl <default>`. It passes no `-db`, so the
+  service loads the configured drive list and drives added later in Settings
+  survive a restart (`seekfs install` pins `-db` paths instead).
+- The helper starts the service, waits until it answers as `windows-service`,
+  and then applies the settings (an empty `{}` patch is valid for install only).
 
 ## CLI
 
 - `seekfs settings get [--json]`
-- `seekfs settings set --json <file>` (reads a `settings` object from the file)
+- `seekfs settings set --json <file> [--install-service]` (reads a `settings`
+  object from the file; `--install-service` is described above)
