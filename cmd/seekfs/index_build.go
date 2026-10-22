@@ -26,7 +26,7 @@ func cmdIndexUSN(args []string) error {
 		return err
 	}
 	start := time.Now()
-	idx, err := indexUSNVolume(*volume)
+	idx, err := indexUSNVolume(*volume, nil)
 	if err != nil {
 		return err
 	}
@@ -254,8 +254,9 @@ func cmdIndexVolumes(args []string) error {
 	return nil
 }
 
-func indexUSNVolume(volume string) (*Index, error) {
+func indexUSNVolume(volume string, progress *volumeBuildProgress) (*Index, error) {
 	vol := normalizeVolume(volume)
+	progress.setPhase("enumerating")
 	handle, err := openVolume(vol)
 	if err != nil {
 		return nil, err
@@ -282,8 +283,12 @@ func indexUSNVolume(volume string) (*Index, error) {
 	// Prefer the MFT for the initial build: it carries name, parent, size, and
 	// modification time in a single bulk read (the same source Everything uses).
 	// Fall back to FSCTL_ENUM_USN_DATA (names only) if the raw MFT read fails.
-	if entries, err := enumMFT(handle); err == nil && len(entries) > 0 {
+	onMFTProgress := func(done, total uint64) {
+		progress.setCounts(done, total)
+	}
+	if entries, err := enumMFTWithProgress(handle, onMFTProgress); err == nil && len(entries) > 0 {
 		serviceLog("enum-mft complete volume=%s entries=%d", vol, len(entries))
+		progress.setPhase("building")
 		if nodes, usnErr := enumUSN(handle, journal.NextUsn); usnErr == nil {
 			if added := mergeUSNNodesIntoMFT(entries, nodes); added > 0 {
 				serviceLog("enum-usn merge complete volume=%s added=%d total=%d", vol, added, len(entries))
@@ -298,11 +303,13 @@ func indexUSNVolume(volume string) (*Index, error) {
 		serviceLog("enum-mft failed volume=%s err=%v; falling back to USN enum", vol, err)
 	}
 
+	progress.setCounts(0, 0)
 	nodes, err := enumUSN(handle, journal.NextUsn)
 	if err != nil {
 		return nil, err
 	}
 	serviceLog("enum-usn complete volume=%s nodes=%d next_usn=%d", vol, len(nodes), journal.NextUsn)
+	progress.setPhase("building")
 
 	frns := make([]uint64, 0, len(nodes))
 	for frn := range nodes {

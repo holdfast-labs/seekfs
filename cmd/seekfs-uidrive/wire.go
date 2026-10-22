@@ -5,11 +5,18 @@ package main
 // wire.go mirrors the automation JSON contract in cmd/seekfs-native/uiauto.go.
 
 type automationDrive struct {
-	Volume  string `json:"volume"`
-	Indexed bool   `json:"indexed"`
-	State   string `json:"state"`
-	Entries int64  `json:"entries"`
-	Error   string `json:"error"`
+	Volume   string              `json:"volume"`
+	Indexed  bool                `json:"indexed"`
+	State    string              `json:"state"`
+	Entries  int64               `json:"entries"`
+	Error    string              `json:"error"`
+	Progress *automationProgress `json:"progress,omitempty"`
+}
+
+type automationProgress struct {
+	Phase string `json:"phase"`
+	Done  int64  `json:"done"`
+	Total int64  `json:"total"`
 }
 
 type automationState struct {
@@ -30,6 +37,7 @@ type automationState struct {
 	HealthMsg           string            `json:"health_msg"`
 	Entries             int               `json:"entries"`
 	NoVolumes           bool              `json:"no_volumes"`
+	SettingsApplyStep   string            `json:"settings_apply_step"`
 }
 
 type automationStats struct {

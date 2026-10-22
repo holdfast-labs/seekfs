@@ -35,15 +35,23 @@ type serviceSettings struct {
 }
 
 type serviceVolume struct {
-	Volume     string `json:"volume"`
-	Indexed    *bool  `json:"indexed,omitempty"`
-	FS         string `json:"fs,omitempty"`
-	Label      string `json:"label,omitempty"`
-	TotalBytes int64  `json:"total_bytes,omitempty"`
-	FreeBytes  int64  `json:"free_bytes,omitempty"`
-	Entries    int64  `json:"entries,omitempty"`
-	State      string `json:"state,omitempty"`
-	Error      string `json:"error,omitempty"`
+	Volume     string                 `json:"volume"`
+	Indexed    *bool                  `json:"indexed,omitempty"`
+	FS         string                 `json:"fs,omitempty"`
+	Label      string                 `json:"label,omitempty"`
+	TotalBytes int64                  `json:"total_bytes,omitempty"`
+	FreeBytes  int64                  `json:"free_bytes,omitempty"`
+	Entries    int64                  `json:"entries,omitempty"`
+	State      string                 `json:"state,omitempty"`
+	Error      string                 `json:"error,omitempty"`
+	Progress   *serviceVolumeProgress `json:"progress,omitempty"`
+}
+
+type serviceVolumeProgress struct {
+	Phase     string `json:"phase"`
+	Done      int64  `json:"done"`
+	Total     int64  `json:"total"`
+	StartedAt string `json:"started_at"`
 }
 
 // serviceContent mirrors [content] plus per-drive overrides. Every field is a
@@ -80,6 +88,7 @@ type volumeDraft struct {
 	FreeBytes  int64
 	Entries    int64
 	Error      string
+	Progress   *serviceVolumeProgress
 }
 
 type contentDraft struct {
@@ -168,6 +177,7 @@ func draftFromService(s serviceSettings) settingsDraft {
 			FreeBytes:  v.FreeBytes,
 			Entries:    v.Entries,
 			Error:      v.Error,
+			Progress:   v.Progress,
 		})
 	}
 	if c := s.Content; c != nil {
@@ -226,6 +236,42 @@ func contentVolumeFromService(ov serviceContentVolume) *contentVolumeDraft {
 		d.BudgetBytes, d.HasBudget = *ov.BudgetBytes, true
 	}
 	return d
+}
+
+// mergeServerState refreshes server-side volume state, entries and progress
+// while keeping the user's staged (unapplied) edits. Content edits are kept
+// as staged too: only the snapshot used to compute the patch is updated.
+func (m *settingsModel) mergeServerState(s serviceSettings) {
+	if m == nil {
+		return
+	}
+	m.canWrite = s.CanWrite
+	m.serviceMode = s.ServiceMode
+	next := draftFromService(s)
+	merged := make([]volumeDraft, 0, len(next.Volumes))
+	for _, nv := range next.Volumes {
+		for i := range m.draft.Volumes {
+			if m.draft.Volumes[i].Volume == nv.Volume {
+				nv.Indexed = m.draft.Volumes[i].Indexed
+				break
+			}
+		}
+		merged = append(merged, nv)
+	}
+	m.base = next
+	m.draft.Volumes = merged
+}
+
+func hasIndexingVolume(s *serviceSettings) bool {
+	if s == nil {
+		return false
+	}
+	for _, v := range s.Volumes {
+		if v.State == "indexing" {
+			return true
+		}
+	}
+	return false
 }
 
 func (d settingsDraft) clone() settingsDraft {
@@ -833,6 +879,57 @@ func parseExtList(s string) ([]string, error) {
 
 func formatExtList(exts []string) string {
 	return strings.Join(exts, ", ")
+}
+
+func formatCompactCount(n int64) string {
+	if n < 0 {
+		n = 0
+	}
+	if n < 1000 {
+		return strconv.FormatInt(n, 10)
+	}
+	units := []string{"K", "M", "B", "T"}
+	v := float64(n)
+	i := -1
+	for v >= 1000 && i < len(units)-1 {
+		v /= 1000
+		i++
+	}
+	text := strconv.FormatFloat(v, 'f', 1, 64)
+	text = strings.TrimSuffix(text, ".0")
+	return text + units[i]
+}
+
+func indexingPercent(v *serviceVolumeProgress) int {
+	if v == nil || v.Total <= 0 {
+		return -1
+	}
+	pct := int(v.Done * 100 / v.Total)
+	if pct < 0 {
+		return 0
+	}
+	if pct > 100 {
+		return 100
+	}
+	return pct
+}
+
+func formatIndexingProgress(v *serviceVolumeProgress) string {
+	pct := indexingPercent(v)
+	if pct >= 0 {
+		return fmt.Sprintf("Indexing… %d%% (%s of %s files)", pct, formatCompactCount(v.Done), formatCompactCount(v.Total))
+	}
+	if v != nil && v.Done > 0 {
+		return "Indexing… " + formatCompactCount(v.Done) + " files"
+	}
+	return "Indexing…"
+}
+
+func formatIndexingStatus(volume string, v *serviceVolumeProgress) string {
+	if pct := indexingPercent(v); pct >= 0 {
+		return fmt.Sprintf("Indexing %s %d%%", volume, pct)
+	}
+	return "Indexing " + volume
 }
 
 func formatBytesCompact(n int64) string {

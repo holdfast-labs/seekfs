@@ -22,6 +22,100 @@ import (
 // sibling, the elevated helper restarts it elevated with the same spawn spec
 // before sending the write.
 
+const (
+	progressPhaseStart         = "start"
+	progressPhaseInstallStop   = "install-stop-sibling"
+	progressPhaseInstallConfig = "install-configure"
+	progressPhaseInstallStart  = "install-start"
+	progressPhaseInstallWait   = "install-wait-service"
+	progressPhaseRestartStop   = "restart-stop"
+	progressPhaseRestartStart  = "restart-start"
+	progressPhaseRestartWait   = "restart-wait-loading"
+	progressPhaseApply         = "apply"
+)
+
+// settingsProgress appends JSON lines to --progress so the desktop app can
+// show which step is slow, and logs each phase with elapsed ms to service.log.
+type settingsProgress struct {
+	path    string
+	started time.Time
+}
+
+func newSettingsProgress(path string) *settingsProgress {
+	return &settingsProgress{path: path, started: time.Now()}
+}
+
+func (p *settingsProgress) report(phase string) {
+	if p == nil {
+		return
+	}
+	serviceLog("settings-helper phase=%s elapsed_ms=%d", phase, time.Since(p.started).Milliseconds())
+	if p.path == "" {
+		return
+	}
+	line := struct {
+		Phase string `json:"phase"`
+		At    string `json:"at"`
+	}{Phase: phase, At: time.Now().UTC().Format(time.RFC3339Nano)}
+	data, err := json.Marshal(line)
+	if err != nil {
+		return
+	}
+	f, err := os.OpenFile(p.path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		return
+	}
+	_, _ = f.Write(append(data, '\n'))
+	_ = f.Close()
+}
+
+// installServiceSteps is the ordered install path, split from the SCM and
+// process calls so the phase sequence is testable without administrator rights.
+type installServiceSteps struct {
+	stopSibling func() error
+	configure   func() error
+	start       func() error
+	wait        func() error
+}
+
+func (st installServiceSteps) run(progress *settingsProgress) error {
+	if st.stopSibling != nil {
+		progress.report(progressPhaseInstallStop)
+		if err := st.stopSibling(); err != nil {
+			return err
+		}
+	}
+	progress.report(progressPhaseInstallConfig)
+	if err := st.configure(); err != nil {
+		return err
+	}
+	progress.report(progressPhaseInstallStart)
+	if err := st.start(); err != nil {
+		return err
+	}
+	progress.report(progressPhaseInstallWait)
+	return st.wait()
+}
+
+type restartServiceSteps struct {
+	stop  func() error
+	start func() error
+	wait  func() error
+}
+
+func (st restartServiceSteps) run(progress *settingsProgress) error {
+	progress.report(progressPhaseRestartStop)
+	if err := st.stop(); err != nil {
+		return err
+	}
+	progress.report(progressPhaseRestartStart)
+	if err := st.start(); err != nil {
+		return err
+	}
+	progress.report(progressPhaseRestartWait)
+	return st.wait()
+}
+
 // uiServiceArgs is the argv the desktop apps use to start the sibling service.
 // cmd/seekfs-native mirrors it in serviceSpawnSpecFor.
 func uiServiceArgs(pipeName string, dbs []string) []string {
@@ -94,7 +188,7 @@ var (
 
 // ensureSettingsServiceElevated restarts the unelevated sibling service
 // elevated when raw is a write that adds a drive. Any other case is a no-op.
-func ensureSettingsServiceElevated(pipe string, raw []byte) error {
+func ensureSettingsServiceElevated(pipe string, raw []byte, progress *settingsProgress) error {
 	if !settingsPatchAddsVolume(raw) {
 		return nil
 	}
@@ -107,7 +201,7 @@ func ensureSettingsServiceElevated(pipe string, raw []byte) error {
 	if !settingsServiceNeedsElevatedRestart(info, settingsHelperElevated(), exe) {
 		return nil
 	}
-	if err := settingsRestartService(info, pipe); err != nil {
+	if err := settingsRestartService(info, pipe, progress); err != nil {
 		return fmt.Errorf("restart the seekfs service as administrator to index drives: %w", err)
 	}
 	return nil
@@ -119,32 +213,40 @@ const siblingServiceReadyTimeout = 60 * time.Second
 // starts it again from this elevated process, so the new service inherits
 // the elevated token. It waits until the new service answers and has
 // finished loading.
-func restartSiblingServiceElevated(info serviceResponse, pipe string) error {
-	if err := stopServiceProcess(info.PID, pipe); err != nil {
-		return err
-	}
-	cmd := exec.Command(info.Executable, uiServiceArgs(pipe, nil)...)
-	cmd.Dir = filepath.Dir(info.Executable)
-	configureUIServiceEnvironment(cmd)
-	prepareUIServiceCommand(cmd)
-	if err := cmd.Start(); err != nil {
-		return err
-	}
-	_ = cmd.Process.Release()
-	deadline := time.Now().Add(siblingServiceReadyTimeout)
-	for {
-		resp, err := callServiceOnce(pipe, serviceRequest{Command: "info"})
-		if err == nil && resp.Elevated && !resp.Loading {
-			return nil
-		}
-		if time.Now().After(deadline) {
-			if err == nil {
-				err = errors.New("service did not finish loading")
+func restartSiblingServiceElevated(info serviceResponse, pipe string, progress *settingsProgress) error {
+	steps := restartServiceSteps{
+		stop: func() error {
+			return stopServiceProcess(info.PID, pipe)
+		},
+		start: func() error {
+			cmd := exec.Command(info.Executable, uiServiceArgs(pipe, nil)...)
+			cmd.Dir = filepath.Dir(info.Executable)
+			configureUIServiceEnvironment(cmd)
+			prepareUIServiceCommand(cmd)
+			if err := cmd.Start(); err != nil {
+				return err
 			}
-			return fmt.Errorf("restarted service did not become ready: %w", err)
-		}
-		time.Sleep(200 * time.Millisecond)
+			_ = cmd.Process.Release()
+			return nil
+		},
+		wait: func() error {
+			deadline := time.Now().Add(siblingServiceReadyTimeout)
+			for {
+				resp, err := callServiceOnce(pipe, serviceRequest{Command: "info"})
+				if err == nil && resp.Elevated && !resp.Loading {
+					return nil
+				}
+				if time.Now().After(deadline) {
+					if err == nil {
+						err = errors.New("service did not finish loading")
+					}
+					return fmt.Errorf("restarted service did not become ready: %w", err)
+				}
+				time.Sleep(200 * time.Millisecond)
+			}
+		},
 	}
+	return steps.run(progress)
 }
 
 // stopServiceProcess terminates pid and waits until the pipe stops answering.
@@ -181,11 +283,12 @@ const appServiceReadyTimeout = 2 * time.Minute
 // (drives added later in Settings survive a restart). A standalone sibling on
 // the pipe is stopped first so the service can own the pipe. An existing
 // seekfs service is reconfigured in place rather than deleted and recreated.
-func installAppWindowsService(pipe string) error {
+func installAppWindowsService(pipe string, progress *settingsProgress) error {
 	exe, err := os.Executable()
 	if err != nil {
 		return err
 	}
+	steps := installServiceSteps{}
 	if info, err := callService(pipe, serviceRequest{Command: "info"}); err == nil {
 		if strings.EqualFold(info.ProcessMode, "windows-service") {
 			return nil
@@ -193,30 +296,37 @@ func installAppWindowsService(pipe string) error {
 		if !strings.EqualFold(info.ProcessMode, "standalone") || !samePath(info.Executable, exe) {
 			return fmt.Errorf("another seekfs process (%s) is using %s; stop it and try again", firstNonEmpty(info.Executable, "unknown"), pipe)
 		}
-		if err := stopServiceProcess(info.PID, pipe); err != nil {
-			return err
+		pid := info.PID
+		steps.stopSibling = func() error {
+			return stopServiceProcess(pid, pipe)
 		}
 	}
-	if err := configureAppWindowsService(exe, appServiceArgs(pipe)); err != nil {
-		return err
+	steps.configure = func() error {
+		return configureAppWindowsService(exe, appServiceArgs(pipe))
 	}
-	if err := startWindowsService(); err != nil {
-		return fmt.Errorf("start the seekfs service: %w", err)
-	}
-	deadline := time.Now().Add(appServiceReadyTimeout)
-	for {
-		resp, err := callServiceOnce(pipe, serviceRequest{Command: "info"})
-		if err == nil && strings.EqualFold(resp.ProcessMode, "windows-service") {
-			return nil
+	steps.start = func() error {
+		if err := startWindowsService(); err != nil {
+			return fmt.Errorf("start the seekfs service: %w", err)
 		}
-		if time.Now().After(deadline) {
-			if err == nil {
-				err = fmt.Errorf("pipe answered as %q", resp.ProcessMode)
+		return nil
+	}
+	steps.wait = func() error {
+		deadline := time.Now().Add(appServiceReadyTimeout)
+		for {
+			resp, err := callServiceOnce(pipe, serviceRequest{Command: "info"})
+			if err == nil && strings.EqualFold(resp.ProcessMode, "windows-service") {
+				return nil
 			}
-			return fmt.Errorf("the seekfs service did not start: %w", err)
+			if time.Now().After(deadline) {
+				if err == nil {
+					err = fmt.Errorf("pipe answered as %q", resp.ProcessMode)
+				}
+				return fmt.Errorf("the seekfs service did not start: %w", err)
+			}
+			time.Sleep(250 * time.Millisecond)
 		}
-		time.Sleep(250 * time.Millisecond)
 	}
+	return steps.run(progress)
 }
 
 // appServiceArgs is the installed service command line for the apps. Unlike

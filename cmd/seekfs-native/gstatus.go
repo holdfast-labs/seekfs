@@ -11,6 +11,36 @@ import (
 // gstatus.go: the bottom status bar — result count/message, query time,
 // content health, and index health.
 
+type healthTone int
+
+const (
+	healthToneMuted healthTone = iota
+	healthToneOK
+	healthToneWarning
+	healthToneError
+)
+
+// healthStatusText maps the service health to the status bar text and tone.
+// The normal first-run state (service up, no drives indexed yet) is neutral,
+// not an error.
+func healthStatusText(health, msg string, entries int) (string, healthTone) {
+	switch health {
+	case serviceHealthOK:
+		return fmt.Sprintf("Index ready (%s entries)", formatCount(entries)), healthToneOK
+	case serviceHealthDegraded:
+		return "Index: " + firstNonEmpty(msg, "degraded"), healthToneWarning
+	case serviceHealthEmpty:
+		return firstNonEmpty(msg, "No drives indexed yet"), healthToneMuted
+	case serviceHealthError:
+		return "Index: " + firstNonEmpty(msg, "error"), healthToneError
+	default:
+		if msg != "" {
+			return msg, healthToneMuted
+		}
+		return "Connecting…", healthToneMuted
+	}
+}
+
 // layoutStatus renders the status bar.
 func (u *UI) layoutStatus(gtx layout.Context) layout.Dimensions {
 	s := u.scheme
@@ -25,6 +55,7 @@ func (u *UI) layoutStatus(gtx layout.Context) layout.Dimensions {
 	health, healthMsg := u.health, u.healthMsg
 	entries := u.entries
 	flash := u.flashMsg
+	snapshot := u.settingsSnapshot
 	u.flashMsg = ""
 	u.mu.Unlock()
 
@@ -54,19 +85,23 @@ func (u *UI) layoutStatus(gtx layout.Context) layout.Dimensions {
 	}
 
 	healthText, healthColor := "Connecting…", s.Muted
-	switch health {
-	case serviceHealthOK:
-		healthText = fmt.Sprintf("Index ready (%s entries)", formatCount(entries))
+	healthText, tone := healthStatusText(health, healthMsg, entries)
+	healthColor = s.Muted
+	switch tone {
+	case healthToneOK:
 		healthColor = s.OK
-	case serviceHealthDegraded:
-		healthText = "Index: " + firstNonEmpty(healthMsg, "degraded")
+	case healthToneWarning:
 		healthColor = s.Warning
-	case serviceHealthError:
-		healthText = "Index: " + firstNonEmpty(healthMsg, "error")
+	case healthToneError:
 		healthColor = s.Error
-	default:
-		if healthMsg != "" {
-			healthText = healthMsg
+	}
+	if snapshot != nil {
+		for _, v := range snapshot.Volumes {
+			if v.State == "indexing" {
+				healthText = formatIndexingStatus(v.Volume, v.Progress)
+				healthColor = s.Warning
+				break
+			}
 		}
 	}
 

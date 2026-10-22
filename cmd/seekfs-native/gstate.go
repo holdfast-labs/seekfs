@@ -140,6 +140,12 @@ type UI struct {
 	gdiHead gdiHeadless
 	// frame times for perf measurement.
 	frameTimes []float64
+
+	// Indexing progress snapshot from the last settings-get (also kept while
+	// the Settings panel is closed) and the elevated helper step.
+	settingsSnapshot *serviceSettings
+	settingsIndexing bool
+	applyStep        string
 }
 
 type sideRow struct {

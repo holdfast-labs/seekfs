@@ -54,6 +54,7 @@ type startupReport struct {
 	Entries            int     `json:"entries"`
 	NoVolumes          bool    `json:"no_volumes"`
 	Rows               int     `json:"rows"`
+	Screenshot         string  `json:"screenshot,omitempty"`
 }
 
 type setupReport struct {
@@ -112,6 +113,11 @@ type settingsReport struct {
 	FinalDrive         string  `json:"final_drive,omitempty"`
 	FinalNotice        string  `json:"final_notice,omitempty"`
 	FinalErr           string  `json:"final_settings_err,omitempty"`
+	ProgressSamples    int     `json:"progress_samples"`
+	ProgressIncreases  int     `json:"progress_increases"`
+	ProgressSeen       bool    `json:"progress_seen"`
+	PanelLagMS         float64 `json:"panel_lag_ms"`
+	ProgressScreenshot string  `json:"progress_screenshot,omitempty"`
 }
 
 func newReport(scenario, out string) *report {
@@ -201,11 +207,13 @@ func renderSummary(r *report) string {
 		fmt.Fprintf(&b, "| X: service ready | %.1f ms |\n", r.Settings.ServiceReadyMS)
 		fmt.Fprintf(&b, "| X: panel ready | %.1f ms |\n", r.Settings.ReadyMS)
 		fmt.Fprintf(&b, "| panel needed reopen to refresh | %t |\n", r.Settings.PanelRefresh)
+		fmt.Fprintf(&b, "| panel ready after service (lag) | %.1f ms |\n", r.Settings.PanelLagMS)
+		fmt.Fprintf(&b, "| progress observed | %t (%d increases in %d samples) |\n", r.Settings.ProgressSeen, r.Settings.ProgressIncreases, r.Settings.ProgressSamples)
 		fmt.Fprintf(&b, "| X: ready entries | %d |\n", r.Settings.ReadyEntries)
 		fmt.Fprintf(&b, "| content mode %s apply | %.1f ms |\n", mdCell(r.Settings.ContentMode), r.Settings.ContentApplyMS)
 		if r.Settings.OpenScreenshot != "" {
-			fmt.Fprintf(&b, "| screenshots | `%s`, `%s`, `%s` |\n",
-				shortPath(r.Settings.OpenScreenshot), shortPath(r.Settings.IndexingScreenshot), shortPath(r.Settings.DoneScreenshot))
+			fmt.Fprintf(&b, "| screenshots | `%s`, `%s`, `%s`, `%s` |\n",
+				shortPath(r.Settings.OpenScreenshot), shortPath(r.Settings.IndexingScreenshot), shortPath(r.Settings.ProgressScreenshot), shortPath(r.Settings.DoneScreenshot))
 		}
 		if r.Settings.Error != "" {
 			fmt.Fprintf(&b, "| error | %s |\n", mdCell(r.Settings.Error))
@@ -258,8 +266,11 @@ func stats(values []float64) (p50, p95, max float64) {
 func collectFindings(r *report) []string {
 	var out []string
 	if r.Startup != nil {
-		if r.Startup.Health != "" && r.Startup.Health != "ok" {
+		if r.Startup.Health != "" && r.Startup.Health != "ok" && r.Startup.Health != "empty" {
 			out = append(out, fmt.Sprintf("startup health was %q: %s", r.Startup.Health, r.Startup.HealthMsg))
+		}
+		if r.Startup.Health == "empty" && !strings.Contains(strings.ToLower(r.Startup.HealthMsg), "no drives") {
+			out = append(out, fmt.Sprintf("startup empty health message was %q", r.Startup.HealthMsg))
 		}
 	}
 	if r.Resize != nil {
@@ -285,6 +296,14 @@ func collectFindings(r *report) []string {
 	}
 	if r.Settings != nil && r.Settings.PanelRefresh {
 		out = append(out, "settings panel did not refresh the drive after indexing; the harness reopened it")
+	}
+	if r.Settings != nil && r.Settings.Error == "" {
+		if !r.Settings.ProgressSeen || r.Settings.ProgressIncreases < 3 {
+			out = append(out, fmt.Sprintf("indexing progress was not observed increasing at least 3 times (%d increases in %d samples)", r.Settings.ProgressIncreases, r.Settings.ProgressSamples))
+		}
+		if r.Settings.ProgressScreenshot == "" {
+			out = append(out, "no mid-build progress screenshot was captured")
+		}
 	}
 	if r.Setup != nil && r.Setup.Error != "" {
 		out = append(out, "fixture drive setup: "+r.Setup.Error)

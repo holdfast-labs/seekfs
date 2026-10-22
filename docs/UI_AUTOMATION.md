@@ -45,8 +45,9 @@ Built with `-tags uiautomation` and
 returns one JSON object per line. All commands run on the UI goroutine.
 
 - `{"cmd":"state"}`: window size, settings open/tab/saving/notice/err,
-  `service_mode`, content mode, drive drafts (volume, indexed, state, entries,
-  error), rows, query, search sequence, health/message, entries, no-volumes.
+  current Apply step, `service_mode`, content mode, drive drafts (volume,
+  indexed, state, entries, error, progress phase/done/total), rows, query,
+  search sequence, health/message, entries, no-volumes.
 - `{"cmd":"action","name":...,"arg":...}`:
   - `open-settings` (`drives`, `content`, `search`), `close-settings`;
   - `toggle-drive` (volume), `set-install-service` (bool);
@@ -95,7 +96,10 @@ active.
   settle.
 - `settings`: drives list latency; fixture drive off then on with Apply;
   action to saving cleared, indexing, and ready (service truth and panel);
-  screenshots at open, indexing, and done; then a content-mode Apply.
+  progress samples and increases while the fixture build runs; screenshots at
+  open, indexing, mid-build progress, and done; then a content-mode Apply. The
+  panel must reach `ready` without being reopened, and its lag after the
+  service is reported.
 
 If the app misbehaves, the harness records it under Findings and still exits
 0. A non-zero exit means the harness itself could not set up or reach the app.

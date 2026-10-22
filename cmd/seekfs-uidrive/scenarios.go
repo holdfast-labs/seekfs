@@ -89,17 +89,27 @@ func (h *harness) startupScenario(run bool) *startupReport {
 	rep.Entries = st.Entries
 	rep.NoVolumes = st.NoVolumes
 	rep.Rows = st.Rows
+	rep.Screenshot = filepath.Join(h.out, "shots", "startup.png")
+	_ = h.auto.Screenshot(rep.Screenshot)
 	return rep
 }
 
 // ---- fixture drive setup (service-level, outside scenario timings) ----
 
 type serviceVolumeView struct {
-	Volume  string `json:"volume"`
-	Indexed bool   `json:"indexed"`
-	State   string `json:"state"`
-	Entries int    `json:"entries"`
-	Error   string `json:"error"`
+	Volume   string               `json:"volume"`
+	Indexed  bool                 `json:"indexed"`
+	State    string               `json:"state"`
+	Entries  int                  `json:"entries"`
+	Error    string               `json:"error"`
+	Progress *serviceProgressView `json:"progress,omitempty"`
+}
+
+type serviceProgressView struct {
+	Phase     string `json:"phase"`
+	Done      int64  `json:"done"`
+	Total     int64  `json:"total"`
+	StartedAt string `json:"started_at"`
 }
 
 type serviceSettingsView struct {
@@ -416,6 +426,9 @@ func (h *harness) settingsScenario() *settingsReport {
 	shotIndexing := false
 	serviceReady := false
 	nextServicePoll := time.Now()
+	lastProgressDone := int64(-1)
+	shotProgress := false
+	progressSeen := false
 	for {
 		if h.expired() || time.Since(onStart) > 120*time.Second {
 			if st, serr := h.auto.State(); serr == nil {
@@ -428,6 +441,7 @@ func (h *harness) settingsScenario() *settingsReport {
 			if rep.Error == "" {
 				rep.Error = "drive did not reach ready"
 			}
+			rep.ProgressSeen = progressSeen
 			break
 		}
 		st, err := h.auto.State()
@@ -449,12 +463,6 @@ func (h *harness) settingsScenario() *settingsReport {
 					}
 				}
 			}
-		}
-		if serviceReady && !rep.PanelRefresh && (d == nil || d.State != "ready") {
-			// The panel does not poll after Apply; reopen to show the service truth.
-			rep.PanelRefresh = true
-			_ = h.auto.Action("close-settings", nil)
-			_ = h.auto.Action("open-settings", "drives")
 		}
 		if st.SettingsSaving {
 			sawSaving = true
@@ -479,13 +487,34 @@ func (h *harness) settingsScenario() *settingsReport {
 					rep.IndexingScreenshot = filepath.Join(h.out, "shots", "settings-indexing.png")
 					_ = h.auto.Screenshot(rep.IndexingScreenshot)
 				}
+				if d.Progress != nil {
+					progressSeen = true
+					rep.ProgressSamples++
+					if lastProgressDone >= 0 && d.Progress.Done > lastProgressDone {
+						rep.ProgressIncreases++
+					}
+					lastProgressDone = d.Progress.Done
+					if !shotProgress && d.Progress.Done > 0 &&
+						(d.Progress.Total <= 0 || d.Progress.Done*4 >= d.Progress.Total) {
+						shotProgress = true
+						rep.ProgressScreenshot = filepath.Join(h.out, "shots", "settings-progress.png")
+						_ = h.auto.Screenshot(rep.ProgressScreenshot)
+					}
+				}
 			case "ready":
 				rep.ReadyMS = float64(time.Since(onStart)) / float64(time.Millisecond)
+				if serviceReady {
+					rep.PanelLagMS = rep.ReadyMS - rep.ServiceReadyMS
+					if rep.PanelLagMS < 0 {
+						rep.PanelLagMS = 0
+					}
+				}
 				if d.Entries > 0 {
 					rep.ReadyEntries = d.Entries
 				}
 				rep.DoneScreenshot = filepath.Join(h.out, "shots", "settings-done.png")
 				_ = h.auto.Screenshot(rep.DoneScreenshot)
+				rep.ProgressSeen = progressSeen
 				goto content
 			}
 		}

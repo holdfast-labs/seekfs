@@ -52,8 +52,8 @@ func installUIAutoFixtureService() {
 	}
 	uiDriveFixtureData = fixture
 	settingsVolumeEnumeration = fixture.enumerateVolumes
-	serviceIndexUSNVolume = func(volume string) (*Index, error) {
-		return buildUIDriveFixtureIndex(fixture, volume)
+	serviceIndexUSNVolume = func(volume string, progress *volumeBuildProgress) (*Index, error) {
+		return buildUIDriveFixtureIndex(fixture, volume, progress)
 	}
 }
 
@@ -127,7 +127,7 @@ func fixtureCapabilities(caps serviceCapabilities) serviceCapabilities {
 // buildUIDriveFixtureIndex walks the fixture root and returns a compact index
 // shaped like a USN/walk build. It sleeps PerEntryDelayMS per entry so a
 // settings apply that starts a build takes a predictable time.
-func buildUIDriveFixtureIndex(f *uiDriveFixture, volume string) (*Index, error) {
+func buildUIDriveFixtureIndex(f *uiDriveFixture, volume string, progress *volumeBuildProgress) (*Index, error) {
 	v := f.volume(volume)
 	if v == nil {
 		return nil, fmt.Errorf("fixture has no volume %s", volume)
@@ -160,6 +160,16 @@ func buildUIDriveFixtureIndex(f *uiDriveFixture, volume string) (*Index, error) 
 	idByPath := map[string]int{root: 0}
 	nextFRN := uint64(2)
 	delay := time.Duration(v.PerEntryDelayMS) * time.Millisecond
+	total := uint64(0)
+	_ = filepath.WalkDir(root, func(path string, d fs.DirEntry, walkErr error) error {
+		if walkErr == nil && path != root {
+			total++
+		}
+		return nil
+	})
+	progress.setPhase("building")
+	progress.setCounts(0, total)
+	done := uint64(0)
 	walkErr := filepath.WalkDir(root, func(path string, d fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return nil
@@ -190,6 +200,10 @@ func buildUIDriveFixtureIndex(f *uiDriveFixture, volume string) (*Index, error) 
 		})
 		idByPath[path] = len(idx.Records) - 1
 		nextFRN++
+		done++
+		if done%16 == 0 {
+			progress.setDone(done)
+		}
 		if delay > 0 {
 			time.Sleep(delay)
 		}
@@ -198,5 +212,7 @@ func buildUIDriveFixtureIndex(f *uiDriveFixture, volume string) (*Index, error) 
 	if walkErr != nil {
 		return nil, walkErr
 	}
+	progress.setDone(done)
+	progress.setPhase("writing")
 	return idx, nil
 }

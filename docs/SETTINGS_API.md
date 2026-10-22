@@ -24,7 +24,12 @@ Response (`serviceResponse` with a new `settings` field):
        "entries": 1460000, "state": "ready"},
       {"volume": "F:", "indexed": false, "fs": "NTFS", "label": "Data",
        "total_bytes": 2000398934016, "free_bytes": 900000000000,
-       "entries": 0, "state": "not_indexed"}
+       "entries": 0, "state": "not_indexed"},
+      {"volume": "X:", "indexed": true, "fs": "NTFS", "label": "Fixture",
+       "total_bytes": 549755813888, "free_bytes": 274877906944,
+       "entries": 0, "state": "indexing",
+       "progress": {"phase": "building", "done": 1200000, "total": 2900000,
+                    "started_at": "2026-10-22T10:00:00Z"}}
     ],
     "content": {
       "enabled": true,
@@ -45,6 +50,12 @@ Response (`serviceResponse` with a new `settings` field):
   that are not indexed yet), plus any indexed volume that is not fixed/NTFS.
   `state` is one of `ready`, `indexing`, `not_indexed`, `error`. `error`, when
   present, is the last background build failure for that volume.
+- `progress` is present only while `state` is `indexing`. `phase` is
+  `enumerating` (reading the MFT or USN journal), `building` (converting
+  records), or `writing` (persisting the index). `done` and `total` count
+  records where the phase can report a total (MFT enumeration); `total` is 0
+  when the count is unknown (USN fallback). `started_at` is an RFC 3339
+  timestamp. The app uses this for a determinate progress bar.
 - `content` mirrors the `[content]` keys in docs/CONFIG.md, with
   `[plugins.content]` values from `plugin.toml` merged in; `volumes` holds the
   per-volume `[content."X:"]` overrides from `seekfs.toml` (only keys that are

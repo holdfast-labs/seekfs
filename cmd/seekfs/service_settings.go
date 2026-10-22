@@ -35,6 +35,8 @@ type settingsVolume struct {
 	Entries    int    `json:"entries"`
 	State      string `json:"state"`
 	Error      string `json:"error,omitempty"`
+	// Progress is present only while State is "indexing".
+	Progress *settingsVolumeProgress `json:"progress,omitempty"`
 }
 
 type settingsContentInfo struct {
@@ -89,8 +91,10 @@ var settingsVolumeEnumeration = enumerateSettingsVolumes
 
 // serviceIndexUSNVolume is the low-level index build seam shared by the
 // index-usn path. Tests replace it with a small synthetic Index instead of
-// touching a real USN journal.
-var serviceIndexUSNVolume = indexUSNVolume
+// touching a real USN journal. progress is nil outside settings-driven builds.
+var serviceIndexUSNVolume = func(volume string, progress *volumeBuildProgress) (*Index, error) {
+	return indexUSNVolume(volume, progress)
+}
 
 func (s *goSearchService) settingsConfigPath() string {
 	if s != nil && s.configPath != "" {
@@ -160,17 +164,18 @@ func (s *goSearchService) currentServiceSettings(caps serviceCapabilities) servi
 }
 
 type settingsVolumeStateOverride struct {
-	indexed bool
-	state   string
-	err     string
+	indexed  bool
+	state    string
+	err      string
+	progress *volumeBuildProgress
 }
 
 func (s *goSearchService) settingsVolumeStateOverrides() map[string]settingsVolumeStateOverride {
 	s.settingsVolumeMu.Lock()
 	defer s.settingsVolumeMu.Unlock()
 	out := make(map[string]settingsVolumeStateOverride, len(s.settingsVolumeTasks)+len(s.settingsVolumeErrs))
-	for volume := range s.settingsVolumeTasks {
-		out[volume] = settingsVolumeStateOverride{indexed: true, state: "indexing"}
+	for volume, task := range s.settingsVolumeTasks {
+		out[volume] = settingsVolumeStateOverride{indexed: true, state: "indexing", progress: task.progress}
 	}
 	for volume, message := range s.settingsVolumeErrs {
 		if _, pending := out[volume]; pending {
@@ -229,6 +234,9 @@ func settingsVolumeList(infos []settingsVolumeInfo, volumes []*serviceVolumeInde
 		entry.Indexed = override.indexed
 		entry.State = override.state
 		entry.Error = override.err
+		if override.state == "indexing" {
+			entry.Progress = override.progress.settingsProgress()
+		}
 		if override.state != "ready" {
 			entry.Entries = 0
 		}
@@ -519,6 +527,7 @@ func (s *goSearchService) addSettingsVolume(volume string) error {
 		db:       db,
 		cancel:   make(chan struct{}),
 		finished: make(chan struct{}),
+		progress: newVolumeBuildProgress(),
 	}
 	s.settingsVolumeTasks[volume] = task
 	delete(s.settingsVolumeErrs, volume)
@@ -546,7 +555,7 @@ func (s *goSearchService) runSettingsVolumeBuild(task *settingsVolumeTask) {
 	default:
 	}
 
-	idx, err := s.buildIndexUSNVolume(task.volume, task.db)
+	idx, err := s.buildIndexUSNVolume(task.volume, task.db, task.progress)
 
 	s.settingsVolumeMu.Lock()
 	current := s.settingsVolumeTasks[task.volume] == task
@@ -1118,6 +1127,7 @@ func runSettingsSet(args []string, out io.Writer) (err error) {
 	pipe := fs.String("pipe", defaultServicePipe, "resident service pipe")
 	jsonPath := fs.String("json", "", "settings JSON file")
 	resultPath := fs.String("result", "", "write the service response JSON here (for the elevated app helper)")
+	progressPath := fs.String("progress", "", "append JSON progress lines here (for the elevated app helper)")
 	installService := fs.Bool("install-service", false, "first install and start seekfs as an automatic Windows service on --pipe (elevated)")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -1146,13 +1156,16 @@ func runSettingsSet(args []string, out io.Writer) (err error) {
 	if err := json.Unmarshal(data, &raw); err != nil {
 		return fmt.Errorf("settings JSON: %w", err)
 	}
+	progress := newSettingsProgress(*progressPath)
+	progress.report(progressPhaseStart)
 	if *installService {
-		if err := settingsInstallService(*pipe); err != nil {
+		if err := settingsInstallService(*pipe, progress); err != nil {
 			return err
 		}
-	} else if err := ensureSettingsServiceElevated(*pipe, raw); err != nil {
+	} else if err := ensureSettingsServiceElevated(*pipe, raw, progress); err != nil {
 		return err
 	}
+	progress.report(progressPhaseApply)
 	resp, err = callService(*pipe, serviceRequest{Command: "settings-set", Settings: raw})
 	if err != nil {
 		return err
