@@ -143,6 +143,8 @@ func TestStatusRefresherUnreachableDoesNotSpawn(t *testing.T) {
 	defer func() { nativeServiceSpawnHook = prev }()
 
 	u := testUI(t, false)
+	var invalidations atomic.Int32
+	u.invalidate = func() { invalidations.Add(1) }
 	u.client.exchange = func(serviceRequest) (serviceResponse, error) {
 		return serviceResponse{}, errors.New("pipe missing")
 	}
@@ -152,6 +154,11 @@ func TestStatusRefresherUnreachableDoesNotSpawn(t *testing.T) {
 	}
 	if u.health != serviceHealthError {
 		t.Fatalf("unreachable health = %q", u.health)
+	}
+	first := invalidations.Load()
+	u.refreshStatusOnce()
+	if invalidations.Load() != first {
+		t.Fatalf("unchanged unreachable status invalidated %d more time(s)", invalidations.Load()-first)
 	}
 }
 

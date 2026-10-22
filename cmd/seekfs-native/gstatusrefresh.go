@@ -163,12 +163,13 @@ func (u *UI) applyStatus(s statusSnapshot) statusChange {
 	prevContent := u.contentHealth
 	prevVolumes := u.loadedVolumes
 
-	volumesChanged := !dbVolumesEqual(prevVolumes, s.Volumes)
-	healthChanged := s.Health != prevHealth || s.Message != prevMsg ||
-		s.Entries != prevEntries || s.NoVolumes != prevNoVolumes
-	contentChanged := !contentStatesEqual(prevContent, s.Content)
-
+	healthChanged := s.Health != prevHealth || s.Message != prevMsg
+	volumesChanged := false
+	contentChanged := false
 	if s.Reachable {
+		healthChanged = healthChanged || s.Entries != prevEntries || s.NoVolumes != prevNoVolumes
+		volumesChanged = !dbVolumesEqual(prevVolumes, s.Volumes)
+		contentChanged = !contentStatesEqual(prevContent, s.Content)
 		u.health, u.healthMsg = s.Health, s.Message
 		u.entries = s.Entries
 		u.noVolumes = s.NoVolumes
@@ -194,7 +195,7 @@ func (u *UI) applyStatus(s statusSnapshot) statusChange {
 	change := statusChange{
 		Changed:         changed,
 		VolumesChanged:  volumesChanged,
-		LoadingFinished: prevLoading && !s.Loading && s.Reachable,
+		LoadingFinished: s.Reachable && prevLoading && !s.Loading,
 	}
 	if change.RerunQuery() {
 		u.rerunCurrentQuery()
