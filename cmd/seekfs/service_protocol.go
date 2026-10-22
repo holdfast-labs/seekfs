@@ -513,6 +513,7 @@ type settingsVolumeTask struct {
 	finished chan struct{}
 	mu       sync.Mutex
 	canceled bool
+	progress *volumeBuildProgress
 }
 
 func (t *settingsVolumeTask) cancelNow() {

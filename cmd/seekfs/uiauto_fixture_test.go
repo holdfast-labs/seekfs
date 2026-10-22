@@ -61,7 +61,7 @@ func TestUIDriveFixtureBuildProducesIndex(t *testing.T) {
 	f := &uiDriveFixture{Volumes: []uiDriveFixtureVolume{{
 		Volume: "X:", Label: "Fixture", FS: "NTFS", TotalBytes: 1000, FreeBytes: 400, Root: root,
 	}}}
-	idx, err := buildUIDriveFixtureIndex(f, "X:")
+	idx, err := buildUIDriveFixtureIndex(f, "X:", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -81,7 +81,7 @@ func TestUIDriveFixtureBuildProducesIndex(t *testing.T) {
 			t.Fatalf("record %q count = %d in %+v", want, names[want], names)
 		}
 	}
-	if _, err := buildUIDriveFixtureIndex(f, "Z:"); err == nil {
+	if _, err := buildUIDriveFixtureIndex(f, "Z:", nil); err == nil {
 		t.Fatal("unknown volume accepted")
 	}
 }

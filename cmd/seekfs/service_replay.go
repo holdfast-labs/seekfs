@@ -79,7 +79,7 @@ func rebuildServiceVolumeIndex(vol *serviceVolumeIndex) (*serviceVolumeIndex, er
 	if vol == nil || vol.volume == "" || vol.dbPath == "" {
 		return nil, errors.New("stale index rebuild requires a volume and db path")
 	}
-	idx, err := indexUSNVolume(vol.volume)
+	idx, err := indexUSNVolume(vol.volume, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -192,7 +192,7 @@ func (s *goSearchService) rebuildVolumeInPlace(vol *serviceVolumeIndex) error {
 	if vol == nil || vol.volume == "" || vol.dbPath == "" {
 		return errors.New("stale index rebuild requires a volume and db path")
 	}
-	idx, err := indexUSNVolume(vol.volume)
+	idx, err := indexUSNVolume(vol.volume, nil)
 	if err != nil {
 		return err
 	}

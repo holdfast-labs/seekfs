@@ -429,6 +429,12 @@ func filterMFTExclusions(entries map[uint64]mftEntry, vol string, exclusions []s
 // them keyed by FRN. It reads the MFT through the $DATA attribute of MFT record
 // 0 so a fragmented MFT is handled. modUnix and size are populated.
 func enumMFT(handle windows.Handle) (map[uint64]mftEntry, error) {
+	return enumMFTWithProgress(handle, nil)
+}
+
+// enumMFTWithProgress is enumMFT with a throttled progress callback. onRecord
+// receives the records processed and the total record count (0 when unknown).
+func enumMFTWithProgress(handle windows.Handle, onRecord func(done, total uint64)) (map[uint64]mftEntry, error) {
 	vol, err := queryNTFSVolumeData(handle)
 	if err != nil {
 		return nil, err
@@ -466,6 +472,19 @@ func enumMFT(handle windows.Handle) (map[uint64]mftEntry, error) {
 	// stop to avoid wasted reads).
 	mftValid := vol.MftValidDataLength
 
+	totalRecords := uint64(0)
+	if mftValid > 0 {
+		totalRecords = uint64(mftValid / int64(recSize))
+	}
+	if totalRecords == 0 {
+		var runBytes int64
+		for _, run := range runs {
+			runBytes += run.clusters * bytesPerCluster
+		}
+		totalRecords = uint64(runBytes / int64(recSize))
+	}
+	progress := newMFTProgressTracker(totalRecords, onRecord)
+
 	var recordNumber uint64
 	var consumed int64
 	readErrors := 0
@@ -497,6 +516,7 @@ func enumMFT(handle windows.Handle) (map[uint64]mftEntry, error) {
 			for off := 0; off+recSize <= n; off += recSize {
 				parseMFTRecordInto(buf[off:off+recSize], recordNumber, bytesPerSector, nodes)
 				recordNumber++
+				progress.record(recordNumber)
 			}
 			offset += int64(n)
 			remaining -= int64(n)
@@ -506,6 +526,7 @@ func enumMFT(handle windows.Handle) (map[uint64]mftEntry, error) {
 			break
 		}
 	}
+	progress.finish(recordNumber)
 	if len(nodes) == 0 {
 		return nil, errors.New("MFT enumeration produced no records")
 	}

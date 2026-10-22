@@ -108,7 +108,7 @@ func TestSettingsCLISetRestartsUnelevatedSiblingForNewDrive(t *testing.T) {
 	serviceProcessElevated = func() bool { return false }
 	settingsHelperElevated = func() bool { return true }
 	var restarts []serviceResponse
-	settingsRestartService = func(info serviceResponse, pipe string) error {
+	settingsRestartService = func(info serviceResponse, pipe string, _ *settingsProgress) error {
 		if pipe != pipeName {
 			t.Errorf("restart pipe = %q, want %q", pipe, pipeName)
 		}
@@ -174,12 +174,12 @@ func TestSettingsCLISetInstallServiceRunsBeforeWrite(t *testing.T) {
 	})
 	serviceProcessElevated = func() bool { return false }
 	settingsHelperElevated = func() bool { return true }
-	settingsRestartService = func(serviceResponse, string) error {
+	settingsRestartService = func(serviceResponse, string, *settingsProgress) error {
 		t.Error("install path also restarted the sibling")
 		return nil
 	}
 	var installs []string
-	settingsInstallService = func(pipe string) error {
+	settingsInstallService = func(pipe string, _ *settingsProgress) error {
 		installs = append(installs, pipe)
 		return nil
 	}
@@ -193,7 +193,7 @@ func TestSettingsCLISetInstallServiceRunsBeforeWrite(t *testing.T) {
 		t.Fatalf("installs = %v, want [%s]", installs, pipeName)
 	}
 
-	settingsInstallService = func(string) error { return errors.New("access denied by SCM") }
+	settingsInstallService = func(string, *settingsProgress) error { return errors.New("access denied by SCM") }
 	result := filepath.Join(t.TempDir(), "result.json")
 	_, err := runCLICaptured(t, []string{"settings", "set", "--json", patch, "--pipe", pipeName, "--install-service", "--result", result})
 	if err == nil || !strings.Contains(err.Error(), "access denied by SCM") {
