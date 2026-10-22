@@ -109,3 +109,39 @@ go test -p 1 -tags uiautomation ./cmd/seekfs -run TestUIDriveFixture
 go test -p 1 ./cmd/seekfs -run TestUIDriveFixtureDisabled
 go test -p 1 ./cmd/seekfs-uidrive -run TestGenerateFixtureTree
 ```
+
+## Results
+
+Measured on branch `ux/perf` (base `cf67f8a`) on Windows with the 20,000-file
+fixture. The "before" values are from the base revision.
+
+| scenario | metric | before | after |
+|---|---|---:|---:|
+| resize | SetWindowPos p50 | 240-277 ms | 12.9 ms |
+| resize | SetWindowPos max | 316-4466 ms | 274.0 ms |
+| resize | frame p95 | 252-271 ms | 13.2 ms |
+| resize | frames over 100 ms | 40 | 1 |
+| resize | frame p50 | - | 9.9 ms |
+| resize | time to settle | ~4.97 s | ~4.99 s |
+| search | action to rows p50 | ~175 ms | 16.0 ms |
+
+The resize numbers come from `-scenario all`; the search p50 is from
+`-scenario search` (queries 12.9, 19.6, and 16.0 ms in the first run).
+
+Notes:
+
+- The presenter keeps one headless window, grows it in 256 px buckets, and
+  never shrinks it. It converts RGBA to BGRA once into a reusable buffer and
+  blits only the visible rectangle.
+- The one 267-305 ms frame and the 274-315 ms `SetWindowPos` are the one-time
+  creation of the larger headless GPU context when the window crosses a bucket
+  boundary (1024 to 1792 px wide in this sweep). The other frames stay near
+  10-13 ms.
+- `time to settle` does not improve. Every automation command calls
+  `u.invalidate()` (`uiauto.go`), so the harness `metrics` poll at 20 ms makes
+  a frame every 20 ms. The 300 ms quiet-gap condition never occurs and the loop
+  stops at its 5 s limit. The base revision shows the same ~5 s value, so this
+  is a harness measurement effect, not presenter time.
+- `-scenario resize` alone can report `no window handle` when it calls `hwnd`
+  before the app handles its first `ViewEvent`. `-scenario all` waits for the
+  first frame and measures reliably.
