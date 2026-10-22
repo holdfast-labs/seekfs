@@ -31,6 +31,7 @@ type report struct {
 	Resize        *resizeReport   `json:"resize,omitempty"`
 	Settings      *settingsReport `json:"settings,omitempty"`
 	Status        *statusReport   `json:"status,omitempty"`
+	Content       *contentReport  `json:"content,omitempty"`
 	Findings      []string        `json:"findings,omitempty"`
 }
 
@@ -42,6 +43,7 @@ type buildReport struct {
 
 type fixtureReport struct {
 	Files           int `json:"files"`
+	ContentFiles    int `json:"content_files,omitempty"`
 	Dirs            int `json:"dirs"`
 	PerEntryDelayMS int `json:"per_entry_delay_ms"`
 }
@@ -135,6 +137,75 @@ type statusReport struct {
 	LoadingScreenshot   string  `json:"loading_screenshot,omitempty"`
 	ReadyScreenshot     string  `json:"ready_screenshot,omitempty"`
 	Error               string  `json:"error,omitempty"`
+}
+
+type contentQueryReport struct {
+	ID             string   `json:"id"`
+	Query          string   `json:"query"`
+	Expected       []string `json:"expected"`
+	Actual         []string `json:"actual,omitempty"`
+	Missing        []string `json:"missing,omitempty"`
+	Extra          []string `json:"extra,omitempty"`
+	Pass           bool     `json:"pass"`
+	SnippetPass    bool     `json:"snippet_pass"`
+	SnippetText    string   `json:"snippet_text,omitempty"`
+	TypedLatencyMS float64  `json:"typed_latency_ms,omitempty"`
+	NowLatencyMS   float64  `json:"search_now_latency_ms,omitempty"`
+	Rows           int      `json:"rows"`
+	ServicePass    *bool    `json:"service_pass,omitempty"`
+	ServiceActual  []string `json:"service_actual,omitempty"`
+	Attribution    string   `json:"attribution,omitempty"`
+	Notice         string   `json:"notice,omitempty"`
+	SearchMessage  string   `json:"search_message,omitempty"`
+}
+
+type contentNegativeReport struct {
+	ID          string   `json:"id"`
+	Query       string   `json:"query"`
+	Pass        bool     `json:"pass"`
+	Rows        int      `json:"rows"`
+	Actual      []string `json:"actual,omitempty"`
+	ServicePass *bool    `json:"service_pass,omitempty"`
+	Attribution string   `json:"attribution,omitempty"`
+}
+
+type contentFreshnessReport struct {
+	Path        string  `json:"path"`
+	QueryBefore string  `json:"query_before"`
+	QueryAfter  string  `json:"query_after"`
+	BeforePass  bool    `json:"before_pass"`
+	AfterPass   bool    `json:"after_pass"`
+	ReflectMS   float64 `json:"reflect_ms"`
+	OldRows     int     `json:"old_rows"`
+	NewRows     int     `json:"new_rows"`
+	Pass        bool    `json:"pass"`
+	Attribution string  `json:"attribution,omitempty"`
+}
+
+type contentLatencyReport struct {
+	Typed     []float64 `json:"typed_ms,omitempty"`
+	SearchNow []float64 `json:"search_now_ms,omitempty"`
+}
+
+type contentReport struct {
+	ContentState        string                  `json:"content_state,omitempty"`
+	ContentDocs         int                     `json:"content_docs,omitempty"`
+	ContentBuildError   string                  `json:"content_build_error,omitempty"`
+	ContentBuildDone    int                     `json:"content_build_done,omitempty"`
+	ContentBuildTotal   int                     `json:"content_build_total,omitempty"`
+	ContentReadyMS      float64                 `json:"content_ready_ms"`
+	BuildingSeen        bool                    `json:"building_seen"`
+	BuildingNoticeSeen  bool                    `json:"building_notice_seen"`
+	BuildingRows        int                     `json:"building_rows"`
+	BuildingNotice      string                  `json:"building_notice,omitempty"`
+	BuildingScreenshot  string                  `json:"building_screenshot,omitempty"`
+	SnippetsScreenshot  string                  `json:"snippets_screenshot,omitempty"`
+	NoResultsScreenshot string                  `json:"no_results_screenshot,omitempty"`
+	Queries             []contentQueryReport    `json:"queries"`
+	Negatives           []contentNegativeReport `json:"negatives"`
+	Freshness           *contentFreshnessReport `json:"freshness,omitempty"`
+	Latency             contentLatencyReport    `json:"latency"`
+	Error               string                  `json:"error,omitempty"`
 }
 
 func newReport(scenario, out string) *report {
@@ -267,6 +338,58 @@ func renderSummary(r *report) string {
 		}
 		fmt.Fprintln(&b)
 	}
+	if r.Content != nil {
+		c := r.Content
+		fmt.Fprintf(&b, "## Content search\n\n")
+		fmt.Fprintf(&b, "| metric | value |\n|---|---:|\n")
+		fmt.Fprintf(&b, "| content state | %s |\n", mdCell(c.ContentState))
+		fmt.Fprintf(&b, "| content docs | %d |\n", c.ContentDocs)
+		if c.ContentBuildError != "" {
+			fmt.Fprintf(&b, "| content build error | %s |\n", mdCell(c.ContentBuildError))
+		}
+		fmt.Fprintf(&b, "| content ready | %.1f ms |\n", c.ContentReadyMS)
+		fmt.Fprintf(&b, "| building state seen | %t |\n", c.BuildingSeen)
+		fmt.Fprintf(&b, "| building notice shown | %t |\n", c.BuildingNoticeSeen)
+		fmt.Fprintf(&b, "| rows while building | %d |\n", c.BuildingRows)
+		if c.Error != "" {
+			fmt.Fprintf(&b, "| error | %s |\n", mdCell(c.Error))
+		}
+		if len(c.Latency.Typed) > 0 {
+			p50, p95, max := stats(c.Latency.Typed)
+			fmt.Fprintf(&b, "| typed latency p50/p95/max | %.1f / %.1f / %.1f ms |\n", p50, p95, max)
+		}
+		if len(c.Latency.SearchNow) > 0 {
+			p50, p95, max := stats(c.Latency.SearchNow)
+			fmt.Fprintf(&b, "| SearchNow latency p50/p95/max | %.1f / %.1f / %.1f ms |\n", p50, p95, max)
+		}
+		if c.SnippetsScreenshot != "" {
+			fmt.Fprintf(&b, "| screenshots | `%s`, `%s`, `%s` |\n", shortPath(c.SnippetsScreenshot), shortPath(c.BuildingScreenshot), shortPath(c.NoResultsScreenshot))
+		}
+		fmt.Fprintln(&b)
+		fmt.Fprintf(&b, "| query | pass | rows | missing | extra | snippet | typed ms | now ms | attribution |\n|---|---:|---:|---|---|---:|---:|---:|---|\n")
+		for _, q := range c.Queries {
+			fmt.Fprintf(&b, "| %s | %t | %d | %s | %s | %t | %.1f | %.1f | %s |\n",
+				mdCell(q.ID), q.Pass, q.Rows, mdCell(strings.Join(q.Missing, ", ")), mdCell(strings.Join(q.Extra, ", ")),
+				q.SnippetPass, q.TypedLatencyMS, q.NowLatencyMS, mdCell(q.Attribution))
+		}
+		if len(c.Negatives) > 0 {
+			fmt.Fprintf(&b, "\n| negative | pass | rows | attribution |\n|---|---:|---:|---|\n")
+			for _, q := range c.Negatives {
+				fmt.Fprintf(&b, "| %s | %t | %d | %s |\n", mdCell(q.ID), q.Pass, q.Rows, mdCell(q.Attribution))
+			}
+		}
+		if c.Freshness != nil {
+			f := c.Freshness
+			fmt.Fprintf(&b, "\n| freshness | value |\n|---|---:|\n")
+			fmt.Fprintf(&b, "| old query gone | %t |\n", f.BeforePass)
+			fmt.Fprintf(&b, "| new query present | %t |\n", f.AfterPass)
+			fmt.Fprintf(&b, "| reflect time | %.1f ms |\n", f.ReflectMS)
+			if f.Attribution != "" {
+				fmt.Fprintf(&b, "| attribution | %s |\n", mdCell(f.Attribution))
+			}
+		}
+		fmt.Fprintln(&b)
+	}
 	fmt.Fprintf(&b, "## Findings\n\n")
 	if len(r.Findings) == 0 {
 		fmt.Fprintf(&b, "- none\n")
@@ -355,6 +478,31 @@ func collectFindings(r *report) []string {
 		}
 		if !r.Status.SidebarX {
 			out = append(out, "status scenario: sidebar never listed the fixture drive without a restart")
+		}
+	}
+	if r.Content != nil {
+		c := r.Content
+		if c.Error != "" {
+			out = append(out, "content scenario: "+c.Error)
+		}
+		if c.BuildingSeen && !c.BuildingNoticeSeen {
+			out = append(out, "content scenario: index was building but the results notice was not shown")
+		}
+		for _, q := range c.Queries {
+			if !q.Pass {
+				out = append(out, fmt.Sprintf("content query %q failed: missing=%v extra=%v; service=%v (attribution %s)", q.Query, q.Missing, q.Extra, q.ServiceActual, q.Attribution))
+			}
+			if !q.SnippetPass {
+				out = append(out, fmt.Sprintf("content query %q snippet did not contain the expected text: %q", q.Query, q.SnippetText))
+			}
+		}
+		for _, q := range c.Negatives {
+			if !q.Pass {
+				out = append(out, fmt.Sprintf("content negative %q returned %d rows: %v (attribution %s)", q.Query, q.Rows, q.Actual, q.Attribution))
+			}
+		}
+		if c.Freshness != nil && !c.Freshness.Pass {
+			out = append(out, fmt.Sprintf("content freshness failed: old_gone=%t new_present=%t (attribution %s)", c.Freshness.BeforePass, c.Freshness.AfterPass, c.Freshness.Attribution))
 		}
 	}
 	return out

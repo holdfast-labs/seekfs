@@ -48,6 +48,7 @@ func TestAutomationStateDispatch(t *testing.T) {
 	sink := &fakeAutomationSink{state: automationState{
 		Width: 1600, Height: 1000, SettingsOpen: true, SettingsTab: "drives",
 		Rows: 7, Query: "needle", Health: "ok", Entries: 20000,
+		Contents: true, RowDetails: []automationRow{{Index: 0, Name: "a.txt", Path: `C:\a.txt`, Snippet: "a needle", MatchRanges: [][2]int{{2, 8}}}}, ResultsNotice: "building", ContentDocs: 12,
 		Drives: []automationDrive{{Volume: "X:", Indexed: true, State: "ready", Entries: 20001}},
 	}}
 	resp := decodeAutomationResponse(t, runAutomationCommand([]byte(`{"cmd":"state"}`), sink))
@@ -56,6 +57,9 @@ func TestAutomationStateDispatch(t *testing.T) {
 	}
 	if resp.State.Width != 1600 || resp.State.Rows != 7 || len(resp.State.Drives) != 1 {
 		t.Fatalf("state = %+v", resp.State)
+	}
+	if !resp.State.Contents || len(resp.State.RowDetails) != 1 || resp.State.RowDetails[0].Snippet != "a needle" || len(resp.State.RowDetails[0].MatchRanges) != 1 || resp.State.ResultsNotice == "" || resp.State.ContentDocs != 12 {
+		t.Fatalf("content state = %+v", resp.State)
 	}
 	if resp.State.Drives[0].Volume != "X:" || resp.State.Drives[0].Entries != 20001 {
 		t.Fatalf("drive = %+v", resp.State.Drives[0])
@@ -73,6 +77,9 @@ func TestAutomationActionDispatch(t *testing.T) {
 		{`{"cmd":"action","name":"toggle-drive","arg":"X:"}`, "toggle-drive", "X:"},
 		{`{"cmd":"action","name":"set-install-service","arg":true}`, "set-install-service", true},
 		{`{"cmd":"action","name":"set-query","arg":"needle"}`, "set-query", "needle"},
+		{`{"cmd":"action","name":"type-query","arg":"needle"}`, "type-query", "needle"},
+		{`{"cmd":"action","name":"search-now","arg":"needle"}`, "search-now", "needle"},
+		{`{"cmd":"action","name":"set-contents-mode","arg":true}`, "set-contents-mode", true},
 		{`{"cmd":"action","name":"set-content-mode","arg":"explicit"}`, "set-content-mode", "explicit"},
 		{`{"cmd":"action","name":"apply-settings"}`, "apply-settings", nil},
 	}

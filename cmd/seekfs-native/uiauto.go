@@ -51,6 +51,14 @@ type automationProgress struct {
 	Total int64  `json:"total"`
 }
 
+type automationRow struct {
+	Index       int      `json:"index"`
+	Name        string   `json:"name"`
+	Path        string   `json:"path"`
+	Snippet     string   `json:"snippet,omitempty"`
+	MatchRanges [][2]int `json:"match_ranges,omitempty"`
+}
+
 type automationState struct {
 	Width               int                 `json:"width"`
 	Height              int                 `json:"height"`
@@ -75,6 +83,14 @@ type automationState struct {
 	ContentDone         int64               `json:"content_done,omitempty"`
 	ContentTotal        int64               `json:"content_total,omitempty"`
 	ContentIncomplete   bool                `json:"content_incomplete,omitempty"`
+	ContentDocs         int                 `json:"content_docs,omitempty"`
+	Contents            bool                `json:"contents"`
+	RowDetails          []automationRow     `json:"row_details,omitempty"`
+	ResultsNotice       string              `json:"results_notice,omitempty"`
+	SearchMessage       string              `json:"search_message,omitempty"`
+	ElapsedMS           int64               `json:"elapsed_ms,omitempty"`
+	SearchMS            float64             `json:"search_ms,omitempty"`
+	Source              string              `json:"source,omitempty"`
 }
 
 type automationSideRow struct {
@@ -368,6 +384,21 @@ func (s uiAutomationSink) AutomationState() automationState {
 		st.ContentDone = int64(c.BuildDone)
 		st.ContentTotal = int64(c.BuildTotal)
 		st.ContentIncomplete = c.Incomplete || c.Partial
+		st.ContentDocs = c.Docs
+	}
+	st.Contents = u.contents
+	st.ElapsedMS = u.elapsedMS
+	st.SearchMS = u.searchMS
+	st.Source = u.source
+	st.ResultsNotice = contentIncompleteNotice(u.contents, u.contentHealth)
+	st.SearchMessage = firstNonEmpty(u.unavail, u.fuzzyMsg)
+	terms := contentHighlightTerms(u.query)
+	for i, r := range u.rows {
+		detail := automationRow{Index: i, Name: r.Name, Path: r.Path, Snippet: r.Snippet}
+		if r.Snippet != "" && len(terms) > 0 {
+			detail.MatchRanges = matchSegmentBounds(r.Snippet, terms)
+		}
+		st.RowDetails = append(st.RowDetails, detail)
 	}
 	u.mu.Unlock()
 	st.SettingsOpen = u.settingsOpen
@@ -467,6 +498,20 @@ func (s uiAutomationSink) AutomationAction(name string, arg any) error {
 		u.searchEd.SetText(text)
 		u.typedQuery(text)
 		u.commitQuery()
+	case "type-query":
+		text := automationArgString(arg)
+		u.searchEd.SetText(text)
+		u.typedQuery(text)
+	case "search-now":
+		text := automationArgString(arg)
+		u.searchEd.SetText(text)
+		u.commitQuery()
+	case "set-contents-mode":
+		on := automationArgBool(arg)
+		u.mu.Lock()
+		u.contents = on
+		u.mu.Unlock()
+		u.settings.ContentsMode = on
 	case "set-content-mode":
 		mode := automationArgString(arg)
 		p := u.gsettings

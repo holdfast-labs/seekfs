@@ -55,18 +55,21 @@ type harness struct {
 	toml     string
 	fixture  string
 
-	svcCmd    *exec.Cmd
-	appCmd    *exec.Cmd
-	appStart  time.Time
-	appPipeAt time.Time
-	rep       *report
-	auto      *autoClient
+	svcCmd      *exec.Cmd
+	appCmd      *exec.Cmd
+	appStart    time.Time
+	appPipeAt   time.Time
+	rep         *report
+	auto        *autoClient
+	content     bool
+	contentSet  contentExpectedSet
+	contentJSON string
 }
 
 func runHarness(out string, timeout time.Duration, scenario string) error {
 	scenario = strings.ToLower(strings.TrimSpace(scenario))
 	switch scenario {
-	case "all", "startup", "search", "resize", "settings", "status":
+	case "all", "startup", "search", "resize", "settings", "status", "content":
 	default:
 		return fmt.Errorf("unknown scenario %q", scenario)
 	}
@@ -90,6 +93,7 @@ func runHarness(out string, timeout time.Duration, scenario string) error {
 		cancel:   cancel,
 		deadline: deadline,
 		rep:      newReport(scenario, absOut),
+		content:  scenario == "all" || scenario == "content",
 	}
 	h.svcPipe = fmt.Sprintf(`\\.\pipe\seekfs-uidrive-%d-1`, os.Getpid())
 	h.autoPipe = fmt.Sprintf(`\\.\pipe\seekfs-uidrive-%d-2`, os.Getpid())
@@ -127,9 +131,10 @@ func runHarness(out string, timeout time.Duration, scenario string) error {
 		runSearch := scenario == "all" || scenario == "search"
 		runResize := scenario == "all" || scenario == "resize"
 		runSettings := scenario == "all" || scenario == "settings"
+		runContent := scenario == "all" || scenario == "content"
 
 		h.rep.Startup = h.startupScenario(runStartup)
-		if runSearch || runSettings {
+		if runSearch || runSettings || runContent {
 			h.rep.Setup = h.ensureFixtureDrive()
 		}
 		if runSearch {
@@ -140,6 +145,9 @@ func runHarness(out string, timeout time.Duration, scenario string) error {
 		}
 		if runSettings {
 			h.rep.Settings = h.settingsScenario()
+		}
+		if runContent {
+			h.rep.Content = h.contentScenario()
 		}
 	}
 	h.rep.Finished = time.Now()
@@ -185,6 +193,22 @@ func (h *harness) writeFixtureFile() error {
 		return err
 	}
 	h.rep.Fixture = fixtureReport{Files: plan.Files, Dirs: plan.Dirs, PerEntryDelayMS: plan.PerEntryDelayMS}
+	if h.content {
+		set, cerr := generateContentFixture(plan.Root)
+		if cerr != nil {
+			return cerr
+		}
+		h.contentSet = set
+		h.rep.Fixture.ContentFiles = set.Files
+		h.contentJSON = filepath.Join(h.out, "content-expected.json")
+		expected, merr := json.MarshalIndent(set, "", "  ")
+		if merr != nil {
+			return merr
+		}
+		if werr := os.WriteFile(h.contentJSON, expected, 0o600); werr != nil {
+			return werr
+		}
+	}
 	fixture := uiDriveFixture{
 		Volumes: []uiDriveFixtureVolume{{
 			Volume: "X:", Label: "Fixture", FS: "NTFS",
@@ -281,7 +305,11 @@ func (h *harness) childEnv(extra map[string]string) []string {
 		env = append(env, prefix+value)
 	}
 	set("SEEKFS_DIR", filepath.Join(h.out, "seekfsdir"))
-	set("SEEKFS_CONTENT_SEARCH", "0")
+	if h.content {
+		set("SEEKFS_CONTENT_SEARCH", "1")
+	} else {
+		set("SEEKFS_CONTENT_SEARCH", "0")
+	}
 	set("GOMAXPROCS", "2")
 	for k, v := range extra {
 		set(k, v)
@@ -296,11 +324,20 @@ func (h *harness) startService() error {
 	}
 	cmd := exec.Command(h.svcExe, "service", "-lowmem", "-pipe", h.svcPipe, "-config", h.toml)
 	cmd.Dir = h.bin
-	cmd.Env = h.childEnv(map[string]string{
+	svcEnv := map[string]string{
 		"SEEKFS_UIDRIVE_FIXTURE": h.fixture,
 		"SEEKFS_MEMORY_MODE":     "lowmem",
 		"SEEKFS_STARTUP_WORKERS": "1",
-	})
+	}
+	if h.content {
+		svcEnv["SEEKFS_CONTENT_SCOPE"] = "explicit"
+		svcEnv["SEEKFS_CONTENT_BUDGET_BYTES"] = "67108864"
+		svcEnv["SEEKFS_CONTENT_ROOTS"] = filepath.Join(h.out, "fixture")
+		svcEnv["SEEKFS_CONTENT_EXCLUDE"] = strings.Join([]string{
+			filepath.Join(h.out, "fixture", "node_modules"),
+		}, string(filepath.ListSeparator))
+	}
+	cmd.Env = h.childEnv(svcEnv)
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
 	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true, CreationFlags: 0x08000000}

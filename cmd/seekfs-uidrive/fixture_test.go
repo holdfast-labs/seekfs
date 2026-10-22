@@ -3,6 +3,7 @@
 package main
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
 	"strings"
@@ -67,5 +68,70 @@ func TestGenerateFixtureTree(t *testing.T) {
 	}
 	if again.Files != 500 {
 		t.Fatalf("second generate files = %d", again.Files)
+	}
+}
+
+func TestGenerateContentFixtureAnswers(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "fixture")
+	if _, err := generateFixtureTree(root, 200); err != nil {
+		t.Fatal(err)
+	}
+	set, err := generateContentFixture(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if set.Files < 3000 {
+		t.Fatalf("content files = %d, want >= 3000", set.Files)
+	}
+	for _, q := range set.Queries {
+		for _, rel := range q.Expected {
+			path := filepath.Join(root, filepath.FromSlash(rel))
+			data, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatalf("%s: %v", q.ID, err)
+			}
+			snippet := q.Snippet
+			if snippet == "" {
+				snippet = q.SnippetAlt
+			}
+			if snippet != "" && !strings.Contains(strings.ToLower(string(data)), strings.ToLower(snippet)) {
+				t.Fatalf("%s: %s does not contain %q", q.ID, rel, snippet)
+			}
+		}
+	}
+	// Unique needles must appear in exactly the expected file (or no file).
+	countNeedle := func(needle string) int {
+		n := 0
+		_ = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+			if err != nil || d.IsDir() {
+				return nil
+			}
+			data, readErr := os.ReadFile(path)
+			if readErr == nil && strings.Contains(strings.ToLower(string(data)), needle) {
+				n++
+			}
+			return nil
+		})
+		return n
+	}
+	if got := countNeedle("zzuniqueneedlealpha"); got != 1 {
+		t.Fatalf("unique needle count = %d, want 1", got)
+	}
+	if got := countNeedle("cobalt lantern phrase"); got != 3 {
+		t.Fatalf("phrase count = %d, want 3", got)
+	}
+	if got := countNeedle("binaryneedle"); got != 1 {
+		t.Fatalf("binary needle count = %d, want 1", got)
+	}
+	binaryData, err := os.ReadFile(filepath.Join(root, "content", "binary.bin"))
+	if err != nil || !bytes.Contains(binaryData[:min(8, len(binaryData))], []byte{0}) {
+		t.Fatalf("binary fixture lacks NUL head: %v", err)
+	}
+	large, err := os.Stat(filepath.Join(root, "content", "large.txt"))
+	if err != nil || large.Size() <= 1<<20 {
+		t.Fatalf("large fixture size = %v err=%v, want > 1 MiB", large.Size(), err)
+	}
+	if _, err := os.Stat(filepath.Join(root, "repo", ".git", "HEAD")); err != nil {
+		t.Fatalf("nested git repo missing: %v", err)
 	}
 }

@@ -36,7 +36,7 @@ Flags:
 
 - `-out <dir>`: output directory.
 - `-timeout 5m`: hard harness deadline; children are killed when it expires.
-- `-scenario all|startup|search|resize|settings|status`.
+- `-scenario all|startup|search|resize|settings|status|content`.
 
 ## Automation commands
 
@@ -51,6 +51,9 @@ returns one JSON object per line. All commands run on the UI goroutine.
   (kind/label/under), and the content-index state/progress.
 - `{"cmd":"action","name":...,"arg":...}`:
   - `open-settings` (`drives`, `content`, `search`), `close-settings`;
+  - `set-contents-mode` (bool) turns the Contents toggle on or off;
+  - `type-query` (text) drives the typed/leading-edge searcher path without Enter;
+  - `search-now` (text) sends immediately through the SearchNow path;
   - `toggle-drive` (volume), `set-install-service` (bool);
   - `apply-settings`; `set-query` (text; same path as typing then Enter);
   - `set-content-mode` (`auto`, `explicit`, `off`) for the settings scenario.
@@ -159,3 +162,32 @@ Notes:
 - `-scenario resize` alone can report `no window handle` when it calls `hwnd`
   before the app handles its first `ViewEvent`. `-scenario all` waits for the
   first frame and measures reliably.
+
+## Content scenario
+
+`-scenario content` (and `all`) generates a known-answer content corpus under
+the existing fixture tree: unique needles, a phrase in three files, smart-case
+variants, a regex, a fuzzy typo, a `sym:` definition, a 1 MiB+ text file, a
+binary file with a needle, `node_modules` and `.gitignore` negatives, and a
+nested git repository. The expected answers are written to
+`content-expected.json` next to `fixture.json`.
+
+The service runs with `SEEKFS_CONTENT_SEARCH=1`, an explicit scope rooted at
+the fixture, and a small explicit content budget (the default disk reserve
+would refuse a build on a nearly full test volume). The scenario:
+
+1. enables Contents mode and records the building notice and rows from an
+   early typed query;
+2. waits for the service content index to reach `ready`;
+3. runs every expected query through both `type-query` and `search-now`,
+   compares result paths exactly, and checks snippets;
+4. runs binary/excluded/ignored/oversized negative queries;
+5. rewrites one fixture file (old token out, new token in) and polls for up
+   to 60 s;
+6. writes screenshots, latency p50/p95/max, `report.json`, and `summary.md`.
+
+When a query is wrong, the harness repeats it directly against its private
+service pipe and records whether the UI or the service is at fault.
+
+Run the fixture on a volume with free space above the content reserve (10 GiB
+plus scratch) or the content build stops before writing a sidecar.
