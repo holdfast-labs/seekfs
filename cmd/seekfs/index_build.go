@@ -376,7 +376,12 @@ func buildRecordsFromMFT(idx *Index, entries *mftTable) {
 		return
 	}
 	idx.NameBlob = entries.names
-	idx.nameArena = true
+	idx.nameArena = len(entries.distinct) > 0
+	idx.nameArenaOffsets = entries.distinct
+	idx.nameArenaLens = entries.distinctLens
+	if !idx.nameArena {
+		idx.NameBlob = nil
+	}
 	idx.Records = make([]CompactRecord, 0, entries.count)
 	for frn := 0; frn < len(entries.recs); frn++ {
 		e := &entries.recs[frn]
