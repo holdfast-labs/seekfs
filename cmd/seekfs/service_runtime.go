@@ -6,6 +6,7 @@ import (
 	"golang.org/x/sys/windows"
 	"os"
 	"path/filepath"
+	"runtime"
 	"runtime/debug"
 	"sort"
 	"strconv"
@@ -1662,6 +1663,23 @@ func persistFailureBackoff(failures int) time.Duration {
 
 func releaseServiceMemoryAfterSave() {
 	debug.FreeOSMemory()
+}
+
+// releaseBuildMemoryAfterSettings releases the heap held by a finished
+// settings-driven index build. The built Index is replaced by the reloaded
+// mmap one before this runs, so anything still in the heap is build garbage.
+func releaseBuildMemoryAfterSettings(volume string) {
+	var before runtime.MemStats
+	runtime.ReadMemStats(&before)
+	debug.FreeOSMemory()
+	var after runtime.MemStats
+	runtime.ReadMemStats(&after)
+	released := uint64(0)
+	if before.HeapInuse > after.HeapInuse {
+		released = before.HeapInuse - after.HeapInuse
+	}
+	serviceLog("index-usn memory volume=%s heap_inuse_mb=%d released_mb=%d",
+		volume, after.HeapInuse>>20, released>>20)
 }
 
 func queryUSNJournal(handle windows.Handle) (usnJournalDataV0, error) {

@@ -80,6 +80,158 @@ type mftEntry struct {
 	parentSeq uint16 // the parent reference's sequence number, when known
 }
 
+// mftTable accumulates MFT records by record number. NTFS record numbers are
+// dense from zero, so a slice indexed by record number plus one name byte arena
+// replaces the former map[uint64]mftEntry, whose per-record bucket, key and
+// string-header overhead dominated the build peak.
+type mftTable struct {
+	recs  []mftTableRecord
+	names []byte
+	count int
+}
+
+const (
+	mftRecordPresent = 1 << iota
+	mftRecordDir
+	mftRecordInUse
+)
+
+// mftTableRecord is the compact per-record form. It stays 40 bytes and carries
+// the name as an offset/length into mftTable.names.
+type mftTableRecord struct {
+	parentFRN uint64
+	size      int64
+	modUnix   int64
+	nameOff   uint32
+	attr      uint32
+	nameLen   uint16
+	flags     uint8
+	seq       uint16
+	parentSeq uint16
+}
+
+// newMFTTable returns a table with room for capacity record numbers. capacity
+// is a hint only; add grows the slice when a larger record number arrives.
+func newMFTTable(capacity uint64) *mftTable {
+	t := &mftTable{}
+	const maxInt = uint64(^uint(0) >> 1)
+	if capacity > 0 && capacity <= maxInt {
+		t.recs = make([]mftTableRecord, int(capacity))
+	}
+	return t
+}
+
+func (t *mftTable) grow(frn uint64) {
+	const maxInt = uint64(^uint(0) >> 1)
+	if frn >= maxInt {
+		return
+	}
+	size := len(t.recs)
+	if size == 0 {
+		size = 1024
+	}
+	for uint64(size) <= frn {
+		size *= 2
+	}
+	recs := make([]mftTableRecord, size)
+	copy(recs, t.recs)
+	t.recs = recs
+}
+
+// add stores entry, replacing any previous record with the same FRN.
+func (t *mftTable) add(entry mftEntry) {
+	if entry.frn >= uint64(len(t.recs)) {
+		t.grow(entry.frn)
+	}
+	if entry.frn >= uint64(len(t.recs)) {
+		return
+	}
+	rec := &t.recs[entry.frn]
+	nameLen := len(entry.name)
+	if nameLen > 255 {
+		nameLen = 255
+	}
+	flags := uint8(mftRecordPresent)
+	if entry.isDir {
+		flags |= mftRecordDir
+	}
+	if entry.inUse {
+		flags |= mftRecordInUse
+	}
+	nameOff := uint32(len(t.names))
+	t.names = append(t.names, entry.name[:nameLen]...)
+	if rec.flags&mftRecordPresent == 0 {
+		t.count++
+	}
+	*rec = mftTableRecord{
+		parentFRN: entry.parentFRN,
+		size:      entry.size,
+		modUnix:   entry.modUnix,
+		nameOff:   nameOff,
+		attr:      entry.attr,
+		nameLen:   uint16(nameLen),
+		flags:     flags,
+		seq:       entry.seq,
+		parentSeq: entry.parentSeq,
+	}
+}
+
+// addIfMissing stores entry only when its FRN has no record yet.
+func (t *mftTable) addIfMissing(entry mftEntry) bool {
+	if entry.frn < uint64(len(t.recs)) && t.recs[entry.frn].flags&mftRecordPresent != 0 {
+		return false
+	}
+	t.add(entry)
+	return true
+}
+
+func (t *mftTable) nameAt(rec *mftTableRecord) string {
+	if rec.nameLen == 0 {
+		return ""
+	}
+	end := uint64(rec.nameOff) + uint64(rec.nameLen)
+	if end > uint64(len(t.names)) {
+		return ""
+	}
+	return stringView(t.names[int(rec.nameOff):int(end)])
+}
+
+// get returns the entry for frn in its former mftEntry form.
+func (t *mftTable) get(frn uint64) (mftEntry, bool) {
+	if frn >= uint64(len(t.recs)) {
+		return mftEntry{}, false
+	}
+	rec := &t.recs[frn]
+	if rec.flags&mftRecordPresent == 0 {
+		return mftEntry{}, false
+	}
+	return mftEntry{
+		frn:       frn,
+		parentFRN: rec.parentFRN,
+		name:      t.nameAt(rec),
+		attr:      rec.attr,
+		size:      rec.size,
+		modUnix:   rec.modUnix,
+		isDir:     rec.flags&mftRecordDir != 0,
+		inUse:     rec.flags&mftRecordInUse != 0,
+		seq:       rec.seq,
+		parentSeq: rec.parentSeq,
+	}, true
+}
+
+func (t *mftTable) remove(frn uint64) bool {
+	if frn >= uint64(len(t.recs)) {
+		return false
+	}
+	rec := &t.recs[frn]
+	if rec.flags&mftRecordPresent == 0 {
+		return false
+	}
+	rec.flags &^= mftRecordPresent
+	t.count--
+	return true
+}
+
 // filetimeToUnixNano converts a Windows FILETIME (100ns ticks since 1601) to
 // unix nanoseconds. Returns 0 for a zero/!valid timestamp.
 func filetimeToUnixNano(ft uint64) int64 {
@@ -340,13 +492,13 @@ func directVolumeSource(volume string, exclusions []string) (directRecordSource,
 	}
 	if nodes, usnErr := enumUSN(handle, journal.NextUsn); usnErr == nil {
 		if added := mergeUSNNodesIntoMFT(entries, nodes); added > 0 {
-			serviceLog("direct volume=%s mft=%d usn-merged=%d", vol, len(entries), added)
+			serviceLog("direct volume=%s mft=%d usn-merged=%d", vol, entries.count, added)
 		}
 	} else {
 		serviceLog("direct volume=%s usn merge skipped err=%v", vol, usnErr)
 	}
 	if filtered := filterMFTExclusions(entries, vol, exclusions); filtered > 0 {
-		serviceLog("direct volume=%s excluded=%d remaining=%d", vol, filtered, len(entries))
+		serviceLog("direct volume=%s excluded=%d remaining=%d", vol, filtered, entries.count)
 	}
 	return newDirectMFTSource(entries), []string{vol + `\`}, journal.UsnJournalID, journal.NextUsn, nil
 }
@@ -358,14 +510,45 @@ const mftRootFRN = 5
 // this volume. Each exclusion is resolved to a directory FRN by descending the
 // parent links from the volume root, then the whole subtree under that FRN is
 // dropped from entries. It returns the number of entries removed.
-func filterMFTExclusions(entries map[uint64]mftEntry, vol string, exclusions []string) int {
-	if len(exclusions) == 0 || len(entries) == 0 {
+func filterMFTExclusions(entries *mftTable, vol string, exclusions []string) int {
+	if len(exclusions) == 0 || entries == nil || entries.count == 0 {
 		return 0
 	}
-	children := make(map[uint64][]uint64, len(entries)/2)
-	for frn, e := range entries {
-		if e.parentFRN != 0 && e.parentFRN != frn {
-			children[e.parentFRN] = append(children[e.parentFRN], frn)
+	maxFRN := len(entries.recs)
+	// Compact child lists (CSR) replace the former map[uint64][]uint64: counts
+	// and offsets are uint32 per record and the child ids are one uint32 each.
+	counts := make([]uint32, maxFRN)
+	for frn := 0; frn < maxFRN; frn++ {
+		rec := &entries.recs[frn]
+		if rec.flags&mftRecordPresent == 0 {
+			continue
+		}
+		parent := rec.parentFRN
+		if parent != 0 && parent != uint64(frn) && parent < uint64(maxFRN) {
+			counts[parent]++
+		}
+	}
+	offsets := make([]uint32, maxFRN+1)
+	var total uint32
+	for i := 0; i < maxFRN; i++ {
+		offsets[i] = total
+		total += counts[i]
+	}
+	offsets[maxFRN] = total
+	childIDs := make([]uint32, total)
+	cursor := counts
+	for i := range cursor {
+		cursor[i] = offsets[i]
+	}
+	for frn := 0; frn < maxFRN; frn++ {
+		rec := &entries.recs[frn]
+		if rec.flags&mftRecordPresent == 0 {
+			continue
+		}
+		parent := rec.parentFRN
+		if parent != 0 && parent != uint64(frn) && parent < uint64(maxFRN) {
+			childIDs[cursor[parent]] = uint32(frn)
+			cursor[parent]++
 		}
 	}
 	var roots []uint64
@@ -384,9 +567,15 @@ func filterMFTExclusions(entries map[uint64]mftEntry, vol string, exclusions []s
 		cur := uint64(mftRootFRN)
 		resolved := true
 		for _, component := range components {
+			if cur >= uint64(len(offsets)-1) {
+				resolved = false
+				break
+			}
 			var next uint64
-			for _, frn := range children[cur] {
-				if strings.EqualFold(entries[frn].name, component) {
+			for i := offsets[cur]; i < offsets[cur+1]; i++ {
+				frn := uint64(childIDs[i])
+				rec := &entries.recs[frn]
+				if strings.EqualFold(entries.nameAt(rec), component) {
 					next = frn
 					break
 				}
@@ -404,21 +593,27 @@ func filterMFTExclusions(entries map[uint64]mftEntry, vol string, exclusions []s
 	if len(roots) == 0 {
 		return 0
 	}
-	excluded := make(map[uint64]bool, len(roots))
+	excluded := make([]uint64, (maxFRN+63)/64)
 	queue := roots
 	for len(queue) > 0 {
 		frn := queue[0]
 		queue = queue[1:]
-		if excluded[frn] {
+		if frn >= uint64(maxFRN) {
 			continue
 		}
-		excluded[frn] = true
-		queue = append(queue, children[frn]...)
+		word, bit := frn/64, uint64(1)<<(frn%64)
+		if excluded[word]&bit != 0 {
+			continue
+		}
+		excluded[word] |= bit
+		for i := offsets[frn]; i < offsets[frn+1]; i++ {
+			queue = append(queue, uint64(childIDs[i]))
+		}
 	}
 	removed := 0
-	for frn := range excluded {
-		if _, ok := entries[frn]; ok {
-			delete(entries, frn)
+	for frn := 0; frn < maxFRN; frn++ {
+		word, bit := uint64(frn)/64, uint64(1)<<(uint64(frn)%64)
+		if excluded[word]&bit != 0 && entries.remove(uint64(frn)) {
 			removed++
 		}
 	}
@@ -428,13 +623,13 @@ func filterMFTExclusions(entries map[uint64]mftEntry, vol string, exclusions []s
 // enumMFT reads every in-use file/dir record from the volume's $MFT and returns
 // them keyed by FRN. It reads the MFT through the $DATA attribute of MFT record
 // 0 so a fragmented MFT is handled. modUnix and size are populated.
-func enumMFT(handle windows.Handle) (map[uint64]mftEntry, error) {
+func enumMFT(handle windows.Handle) (*mftTable, error) {
 	return enumMFTWithProgress(handle, nil)
 }
 
 // enumMFTWithProgress is enumMFT with a throttled progress callback. onRecord
 // receives the records processed and the total record count (0 when unknown).
-func enumMFTWithProgress(handle windows.Handle, onRecord func(done, total uint64)) (map[uint64]mftEntry, error) {
+func enumMFTWithProgress(handle windows.Handle, onRecord func(done, total uint64)) (*mftTable, error) {
 	vol, err := queryNTFSVolumeData(handle)
 	if err != nil {
 		return nil, err
@@ -453,7 +648,6 @@ func enumMFTWithProgress(handle windows.Handle, onRecord func(done, total uint64
 		return nil, err
 	}
 
-	nodes := make(map[uint64]mftEntry, 1<<20)
 	bytesPerCluster := int64(vol.BytesPerCluster)
 
 	// Read in chunks that are a whole number of MFT records AND a multiple of the
@@ -484,6 +678,7 @@ func enumMFTWithProgress(handle windows.Handle, onRecord func(done, total uint64
 		totalRecords = uint64(runBytes / int64(recSize))
 	}
 	progress := newMFTProgressTracker(totalRecords, onRecord)
+	nodes := newMFTTable(totalRecords)
 
 	var recordNumber uint64
 	var consumed int64
@@ -527,19 +722,18 @@ func enumMFTWithProgress(handle windows.Handle, onRecord func(done, total uint64
 		}
 	}
 	progress.finish(recordNumber)
-	if len(nodes) == 0 {
+	if nodes.count == 0 {
 		return nil, errors.New("MFT enumeration produced no records")
 	}
 	return nodes, nil
 }
 
-// parseMFTRecordInto parses a record and inserts it into nodes if valid. It
-// copies the record before fixup so the shared read buffer is not mutated.
-func parseMFTRecordInto(src []byte, recordNumber uint64, bytesPerSector int, nodes map[uint64]mftEntry) {
-	rec := make([]byte, len(src))
-	copy(rec, src)
-	if entry, ok := parseMFTRecord(rec, recordNumber, bytesPerSector); ok {
-		nodes[entry.frn] = entry
+// parseMFTRecordInto parses a record and inserts it into nodes if valid. The
+// record is parsed in place: the read buffer is overwritten by the next read,
+// and each record is parsed exactly once.
+func parseMFTRecordInto(src []byte, recordNumber uint64, bytesPerSector int, nodes *mftTable) {
+	if entry, ok := parseMFTRecord(src, recordNumber, bytesPerSector); ok {
+		nodes.add(entry)
 	}
 }
 

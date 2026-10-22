@@ -540,7 +540,30 @@ func writeIndexFile(f *os.File, idx *Index) error {
 	nameLens := make([]uint16, 0, recordCount)
 	nameTokens := make([]string, 0, recordCount)
 	nameIDForRecord := make([]uint32, recordCount)
-	if recs := idx.MMapRecords; recs != nil && len(recs.tokenTable) > 0 {
+	if idx.nameArena && len(idx.NameBlob) > 0 {
+		// The MFT build already holds every name once in NameBlob, and each
+		// record carries its byte offset there. Publish those offsets as the
+		// token table directly: no dedup map, no second copy of the names.
+		nameBlob = idx.NameBlob
+		nameOffs = make([]uint32, recordCount)
+		nameLens = make([]uint16, recordCount)
+		nameTokens = make([]string, recordCount)
+		for i := 0; i < recordCount; i++ {
+			rec := idx.compactRecord(i)
+			end := uint64(rec.NameOff) + uint64(rec.NameLen)
+			if end > uint64(len(nameBlob)) {
+				return errors.New("compact name arena reference out of range")
+			}
+			nameOffs[i] = rec.NameOff
+			nameLens[i] = rec.NameLen
+			nameIDForRecord[i] = uint32(i)
+			if rec.Name != "" {
+				nameTokens[i] = rec.Name
+			} else if rec.NameLen > 0 {
+				nameTokens[i] = stringView(nameBlob[int(rec.NameOff):int(end)])
+			}
+		}
+	} else if recs := idx.MMapRecords; recs != nil && len(recs.tokenTable) > 0 {
 		// The source is already tokenized: every record references a stable name
 		// token, so dedup by token id (O(1), no string hashing) and compact away
 		// tokens that no longer appear.  Hashing every name string dominated the
@@ -1396,8 +1419,13 @@ func encodeLowerSection(nameTokens []string) []byte {
 	offs := make([]uint32, len(nameTokens))
 	lens := make([]uint16, len(nameTokens))
 	blob := make([]byte, 0, len(nameTokens)*8)
-	refs := make(map[string]uint32, max(1, len(nameTokens)/2))
-	lengths := make(map[string]uint16, max(1, len(nameTokens)/2))
+	type lowerRef struct {
+		off uint32
+		len uint16
+	}
+	// Presizing this to len(nameTokens)/2 used to allocate a large bucket array
+	// even for an all-lowercase corpus, where no distinct lower name is stored.
+	var refs map[string]lowerRef
 	for i, name := range nameTokens {
 		lower := strings.ToLower(name)
 		if len(lower) > int(^uint16(0)) {
@@ -1408,14 +1436,16 @@ func encodeLowerSection(nameTokens []string) []byte {
 			offs[i] = packedLowerSameAsName
 			continue
 		}
-		if off, ok := refs[lower]; ok {
-			offs[i] = off
-			lens[i] = lengths[lower]
+		if ref, ok := refs[lower]; ok {
+			offs[i] = ref.off
+			lens[i] = ref.len
 			continue
 		}
 		off := uint32(len(blob))
-		refs[lower] = off
-		lengths[lower] = uint16(len(lower))
+		if refs == nil {
+			refs = make(map[string]lowerRef)
+		}
+		refs[lower] = lowerRef{off: off, len: uint16(len(lower))}
 		offs[i] = off
 		blob = append(blob, lower...)
 	}
