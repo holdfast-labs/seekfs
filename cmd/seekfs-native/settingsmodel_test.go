@@ -304,3 +304,54 @@ func TestSettingsSizeFormatting(t *testing.T) {
 
 func boolPtr(v bool) *bool    { return &v }
 func strPtr(v string) *string { return &v }
+
+func TestSettingsDraftKeepsVolumeError(t *testing.T) {
+	var resp serviceResponse
+	body := `{"ok":true,"settings":{"volumes":[{"volume":"D:","indexed":false,"state":"error","error":"Access is denied."}]}}`
+	if err := json.Unmarshal([]byte(body), &resp); err != nil {
+		t.Fatal(err)
+	}
+	m := newSettingsModel(*resp.Settings)
+	if len(m.draft.Volumes) != 1 || m.draft.Volumes[0].State != "error" || m.draft.Volumes[0].Error != "Access is denied." {
+		t.Fatalf("draft volumes = %+v", m.draft.Volumes)
+	}
+	m.setDriveIndexed("D:", true)
+	patch, err := json.Marshal(m.patch())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(patch), "error") {
+		t.Fatalf("patch carries the read-only error field: %s", patch)
+	}
+}
+
+func TestSettingsOfferServiceInstallOnFirstRun(t *testing.T) {
+	decode := func(body string) *settingsModel {
+		t.Helper()
+		var resp serviceResponse
+		if err := json.Unmarshal([]byte(body), &resp); err != nil {
+			t.Fatal(err)
+		}
+		return newSettingsModel(*resp.Settings)
+	}
+	first := decode(`{"ok":true,"settings":{"service_mode":"standalone","volumes":[{"volume":"C:","indexed":false}]}}`)
+	if first.serviceInstalled() || !first.offerServiceInstallByDefault() {
+		t.Fatal("first run without the installed service must pre-check the install")
+	}
+	indexed := decode(`{"ok":true,"settings":{"service_mode":"standalone","volumes":[{"volume":"C:","indexed":true}]}}`)
+	if indexed.offerServiceInstallByDefault() {
+		t.Fatal("install pre-checked although a drive is already indexed")
+	}
+	installed := decode(`{"ok":true,"settings":{"service_mode":"windows-service","volumes":[{"volume":"C:","indexed":false}]}}`)
+	if !installed.serviceInstalled() || installed.offerServiceInstallByDefault() {
+		t.Fatal("installed service must not offer the install")
+	}
+	installed.setDriveIndexed("C:", true)
+	patch, err := json.Marshal(installed.patch())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(patch), "service_mode") {
+		t.Fatalf("patch carries the read-only service_mode: %s", patch)
+	}
+}

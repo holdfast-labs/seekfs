@@ -75,7 +75,12 @@ type settingsPanelState struct {
 	undoBtn   widget.Clickable
 	tabBtns   [3]widget.Clickable
 
-	driveBools   []widget.Bool
+	driveBools  []widget.Bool
+	installBool widget.Bool
+	// installService stages "install the seekfs Windows service" for Apply.
+	installService bool
+	// installing marks an Apply that included the service install.
+	installing   bool
 	driveChips   []widget.Clickable
 	overrideBool widget.Bool
 	enabledBool  widget.Bool
@@ -183,8 +188,10 @@ func (u *UI) consumeSettingsPending() {
 	}
 	p := u.gsettings
 	wasSaving := p.saving
+	installing := p.installing
 	p.load = false
 	p.saving = false
+	p.installing = false
 	if pend.err != nil {
 		p.err = pend.err.Error()
 		return
@@ -195,6 +202,7 @@ func (u *UI) consumeSettingsPending() {
 			p.drive = ""
 		}
 		p.budgetCustom = p.model.contentValues(p.drive).BudgetBytes > 0
+		p.installService = p.model.offerServiceInstallByDefault()
 		p.syncEditors()
 	}
 	if !pend.resp.OK {
@@ -207,6 +215,9 @@ func (u *UI) consumeSettingsPending() {
 	p.err = ""
 	if wasSaving {
 		p.notice = indexingNotice(pend.resp.Settings)
+		if installing && p.model != nil && p.model.serviceInstalled() {
+			p.notice = "Installed the seekfs service. " + p.notice
+		}
 		if strings.HasPrefix(p.notice, "Settings saved. Indexing") {
 			u.mu.Lock()
 			u.flashMsg = p.notice
@@ -313,24 +324,37 @@ func (u *UI) applySettings() {
 	}
 	patch := p.model.patch()
 	u.applyLocalPrefs(p.prefs)
-	if patch == nil {
+	install := p.installService && !p.model.serviceInstalled()
+	if patch == nil && !install {
 		p.notice = "No changes to apply"
 		return
 	}
 	p.saving = true
+	p.installing = install
 	p.notice = ""
 	canWrite := p.model.canWrite
-	go u.applySettingsAsync(patch, canWrite)
+	go u.applySettingsAsync(patch, canWrite, install)
 }
 
-func (u *UI) applySettingsAsync(patch *serviceSettings, canWrite bool) {
+func (u *UI) applySettingsAsync(patch *serviceSettings, canWrite, installService bool) {
+	if installService {
+		// Installing the service needs the elevated helper; it applies the
+		// staged changes after the service is up.
+		if err := runElevatedSettings(patch, u.client.PipeName, true); err != nil {
+			u.postSettings(serviceResponse{}, err)
+			return
+		}
+		refreshed, gerr := u.client.SettingsGet()
+		u.postSettings(refreshed, gerr)
+		return
+	}
 	resp, err := u.client.SettingsSet(*patch)
 	if err == nil && resp.OK {
 		u.postSettings(resp, nil)
 		return
 	}
 	if err == nil && elevationDecision(canWrite, &resp) {
-		if eerr := runElevatedSettings(patch); eerr != nil {
+		if eerr := runElevatedSettings(patch, u.client.PipeName, false); eerr != nil {
 			u.postSettings(serviceResponse{}, eerr)
 			return
 		}
@@ -608,6 +632,9 @@ func (u *UI) layoutSettingsDrives(gtx layout.Context, p *settingsPanelState) lay
 		return u.settingsHeading(gtx, "Drives",
 			"Choose the volumes the service indexes. New drives start indexing after Apply.")
 	})
+	p.block(gtx, "drives-service", func(gtx layout.Context) layout.Dimensions {
+		return u.layoutServiceInstall(gtx, p)
+	})
 	if p.fieldErr["drives"] != "" {
 		p.block(gtx, "drives-error", func(gtx layout.Context) layout.Dimensions {
 			return u.fieldError(gtx, p, "drives")
@@ -633,6 +660,32 @@ func (u *UI) layoutSettingsDrives(gtx layout.Context, p *settingsPanelState) lay
 		})
 	}
 	return layout.Dimensions{Size: image.Pt(gtx.Constraints.Max.X, p.cursor)}
+}
+
+// layoutServiceInstall shows whether the installed Windows service runs, or
+// offers to install it. Without it the app's own service stops with the app
+// session and cannot keep drives current after a restart.
+func (u *UI) layoutServiceInstall(gtx layout.Context, p *settingsPanelState) layout.Dimensions {
+	s := u.scheme
+	if p.model.serviceInstalled() {
+		return label(u.th, Sp(12), "seekfs runs as a Windows service: it starts with Windows and keeps indexed drives up to date.", s.Muted).Layout(gtx)
+	}
+	p.installBool.Value = p.installService
+	if p.installBool.Update(gtx) {
+		p.installService = p.installBool.Value
+	}
+	return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
+		layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+			return material.CheckBox(u.th, &p.installBool, "Install the seekfs service (recommended)").Layout(gtx)
+		}),
+		layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+			return layout.Inset{Left: Dp(32)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+				l := label(u.th, Sp(11), "Starts with Windows and keeps indexed drives up to date. Apply asks for administrator approval once.", s.Muted)
+				l.MaxLines = 2
+				return l.Layout(gtx)
+			})
+		}),
+	)
 }
 
 func (u *UI) layoutDriveRow(gtx layout.Context, p *settingsPanelState, v volumeDraft, clk *widget.Bool) layout.Dimensions {
@@ -684,6 +737,18 @@ func (u *UI) layoutDriveRow(gtx layout.Context, p *settingsPanelState, v volumeD
 							}
 							return layout.Inset{Top: Dp(2)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
 								return label(u.th, Sp(11), free, s.Muted).Layout(gtx)
+							})
+						}),
+						layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+							// The service's build failure reason; without it
+							// the row only says "Error".
+							if state != "error" || v.Error == "" {
+								return layout.Dimensions{}
+							}
+							return layout.Inset{Top: Dp(2)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+								l := label(u.th, Sp(11), v.Error, s.Error)
+								l.MaxLines = 3
+								return l.Layout(gtx)
 							})
 						}),
 					)

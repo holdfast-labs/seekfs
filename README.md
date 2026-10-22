@@ -48,6 +48,10 @@ results, not screen recordings or speed benchmarks. [Video sources and exports](
    .\seekfs.exe index-volumes -volume C: -launch
    ```
 
+   Or skip this step: open `seekfs-native.exe`, tick drives in Settings >
+   Drives, keep "Install the seekfs service" checked, and click Apply (one UAC
+   prompt installs the service and starts indexing).
+
 3. Open `seekfs-native.exe` (the desktop app), or query from the terminal:
 
    ```powershell
@@ -104,9 +108,13 @@ The gear button (or `Ctrl+,`) opens Settings. It has three sections:
 
 Apply sends only changed fields over the service pipe. If the service refuses
 the write as non-elevated, the app runs `seekfs.exe settings set --json
-<file>` with a UAC prompt and then reloads the settings. Validation errors
-appear next to the named field. A drive that starts indexing shows a
-non-blocking notice while it builds.
+<file>` with a UAC prompt and then reloads the settings. Drives also offers
+"Install the seekfs service" when no installed service runs (checked on first
+run); Apply then installs and starts it through the same prompt. If you leave
+it unchecked, adding a drive restarts the app's own service as administrator
+for the session, since reading a drive needs it. Validation errors appear next to the named field, and a drive whose
+build failed shows the reason under its name. A drive that starts indexing
+shows a non-blocking notice while it builds.
 
 ## Search your way
 

@@ -11,6 +11,7 @@ seekfs-windows-amd64.zip
 Contents:
 
 - `seekfs.exe`
+- `seekfs-native.exe`
 - `seekfs-ui.exe`
 - `README.md`
 - `LICENSE`
@@ -37,12 +38,12 @@ from the previous release. The tag is passed through verbatim, so
 
 ## Current Release
 
-Current release: `v1.12.0`.
+Current release: `v1.12.1`.
 
 Release notes:
 
 ```text
-docs/RELEASE_NOTES_1.12.0.md
+docs/RELEASE_NOTES_1.12.1.md
 ```
 
 ## Signing

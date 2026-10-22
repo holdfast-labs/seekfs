@@ -67,3 +67,17 @@ func TestStartNativeServiceUsesHook(t *testing.T) {
 		t.Fatalf("spawned %q, want sibling seekfs.exe", got.Executable)
 	}
 }
+
+func TestElevatedSettingsArgsPassPipe(t *testing.T) {
+	got := elevatedSettingsArgs(`C:\Temp\p.json`, `C:\Temp\p.json.result`, `\\.\pipe\seekfs-alt`, false)
+	want := `settings set --json C:\Temp\p.json --result C:\Temp\p.json.result --pipe \\.\pipe\seekfs-alt`
+	if got != want {
+		t.Fatalf("args = %q, want %q", got, want)
+	}
+	if got := elevatedSettingsArgs(`C:\a b\p.json`, `r`, "", false); got != `settings set --json "C:\a b\p.json" --result r` {
+		t.Fatalf("args without pipe = %q", got)
+	}
+	if got := elevatedSettingsArgs(`p`, `r`, `\\.\pipe\x`, true); got != `settings set --json p --result r --pipe \\.\pipe\x --install-service` {
+		t.Fatalf("install args = %q", got)
+	}
+}
