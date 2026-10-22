@@ -724,3 +724,50 @@ build's footprint instead of scheduler-dependent peak-transient).
   reported `overlay_aware_count` at 17.742 ms/op and
   `search_merge_fallback` at 304.145 ms/op on a 200k-base-record fixture with
   10k overlay creates and 10k tombstones.
+
+## Name-Index Build Memory (MFT/USN)
+
+2026-10-22, branch `ux/build-memory`. Synthetic MFT records (8-40 char names,
+about 8% directories, depth about 8) fed through the same parse/accumulate
+code that `enumMFT` uses, then `buildRecordsFromMFT`, `buildOrders`, and
+`stageIndexFile` into a temp file. Run on an unelevated shell with no raw
+volume access:
+
+```powershell
+$env:SEEKFS_MFT_BENCH_N='1000000'
+go test ./cmd/seekfs -tags uiautomation -run '^$' -bench '^BenchmarkMFTBuildMemory$' -benchtime=1x -v
+```
+
+Bytes per record at each stage (peak HeapInuse). The before column was
+measured at 200,000 records before the change; the after column at 1,000,000
+records. Both shapes scale linearly, so the per-record values compare:
+
+| Stage | Before B/record | After B/record | Change |
+| --- | ---: | ---: | ---: |
+| MFT accumulate (`parseMFTRecordInto`) | 303.9 | 120.7 | -60% |
+| `buildRecordsFromMFT` | 260.9 | 147.2 | -44% |
+| `buildOrders` | 132.4 | 115.2 | -13% |
+| `stageIndexFile` | 646.7 | 447.7 | -31% |
+| Build peak (stage max) | 646.7 | 447.7 | -31% |
+
+Retained heap after the build returns and `runtime.GC()` runs:
+1.3 MB before and after, a 0.0 MB delta from baseline. The former
+`map[uint64]mftEntry` is replaced by a 40-byte record slice indexed by MFT
+record number plus one name byte arena. Names are not copied again for the
+Index: `CompactRecord.Name` views `Index.NameBlob`, and `writeIndexFile`
+publishes that arena as the token table directly.
+
+What still dominates: `stageIndexFile` and its path-rank derived section.
+`buildCompactPathOrderRank` materialises a full lowercase path string for
+every record (about 150-200 MB at 1M records), so the whole-build peak stays
+above the 40% target even though accumulation and record construction now
+clear it. Reducing that needs an arena or trie path key, which this change
+does not attempt.
+
+Service path: a settings-driven build now releases the built `Index` as soon
+as `buildIndexUSNVolume` returns. `runSettingsVolumeBuild` defers a single
+`debug.FreeOSMemory()` and logs
+`index-usn memory volume=... heap_inuse_mb=... released_mb=...`.
+`TestSettingsBuildReleasesBuiltIndex` proves the stub Index is finalizable
+after the build, the installed volume is the reloaded mmap index, and
+HeapInuse returns within a generous baseline bound.

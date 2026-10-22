@@ -286,12 +286,12 @@ func indexUSNVolume(volume string, progress *volumeBuildProgress) (*Index, error
 	onMFTProgress := func(done, total uint64) {
 		progress.setCounts(done, total)
 	}
-	if entries, err := enumMFTWithProgress(handle, onMFTProgress); err == nil && len(entries) > 0 {
-		serviceLog("enum-mft complete volume=%s entries=%d", vol, len(entries))
+	if entries, err := enumMFTWithProgress(handle, onMFTProgress); err == nil && entries.count > 0 {
+		serviceLog("enum-mft complete volume=%s entries=%d", vol, entries.count)
 		progress.setPhase("building")
 		if nodes, usnErr := enumUSN(handle, journal.NextUsn); usnErr == nil {
 			if added := mergeUSNNodesIntoMFT(entries, nodes); added > 0 {
-				serviceLog("enum-usn merge complete volume=%s added=%d total=%d", vol, added, len(entries))
+				serviceLog("enum-usn merge complete volume=%s added=%d total=%d", vol, added, entries.count)
 			}
 		} else {
 			serviceLog("enum-usn merge skipped volume=%s err=%v", vol, usnErr)
@@ -340,8 +340,8 @@ func indexUSNVolume(volume string, progress *volumeBuildProgress) (*Index, error
 	return idx, nil
 }
 
-func mergeUSNNodesIntoMFT(entries map[uint64]mftEntry, nodes map[uint64]usnNode) int {
-	if len(entries) == 0 || len(nodes) == 0 {
+func mergeUSNNodesIntoMFT(entries *mftTable, nodes map[uint64]usnNode) int {
+	if entries == nil || entries.count == 0 || len(nodes) == 0 {
 		return 0
 	}
 	added := 0
@@ -349,10 +349,7 @@ func mergeUSNNodesIntoMFT(entries map[uint64]mftEntry, nodes map[uint64]usnNode)
 		if frn == 0 || node.name == "" {
 			continue
 		}
-		if _, ok := entries[frn]; ok {
-			continue
-		}
-		entries[frn] = mftEntry{
+		if entries.addIfMissing(mftEntry{
 			frn:       frn,
 			parentFRN: node.parentFRN,
 			name:      node.name,
@@ -361,42 +358,55 @@ func mergeUSNNodesIntoMFT(entries map[uint64]mftEntry, nodes map[uint64]usnNode)
 			inUse:     true,
 			seq:       node.seq,
 			parentSeq: node.parentSeq,
+		}) {
+			added++
 		}
-		added++
 	}
 	return added
 }
 
 // buildRecordsFromMFT converts MFT entries into compact records with stable
-// parent indexes, populating size and modification time.
-func buildRecordsFromMFT(idx *Index, entries map[uint64]mftEntry) {
+// parent indexes, populating size and modification time. Records are already
+// ordered by FRN because mftTable is indexed by record number, so the parent
+// index comes from a binary search instead of a second map.
+func buildRecordsFromMFT(idx *Index, entries *mftTable) {
 	idx.CompactAttrs = true
-	frns := make([]uint64, 0, len(entries))
-	for frn := range entries {
-		frns = append(frns, frn)
+	if entries == nil {
+		idx.Records = nil
+		return
 	}
-	sort.Slice(frns, func(i, j int) bool { return frns[i] < frns[j] })
-	frnToIndex := make(map[uint64]int, len(frns))
-	for i, frn := range frns {
-		frnToIndex[frn] = i
-	}
-	idx.Records = make([]CompactRecord, 0, len(frns))
-	for _, frn := range frns {
-		e := entries[frn]
-		parent := int32(-1)
-		if p, ok := frnToIndex[e.parentFRN]; ok && p != frnToIndex[frn] {
-			parent = int32(p)
+	idx.NameBlob = entries.names
+	idx.nameArena = true
+	idx.Records = make([]CompactRecord, 0, entries.count)
+	for frn := 0; frn < len(entries.recs); frn++ {
+		e := &entries.recs[frn]
+		if e.flags&mftRecordPresent == 0 {
+			continue
 		}
 		idx.Records = append(idx.Records, CompactRecord{
-			FRN:       frn,
+			FRN:       uint64(frn),
 			ParentFRN: e.parentFRN,
-			Parent:    parent,
-			Name:      e.name,
+			Parent:    -1,
+			Name:      entries.nameAt(e),
+			NameOff:   e.nameOff,
+			NameLen:   uint16(e.nameLen),
 			Mode:      modeFromAttrs(e.attr),
 			Size:      e.size,
 			ModUnix:   e.modUnix,
 			Seq:       e.seq,
 		})
+	}
+	for i := range idx.Records {
+		rec := &idx.Records[i]
+		if rec.ParentFRN == 0 {
+			continue
+		}
+		j := sort.Search(len(idx.Records), func(k int) bool {
+			return idx.Records[k].FRN >= rec.ParentFRN
+		})
+		if j < len(idx.Records) && idx.Records[j].FRN == rec.ParentFRN && j != i {
+			rec.Parent = int32(j)
+		}
 	}
 }
 

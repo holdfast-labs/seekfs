@@ -25,12 +25,28 @@ type synthOpts struct {
 	attrs       uint32
 	nonResident bool
 	namedData   bool // a named $DATA stream that must NOT count as file size
+	// altName/altNamespace add a second $FILE_NAME attribute, modelling a hard
+	// link or the DOS 8.3 alias that shares one MFT record.
+	altName      string
+	altNamespace byte
 }
 
 func synthMFTRecord(o synthOpts) []byte {
 	const recSize = 1024
-	const bps = 512
 	rec := make([]byte, recSize)
+	fillSynthMFTRecord(rec, o)
+	return rec
+}
+
+// fillSynthMFTRecord writes a synthetic MFT record into rec, which must be at
+// least 1024 bytes. It lets benchmarks reuse one buffer instead of allocating a
+// kilobyte per generated record.
+func fillSynthMFTRecord(rec []byte, o synthOpts) {
+	const recSize = 1024
+	const bps = 512
+	for i := range rec {
+		rec[i] = 0
+	}
 	binary.LittleEndian.PutUint32(rec[0:4], mftRecordMagic)
 	// Update sequence array at offset 48, count = 1 + (recSize/bps) = 3.
 	usaOff := 48
@@ -113,6 +129,21 @@ func synthMFTRecord(o synthOpts) []byte {
 	}
 	writeAttrHeader(attrFileName, len(fn), fn)
 
+	if o.altName != "" {
+		altU16 := windows.StringToUTF16(o.altName)
+		if len(altU16) > 0 && altU16[len(altU16)-1] == 0 {
+			altU16 = altU16[:len(altU16)-1]
+		}
+		alt := make([]byte, 66+len(altU16)*2)
+		binary.LittleEndian.PutUint64(alt[0:8], o.parentFRN)
+		alt[64] = byte(len(altU16))
+		alt[65] = o.altNamespace
+		for i, u := range altU16 {
+			binary.LittleEndian.PutUint16(alt[66+i*2:66+i*2+2], u)
+		}
+		writeAttrHeader(attrFileName, len(alt), alt)
+	}
+
 	// $DATA
 	if !o.isDir {
 		if o.nonResident {
@@ -150,7 +181,17 @@ func synthMFTRecord(o synthOpts) []byte {
 
 	// End marker
 	binary.LittleEndian.PutUint32(rec[pos:pos+4], attrEnd)
-	return rec
+}
+
+// mftTableFromEntries builds the compact MFT table from a map, for tests that
+// used to pass map[uint64]mftEntry directly.
+func mftTableFromEntries(entries map[uint64]mftEntry) *mftTable {
+	t := newMFTTable(0)
+	for frn, e := range entries {
+		e.frn = frn
+		t.add(e)
+	}
+	return t
 }
 
 func TestParseMFTRecordFile(t *testing.T) {

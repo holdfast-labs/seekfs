@@ -555,6 +555,11 @@ func (s *goSearchService) runSettingsVolumeBuild(task *settingsVolumeTask) {
 	default:
 	}
 
+	// Whether the build succeeds or fails, the in-memory Index and its MFT
+	// tables are unreachable once it returns. Drop them and give the pages back
+	// to the OS so a 2 GB build peak does not stay resident in lowmem mode.
+	defer releaseBuildMemoryAfterSettings(task.volume)
+
 	idx, err := s.buildIndexUSNVolume(task.volume, task.db, task.progress)
 
 	s.settingsVolumeMu.Lock()

@@ -361,10 +361,10 @@ func TestDirectBuilderRejectsDuplicateFRNAndCleansOwnedScratch(t *testing.T) {
 }
 
 func TestDirectMFTAndUSNAdaptersAreElevationFree(t *testing.T) {
-	mft := newDirectMFTSource(map[uint64]mftEntry{
+	mft := newDirectMFTSource(mftTableFromEntries(map[uint64]mftEntry{
 		20: {frn: 20, parentFRN: 10, name: "child.bin", size: 7},
 		10: {frn: 10, name: "root", attr: fileAttributeDir, isDir: true},
-	})
+	}))
 	first, err := mft.Next(context.Background())
 	if err != nil || first.FRN != 10 || first.Name != "root" {
 		t.Fatalf("MFT adapter first=%+v err=%v", first, err)
@@ -376,10 +376,10 @@ func TestDirectMFTAndUSNAdaptersAreElevationFree(t *testing.T) {
 }
 
 func TestDirectMFTSourceNormalizesRootSelfParent(t *testing.T) {
-	mft := newDirectMFTSource(map[uint64]mftEntry{
+	mft := newDirectMFTSource(mftTableFromEntries(map[uint64]mftEntry{
 		5:  {frn: 5, parentFRN: 5, name: "root", attr: fileAttributeDir, isDir: true},
 		10: {frn: 10, parentFRN: 5, name: "child.bin", size: 3},
-	})
+	}))
 	root, err := mft.Next(context.Background())
 	if err != nil || root.FRN != 5 || root.ParentFRN != 0 {
 		t.Fatalf("MFT root self-parent not normalized: root=%+v err=%v", root, err)
@@ -406,7 +406,7 @@ func TestDirectMFTSourcePersistsSequenceNumbers(t *testing.T) {
 		Volume:     "X:",
 		Source:     "usn",
 		BuiltAt:    time.Unix(123, 0),
-		Records:    newDirectMFTSource(entries),
+		Records:    newDirectMFTSource(mftTableFromEntries(entries)),
 		RunRecords: 1,
 		RunBytes:   4096,
 	}); err != nil {
@@ -789,7 +789,7 @@ func TestDirectCanonicalDerivedParity(t *testing.T) {
 		Compact:      true,
 		CompactAttrs: true,
 	}
-	buildRecordsFromMFT(normal, entries)
+	buildRecordsFromMFT(normal, mftTableFromEntries(entries))
 	if err := saveIndex(normalPath, normal); err != nil {
 		t.Fatalf("saveIndex: %v", err)
 	}

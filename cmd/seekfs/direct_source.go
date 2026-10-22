@@ -229,18 +229,12 @@ type directSyntheticSource struct {
 }
 
 type directMFTSource struct {
-	entries map[uint64]mftEntry
-	frns    []uint64
+	entries *mftTable
 	pos     int
 }
 
-func newDirectMFTSource(entries map[uint64]mftEntry) directRecordSource {
-	frns := make([]uint64, 0, len(entries))
-	for frn := range entries {
-		frns = append(frns, frn)
-	}
-	sort.Slice(frns, func(i, j int) bool { return frns[i] < frns[j] })
-	return &directMFTSource{entries: entries, frns: frns}
+func newDirectMFTSource(entries *mftTable) directRecordSource {
+	return &directMFTSource{entries: entries}
 }
 
 func (s *directMFTSource) Next(ctx context.Context) (directRecord, error) {
@@ -249,24 +243,43 @@ func (s *directMFTSource) Next(ctx context.Context) (directRecord, error) {
 		return directRecord{}, ctx.Err()
 	default:
 	}
-	if s.pos >= len(s.frns) {
+	if s.entries == nil {
 		return directRecord{}, io.EOF
 	}
-	e := s.entries[s.frns[s.pos]]
-	s.pos++
-	parentFRN := e.parentFRN
-	if parentFRN == e.frn {
-		parentFRN = 0
+	for s.pos < len(s.entries.recs) {
+		frn := uint64(s.pos)
+		s.pos++
+		rec := &s.entries.recs[frn]
+		if rec.flags&mftRecordPresent == 0 {
+			continue
+		}
+		e := mftEntry{
+			frn:       frn,
+			parentFRN: rec.parentFRN,
+			name:      s.entries.nameAt(rec),
+			attr:      rec.attr,
+			size:      rec.size,
+			modUnix:   rec.modUnix,
+			isDir:     rec.flags&mftRecordDir != 0,
+			inUse:     rec.flags&mftRecordInUse != 0,
+			seq:       rec.seq,
+			parentSeq: rec.parentSeq,
+		}
+		parentFRN := e.parentFRN
+		if parentFRN == e.frn {
+			parentFRN = 0
+		}
+		return directRecord{
+			FRN:       e.frn,
+			ParentFRN: parentFRN,
+			Mode:      modeFromAttrs(e.attr),
+			Size:      e.size,
+			ModUnix:   e.modUnix,
+			Name:      e.name,
+			Seq:       e.seq,
+		}, nil
 	}
-	return directRecord{
-		FRN:       e.frn,
-		ParentFRN: parentFRN,
-		Mode:      modeFromAttrs(e.attr),
-		Size:      e.size,
-		ModUnix:   e.modUnix,
-		Name:      e.name,
-		Seq:       e.seq,
-	}, nil
+	return directRecord{}, io.EOF
 }
 
 type directUSNSource struct {
