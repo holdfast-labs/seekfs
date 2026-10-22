@@ -37,11 +37,18 @@ type automationRequest struct {
 }
 
 type automationDrive struct {
-	Volume  string `json:"volume"`
-	Indexed bool   `json:"indexed"`
-	State   string `json:"state"`
-	Entries int64  `json:"entries"`
-	Error   string `json:"error"`
+	Volume   string              `json:"volume"`
+	Indexed  bool                `json:"indexed"`
+	State    string              `json:"state"`
+	Entries  int64               `json:"entries"`
+	Error    string              `json:"error"`
+	Progress *automationProgress `json:"progress,omitempty"`
+}
+
+type automationProgress struct {
+	Phase string `json:"phase"`
+	Done  int64  `json:"done"`
+	Total int64  `json:"total"`
 }
 
 type automationState struct {
@@ -62,6 +69,7 @@ type automationState struct {
 	HealthMsg           string            `json:"health_msg"`
 	Entries             int               `json:"entries"`
 	NoVolumes           bool              `json:"no_volumes"`
+	SettingsApplyStep   string            `json:"settings_apply_step"`
 }
 
 type automationStats struct {
@@ -340,6 +348,7 @@ func (s uiAutomationSink) AutomationState() automationState {
 	st.HealthMsg = u.healthMsg
 	st.Entries = u.entries
 	st.NoVolumes = u.noVolumes
+	st.SettingsApplyStep = u.applyStep
 	u.mu.Unlock()
 	st.SettingsOpen = u.settingsOpen
 	if p := u.gsettings; p != nil {
@@ -351,10 +360,14 @@ func (s uiAutomationSink) AutomationState() automationState {
 			st.SettingsServiceMode = p.model.serviceMode
 			st.SettingsContentMode = p.model.contentValues("").Mode
 			for _, v := range p.model.draft.Volumes {
-				st.Drives = append(st.Drives, automationDrive{
+				d := automationDrive{
 					Volume: v.Volume, Indexed: v.Indexed, State: v.State,
 					Entries: v.Entries, Error: v.Error,
-				})
+				}
+				if v.Progress != nil {
+					d.Progress = &automationProgress{Phase: v.Progress.Phase, Done: v.Progress.Done, Total: v.Progress.Total}
+				}
+				st.Drives = append(st.Drives, d)
 			}
 		}
 	}

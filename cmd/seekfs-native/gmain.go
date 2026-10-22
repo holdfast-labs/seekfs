@@ -149,6 +149,9 @@ func runUI(pipe string, limit int) error {
 
 	// Theme poll: re-render when the OS theme or accent changes.
 	go u.themePoll(w)
+	// Background indexing poll: cheap frames for the progress bar and a
+	// settings-get every 500 ms while any drive is indexing.
+	go u.indexProgressPoll(w)
 
 	var ops op.Ops
 	for {
@@ -212,6 +215,32 @@ func (u *UI) themePoll(w *app.Window) {
 	}
 }
 
+// indexProgressPoll renders the progress animation at at most 10 Hz and polls
+// settings-get every 500 ms while a drive is indexing. It stops polling (but
+// keeps the cheap ticker) when no build is active.
+func (u *UI) indexProgressPoll(w *app.Window) {
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	lastPoll := time.Time{}
+	for range ticker.C {
+		u.mu.Lock()
+		active := u.settingsIndexing
+		u.mu.Unlock()
+		if !active {
+			continue
+		}
+		w.Invalidate()
+		if time.Since(lastPoll) < 500*time.Millisecond {
+			continue
+		}
+		lastPoll = time.Now()
+		resp, err := u.client.SettingsGet()
+		if err == nil && resp.OK && resp.Settings != nil {
+			u.postSettingsMerge(resp)
+		}
+	}
+}
+
 // initialInfo runs the service handshake off the UI thread.
 func (u *UI) initialInfo() {
 	resp, err := u.ensureService()
@@ -229,6 +258,8 @@ func (u *UI) initialInfo() {
 		}
 		u.healthMsg = resp.HealthMessage
 		u.entries = resp.Entries
+	} else if u.noVolumes {
+		u.health, u.healthMsg = serviceHealthEmpty, "No drives indexed yet"
 	} else {
 		u.health, u.healthMsg = serviceHealthError, firstNonEmpty(resp.Message, "service has no search indexes loaded")
 	}
@@ -236,6 +267,7 @@ func (u *UI) initialInfo() {
 	u.mu.Unlock()
 	u.rebuildSideRows(vols)
 	u.invalidate()
+	go u.seedSettingsSnapshot()
 }
 
 // deliver handles a Searcher result on the searcher goroutine: store under

@@ -92,6 +92,9 @@ const (
 	serviceHealthOK       = "ok"
 	serviceHealthDegraded = "degraded"
 	serviceHealthError    = "error"
+	// serviceHealthEmpty is the normal first-run state: the service answers
+	// but has no volumes indexed yet.
+	serviceHealthEmpty = "empty"
 )
 
 // Content index states reported by the service.
