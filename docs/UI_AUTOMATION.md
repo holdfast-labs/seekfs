@@ -36,7 +36,7 @@ Flags:
 
 - `-out <dir>`: output directory.
 - `-timeout 5m`: hard harness deadline; children are killed when it expires.
-- `-scenario all|startup|search|resize|settings`.
+- `-scenario all|startup|search|resize|settings|status`.
 
 ## Automation commands
 
@@ -47,7 +47,8 @@ returns one JSON object per line. All commands run on the UI goroutine.
 - `{"cmd":"state"}`: window size, settings open/tab/saving/notice/err,
   current Apply step, `service_mode`, content mode, drive drafts (volume,
   indexed, state, entries, error, progress phase/done/total), rows, query,
-  search sequence, health/message, entries, no-volumes.
+  search sequence, health/message, entries, no-volumes, sidebar rows
+  (kind/label/under), and the content-index state/progress.
 - `{"cmd":"action","name":...,"arg":...}`:
   - `open-settings` (`drives`, `content`, `search`), `close-settings`;
   - `toggle-drive` (volume), `set-install-service` (bool);
@@ -100,6 +101,13 @@ active.
   open, indexing, mid-build progress, and done; then a content-mode Apply. The
   panel must reach `ready` without being reopened, and its lag after the
   service is reported.
+- `status`: turns the fixture drive off, starts a service-side build, then
+  starts the app while the build still runs. It requires the status line to
+  reach healthy `ok` and the sidebar to list `X:` without an app restart, and
+  records app-start-to-ready, service-ready, status lag, and sidebar timing.
+  Screenshots: `status-loading.png` and `status-ready.png`.
+- `all` does not include `status`; run it on its own so its app restart
+  timing does not disturb the other scenarios.
 
 If the app misbehaves, the harness records it under Findings and still exits
 0. A non-zero exit means the harness itself could not set up or reach the app.
@@ -128,6 +136,8 @@ fixture. The "before" values are from the base revision.
 | resize | frame p50 | - | 9.9 ms |
 | resize | time to settle | ~4.97 s | ~4.99 s |
 | search | action to rows p50 | ~175 ms | 16.0 ms |
+| status | app start to ready, mid-build start | - | 28.2 s |
+| status | status lag after service ready | - | 257 ms |
 
 The resize numbers come from `-scenario all`; the search p50 is from
 `-scenario search` (queries 12.9, 19.6, and 16.0 ms in the first run).

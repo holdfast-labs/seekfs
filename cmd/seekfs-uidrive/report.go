@@ -30,6 +30,7 @@ type report struct {
 	Search        *searchReport   `json:"search,omitempty"`
 	Resize        *resizeReport   `json:"resize,omitempty"`
 	Settings      *settingsReport `json:"settings,omitempty"`
+	Status        *statusReport   `json:"status,omitempty"`
 	Findings      []string        `json:"findings,omitempty"`
 }
 
@@ -118,6 +119,22 @@ type settingsReport struct {
 	ProgressSeen       bool    `json:"progress_seen"`
 	PanelLagMS         float64 `json:"panel_lag_ms"`
 	ProgressScreenshot string  `json:"progress_screenshot,omitempty"`
+}
+
+type statusReport struct {
+	InitialHealth       string  `json:"initial_health"`
+	InitialHealthMsg    string  `json:"initial_health_msg"`
+	SawNotReady         bool    `json:"saw_not_ready"`
+	AppStartToReadyMS   float64 `json:"app_start_to_ready_ms"`
+	BuildStartToReadyMS float64 `json:"build_start_to_ready_ms"`
+	ServiceReadyMS      float64 `json:"service_ready_ms"`
+	StatusLagMS         float64 `json:"status_lag_ms"`
+	Entries             int     `json:"entries"`
+	SidebarX            bool    `json:"sidebar_lists_x"`
+	SidebarXMS          float64 `json:"sidebar_x_ms"`
+	LoadingScreenshot   string  `json:"loading_screenshot,omitempty"`
+	ReadyScreenshot     string  `json:"ready_screenshot,omitempty"`
+	Error               string  `json:"error,omitempty"`
 }
 
 func newReport(scenario, out string) *report {
@@ -229,6 +246,27 @@ func renderSummary(r *report) string {
 		}
 		fmt.Fprintln(&b)
 	}
+	if r.Status != nil {
+		fmt.Fprintf(&b, "## Status freshness\n\n")
+		fmt.Fprintf(&b, "| metric | value |\n|---|---:|\n")
+		fmt.Fprintf(&b, "| initial health | %s |\n", mdCell(r.Status.InitialHealth))
+		fmt.Fprintf(&b, "| initial health message | %s |\n", mdCell(r.Status.InitialHealthMsg))
+		fmt.Fprintf(&b, "| saw not-ready status | %t |\n", r.Status.SawNotReady)
+		fmt.Fprintf(&b, "| app start to ready (no restart) | %.1f ms |\n", r.Status.AppStartToReadyMS)
+		fmt.Fprintf(&b, "| build start to ready | %.1f ms |\n", r.Status.BuildStartToReadyMS)
+		fmt.Fprintf(&b, "| service ready | %.1f ms |\n", r.Status.ServiceReadyMS)
+		fmt.Fprintf(&b, "| status lag after service ready | %.1f ms |\n", r.Status.StatusLagMS)
+		fmt.Fprintf(&b, "| entries | %d |\n", r.Status.Entries)
+		fmt.Fprintf(&b, "| sidebar lists X: | %t |\n", r.Status.SidebarX)
+		fmt.Fprintf(&b, "| sidebar listed X: at | %.1f ms |\n", r.Status.SidebarXMS)
+		if r.Status.LoadingScreenshot != "" {
+			fmt.Fprintf(&b, "| screenshots | `%s`, `%s` |\n", shortPath(r.Status.LoadingScreenshot), shortPath(r.Status.ReadyScreenshot))
+		}
+		if r.Status.Error != "" {
+			fmt.Fprintf(&b, "| error | %s |\n", mdCell(r.Status.Error))
+		}
+		fmt.Fprintln(&b)
+	}
 	fmt.Fprintf(&b, "## Findings\n\n")
 	if len(r.Findings) == 0 {
 		fmt.Fprintf(&b, "- none\n")
@@ -307,6 +345,17 @@ func collectFindings(r *report) []string {
 	}
 	if r.Setup != nil && r.Setup.Error != "" {
 		out = append(out, "fixture drive setup: "+r.Setup.Error)
+	}
+	if r.Status != nil {
+		if r.Status.Error != "" {
+			out = append(out, "status scenario: "+r.Status.Error)
+		}
+		if !r.Status.SawNotReady {
+			out = append(out, "status scenario: app never observed a not-ready state before ready")
+		}
+		if !r.Status.SidebarX {
+			out = append(out, "status scenario: sidebar never listed the fixture drive without a restart")
+		}
 	}
 	return out
 }

@@ -28,7 +28,7 @@ const defaultOutRoot = `E:\bench\gotmp`
 func main() {
 	out := flag.String("out", "", "output directory (default E:\\bench\\gotmp\\uidrive-<timestamp>)")
 	timeout := flag.Duration("timeout", 5*time.Minute, "harness timeout")
-	scenario := flag.String("scenario", "all", "all|startup|search|resize|settings")
+	scenario := flag.String("scenario", "all", "all|startup|search|resize|settings|status")
 	flag.Parse()
 
 	if *out == "" {
@@ -66,7 +66,7 @@ type harness struct {
 func runHarness(out string, timeout time.Duration, scenario string) error {
 	scenario = strings.ToLower(strings.TrimSpace(scenario))
 	switch scenario {
-	case "all", "startup", "search", "resize", "settings":
+	case "all", "startup", "search", "resize", "settings", "status":
 	default:
 		return fmt.Errorf("unknown scenario %q", scenario)
 	}
@@ -114,27 +114,33 @@ func runHarness(out string, timeout time.Duration, scenario string) error {
 	if err := h.startService(); err != nil {
 		return fmt.Errorf("service: %w", err)
 	}
-	if err := h.startApp(); err != nil {
-		return fmt.Errorf("app: %w", err)
-	}
+	if scenario == "status" {
+		// statusScenario starts the app itself, after it starts a service-side
+		// build, so the app comes up mid-build.
+		h.rep.Status = h.statusScenario()
+	} else {
+		if err := h.startApp(); err != nil {
+			return fmt.Errorf("app: %w", err)
+		}
 
-	runStartup := scenario == "all" || scenario == "startup"
-	runSearch := scenario == "all" || scenario == "search"
-	runResize := scenario == "all" || scenario == "resize"
-	runSettings := scenario == "all" || scenario == "settings"
+		runStartup := scenario == "all" || scenario == "startup"
+		runSearch := scenario == "all" || scenario == "search"
+		runResize := scenario == "all" || scenario == "resize"
+		runSettings := scenario == "all" || scenario == "settings"
 
-	h.rep.Startup = h.startupScenario(runStartup)
-	if runSearch || runSettings {
-		h.rep.Setup = h.ensureFixtureDrive()
-	}
-	if runSearch {
-		h.rep.Search = h.searchScenario()
-	}
-	if runResize {
-		h.rep.Resize = h.resizeScenario()
-	}
-	if runSettings {
-		h.rep.Settings = h.settingsScenario()
+		h.rep.Startup = h.startupScenario(runStartup)
+		if runSearch || runSettings {
+			h.rep.Setup = h.ensureFixtureDrive()
+		}
+		if runSearch {
+			h.rep.Search = h.searchScenario()
+		}
+		if runResize {
+			h.rep.Resize = h.resizeScenario()
+		}
+		if runSettings {
+			h.rep.Settings = h.settingsScenario()
+		}
 	}
 	h.rep.Finished = time.Now()
 	h.rep.DurationMS = float64(h.rep.Finished.Sub(h.rep.Started)) / float64(time.Millisecond)

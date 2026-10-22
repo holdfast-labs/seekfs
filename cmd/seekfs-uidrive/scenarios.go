@@ -571,3 +571,115 @@ func findDrive(st automationState, volume string) *automationDrive {
 	}
 	return nil
 }
+
+func findServiceVolume(settings serviceSettingsView, volume string) *serviceVolumeView {
+	for i := range settings.Volumes {
+		if strings.EqualFold(settings.Volumes[i].Volume, volume) {
+			v := settings.Volumes[i]
+			return &v
+		}
+	}
+	return nil
+}
+
+func millis(d time.Duration) float64 {
+	return float64(d) / float64(time.Millisecond)
+}
+
+// statusScenario starts a service-side build and then starts the app while the
+// build runs. It requires the app to reach ready health and list the volume in
+// the sidebar without a restart.
+func (h *harness) statusScenario() *statusReport {
+	rep := &statusReport{}
+	if err := h.serviceSetDrive("X:", false); err != nil {
+		rep.Error = "drive off: " + err.Error()
+		return rep
+	}
+	offDeadline := time.Now().Add(30 * time.Second)
+	for {
+		if h.expired() || time.Now().After(offDeadline) {
+			rep.Error = "fixture drive did not turn off"
+			return rep
+		}
+		settings, err := h.serviceSettings()
+		if err == nil {
+			if v := findServiceVolume(settings, "X:"); v == nil || !v.Indexed || v.State == "not_indexed" {
+				break
+			}
+		}
+		sleepCtx(h.ctx, 100*time.Millisecond)
+	}
+
+	buildStart := time.Now()
+	if err := h.serviceSetDrive("X:", true); err != nil {
+		rep.Error = "drive on: " + err.Error()
+		return rep
+	}
+	if err := h.startApp(); err != nil {
+		rep.Error = "app: " + err.Error()
+		return rep
+	}
+
+	var first bool
+	var serviceReadyAt time.Time
+	var sidebarAt time.Time
+	nextServicePoll := time.Now()
+	deadline := time.Now().Add(3 * time.Minute)
+	for {
+		if h.expired() || time.Now().After(deadline) {
+			rep.Error = "status did not reach ready"
+			return rep
+		}
+		st, err := h.auto.State()
+		if err == nil {
+			if !first {
+				first = true
+				rep.InitialHealth = st.Health
+				rep.InitialHealthMsg = st.HealthMsg
+				rep.LoadingScreenshot = filepath.Join(h.out, "shots", "status-loading.png")
+				_ = h.auto.Screenshot(rep.LoadingScreenshot)
+			}
+			if st.Health != "ok" {
+				rep.SawNotReady = true
+			}
+			if sidebarAt.IsZero() && sidebarListsVolume(st, "X:") {
+				sidebarAt = time.Now()
+			}
+			if serviceReadyAt.IsZero() && time.Now().After(nextServicePoll) {
+				nextServicePoll = time.Now().Add(250 * time.Millisecond)
+				if svc, serr := h.serviceSettings(); serr == nil {
+					if v := findServiceVolume(svc, "X:"); v != nil && v.State == "ready" {
+						serviceReadyAt = time.Now()
+					}
+				}
+			}
+			if st.Health == "ok" && sidebarListsVolume(st, "X:") && st.Entries > 0 {
+				readyAt := time.Now()
+				rep.SidebarX = true
+				rep.Entries = st.Entries
+				rep.BuildStartToReadyMS = millis(readyAt.Sub(buildStart))
+				rep.AppStartToReadyMS = millis(readyAt.Sub(h.appStart))
+				if !sidebarAt.IsZero() {
+					rep.SidebarXMS = millis(sidebarAt.Sub(buildStart))
+				}
+				if !serviceReadyAt.IsZero() {
+					rep.ServiceReadyMS = millis(serviceReadyAt.Sub(buildStart))
+					rep.StatusLagMS = millis(readyAt.Sub(serviceReadyAt))
+				}
+				rep.ReadyScreenshot = filepath.Join(h.out, "shots", "status-ready.png")
+				_ = h.auto.Screenshot(rep.ReadyScreenshot)
+				return rep
+			}
+		}
+		sleepCtx(h.ctx, 50*time.Millisecond)
+	}
+}
+
+func sidebarListsVolume(st automationState, volume string) bool {
+	for _, row := range st.Sidebar {
+		if row.Kind == "scope" && strings.Contains(row.Label, volume) {
+			return true
+		}
+	}
+	return false
+}

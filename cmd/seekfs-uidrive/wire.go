@@ -20,24 +20,35 @@ type automationProgress struct {
 }
 
 type automationState struct {
-	Width               int               `json:"width"`
-	Height              int               `json:"height"`
-	SettingsOpen        bool              `json:"settings_open"`
-	SettingsTab         string            `json:"settings_tab"`
-	SettingsSaving      bool              `json:"settings_saving"`
-	SettingsNotice      string            `json:"settings_notice"`
-	SettingsErr         string            `json:"settings_err"`
-	SettingsServiceMode string            `json:"settings_service_mode"`
-	SettingsContentMode string            `json:"settings_content_mode"`
-	Drives              []automationDrive `json:"drives"`
-	Rows                int               `json:"rows"`
-	Query               string            `json:"query"`
-	Seq                 int64             `json:"seq"`
-	Health              string            `json:"health"`
-	HealthMsg           string            `json:"health_msg"`
-	Entries             int               `json:"entries"`
-	NoVolumes           bool              `json:"no_volumes"`
-	SettingsApplyStep   string            `json:"settings_apply_step"`
+	Width               int                 `json:"width"`
+	Height              int                 `json:"height"`
+	SettingsOpen        bool                `json:"settings_open"`
+	SettingsTab         string              `json:"settings_tab"`
+	SettingsSaving      bool                `json:"settings_saving"`
+	SettingsNotice      string              `json:"settings_notice"`
+	SettingsErr         string              `json:"settings_err"`
+	SettingsServiceMode string              `json:"settings_service_mode"`
+	SettingsContentMode string              `json:"settings_content_mode"`
+	Drives              []automationDrive   `json:"drives"`
+	Rows                int                 `json:"rows"`
+	Query               string              `json:"query"`
+	Seq                 int64               `json:"seq"`
+	Health              string              `json:"health"`
+	HealthMsg           string              `json:"health_msg"`
+	Entries             int                 `json:"entries"`
+	NoVolumes           bool                `json:"no_volumes"`
+	SettingsApplyStep   string              `json:"settings_apply_step"`
+	Sidebar             []automationSideRow `json:"sidebar,omitempty"`
+	ContentState        string              `json:"content_state,omitempty"`
+	ContentDone         int64               `json:"content_done,omitempty"`
+	ContentTotal        int64               `json:"content_total,omitempty"`
+	ContentIncomplete   bool                `json:"content_incomplete,omitempty"`
+}
+
+type automationSideRow struct {
+	Kind  string `json:"kind"`
+	Label string `json:"label"`
+	Under string `json:"under,omitempty"`
 }
 
 type automationStats struct {
