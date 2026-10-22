@@ -3,6 +3,7 @@ package main
 import (
 	"image"
 	"image/color"
+	"strings"
 
 	"gioui.org/f32"
 	"gioui.org/io/event"
@@ -470,6 +471,28 @@ func (u *UI) layoutDetailList(gtx layout.Context, rows []ResultRow) layout.Dimen
 
 // layoutEmpty renders the centered empty/error state for the results area:
 // icon + title + hint. It lives below the column headers, never over them.
+// indexingSummary returns the empty-view title for volumes still being
+// indexed, e.g. "Indexing C: 42%" or "Indexing C:, D:…", and whether any is.
+func indexingSummary(vols []DBVolume) (string, bool) {
+	var names []string
+	pct := -1
+	for _, v := range vols {
+		if v.State != "indexing" {
+			continue
+		}
+		names = append(names, firstNonEmpty(v.Volume, v.Path))
+		pct = indexingPercent(v.Progress)
+	}
+	switch {
+	case len(names) == 0:
+		return "", false
+	case len(names) == 1 && pct >= 0:
+		return "Indexing " + names[0] + " " + itoa(pct) + "%", true
+	default:
+		return "Indexing " + strings.Join(names, ", ") + "…", true
+	}
+}
+
 func (u *UI) layoutEmpty(gtx layout.Context) layout.Dimensions {
 	th := u.th
 	s := u.scheme
@@ -478,14 +501,18 @@ func (u *UI) layoutEmpty(gtx layout.Context) layout.Dimensions {
 	unavail := u.unavail
 	fuzzy := u.fuzzyMsg
 	noVolumes := u.noVolumes
+	indexingTitle, indexing := indexingSummary(u.volumes)
 	u.mu.Unlock()
-	if firstRunClicked := noVolumes && query == "" && unavail == ""; firstRunClicked && u.emptyDrivesBtn.Clicked(gtx) {
+	if firstRunClicked := noVolumes && !indexing && query == "" && unavail == ""; firstRunClicked && u.emptyDrivesBtn.Clicked(gtx) {
 		u.openSettingsTab(settingsTabDrives)
 	}
 	icon, title, hint := iconSearch, "Type to search", "Results appear as you type"
 	firstRun := false
 	if unavail != "" {
 		icon, title, hint = iconContents, "Content search is off", "Run `seekfs plugin add content` to enable it"
+	} else if indexing && noVolumes {
+		// A drive is being indexed: say so instead of offering first-run setup.
+		icon, title, hint = iconFolder, indexingTitle, "Results appear here as soon as indexing finishes"
 	} else if noVolumes && query == "" {
 		icon, title, hint = iconFolder, "No drives indexed", "Choose the drives seekfs should index"
 		firstRun = true
