@@ -193,6 +193,9 @@ type contentReport struct {
 	ContentBuildError   string                  `json:"content_build_error,omitempty"`
 	ContentBuildDone    int                     `json:"content_build_done,omitempty"`
 	ContentBuildTotal   int                     `json:"content_build_total,omitempty"`
+	ContentPartial      bool                    `json:"content_partial,omitempty"`
+	ContentIncomplete   bool                    `json:"content_incomplete,omitempty"`
+	ContentStale        bool                    `json:"content_stale,omitempty"`
 	ContentReadyMS      float64                 `json:"content_ready_ms"`
 	BuildingSeen        bool                    `json:"building_seen"`
 	BuildingNoticeSeen  bool                    `json:"building_notice_seen"`

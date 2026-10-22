@@ -110,6 +110,7 @@ func rebuildWalkIndex(vol *serviceVolumeIndex) (*Index, error) {
 	}
 	idx := &Index{
 		Version: vol.index.Version,
+		Volume:  vol.index.Volume,
 		Roots:   append([]string(nil), vol.index.Roots...),
 		BuiltAt: time.Now(),
 		Source:  "walk",

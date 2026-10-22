@@ -17,6 +17,7 @@ type contentHealthView struct {
 	Docs       int    `json:"docs"`
 	Partial    bool   `json:"partial"`
 	Incomplete bool   `json:"incomplete"`
+	Stale      bool   `json:"content_stale"`
 	BuildDone  int    `json:"build_done"`
 	BuildTotal int    `json:"build_total"`
 	BuildError string `json:"build_error"`
@@ -184,6 +185,18 @@ func (h *harness) contentScenario() *contentReport {
 			rep.BuildingSeen = true
 		}
 	}
+	// Give the status refresher one poll to publish the building state before the
+	// early query, so the notice has a chance to appear.
+	buildingDeadline := time.Now().Add(8 * time.Second)
+	for time.Now().Before(buildingDeadline) {
+		if st, err := h.auto.State(); err == nil {
+			if st.ContentState == "indexing" || st.ContentState == "reconciling" {
+				rep.BuildingSeen = true
+				break
+			}
+		}
+		sleepCtx(h.ctx, 100*time.Millisecond)
+	}
 	earlyQuery := expected.Queries[0].Query
 	st, _, _ := h.runUIContentQuery("type-query", earlyQuery)
 	rep.BuildingRows = st.Rows
@@ -314,9 +327,21 @@ func (h *harness) contentScenario() *contentReport {
 	}
 	fr.Pass = fr.BeforePass && fr.AfterPass
 	rep.Freshness = fr
+	// Wait briefly for the post-freshness reconcile to return to ready, so the
+	// recorded final state is not a transient build state.
+	readyDeadline := time.Now().Add(20 * time.Second)
+	for time.Now().Before(readyDeadline) {
+		if info, err := h.serviceInfo(); err == nil && info.Content != nil && info.Content.State == "ready" {
+			break
+		}
+		sleepCtx(h.ctx, 200*time.Millisecond)
+	}
 	if info, err := h.serviceInfo(); err == nil && info.Content != nil {
 		rep.ContentState = info.Content.State
 		rep.ContentDocs = info.Content.Docs
+		rep.ContentPartial = info.Content.Partial
+		rep.ContentIncomplete = info.Content.Incomplete
+		rep.ContentStale = info.Content.Stale
 		rep.ContentBuildError = info.Content.BuildError
 		rep.ContentBuildDone = info.Content.BuildDone
 		rep.ContentBuildTotal = info.Content.BuildTotal
