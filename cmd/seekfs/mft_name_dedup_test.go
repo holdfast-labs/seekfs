@@ -310,6 +310,9 @@ func runLegacyZipfPipeline(n int, tmpPath string) []mftBenchStage {
 	stages = append(stages, measureMFTStage("orders", len(idx.Records), func() {
 		buildOrders(idx)
 	}))
+	stages = append(stages, measureMFTStage("pathrank", len(idx.Records), func() {
+		_, _ = buildCompactPathOrderRankLegacy(idx)
+	}))
 	stages = append(stages, measureMFTStage("stage", len(idx.Records), func() {
 		tmp, err := stageIndexFile(tmpPath, idx)
 		if err != nil {
@@ -342,6 +345,9 @@ func runCompactZipfPipeline(n int, tmpPath string) []mftBenchStage {
 	}))
 	stages = append(stages, measureMFTStage("orders", len(idx.Records), func() {
 		buildOrders(idx)
+	}))
+	stages = append(stages, measureMFTStage("pathrank", len(idx.Records), func() {
+		_, _ = buildCompactPathOrderRank(idx)
 	}))
 	stages = append(stages, measureMFTStage("stage", len(idx.Records), func() {
 		tmp, err := stageIndexFile(tmpPath, idx)

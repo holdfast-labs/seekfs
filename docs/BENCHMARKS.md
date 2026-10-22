@@ -810,3 +810,32 @@ path strings, so on this shorter-name corpus it is only 3.7% below a legacy
 run of the same corpus. Against the pre-change unique-name peak of
 646.7 B/rec, the compact Zipf peak is 40% lower. Accumulation itself is 71%
 lower on identical input.
+
+### Path Rank Without Path Strings
+
+2026-10-22, same 1M Zipf corpus. `buildCompactPathOrderRank` no longer
+materialises one lowercase path string per record. It keeps the legacy lazy
+memo semantics but stores each key as a chain of record ids in one `int32`
+arena, walks parent links, and rebuilds a joined lowercase path only in a
+reusable comparator buffer.
+
+| Metric | Legacy | New |
+| --- | ---: | ---: |
+| Path-rank stage peak | 263.9 B/rec | 242.9 B/rec |
+| Path-rank stage delta over prior stage | 155 MB | 141 MB |
+| Whole-build peak | 415.0 B/rec | 373.1 B/rec |
+| Token count / file size | 651,435 / 164,265,724 | identical |
+| `LOWR` / `PNGR` / `PNGC` | 3,912,103 / 11,829,861 / 4,084,648 | identical |
+
+`TestPathOrderRankMatchesLegacy` checks order and rank arrays plus `PRNK`
+bytes on the Zipf corpus and on an edge fixture (case-only names, deep
+nesting, shared prefixes, unicode, root/root-name skip, orphan).
+`TestPathOrderRankSectionsByteIdentical` routes the legacy arrays through the
+writer and compares the whole index file byte for byte.
+
+The 25% whole-build target is not met: the new whole-build peak is 10% below
+the legacy 415.0 B/rec. Path rank is no longer the peak. The next largest
+consumer is the name-trigram posting build (`PNGR`), whose stage peak is
+355.9 B/rec (about 356 MB at 1M records), followed by path rank at 242.9.
+`PNGR` now sets the whole-build peak, so further reduction needs a streaming
+merge for the trigram postings rather than path work.
