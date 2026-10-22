@@ -107,24 +107,30 @@ func TestSelectedRowKeepsTextX(t *testing.T) {
 	}
 }
 
-func TestSettingsHeaderSubtitleOnlyWhenBusyOrIndexing(t *testing.T) {
-	_, p := settingsTestUI(t, false)
-	if got := settingsHeaderSubtitle(p); got != "" {
+func TestSettingsHeaderSubtitleOnlyDetailedText(t *testing.T) {
+	u, p := settingsTestUI(t, false)
+	if got := u.settingsHeaderSubtitle(p); got != "" {
 		t.Fatalf("ready volumes subtitle = %q, want empty", got)
 	}
-	p.model.draft.Volumes[0].State = "indexing"
-	if got := settingsHeaderSubtitle(p); got != "Indexing..." {
-		t.Fatalf("indexing volume subtitle = %q, want \"Indexing...\"", got)
+	v := &p.model.draft.Volumes[0]
+	v.State = "indexing"
+	v.Progress = &serviceVolumeProgress{Done: 42, Total: 100}
+	if got, want := u.settingsHeaderSubtitle(p), formatIndexingProgress(v.Progress); got != want {
+		t.Fatalf("indexing volume subtitle = %q, want %q", got, want)
 	}
-	p.model.draft.Volumes[0].State = "ready"
+	v.State = "ready"
 	p.load = true
-	if got := settingsHeaderSubtitle(p); got != "Loading..." {
-		t.Fatalf("in-flight load subtitle = %q, want \"Loading...\"", got)
+	if got := u.settingsHeaderSubtitle(p); got != "" {
+		t.Fatalf("in-flight load subtitle = %q, want empty", got)
 	}
 	p.load = false
 	p.saving = true
-	if got := settingsHeaderSubtitle(p); got != "Applying..." {
-		t.Fatalf("in-flight save subtitle = %q, want \"Applying...\"", got)
+	if got := u.settingsHeaderSubtitle(p); got != "" {
+		t.Fatalf("generic apply subtitle = %q, want empty", got)
+	}
+	u.setApplyStep("Installing service…")
+	if got := u.settingsHeaderSubtitle(p); got != "Installing service…" {
+		t.Fatalf("detailed apply subtitle = %q", got)
 	}
 }
 

@@ -192,8 +192,19 @@ func (u *UI) rebuildSideRows(vols []DBVolume) {
 		if lbl == "" {
 			lbl = v.Path
 		}
-		if v.Entries > 0 {
-			lbl += "  (" + formatCount(v.Entries) + ")"
+		switch v.State {
+		case "indexing":
+			if pct := indexingPercent(v.Progress); pct >= 0 {
+				lbl += "  (indexing " + itoa(pct) + "%)"
+			} else {
+				lbl += "  (indexing…)"
+			}
+		case "error":
+			lbl += "  (error)"
+		default:
+			if v.Entries > 0 {
+				lbl += "  (" + formatCount(v.Entries) + ")"
+			}
 		}
 		rows = append(rows, sideRow{kind: sideScope, label: lbl, under: under, depth: 1})
 	}

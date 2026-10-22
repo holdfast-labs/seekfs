@@ -99,6 +99,8 @@ const (
 
 // Content index states reported by the service.
 const (
-	contentStateIndexing = "indexing"
-	contentStateReady    = "ready"
+	contentStateIndexing    = "indexing"
+	contentStateReady       = "ready"
+	contentStateDegraded    = "degraded"
+	contentStateReconciling = "reconciling"
 )

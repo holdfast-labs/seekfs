@@ -149,9 +149,11 @@ func runUI(pipe string, limit int) error {
 
 	// Theme poll: re-render when the OS theme or accent changes.
 	go u.themePoll(w)
-	// Background indexing poll: cheap frames for the progress bar and a
-	// settings-get every 500 ms while any drive is indexing.
-	go u.indexProgressPoll(w)
+	// Background status refresher: info polls at a state-dependent cadence.
+	go u.statusRefreshLoop()
+	// Settings poll: progress animation frames and a settings-get every 500 ms
+	// while the panel is open or a drive is indexing.
+	go u.settingsProgressPoll(w)
 
 	var ops op.Ops
 	for {
@@ -215,21 +217,25 @@ func (u *UI) themePoll(w *app.Window) {
 	}
 }
 
-// indexProgressPoll renders the progress animation at at most 10 Hz and polls
-// settings-get every 500 ms while a drive is indexing. It stops polling (but
-// keeps the cheap ticker) when no build is active.
-func (u *UI) indexProgressPoll(w *app.Window) {
+// settingsProgressPoll renders the progress animation at at most 10 Hz and
+// polls settings-get every 500 ms while the Settings panel is open or a drive
+// is indexing. It stops polling (but keeps the cheap ticker) when neither is
+// active.
+func (u *UI) settingsProgressPoll(w *app.Window) {
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
 	lastPoll := time.Time{}
 	for range ticker.C {
 		u.mu.Lock()
-		active := u.settingsIndexing
+		indexing := u.settingsIndexing
+		panel := u.settingsPoll
 		u.mu.Unlock()
-		if !active {
+		if !indexing && !panel {
 			continue
 		}
-		w.Invalidate()
+		if indexing {
+			w.Invalidate()
+		}
 		if time.Since(lastPoll) < 500*time.Millisecond {
 			continue
 		}
@@ -241,32 +247,11 @@ func (u *UI) indexProgressPoll(w *app.Window) {
 	}
 }
 
-// initialInfo runs the service handshake off the UI thread.
+// initialInfo runs the service handshake off the UI thread. The background
+// refresher owns later info polls.
 func (u *UI) initialInfo() {
 	resp, err := u.ensureService()
-	u.mu.Lock()
-	u.noVolumes = err == nil && len(resp.DBs) == 0
-	if err != nil {
-		u.health, u.healthMsg = serviceHealthError, err.Error()
-	} else if resp.Loading {
-		u.health, u.healthMsg = serviceHealthDegraded, "Loading indexes…"
-		u.entries = resp.Entries
-	} else if resp.OK && resp.Entries > 0 {
-		u.health = resp.Health
-		if u.health == "" {
-			u.health = serviceHealthOK
-		}
-		u.healthMsg = resp.HealthMessage
-		u.entries = resp.Entries
-	} else if u.noVolumes {
-		u.health, u.healthMsg = serviceHealthEmpty, "No drives indexed yet"
-	} else {
-		u.health, u.healthMsg = serviceHealthError, firstNonEmpty(resp.Message, "service has no search indexes loaded")
-	}
-	vols := dbVolumesFrom(resp)
-	u.mu.Unlock()
-	u.rebuildSideRows(vols)
-	u.invalidate()
+	u.applyStatus(statusFromInfo(resp, err))
 	go u.seedSettingsSnapshot()
 }
 

@@ -50,6 +50,7 @@ func (u *UI) layoutStatus(gtx layout.Context) layout.Dimensions {
 	elapsed := u.elapsedMS
 	searchMS := u.searchMS
 	content := u.content
+	contentIndex := u.contentHealth
 	contentMode := u.contents
 	unavail := u.unavail
 	health, healthMsg := u.health, u.healthMsg
@@ -76,11 +77,18 @@ func (u *UI) layoutStatus(gtx layout.Context) layout.Dimensions {
 	}
 
 	contentText := ""
+	contentColor := s.Muted
 	if contentMode || (content != nil && content.State != "") {
 		if unavail != "" {
 			contentText = "Contents unavailable"
 		} else {
 			contentText = contentStatusText(content)
+		}
+	}
+	if text, tone := contentIndexStatusText(contentIndex); text != "" {
+		contentText = text
+		if tone == healthToneError {
+			contentColor = s.Error
 		}
 	}
 
@@ -117,7 +125,7 @@ func (u *UI) layoutStatus(gtx layout.Context) layout.Dimensions {
 			}),
 			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 				return layout.Inset{Left: Dp(16)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
-					return label(u.th, Sp(12), contentText, s.Muted).Layout(gtx)
+					return label(u.th, Sp(12), contentText, contentColor).Layout(gtx)
 				})
 			}),
 			layout.Rigid(func(gtx layout.Context) layout.Dimensions {

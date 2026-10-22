@@ -128,6 +128,9 @@ func (u *UI) openSettings() {
 		return
 	}
 	u.settingsOpen = true
+	u.mu.Lock()
+	u.settingsPoll = true
+	u.mu.Unlock()
 	if u.gsettings == nil {
 		u.gsettings = newSettingsPanelState(u.settings)
 	}
@@ -163,6 +166,9 @@ func (u *UI) openSettingsTab(tab int) {
 // closeSettings hides the panel and discards staged edits.
 func (u *UI) closeSettings() {
 	u.settingsOpen = false
+	u.mu.Lock()
+	u.settingsPoll = false
+	u.mu.Unlock()
 	if u.gsettings != nil {
 		u.gsettings.fieldErr = map[string]string{}
 		u.gsettings.err = ""
@@ -215,19 +221,16 @@ func (u *UI) noteSettingsSnapshot(s *serviceSettings) {
 	u.settingsIndexing = active
 	u.settingsSnapshot = s
 	u.mu.Unlock()
+	u.refreshSidebarFromState()
 	if was && !active {
 		go u.refreshAfterIndexing()
 	}
 }
 
+// refreshAfterIndexing polls info once through the status refresher (no
+// service spawn); a changed volume set triggers the query rerun.
 func (u *UI) refreshAfterIndexing() {
-	u.initialInfo()
-	u.mu.Lock()
-	query := u.query
-	u.mu.Unlock()
-	if strings.TrimSpace(query) != "" {
-		u.rerun()
-	}
+	u.refreshStatusOnce()
 }
 
 func (u *UI) setApplyStep(step string) {
@@ -578,19 +581,24 @@ func (u *UI) layoutSettingsCard(gtx layout.Context) layout.Dimensions {
 	return dims
 }
 
-// settingsHeaderSubtitle reports the truthful state line under the Settings
-// title: only an in-flight request or an actually indexing volume qualifies.
-func settingsHeaderSubtitle(p *settingsPanelState) string {
+// settingsHeaderSubtitle reports the detailed state line under the Settings
+// title. It never repeats the generic footer text: a specific apply step or
+// indexing progress qualifies, everything else shows nothing.
+func (u *UI) settingsHeaderSubtitle(p *settingsPanelState) string {
 	if p.saving {
-		return "Applying..."
+		step := u.currentApplyStep()
+		if step == "" || step == "Applying…" || step == "Applying settings…" {
+			return ""
+		}
+		return step
 	}
 	if p.load {
-		return "Loading..."
+		return ""
 	}
 	if p.model != nil {
 		for _, v := range p.model.draft.Volumes {
 			if v.State == "indexing" {
-				return "Indexing..."
+				return formatIndexingProgress(v.Progress)
 			}
 		}
 	}
@@ -614,7 +622,7 @@ func (u *UI) layoutSettingsHeader(gtx layout.Context, p *settingsPanelState) lay
 							return label(u.th, Sp(18), "Settings", s.Text).Layout(gtx)
 						}),
 						layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-							subtitle := settingsHeaderSubtitle(p)
+							subtitle := u.settingsHeaderSubtitle(p)
 							if subtitle == "" {
 								return layout.Dimensions{}
 							}
@@ -667,7 +675,7 @@ func (u *UI) layoutSettingsTabs(gtx layout.Context, p *settingsPanelState) layou
 func (u *UI) layoutSettingsBody(gtx layout.Context, p *settingsPanelState) layout.Dimensions {
 	if p.load && p.model == nil {
 		return layout.Center.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
-			return label(u.th, Sp(14), "Loading settings...", u.scheme.Muted).Layout(gtx)
+			return label(u.th, Sp(14), "Loading settings…", u.scheme.Muted).Layout(gtx)
 		})
 	}
 	if p.model == nil {
@@ -852,24 +860,27 @@ func (u *UI) layoutDriveRow(gtx layout.Context, p *settingsPanelState, v volumeD
 								free = formatBytesCompact(v.FreeBytes) + " free of " + formatBytesCompact(v.TotalBytes)
 							}
 							return layout.Inset{Top: Dp(2)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
-								return label(u.th, Sp(11), free, s.Muted).Layout(gtx)
+								return layout.Flex{Axis: layout.Horizontal, Alignment: layout.Middle}.Layout(gtx,
+									layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
+										return label(u.th, Sp(11), free, s.Muted).Layout(gtx)
+									}),
+									layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+										if state != "indexing" {
+											return layout.Dimensions{}
+										}
+										return layout.Inset{Left: Dp(12)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+											return label(u.th, Sp(11), formatIndexingProgress(v.Progress), s.Muted).Layout(gtx)
+										})
+									}),
+								)
 							})
 						}),
 						layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 							if state != "indexing" {
 								return layout.Dimensions{}
 							}
-							return layout.Inset{Top: Dp(4)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
-								return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
-									layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-										return u.indexingBar(gtx, v.Progress)
-									}),
-									layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-										return layout.Inset{Top: Dp(2)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
-											return label(u.th, Sp(11), formatIndexingProgress(v.Progress), s.Muted).Layout(gtx)
-										})
-									}),
-								)
+							return layout.Inset{Top: Dp(6)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+								return u.indexingBar(gtx, v.Progress)
 							})
 						}),
 						layout.Rigid(func(gtx layout.Context) layout.Dimensions {
@@ -906,7 +917,7 @@ func stateLabel(state string) string {
 	case "ready":
 		return "Indexed"
 	case "indexing":
-		return "Indexing..."
+		return "Indexing…"
 	case "error":
 		return "Error"
 	case "not_indexed":
@@ -937,7 +948,7 @@ func (u *UI) usageBar(gtx layout.Context, total, free int64) layout.Dimensions {
 		fw := int(float64(w) * float64(used) / float64(total))
 		if fw > 0 {
 			defer clip.RRect{Rect: image.Rect(0, 0, fw, h), SE: gtx.Dp(Dp(3)), SW: gtx.Dp(Dp(3)), NW: gtx.Dp(Dp(3)), NE: gtx.Dp(Dp(3))}.Push(gtx.Ops).Pop()
-			paint.ColorOp{Color: s.Accent}.Add(gtx.Ops)
+			paint.ColorOp{Color: s.Muted}.Add(gtx.Ops)
 			paint.PaintOp{}.Add(gtx.Ops)
 		}
 	}
@@ -1472,7 +1483,7 @@ func (u *UI) layoutSettingsFooter(gtx layout.Context, p *settingsPanelState) lay
 		notice = p.err
 	}
 	if p.saving {
-		notice = firstNonEmpty(u.currentApplyStep(), "Applying settings...")
+		notice = firstNonEmpty(u.currentApplyStep(), "Applying settings…")
 	}
 	noticeColor := s.Muted
 	if p.err != "" {

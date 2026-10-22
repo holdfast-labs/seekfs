@@ -9,6 +9,8 @@ import (
 	"gioui.org/io/key"
 	"gioui.org/io/pointer"
 	"gioui.org/layout"
+	"gioui.org/op"
+	"gioui.org/op/clip"
 	"gioui.org/op/paint"
 	"gioui.org/text"
 	"gioui.org/unit"
@@ -44,6 +46,13 @@ func (u *UI) layoutResults(gtx layout.Context) layout.Dimensions {
 				return layout.Dimensions{}
 			}
 			return u.layoutHeader(gtx)
+		}),
+		layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+			notice := u.contentNotice()
+			if notice == "" {
+				return layout.Dimensions{}
+			}
+			return u.layoutContentNotice(gtx, notice)
 		}),
 		layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
 			switch view {
@@ -91,6 +100,28 @@ func (u *UI) layoutResults(gtx layout.Context) layout.Dimensions {
 		}
 	}
 	return base
+}
+
+// contentNotice reports the contents-incomplete banner text for this frame.
+func (u *UI) contentNotice() string {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return contentIncompleteNotice(u.contents, u.contentHealth)
+}
+
+// layoutContentNotice renders the contents-incomplete banner under the header.
+func (u *UI) layoutContentNotice(gtx layout.Context, text string) layout.Dimensions {
+	s := u.scheme
+	mac := op.Record(gtx.Ops)
+	dims := layout.Inset{Left: Dp(12), Right: Dp(12), Top: Dp(5), Bottom: Dp(5)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+		return label(u.th, Sp(12), text, s.Warning).Layout(gtx)
+	})
+	call := mac.Stop()
+	defer clip.Rect{Max: dims.Size}.Push(gtx.Ops).Pop()
+	paint.ColorOp{Color: s.Header}.Add(gtx.Ops)
+	paint.PaintOp{}.Add(gtx.Ops)
+	call.Add(gtx.Ops)
+	return dims
 }
 
 // hoverTipRow returns the hovered row index when its folder is truncated,

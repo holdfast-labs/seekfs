@@ -146,6 +146,16 @@ type UI struct {
 	settingsSnapshot *serviceSettings
 	settingsIndexing bool
 	applyStep        string
+
+	// Status refresher state. contentHealth is the content-index telemetry
+	// from the last info response; loadedVolumes is the loaded volume set
+	// (without build-only rows); loadingIndex reports an in-flight service
+	// index load; settingsPoll keeps settings-get polling alive while the
+	// Settings panel is open. All are guarded by mu.
+	contentHealth *contentState
+	loadedVolumes []DBVolume
+	loadingIndex  bool
+	settingsPoll  bool
 }
 
 type sideRow struct {
