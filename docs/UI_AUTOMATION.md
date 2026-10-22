@@ -136,8 +136,8 @@ fixture. The "before" values are from the base revision.
 | resize | frame p50 | - | 9.9 ms |
 | resize | time to settle | ~4.97 s | ~4.99 s |
 | search | action to rows p50 | ~175 ms | 16.0 ms |
-| status | app start to ready, mid-build start | - | 28.2 s |
-| status | status lag after service ready | - | 257 ms |
+| status | app start to ready, mid-build start | - | 28.3 s |
+| status | status lag after service ready | - | 206 ms |
 
 The resize numbers come from `-scenario all`; the search p50 is from
 `-scenario search` (queries 12.9, 19.6, and 16.0 ms in the first run).
