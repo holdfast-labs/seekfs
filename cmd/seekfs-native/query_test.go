@@ -145,3 +145,23 @@ func TestContentQueryHasLiteral(t *testing.T) {
 		t.Fatal("plain term must not count as content literal")
 	}
 }
+
+func TestToContentQueryKeepsStructuralForms(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"content:needle", "content:needle"},
+		{"content~:refactoringg", "content~:refactoringg"},
+		{"content~2:refactoring", "content~2:refactoring"},
+		{"content:/REGEX-[AB]-[0-9]{3}/", "content:/REGEX-[AB]-[0-9]{3}/"},
+		{"content:\"two words\"", "content:\"two words\""},
+		{"sym:SymNeedleTarget", "sym:SymNeedleTarget"},
+		{"-content:skip", "-content:skip"},
+		{"!content~:skip", "!content~:skip"},
+		{"plain words", "content:plain content:words"},
+		{"plain content~:typo ext:go", "content:plain content~:typo ext:go"},
+	}
+	for _, tc := range cases {
+		if got := toContentQuery(tc.in); got != tc.want {
+			t.Errorf("toContentQuery(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}

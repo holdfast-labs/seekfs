@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -35,6 +36,11 @@ type uiDriveFixtureVolume struct {
 
 var uiDriveFixtureData *uiDriveFixture
 
+var (
+	fixtureWatchMu sync.Mutex
+	fixtureWatched map[*serviceVolumeIndex]bool
+)
+
 func uiDriveFixtureActive() bool { return uiDriveFixtureData != nil }
 
 // installUIAutoFixtureService loads the fixture and replaces the settings
@@ -54,6 +60,35 @@ func installUIAutoFixtureService() {
 	settingsVolumeEnumeration = fixture.enumerateVolumes
 	serviceIndexUSNVolume = func(volume string, progress *volumeBuildProgress) (*Index, error) {
 		return buildUIDriveFixtureIndex(fixture, volume, progress)
+	}
+	// The fixture runs on a nearly full test volume. Report the content disk
+	// reserve as satisfied so a small fixture build can write its sidecar under
+	// E:\bench without touching the machine's real free-space policy.
+	baseFreeBytes := contentFreeBytesFn
+	contentFreeBytesFn = func(path string) (uint64, error) {
+		free, err := baseFreeBytes(path)
+		if err != nil {
+			return free, err
+		}
+		return free + (64 << 30), nil
+	}
+	// A settings-added fixture volume is a walk index with no USN journal. Start
+	// the same walk watcher a startup walk volume gets, so edits reach the real
+	// filename-rebuild plus content-reconcile path.
+	featureVolumeReadyHook = func(s *goSearchService, vol *serviceVolumeIndex) {
+		if !uiDriveFixtureActive() || s == nil || vol == nil || vol.index == nil || vol.index.Source != "walk" {
+			return
+		}
+		fixtureWatchMu.Lock()
+		if fixtureWatched == nil {
+			fixtureWatched = make(map[*serviceVolumeIndex]bool)
+		}
+		first := !fixtureWatched[vol]
+		fixtureWatched[vol] = true
+		fixtureWatchMu.Unlock()
+		if first {
+			s.startWalkWatchers(vol)
+		}
 	}
 }
 

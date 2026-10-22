@@ -314,5 +314,12 @@ func (h *harness) contentScenario() *contentReport {
 	}
 	fr.Pass = fr.BeforePass && fr.AfterPass
 	rep.Freshness = fr
+	if info, err := h.serviceInfo(); err == nil && info.Content != nil {
+		rep.ContentState = info.Content.State
+		rep.ContentDocs = info.Content.Docs
+		rep.ContentBuildError = info.Content.BuildError
+		rep.ContentBuildDone = info.Content.BuildDone
+		rep.ContentBuildTotal = info.Content.BuildTotal
+	}
 	return rep
 }

@@ -102,9 +102,16 @@ func (s *goSearchService) prepareFeatureVolume(vol *serviceVolumeIndex) {
 	}
 }
 
+// featureVolumeReadyHook is a test-only seam (uiautomation fixture) that runs
+// after a volume is fully installed. Normal builds leave it nil.
+var featureVolumeReadyHook func(*goSearchService, *serviceVolumeIndex)
+
 func (s *goSearchService) featuresVolumeReady(vol *serviceVolumeIndex) {
 	if vol == nil {
 		return
+	}
+	if featureVolumeReadyHook != nil {
+		featureVolumeReadyHook(s, vol)
 	}
 	if s.features.Load() == nil {
 		s.prepareFeatureVolume(vol)

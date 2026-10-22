@@ -197,6 +197,11 @@ func isStructuralToken(token string) bool {
 	if ok, _ := regexp.MatchString(`^[a-z][\w-]*:`, token); ok {
 		return true
 	}
+	// Fuzzy content leaves (content~:, content~2:) are structural too; the
+	// generic filter pattern stops at the tilde.
+	if strings.HasPrefix(strings.ToLower(token), "content~") {
+		return true
+	}
 	if token == "|" {
 		return true
 	}
