@@ -40,6 +40,7 @@ func cmdService(args []string) error {
 	if err != nil {
 		return err
 	}
+	installUIAutoFixtureService()
 	if *remoteAddr == "" && cfg.RemoteAddr != "" {
 		*remoteAddr = cfg.RemoteAddr
 	}

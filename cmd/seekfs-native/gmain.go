@@ -123,6 +123,10 @@ func runUI(pipe string, limit int) error {
 	u := newUI(pipe, limit, w.Invalidate)
 	u.win = w
 	u.gdiPresent = gdi
+	if err := startUIAutomation(u); err != nil {
+		return err
+	}
+	defer stopUIAutomation()
 
 	// Restore window size (settings store 96-dpi px; Gio takes dp).
 	ww, hh := u.settings.WindowW, u.settings.WindowH
@@ -158,6 +162,7 @@ func runUI(pipe string, limit int) error {
 		case app.ConfigEvent:
 			u.onConfig(e)
 		case app.FrameEvent:
+			uiautoFrameBegin(u, e)
 			gtx := app.NewContext(&ops, e)
 			u.layout(gtx)
 			u.maybeSaveShot(gtx)
@@ -165,6 +170,7 @@ func runUI(pipe string, limit int) error {
 				u.presentGDI(gtx)
 			}
 			e.Frame(gtx.Ops)
+			uiautoFrameEnd(u)
 		}
 	}
 }

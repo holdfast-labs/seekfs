@@ -170,10 +170,12 @@ func (u *UI) closeSettings() {
 }
 
 func (u *UI) fetchSettings() {
+	uiautoMark("settings-fetch-start")
 	resp, err := u.client.SettingsGet()
 	u.mu.Lock()
 	u.settingsPending = settingsPendingResult{set: true, resp: resp, err: err}
 	u.mu.Unlock()
+	uiautoMark("settings-fetch-finish")
 	u.invalidate()
 }
 
@@ -192,6 +194,9 @@ func (u *UI) consumeSettingsPending() {
 	p.load = false
 	p.saving = false
 	p.installing = false
+	if wasSaving {
+		uiautoMark("settings-apply-finish")
+	}
 	if pend.err != nil {
 		p.err = pend.err.Error()
 		return
@@ -332,6 +337,7 @@ func (u *UI) applySettings() {
 	p.saving = true
 	p.installing = install
 	p.notice = ""
+	uiautoMark("settings-apply-start")
 	canWrite := p.model.canWrite
 	go u.applySettingsAsync(patch, canWrite, install)
 }

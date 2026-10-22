@@ -167,7 +167,7 @@ func handleServiceConn(conn *os.File, s *goSearchService) {
 	// impersonating the pipe client.  Failures fail closed (read-only).  A
 	// RevertToSelf failure is process-fatal and does not return.
 	principal := servicePrincipalForPipeConn(conn)
-	caps := localServiceCapabilities(principal)
+	caps := fixtureCapabilities(localServiceCapabilities(principal))
 	s.handleServiceCommand(conn, principal, caps, &req)
 }
 
