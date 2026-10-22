@@ -33,7 +33,12 @@ type mftBenchStage struct {
 	records    int
 }
 
-func (s mftBenchStage) report(b *testing.B) {
+type mftLogger interface {
+	Helper()
+	Logf(format string, args ...any)
+}
+
+func (s mftBenchStage) report(b mftLogger) {
 	b.Helper()
 	b.Logf("stage=%-12s records=%d before_heap_mb=%.1f peak_heap_mb=%.1f peak_sys_mb=%.1f after_heap_mb=%.1f bytes_per_record=%.1f",
 		s.name, s.records,

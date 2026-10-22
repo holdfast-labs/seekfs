@@ -540,28 +540,43 @@ func writeIndexFile(f *os.File, idx *Index) error {
 	nameLens := make([]uint16, 0, recordCount)
 	nameTokens := make([]string, 0, recordCount)
 	nameIDForRecord := make([]uint32, recordCount)
-	if idx.nameArena && len(idx.NameBlob) > 0 {
-		// The MFT build already holds every name once in NameBlob, and each
-		// record carries its byte offset there. Publish those offsets as the
-		// token table directly: no dedup map, no second copy of the names.
+	if idx.nameArena && len(idx.NameBlob) > 0 && len(idx.nameArenaOffsets) > 0 {
+		// The MFT build interned every distinct name once in NameBlob and lists
+		// those names in first-use order. Publish that list as the token table:
+		// equal names already share one offset, so no per-record token and no
+		// string-keyed dedup map is needed.
+		if len(idx.nameArenaLens) != len(idx.nameArenaOffsets) {
+			return errors.New("compact name arena index length mismatch")
+		}
+		offsets := idx.nameArenaOffsets
+		lens := idx.nameArenaLens
 		nameBlob = idx.NameBlob
-		nameOffs = make([]uint32, recordCount)
-		nameLens = make([]uint16, recordCount)
-		nameTokens = make([]string, recordCount)
-		for i := 0; i < recordCount; i++ {
-			rec := idx.compactRecord(i)
-			end := uint64(rec.NameOff) + uint64(rec.NameLen)
+		nameOffs = make([]uint32, len(offsets))
+		nameLens = make([]uint16, len(offsets))
+		copy(nameOffs, offsets)
+		copy(nameLens, lens)
+		nameTokens = make([]string, len(offsets))
+		for j := range offsets {
+			end := uint64(offsets[j]) + uint64(lens[j])
 			if end > uint64(len(nameBlob)) {
 				return errors.New("compact name arena reference out of range")
 			}
-			nameOffs[i] = rec.NameOff
-			nameLens[i] = rec.NameLen
-			nameIDForRecord[i] = uint32(i)
-			if rec.Name != "" {
-				nameTokens[i] = rec.Name
-			} else if rec.NameLen > 0 {
-				nameTokens[i] = stringView(nameBlob[int(rec.NameOff):int(end)])
+			if j > 0 && offsets[j] < offsets[j-1] {
+				return errors.New("compact name arena offsets not ordered")
 			}
+			nameTokens[j] = stringView(nameBlob[int(offsets[j]):int(end)])
+		}
+		for i := 0; i < recordCount; i++ {
+			rec := idx.compactRecord(i)
+			off, length := rec.NameOff, rec.NameLen
+			j := sort.Search(len(offsets), func(k int) bool { return offsets[k] >= off })
+			for j < len(offsets) && offsets[j] == off && lens[j] != length {
+				j++
+			}
+			if j >= len(offsets) || offsets[j] != off {
+				return errors.New("compact name arena token offset not interned")
+			}
+			nameIDForRecord[i] = uint32(j)
 		}
 	} else if recs := idx.MMapRecords; recs != nil && len(recs.tokenTable) > 0 {
 		// The source is already tokenized: every record references a stable name

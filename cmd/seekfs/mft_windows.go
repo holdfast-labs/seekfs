@@ -88,6 +88,109 @@ type mftTable struct {
 	recs  []mftTableRecord
 	names []byte
 	count int
+	// nameIdx deduplicates names as they enter the arena, so a common name
+	// (index.js, README.md, .gitignore) is stored once and every record shares
+	// its offset. distinct holds one offset/length per unique name in first-use
+	// order, which becomes the index token table.
+	nameIdx      mftNameIndex
+	distinct     []uint32
+	distinctLens []uint16
+}
+
+// mftNameIndex is an open-addressing table of arena offsets keyed by name
+// bytes. It adds 12 bytes per distinct name at most (offsets + lengths), far
+// less than a Go map[string]uint32, and never allocates a string.
+type mftNameIndex struct {
+	offs  []uint32
+	lens  []uint16
+	mask  uint32
+	count int
+}
+
+const mftNameIndexEmpty = ^uint32(0)
+
+func mftNameHash(name string) uint32 {
+	const (
+		offset32 = 2166136261
+		prime32  = 16777619
+	)
+	h := uint32(offset32)
+	for i := 0; i < len(name); i++ {
+		h ^= uint32(name[i])
+		h *= prime32
+	}
+	return h
+}
+
+func (x *mftNameIndex) ensure() {
+	if len(x.offs) > 0 {
+		return
+	}
+	const slots = 1024
+	x.offs = make([]uint32, slots)
+	for i := range x.offs {
+		x.offs[i] = mftNameIndexEmpty
+	}
+	x.lens = make([]uint16, slots)
+	x.mask = slots - 1
+}
+
+func (x *mftNameIndex) grow(names []byte) {
+	oldOffs, oldLens := x.offs, x.lens
+	slots := len(oldOffs) * 2
+	if slots == 0 {
+		slots = 1024
+	}
+	x.offs = make([]uint32, slots)
+	for i := range x.offs {
+		x.offs[i] = mftNameIndexEmpty
+	}
+	x.lens = make([]uint16, slots)
+	x.mask = uint32(slots - 1)
+	x.count = 0
+	for i, off := range oldOffs {
+		if off == mftNameIndexEmpty {
+			continue
+		}
+		x.insert(names, off, oldLens[i])
+	}
+}
+
+// lookup returns the arena offset of name when it is already interned.
+func (x *mftNameIndex) lookup(names []byte, name string) (uint32, bool) {
+	if len(x.offs) == 0 {
+		return 0, false
+	}
+	i := mftNameHash(name) & x.mask
+	for {
+		off := x.offs[i]
+		if off == mftNameIndexEmpty {
+			return 0, false
+		}
+		n := int(x.lens[i])
+		if n == len(name) && off <= uint32(len(names)) && uint32(n) <= uint32(len(names))-off {
+			start := int(off)
+			if stringView(names[start:start+n]) == name {
+				return off, true
+			}
+		}
+		i = (i + 1) & x.mask
+	}
+}
+
+func (x *mftNameIndex) insert(names []byte, off uint32, length uint16) {
+	x.ensure()
+	if (x.count+1)*10 >= len(x.offs)*7 {
+		x.grow(names)
+	}
+	name := names[int(off) : int(off)+int(length)]
+	i := mftNameHash(stringView(name)) & x.mask
+	for x.offs[i] != mftNameIndexEmpty {
+		i = (i + 1) & x.mask
+	}
+	x.offs[i] = off
+	x.lens[i] = length
+	x.count++
 }
 
 const (
@@ -147,9 +250,9 @@ func (t *mftTable) add(entry mftEntry) {
 		return
 	}
 	rec := &t.recs[entry.frn]
-	nameLen := len(entry.name)
-	if nameLen > 255 {
-		nameLen = 255
+	name := entry.name
+	if len(name) > int(^uint16(0)) {
+		name = name[:int(^uint16(0))]
 	}
 	flags := uint8(mftRecordPresent)
 	if entry.isDir {
@@ -158,8 +261,15 @@ func (t *mftTable) add(entry mftEntry) {
 	if entry.inUse {
 		flags |= mftRecordInUse
 	}
-	nameOff := uint32(len(t.names))
-	t.names = append(t.names, entry.name[:nameLen]...)
+	nameOff, interned := t.nameIdx.lookup(t.names, name)
+	if !interned {
+		nameOff = uint32(len(t.names))
+		t.names = append(t.names, name...)
+		nameLen := uint16(len(name))
+		t.nameIdx.insert(t.names, nameOff, nameLen)
+		t.distinct = append(t.distinct, nameOff)
+		t.distinctLens = append(t.distinctLens, nameLen)
+	}
 	if rec.flags&mftRecordPresent == 0 {
 		t.count++
 	}
@@ -169,7 +279,7 @@ func (t *mftTable) add(entry mftEntry) {
 		modUnix:   entry.modUnix,
 		nameOff:   nameOff,
 		attr:      entry.attr,
-		nameLen:   uint16(nameLen),
+		nameLen:   uint16(len(name)),
 		flags:     flags,
 		seq:       entry.seq,
 		parentSeq: entry.parentSeq,

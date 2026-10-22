@@ -771,3 +771,42 @@ as `buildIndexUSNVolume` returns. `runSettingsVolumeBuild` defers a single
 `TestSettingsBuildReleasesBuiltIndex` proves the stub Index is finalizable
 after the build, the installed volume is the reloaded mmap index, and
 HeapInuse returns within a generous baseline bound.
+
+### Name Reuse (Zipf) and Dedup
+
+2026-10-22 follow-up on `ux/build-memory`. Corpus: 1M records, 35% drawn
+from a 2,048-name pool (`index.js`, `README.md`, `.gitignore`,
+`__init__.py`, `package.json`, ...), the rest unique, about 8% directories.
+
+```powershell
+$env:SEEKFS_ZIPF_REPORT='1'; $env:SEEKFS_ZIPF_N='1000000'
+go test ./cmd/seekfs -run TestZipfIndexSizeReport -v
+```
+
+| Metric | Legacy | Compact arena |
+| --- | ---: | ---: |
+| Token count | 651,435 | 651,435 |
+| `.gsi` file bytes | 164,265,724 | 164,265,724 |
+| Token table + name blob | 15,497,716 | 15,497,716 |
+| `LOWR` section | 3,912,103 | 3,912,103 |
+| `PNGR` section | 11,829,861 | 11,829,861 |
+| `PNGC` section | 4,084,648 | 4,084,648 |
+| Accumulate peak | 394.0 B/rec | 115.6 B/rec |
+| Record build peak | 320.2 B/rec | 145.2 B/rec |
+| Build peak (stage max) | 405.8 B/rec | 390.9 B/rec |
+
+The arena now interns names at insert time with an open-addressing table of
+`uint32` arena offsets, so equal names share one arena slice. `Index` carries
+the distinct offset/length list and `writeIndexFile` publishes it as the token
+table. Token count, total file size, name blob, token table, `LOWR`, `PNGR`,
+and `PNGC` match the legacy path byte for byte. `TestZipfNameDedupMatchesLegacy`
+pins this at 20,000 records.
+
+`TestZipfIndexSizeReport` is skipped unless `SEEKFS_ZIPF_REPORT=1`. Retained
+heap after build plus GC is 1.4 MB.
+
+Whole-build peak is still paced by the unchanged `buildCompactPathOrderRank`
+path strings, so on this shorter-name corpus it is only 3.7% below a legacy
+run of the same corpus. Against the pre-change unique-name peak of
+646.7 B/rec, the compact Zipf peak is 40% lower. Accumulation itself is 71%
+lower on identical input.
