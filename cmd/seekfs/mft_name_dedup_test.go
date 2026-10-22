@@ -215,6 +215,29 @@ func loadIndexNameBytes(t *testing.T, path string) (blob, tokens, lower []byte) 
 	return blob, tokens, lower
 }
 
+func queryZipfIndex(t *testing.T, path string, queries []string) map[string][]string {
+	t.Helper()
+	idx, err := loadIndexMMap(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	vol := newServiceVolumeIndex(path, idx)
+	t.Cleanup(func() { _ = closeIndexMMapRecords(idx) })
+	out := make(map[string][]string, len(queries))
+	for _, q := range queries {
+		results, err := searchServiceVolumes([]*serviceVolumeIndex{vol}, queryOptions{Query: q, Limit: 20}, false)
+		if err != nil {
+			t.Fatalf("query %q: %v", q, err)
+		}
+		paths := make([]string, 0, len(results))
+		for _, r := range results {
+			paths = append(paths, r.Path)
+		}
+		out[q] = paths
+	}
+	return out
+}
+
 func TestZipfNameDedupMatchesLegacy(t *testing.T) {
 	dir := t.TempDir()
 	const records = 20_000
@@ -241,6 +264,26 @@ func TestZipfNameDedupMatchesLegacy(t *testing.T) {
 	if !bytes.Equal(oldLower, newLower) {
 		t.Fatalf("lower-name section differs: legacy=%d bytes compact=%d bytes", len(oldLower), len(newLower))
 	}
+	queries := []string{"README", "index.js", "unique-0000100", "package.json"}
+	legacyResults := queryZipfIndex(t, legacyPath, queries)
+	compactResults := queryZipfIndex(t, compactPath, queries)
+	for _, q := range queries {
+		if !slicesEqual(legacyResults[q], compactResults[q]) {
+			t.Fatalf("query %q legacy=%v compact=%v", q, legacyResults[q], compactResults[q])
+		}
+	}
+}
+
+func slicesEqual(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // runLegacyZipfPipeline measures the old map accumulation, old record build,
