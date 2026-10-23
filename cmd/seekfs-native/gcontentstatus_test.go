@@ -80,6 +80,13 @@ func TestContentDegradedReasons(t *testing.T) {
 	}
 }
 
+func TestStatusContentOff(t *testing.T) {
+	text, tone := statusContentText(false, nil, nil, "")
+	if text != "" || tone != healthToneMuted {
+		t.Fatalf("Contents off text = %q tone=%d", text, tone)
+	}
+}
+
 func TestStatusBarSingleMessageWhileBuilding(t *testing.T) {
 	health := &contentState{State: contentStateIndexing, BuildDone: 42, BuildTotal: 100}
 	text, tone := statusContentText(true, nil, health,
