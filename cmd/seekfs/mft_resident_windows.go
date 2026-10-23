@@ -77,7 +77,7 @@ func parseMFTResidentRecord(record []byte, recordNumber uint64, bytesPerSector i
 			return contentResidentRecord{}, contentResidentReasonParse, false
 		}
 		attr := record[pos : pos+attrLen]
-		nonResident := attr[8] != 0
+		nonResident := len(attr) > 8 && attr[8] != 0
 		nameLen := 0
 		if len(attr) > 9 {
 			nameLen = int(attr[9])
@@ -87,13 +87,17 @@ func parseMFTResidentRecord(record []byte, recordNumber uint64, bytesPerSector i
 			return contentResidentRecord{}, contentResidentReasonAttributeList, false
 		case attrStandardInformation:
 			// $STANDARD_INFORMATION: file attributes at content offset +32.
-			if contentOff := int(binary.LittleEndian.Uint16(attr[20:22])); contentOff+36 <= len(attr) {
-				attrs = binary.LittleEndian.Uint32(attr[contentOff+32 : contentOff+36])
+			if len(attr) >= 22 {
+				if contentOff := int(binary.LittleEndian.Uint16(attr[20:22])); contentOff >= 0 && contentOff+36 <= len(attr) {
+					attrs = binary.LittleEndian.Uint32(attr[contentOff+32 : contentOff+36])
+				}
 			}
 		case attrFileName:
 			// $FILE_NAME also carries the file attributes at content offset +56.
-			if contentOff := int(binary.LittleEndian.Uint16(attr[20:22])); contentOff+60 <= len(attr) {
-				attrs |= binary.LittleEndian.Uint32(attr[contentOff+56 : contentOff+60])
+			if len(attr) >= 22 {
+				if contentOff := int(binary.LittleEndian.Uint16(attr[20:22])); contentOff >= 0 && contentOff+60 <= len(attr) {
+					attrs |= binary.LittleEndian.Uint32(attr[contentOff+56 : contentOff+60])
+				}
 			}
 		case attrData:
 			if nameLen != 0 {
