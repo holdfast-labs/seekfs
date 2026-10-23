@@ -92,6 +92,21 @@ const contentBuildMaxConcurrent = 1
 // A var so tests and tight-memory machines can pin it to 1 (sequential).
 var contentShardBuildConcurrency = 2
 
+// Early publish. A first build has no serving base until every file is
+// extracted, so a whole-drive build shows "indexing" for many minutes while
+// the answerable prefix already exists. Once the first
+// contentPreviewMinDocs documents (or contentPreviewMinBytes of extracted
+// text, whichever comes first) are spooled, the build assembles and attaches
+// that prefix as a partial base, marks health partial + indexing with
+// build_done/build_total, and keeps extracting; the final publish replaces it
+// atomically. The preview is bounded, so its duplicate tokenize cost is small.
+var (
+	contentPreviewMinDocs         = 2048
+	contentPreviewMinBytes        = int64(8 << 20)
+	contentPreviewPublishedHook   = func(*goSearchService, *contentVolumeState, int) {}
+	contentPreviewPublishDisabled bool
+)
+
 // contentBuildGate is the process-wide build concurrency limiter.
 var contentBuildGate = make(chan struct{}, contentBuildMaxConcurrent)
 
@@ -294,11 +309,26 @@ type contentBuildItem struct {
 	// seq is the source record's NTFS sequence number (0 = unknown), carried
 	// through extraction into the doc row.
 	seq uint16
+	// mod is the source mtime in Unix seconds (0 = unknown). Within a
+	// priority tier newer files extract first, so a build that is still
+	// running (or one that hits its budget) has the most recently edited
+	// files usable first. Selection order only: assembly still sorts by FRN.
+	mod int64
+	// size is the source file size in bytes (< 0 or 0 = unknown). It lets the
+	// metadata-only pre-open skips (large JSON, over-cap containers) decide
+	// without opening the file.
+	size int64
 }
 
+// contentBuildItemLess orders extraction: scope tier first (repositories,
+// configured roots, known folders, then the volume root), then most recently
+// modified first, then path and FRN for determinism.
 func contentBuildItemLess(a, b contentBuildItem) bool {
 	if a.priority != b.priority {
 		return a.priority < b.priority
+	}
+	if a.mod != b.mod {
+		return a.mod > b.mod
 	}
 	if a.path != b.path {
 		return a.path < b.path
@@ -562,7 +592,7 @@ func (s *goSearchService) snapshotContentBuildItemsLegacy(vol *serviceVolumeInde
 					continue
 				}
 			}
-			item := contentBuildItem{frn: frn, path: path, seq: idx.recordSeq(id)}
+			item := contentBuildItem{frn: frn, path: path, seq: idx.recordSeq(id), mod: rec.ModUnix, size: size}
 			if opts.Scope != nil {
 				_, item.inRepo = opts.Scope.Ignore.repoFor(contentNormPath(path))
 			}
@@ -611,6 +641,16 @@ func contentBuildDocSafe(ctx context.Context, item contentBuildItem) (doc conten
 		}
 	}()
 	fctx, fileRaw, _ := contentFileExtractContext(ctx, item.inRepo)
+	// Metadata-only skips run before the open: a known-binary extension,
+	// lockfile, large JSON blob, minified/bundle name or over-cap container
+	// costs zero opens. Selection already applied these when it knew the
+	// size; this also covers size-blind drain/fold callers.
+	if reason, skip := contentPreOpenSkip(item.path, item.size, item.inRepo); skip {
+		if reason == "binary" {
+			return contentBuildDoc{}, contentExtractResult{Binary: true, Reason: "binary", Size: item.size}, false
+		}
+		return contentBuildDoc{}, contentExtractResult{Skipped: true, Reason: reason, Size: item.size}, false
+	}
 	s, err := contentSlurpNoRecall(item.path, fileRaw)
 	if err != nil {
 		return contentBuildDoc{}, contentExtractResult{}, false
@@ -852,7 +892,10 @@ func (s *goSearchService) runContentBuild(vol *serviceVolumeIndex, reuseSidecar 
 	// keeps memory bounded while the assembler later consumes selected docs
 	// in FRN order.
 	type selectedDoc struct {
-		item        contentBuildItem
+		// item indexes the sorted items slice. Storing the index instead of a
+		// second contentBuildItem keeps per-selected-file metadata at ~40 B
+		// (path strings stay shared with items) instead of ~90 B.
+		item        int
 		offset      int64
 		length      int
 		spoolLen    int
@@ -863,6 +906,7 @@ func (s *goSearchService) runContentBuild(vol *serviceVolumeIndex, reuseSidecar 
 		fileModNano int64
 	}
 	selected := make([]selectedDoc, 0, 1024)
+	selItem := func(s *selectedDoc) *contentBuildItem { return &items[s.item] }
 	total := len(items)
 	done := 0
 	var used, skipped, truncated, binary int64
@@ -911,6 +955,87 @@ func (s *goSearchService) runContentBuild(vol *serviceVolumeIndex, reuseSidecar 
 	// the fold create their prefetch once with their (static) count.
 	adaptive := newContentBuildAdaptivePrefetch(ctx, items, contentBuildDocSafe)
 	defer adaptive.stop()
+
+	// Early publish scaffold: identity fields a preview base must carry to be
+	// attachable, and one bounded assemble+attach when enough of the prefix is
+	// spooled. See contentPreviewMinDocs.
+	s.indexMu.RLock()
+	isWalkBuild := vol.index != nil && vol.index.Source == "walk"
+	s.indexMu.RUnlock()
+	previewHeader := &contentIndex{
+		Origin:        contentOriginUSN,
+		JournalID:     journalID,
+		CheckpointUSN: uint64(checkpoint),
+	}
+	if isWalkBuild {
+		previewHeader.Origin = contentOriginWalk
+		previewHeader.JournalID = 0
+	}
+	if opts.Scope != nil {
+		previewHeader.ScopeHash = opts.Scope.fingerprint()
+	}
+	previewFilterID := contentFilterID{
+		MaxRaw:       settings.maxRaw,
+		MaxText:      settings.maxText,
+		CapsExplicit: settings.capsExplicit,
+		Encoding:     contentServiceEncodingLabel(),
+	}
+	previewPublished := false
+	publishPreview := func() {
+		if previewPublished || contentPreviewPublishDisabled || len(selected) == 0 {
+			return
+		}
+		previewPublished = true
+		dir, err := os.MkdirTemp(tmpDir, "preview-*")
+		if err != nil {
+			return
+		}
+		defer os.RemoveAll(dir)
+		order := make([]int, len(selected))
+		for i := range order {
+			order[i] = i
+		}
+		sort.Slice(order, func(i, j int) bool {
+			a, b := selItem(&selected[order[i]]), selItem(&selected[order[j]])
+			if a.frn != b.frn {
+				return a.frn < b.frn
+			}
+			return a.path < b.path
+		})
+		r, err := newContentSpoolReader(spool)
+		if err != nil {
+			return
+		}
+		defer r.Close()
+		next := 0
+		src := func() (contentBuildDoc, bool, error) {
+			if next >= len(order) {
+				return contentBuildDoc{}, false, nil
+			}
+			d := &selected[order[next]]
+			next++
+			text, rerr := r.Read(d.offset, d.spoolLen, d.length)
+			if rerr != nil {
+				return contentBuildDoc{}, false, rerr
+			}
+			it := selItem(d)
+			return contentBuildDoc{path: it.path, frn: it.frn, text: text, modUnix: d.modUnix, class: d.class, version: d.version, fileSize: d.fileSize, fileModNano: d.fileModNano}, true, nil
+		}
+		built, err := assembleContentIndexStreamed(src, dir, previewFilterID)
+		if err != nil {
+			return
+		}
+		shard := contentShardHeader(previewHeader, built)
+		shard.Sections = map[uint32][]byte{contentSectionPaths: encodeContentPaths(built.paths)}
+		shard.Inclusion.DedupeFiles = built.dedupeFiles
+		shard.Inclusion.DedupeBytes = built.dedupeBytes
+		if err := contentSaveAssembled(gsx, shard, contentBuildFiles(built)); err != nil {
+			return
+		}
+		s.attachContentForVolumeReplace(vol, true)
+		vol.content.markPartialBuild(done, total)
+		contentPreviewPublishedHook(s, vol.content, len(shard.Docs))
+	}
 	for done < total {
 		// The atomic generation covers the common abort (a rebuild/journal
 		// reset bumps replayGen); the full journal-id check runs per batch
@@ -923,7 +1048,6 @@ func (s *goSearchService) runContentBuild(vol *serviceVolumeIndex, reuseSidecar 
 			abortReason = "service stopping"
 			break
 		}
-		item := items[done]
 		done++
 		got, live := adaptive.next()
 		if !live {
@@ -1003,9 +1127,14 @@ func (s *goSearchService) runContentBuild(vol *serviceVolumeIndex, reuseSidecar 
 			vol.content.markBuildFailed(err.Error())
 			return
 		}
-		selected = append(selected, selectedDoc{item: item, offset: offset, length: len(doc.text), spoolLen: compLen, modUnix: doc.modUnix, class: doc.class, version: doc.version, fileSize: doc.fileSize, fileModNano: doc.fileModNano})
+		selected = append(selected, selectedDoc{item: done - 1, offset: offset, length: len(doc.text), spoolLen: compLen, modUnix: doc.modUnix, class: doc.class, version: doc.version, fileSize: doc.fileSize, fileModNano: doc.fileModNano})
 		used += n
 		indexUsed += cost
+		// Publish the answerable prefix once it is big enough; the build keeps
+		// extracting and replaces it with the complete base at the end.
+		if !previewPublished && (len(selected) >= contentPreviewMinDocs || used >= contentPreviewMinBytes) {
+			publishPreview()
+		}
 		if sinceDiskCheck += n; sinceDiskCheck >= contentDiskCheckEvery {
 			sinceDiskCheck = 0
 			if err := contentCheckDiskReserve(tmpDir); err != nil {
@@ -1020,10 +1149,11 @@ func (s *goSearchService) runContentBuild(vol *serviceVolumeIndex, reuseSidecar 
 		return
 	}
 	sort.Slice(selected, func(i, j int) bool {
-		if selected[i].item.frn != selected[j].item.frn {
-			return selected[i].item.frn < selected[j].item.frn
+		a, b := selItem(&selected[i]), selItem(&selected[j])
+		if a.frn != b.frn {
+			return a.frn < b.frn
 		}
-		return selected[i].item.path < selected[j].item.path
+		return a.path < b.path
 	})
 	// sourceOf streams the selected docs at the given positions (ascending
 	// FRN) back out of a spool file rf: the shared spool for a single-file
@@ -1066,12 +1196,10 @@ func (s *goSearchService) runContentBuild(vol *serviceVolumeIndex, reuseSidecar 
 			if err != nil {
 				return contentBuildDoc{}, false, err
 			}
-			return contentBuildDoc{path: s.item.path, frn: s.item.frn, text: text, modUnix: s.modUnix, class: s.class, version: s.version, fileSize: s.fileSize, fileModNano: s.fileModNano}, true, nil
+			si := selItem(&s)
+			return contentBuildDoc{path: si.path, frn: si.frn, text: text, modUnix: s.modUnix, class: s.class, version: s.version, fileSize: s.fileSize, fileModNano: s.fileModNano}, true, nil
 		}, r
 	}
-	s.indexMu.RLock()
-	isWalkBuild := vol.index != nil && vol.index.Source == "walk"
-	s.indexMu.RUnlock()
 	var budgetBytes int64
 	if opts.Scope != nil {
 		budgetBytes = opts.Scope.BudgetBytes
@@ -1195,7 +1323,7 @@ func (s *goSearchService) runContentBuild(vol *serviceVolumeIndex, reuseSidecar 
 		paths := make([]string, len(selected))
 		sizes := make([]int64, len(selected))
 		for i, d := range selected {
-			paths[i], sizes[i] = d.item.path, int64(d.length)
+			paths[i], sizes[i] = selItem(&d).path, int64(d.length)
 		}
 		groups := contentGroupByShard(contentPlanShards(paths, sizes, contentShardTargetBytes), paths)
 		dir := contentShardDir(gsx)

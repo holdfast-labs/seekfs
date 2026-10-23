@@ -202,6 +202,63 @@ func contentMinifiedName(base string) bool {
 	return false
 }
 
+// contentPathBaseLower returns the lowercase final path element without
+// allocating a full filepath.Clean. Empty input and a trailing separator
+// return "".
+func contentPathBaseLower(path string) string {
+	base := path
+	for i := len(path) - 1; i >= 0; i-- {
+		if path[i] == '\\' || path[i] == '/' {
+			base = path[i+1:]
+			break
+		}
+	}
+	if base == "" {
+		return ""
+	}
+	return strings.ToLower(base)
+}
+
+// contentContainerOverCap reports whether ext names a format a registered
+// rich extractor claims (OOXML/PDF/RTF/email/...) and size exceeds the file's
+// raw cap. Such a container is Skipped anyway (it cannot be prefixed), so the
+// decision needs no file content: it runs before the open. A non-positive
+// size is unknown and admits (the extractor re-checks).
+func contentContainerOverCap(ext string, size int64, inRepo bool) bool {
+	if size < 0 || !contentRegistryClaimsExt(ext) {
+		return false
+	}
+	raw, _ := contentInclusionCapsForFile(inRepo, 0, 0)
+	return raw > 0 && size > raw
+}
+
+// contentPreOpenSkip applies every inclusion rule that needs only metadata
+// already in the name index (path, extension, size), so a caller decides
+// before it opens the file. It covers the known-binary extensions, lockfiles,
+// large JSON blobs, minified/bundle names and over-cap container formats.
+// Directory rules, git rules and the operator skip list stay in
+// contentInclusionSkip because they need the resolved scope.
+func contentPreOpenSkip(path string, size int64, inRepo bool) (string, bool) {
+	ext := contentPathExtension(path)
+	if contentBinaryRejected(ext) {
+		return "binary", true
+	}
+	base := contentPathBaseLower(path)
+	if contentLockfileBase(base) {
+		return contentSkipLockfile, true
+	}
+	if contentLargeJSONSkip(ext, size) {
+		return contentSkipLargeJSON, true
+	}
+	if contentMinifiedName(base) {
+		return contentSkipMinified, true
+	}
+	if contentContainerOverCap(ext, size, inRepo) {
+		return contentSkipSizeCap, true
+	}
+	return "", false
+}
+
 // contentBuildOutputSegment reports whether a single lowercase path segment
 // names build output.
 func contentBuildOutputSegment(seg string) bool {
@@ -279,6 +336,9 @@ func contentInclusionSkip(normPath, base, ext string, size int64, inRepo bool, s
 	}
 	if contentMinifiedName(base) {
 		return contentSkipMinified, true
+	}
+	if contentContainerOverCap(ext, size, inRepo) {
+		return contentSkipSizeCap, true
 	}
 	if !sysExcludes {
 		return "", false

@@ -440,6 +440,11 @@ func contentVerifyBufPut(b []byte) {
 	contentVerifyBufPool.Put(b[:0])
 }
 
+// contentOpenForExtract is the build/verify file opener. It is a var so tests
+// can count opens (and prove metadata-only skips never reach one); production
+// always opens through contentOpenNoRecall.
+var contentOpenForExtract = contentOpenNoRecall
+
 func contentSlurpNoRecallMode(path string, maxRaw int64, reuse bool) (*contentSlurpedFile, error) {
 	if maxRaw <= 0 {
 		maxRaw = contentExtractMaxRawBytes
@@ -451,7 +456,7 @@ func contentSlurpNoRecallMode(path string, maxRaw int64, reuse bool) (*contentSl
 			path = mapped
 		}
 	}
-	f, err := contentOpenNoRecall(path)
+	f, err := contentOpenForExtract(path)
 	if err != nil {
 		return nil, err
 	}

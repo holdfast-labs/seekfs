@@ -771,3 +771,105 @@ as `buildIndexUSNVolume` returns. `runSettingsVolumeBuild` defers a single
 `TestSettingsBuildReleasesBuiltIndex` proves the stub Index is finalizable
 after the build, the installed volume is the reloaded mmap index, and
 HeapInuse returns within a generous baseline bound.
+
+## Content Build: Earlier Availability, Fewer Opens, Bounded Memory
+
+2026-10-22, branch `ux/content-speed` (based on `ux/integ`), local in-process
+`go test` harnesses only (no service process). Machine: Intel i7-10700KF,
+NVMe, Defender real-time scanning on. Every run used
+`GOCACHE=E:\bench\gocache`, `GOMODCACHE=E:\bench\gomodcache`, `go test -p 1`.
+
+### Pre-open selection (fewer opens)
+
+Rules that need only name-index metadata now run before the file is opened:
+known-binary extensions, lockfiles, JSON at or above 100 KiB, minified/bundle
+names (`.min.`, `.bundle.`, `.chunk.`, `.map`), and container formats a rich
+extractor claims (`pdf`, OOXML, RTF, email, ...) when the source size exceeds
+the per-file raw cap. `contentInclusionSkip` and `contentBuildDocSafe` share
+the decision, so both the selection scan and size-blind drain/fold callers
+avoid the open. Directory/git/operator skip rules stay in the selection scan
+where the resolved scope is available.
+
+| Corpus | Live file records | Selection-admitted | Avoided before any open | Over-cap containers added | Avoided of old opens |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Chromium walk index (auto scope) | 509,271 | 468,148 | 41,123 (8.1%) | 0 | 8.1% |
+| Synthetic mixed corpus (365 files: text, images, `node_modules`, `build`, `.cache`, minified, lockfiles, large JSON, 3 MiB PDF/DOCX) | 365 | 210 | 151 (41.4%) | 4 | 42.5% |
+
+Chromium has one PDF over 1 MiB (`complex_document.pdf`, 1.4 MiB, inside a
+repo, raw cap 20 MiB) and no over-cap container, so that corpus gains nothing
+from the container rule; the synthetic corpus exercises it (4 of 214 old
+opens, 1.9%). The remaining Chromium opens are text/code or extensionless
+files whose head must be sniffed.
+
+### Priority order (newest first within a tier)
+
+Extraction order is scope tier first (Git worktrees, configured roots, known
+folders, volume root), then mtime descending, then path/FRN. The record
+mtime rides the snapshot (`contentBuildItem.mod`), so a running build and a
+budget-capped build both have the most recently edited files usable first.
+The final sidecar is still assembled in FRN order, so published bytes are
+unchanged. The estimate and reconcile budget use the same ordering.
+
+### Early publish (time to first usable result)
+
+After `contentPreviewMinDocs` (2,048) documents or 8 MiB of extracted text,
+the build assembles and attaches that prefix as a partial base, reports
+`state=indexing`, `partial=true`, `build_done`/`build_total`, and keeps
+extracting; the final publish replaces the prefix atomically. Measured on a
+Defender-cold copy of `third_party/blink/renderer/core` (9,403 files) with 16
+open workers:
+
+| Metric | Before | After |
+| --- | ---: | ---: |
+| Time to a queryable content base | 12.98 s (end of build) | 2.46 s (preview) |
+| Build wall time | 12.98 s | 12.98 s |
+
+### Memory
+
+Selection metadata retained for the Chromium auto scope (468,148 admitted
+files): 149.1 B/file before (66.6 MB) and 170.6 B/file after (76.1 MB). The
++21.5 B/file is `mod` and `size`, which buy mtime ordering and the pre-open
+size rules. About 90 B of each value is the path text itself (42.0 MB).
+`selectedDoc` now stores an index into the item slice instead of a second
+`contentBuildItem`: 96 B -> 64 B per selected file. Net retained
+selection+selected metadata is about 106 MB after versus 112 MB before for
+this corpus (path text included; structural metadata excluding paths is about
+80 B/file).
+
+Peak heap for a full service build (workers=2 unless noted), sampling
+`HeapAlloc` every 50 ms:
+
+| Corpus | Files | Extracted text | Peak heap | Peak/B/file |
+| --- | ---: | ---: | ---: | ---: |
+| `blink/renderer/core` | 9,403 | 78.7 MB | 399.5 MB | 42.5 KB |
+| `blink/renderer` | 19,540 | about 150 MB | 531.3 MB | 27.2 KB |
+
+Peak is dominated by the per-shard assembler working set (64 MiB shard
+target, token maps plus posting arenas), not by per-file metadata: doubling
+the corpus raised peak by 1.33x, not 2x. The 2026-10-15 profile already
+measured a 64 MiB shard under about 250 MB; the remaining fixed cost is the
+walk index plus the extraction prefetch.
+
+### Cold open-worker sweep
+
+Defender-cold copies of the same 9,403-file subtree, one fresh copy per run
+(new file IDs), `GOMAXPROCS=8`, batch 128, full build wall:
+
+| Open workers | Wall | Files/s | Peak heap |
+| ---: | ---: | ---: | ---: |
+| 1 | 46.53 s | 202.1 | 443.7 MB |
+| 4 | 20.06 s | 468.8 | 463.3 MB |
+| 16 | 12.80 s | 734.6 | 473.1 MB |
+| 64 | 12.53 s | 750.4 | 481.5 MB |
+
+16 workers capture the cold win (3.6x over 1); 64 adds 2%. This supersedes
+the earlier note that 16 workers gave only about 1.5x.
+
+What still dominates cold build time: Defender on-access scanning at first
+open (about 200 files/s at one worker on this corpus). What still dominates
+peak heap: the 64 MiB per-shard assembler batch. The whole-drive report's
+~8 GB spike is not content metadata: the name-index build is the linear
+component, and `ux/build-memory` records it at 447.7 B/record
+(~4.5 GB at 10M records) before its release step (see "Name-Index Build
+Memory"). Content adds about 0.1 GB of retained selection metadata per
+million admitted files plus a bounded per-shard assembler peak.

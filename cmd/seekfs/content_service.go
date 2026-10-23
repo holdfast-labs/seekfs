@@ -991,6 +991,7 @@ func (s *contentVolumeState) setReady(idx *contentIndex, reader *contentReader, 
 	}
 	s.catchUpFailed = false
 	s.health.BuildPhase = ""
+	s.health.Partial = false
 	s.reconcileActive = false
 	s.health.Docs = len(idx.Docs)
 	s.health.SidecarBytes = idx.EncodedSize
@@ -1355,6 +1356,32 @@ func (s *contentVolumeState) markIndexing(total int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.beginBuildLocked(contentBuildPhaseExtracting, total)
+}
+
+// markPartialBuild keeps an early prefix base attached and served while the
+// full build continues: the state stays indexing (so a drain cannot flip it
+// to ready), health reports partial + build progress, and servingStale keeps
+// a canceled build from dropping the prefix (it degrades instead). The final
+// publish's setReady clears Partial and the build flags.
+func (s *contentVolumeState) markPartialBuild(done, total int) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.reader == nil || s.resolver == nil {
+		return
+	}
+	s.state = contentStateIndexing
+	s.health.State = contentStateIndexing
+	s.health.Partial = true
+	s.health.Incomplete = true
+	s.health.BuildPhase = contentBuildPhaseExtracting
+	s.health.BuildDone = done
+	s.health.BuildTotal = total
+	s.health.BuildError = ""
+	s.servingStale = true
+	s.health.Stale = false
 }
 
 // setBuildPhase moves an in-flight build between phases; ignored once the

@@ -114,7 +114,7 @@ func legacyScanSelection(idx *Index, opts contentBuildOptions, isWalk bool) map[
 				continue
 			}
 		}
-		item := contentBuildItem{frn: frn, path: path}
+		item := contentBuildItem{frn: frn, path: path, mod: rec.ModUnix}
 		if opts.Scope != nil {
 			item.priority = opts.Scope.priority(path)
 		}
@@ -145,7 +145,7 @@ func fastScanSelection(t *testing.T, s *goSearchService, vol *serviceVolumeIndex
 	}
 	for _, l := range lists {
 		for _, m := range l {
-			out[m.frn] = contentBuildItem{frn: m.frn, path: m.path, priority: m.priority}
+			out[m.frn] = contentBuildItem{frn: m.frn, path: m.path, priority: m.priority, mod: m.mod, size: m.size}
 		}
 	}
 	return out
