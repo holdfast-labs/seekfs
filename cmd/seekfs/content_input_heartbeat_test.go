@@ -148,8 +148,15 @@ func TestGovernorPausesOnHeartbeat(t *testing.T) {
 	if got := contentBuildBusyReason(`E:\idx\vol.gsx`); got != "input" {
 		t.Fatalf("heartbeat-active reason = %q, want input", got)
 	}
+	// The input pause length is per build-speed mode: Gentle keeps the full
+	// pause, Balanced (the default) shortens it to a quarter.
+	contentSetBuildSpeed(contentBuildSpeedGentle)
 	if got := contentBuildPauseNow(`E:\idx\vol.gsx`); got != contentBuildBatchPause {
-		t.Fatalf("heartbeat-active pause = %v, want %v", got, contentBuildBatchPause)
+		t.Fatalf("gentle heartbeat-active pause = %v, want %v", got, contentBuildBatchPause)
+	}
+	contentSetBuildSpeed(contentBuildSpeedBalanced)
+	if got := contentBuildPauseNow(`E:\idx\vol.gsx`); got != contentBuildBatchPause/4 {
+		t.Fatalf("balanced heartbeat-active pause = %v, want %v", got, contentBuildBatchPause/4)
 	}
 }
 
