@@ -276,6 +276,9 @@ type contentHealth struct {
 	// drain opened them. This is an expected transient (delete/rename race),
 	// so it is not an extraction error and does not keep the volume degraded.
 	Vanished int `json:"extract_vanished,omitempty"`
+	// BuildWorkers is the effective extraction concurrency for the running
+	// build under the configured build_speed policy, so the app can show it.
+	BuildWorkers int `json:"build_workers,omitempty"`
 }
 
 // contentDeltaDoc is an extracted document for a file changed since the base,
@@ -768,6 +771,9 @@ func mergeContentHealth(dst *contentHealth, src contentHealth) {
 	if src.State == contentStateIndexing && src.BuildPhase != "" {
 		dst.BuildPhase = src.BuildPhase
 	}
+	if src.BuildWorkers > dst.BuildWorkers {
+		dst.BuildWorkers = src.BuildWorkers
+	}
 	for _, v := range src.DegradedVolumes {
 		if !containsVolumeName(dst.DegradedVolumes, v) {
 			dst.DegradedVolumes = append(dst.DegradedVolumes, v)
@@ -1171,6 +1177,7 @@ func (s *contentVolumeState) beginBuildLocked(phase string, total int) {
 	s.health.BuildTotal = total
 	s.health.BuildDone = 0
 	s.health.BuildError = ""
+	s.health.BuildWorkers = contentBuildWorkerCount()
 	s.reconcileActive = false
 	s.clearScopeReconcileLocked()
 	if s.reader != nil && s.resolver != nil {
@@ -1379,6 +1386,7 @@ func (s *contentVolumeState) markPartialBuild(done, total int) {
 	s.health.BuildPhase = contentBuildPhaseExtracting
 	s.health.BuildDone = done
 	s.health.BuildTotal = total
+	s.health.BuildWorkers = contentBuildWorkerCount()
 	s.health.BuildError = ""
 	s.servingStale = true
 	s.health.Stale = false
@@ -1413,6 +1421,7 @@ func (s *contentVolumeState) setBuildProgress(done, total int) {
 	}
 	s.health.BuildDone = done
 	s.health.BuildTotal = total
+	s.health.BuildWorkers = contentBuildWorkerCount()
 }
 
 // markBuildFailed leaves the volume visibly degraded (never ready with an

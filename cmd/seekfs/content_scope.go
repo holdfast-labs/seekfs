@@ -62,6 +62,37 @@ type contentScopeConfig struct {
 	// excludes itself and everything below it) or globs where * spans a
 	// segment and ** spans separators.
 	Skip []string
+	// BuildSpeed selects the indexing-speed policy: "" (default), "balanced",
+	// "fast" or "gentle". See contentBuildSpeedMode.
+	BuildSpeed string
+}
+
+// Indexing-speed policies for a service-owned content build.
+const (
+	// contentBuildSpeedBalanced (default) keeps the build responsive while a
+	// person is at the machine: up to 4 workers with the Low IO-priority hint,
+	// the full cap once idle for 60 s, and 2 on battery.
+	contentBuildSpeedBalanced = "balanced"
+	// contentBuildSpeedFast always uses the full worker cap and normal IO
+	// priority, including on battery.
+	contentBuildSpeedFast = "fast"
+	// contentBuildSpeedGentle is the pre-policy behavior: one worker whenever
+	// the user is active or the machine is on battery.
+	contentBuildSpeedGentle = "gentle"
+)
+
+// parseContentBuildSpeed normalizes one build_speed value. Empty means the
+// default (balanced).
+func parseContentBuildSpeed(s string) (string, bool) {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "", contentBuildSpeedBalanced:
+		return contentBuildSpeedBalanced, true
+	case contentBuildSpeedFast:
+		return contentBuildSpeedFast, true
+	case contentBuildSpeedGentle:
+		return contentBuildSpeedGentle, true
+	}
+	return "", false
 }
 
 // contentScope is the resolved scope for one volume.
@@ -78,6 +109,8 @@ type contentScope struct {
 	WorktreesAll bool
 	// Skip is the normalized content-skip list (paths/globs).
 	Skip []string
+	// BuildSpeed is the resolved indexing-speed policy (never empty).
+	BuildSpeed string
 	// BudgetExplicit is true when the budget came from config or environment
 	// (vs the free-space-derived default). Only an explicit budget joins the
 	// scope fingerprint.
@@ -94,6 +127,7 @@ func defaultContentScope() contentScope {
 		Mode:           contentScopeAuto,
 		IncludeGit:     true,
 		SystemExcludes: true,
+		BuildSpeed:     contentBuildSpeedBalanced,
 	}
 }
 
@@ -183,6 +217,9 @@ func contentScopeForVolume(cfg appConfig, volume string) contentScope {
 		if sc.Worktrees != "" {
 			s.WorktreesAll = strings.EqualFold(strings.TrimSpace(sc.Worktrees), contentWorktreesAll)
 		}
+		if speed, ok := parseContentBuildSpeed(sc.BuildSpeed); ok {
+			s.BuildSpeed = speed
+		}
 		if sc.Skip != nil {
 			s.Skip = contentNormalizeSkipPatterns(sc.Skip)
 		}
@@ -257,6 +294,11 @@ func applyContentScopeEnv(s *contentScope) bool {
 	if v := strings.TrimSpace(os.Getenv("SEEKFS_CONTENT_SKIP")); v != "" {
 		s.Skip = contentNormalizeSkipPatterns(append(append([]string(nil), s.Skip...), filepath.SplitList(v)...))
 	}
+	if v := strings.TrimSpace(os.Getenv("SEEKFS_CONTENT_BUILD_SPEED")); v != "" {
+		if speed, ok := parseContentBuildSpeed(v); ok {
+			s.BuildSpeed = speed
+		}
+	}
 	if v := strings.TrimSpace(os.Getenv("SEEKFS_CONTENT_BUDGET_BYTES")); v != "" {
 		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 {
 			s.BudgetBytes = n
@@ -329,6 +371,8 @@ func applyContentScopeKey(sc *contentScopeConfig, key, value string) {
 		}
 	case "worktrees":
 		sc.Worktrees = parseTOMLString(value)
+	case "build_speed", "build-speed":
+		sc.BuildSpeed = parseTOMLString(value)
 	case "skip", "content_skip", "content-skip":
 		sc.Skip = append(sc.Skip, parseTOMLStringArray(value)...)
 	}

@@ -160,6 +160,9 @@ type contentScopeResolved struct {
 	rootPrefix     []string
 	excludePrefix  []string
 	explicitPrefix []string
+	// BuildSpeed is the resolved indexing-speed policy for the build this
+	// scope was resolved for.
+	BuildSpeed string
 	// driveRootPrefix is the separator-terminated form of DriveRoot ("" when
 	// unset), so the lowest-priority match is one HasPrefix.
 	driveRootPrefix string
@@ -285,7 +288,7 @@ func (r *contentScopeResolved) excludePrefixAt(i int) string {
 // resolve computes the effective roots/excludes. repoRoots are the detected git
 // worktree roots (contentDetectGitRepos).
 func (s contentScope) resolve(volume string, repoRoots []string) contentScopeResolved {
-	r := contentScopeResolved{Mode: s.Mode, BudgetBytes: s.BudgetBytes, BudgetExplicit: s.BudgetExplicit, SystemExcludes: s.SystemExcludes, WorktreesAll: s.WorktreesAll, Skip: s.Skip}
+	r := contentScopeResolved{Mode: s.Mode, BudgetBytes: s.BudgetBytes, BudgetExplicit: s.BudgetExplicit, SystemExcludes: s.SystemExcludes, WorktreesAll: s.WorktreesAll, Skip: s.Skip, BuildSpeed: s.BuildSpeed}
 	kept, dropped := contentFilterLinkedWorktrees(repoRoots, s.WorktreesAll)
 	r.DroppedWorktrees = dropped
 	repoRoots = kept

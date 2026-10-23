@@ -725,6 +725,26 @@ build's footprint instead of scheduler-dependent peak-transient).
   `search_merge_fallback` at 304.145 ms/op on a 200k-base-record fixture with
   10k overlay creates and 10k tombstones.
 
+## Content Indexing-Speed Policy
+
+2026-10-23, branch `ux/content-speed2`. Cold build of a fresh copy of
+`third_party/blink/renderer/core` (9,403 files) with simulated user activity
+(`contentUserActiveNow=true`, `contentInputActiveNow=true`), Defender on,
+`GOMAXPROCS=8`, in-process `go test` harness. Balanced is the default.
+
+| Mode | Workers | Wall | Files/s | Peak heap |
+| --- | ---: | ---: | ---: | ---: |
+| Gentle (previous behavior) | 1 | 48.40 s | 194.3 | 414.9 MB |
+| Balanced (default) | 4 | 35.14 s | 267.6 | 474.1 MB |
+| Fast | 8 | 34.48 s | 272.7 | 440.0 MB |
+
+Simulated activity keeps Balanced at 4 workers, its active cap: it is 1.38x
+Gentle's throughput and 1.02x Fast (cold builds on this corpus are bound by
+Defender scanning, not CPU). Idle Balanced and Fast both use the full cap.
+An in-flight foreground query drops every mode to one worker for the duration
+of that query. The effective count is exposed as `build_workers` in content
+health and the build summary.
+
 ## Name-Index Build Memory (MFT/USN)
 
 2026-10-22, branch `ux/build-memory`. Synthetic MFT records (8-40 char names,

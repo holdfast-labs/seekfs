@@ -84,7 +84,21 @@ exts = [".go", ".md"]    # optional verbatim allowlist; unset means sniff
 git = true               # follow worktree .gitignore rules
 system_excludes = true
 budget_bytes = 1073741824  # explicit cap on the final index size (projected)
+build_speed = "balanced"   # balanced | fast | gentle
 ```
+
+`build_speed` selects the indexing-speed policy for the service-owned build:
+
+- `balanced` (default): up to 4 workers with the Low IO-priority hint while
+  someone is active, the full worker cap after 60 s idle, and 2 on battery.
+- `fast`: always the full worker cap with normal IO priority, including on
+  battery.
+- `gentle`: one worker while active or on battery (the previous behavior).
+
+An in-flight foreground query always drops the build to one worker for the
+duration of that query. The effective count is reported as `build_workers` in
+content health and `loaded --json`. The environment override is
+`SEEKFS_CONTENT_BUILD_SPEED`.
 
 File selection is ripgrep-style by default: every file the scope admits is
 opened and its head sniffed (NUL in the first 8 KiB means binary, like

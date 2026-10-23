@@ -800,6 +800,7 @@ func (s *goSearchService) runContentBuild(vol *serviceVolumeIndex, reuseSidecar 
 		return
 	}
 	opts.Scope = &resolved
+	contentSetBuildSpeed(resolved.BuildSpeed)
 	// Collect per-reason selection rejections for the CXIS stats.
 	var scanTally contentScanTally
 	opts.ScanTally = &scanTally

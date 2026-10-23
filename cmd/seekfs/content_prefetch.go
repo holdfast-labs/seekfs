@@ -5,6 +5,7 @@ import (
 	"os"
 	"runtime"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -34,8 +35,44 @@ var contentBuildWorkers = func() int {
 }()
 
 // contentBuildQueryQuietWindow is how recently a query must have run for the
-// service build to consider the user active and drop to one worker.
+// build's speed policy to count the user as active.
 var contentBuildQueryQuietWindow = 30 * time.Second
+
+// Indexing-speed mode stored for the worker policy. Balanced is the zero
+// value, so a process that never loads the setting keeps the default.
+const (
+	contentBuildSpeedModeBalanced int32 = iota
+	contentBuildSpeedModeFast
+	contentBuildSpeedModeGentle
+)
+
+var contentBuildSpeedCurrent atomic.Int32
+
+// contentSetBuildSpeed records the resolved build_speed for subsequent worker
+// decisions (and the assembler's tokenize stage). Unknown values keep the
+// current mode.
+func contentSetBuildSpeed(speed string) {
+	switch speed {
+	case contentBuildSpeedFast:
+		contentBuildSpeedCurrent.Store(contentBuildSpeedModeFast)
+	case contentBuildSpeedGentle:
+		contentBuildSpeedCurrent.Store(contentBuildSpeedModeGentle)
+	case contentBuildSpeedBalanced:
+		contentBuildSpeedCurrent.Store(contentBuildSpeedModeBalanced)
+	}
+}
+
+// contentBuildSpeedModeNow returns the active policy name.
+func contentBuildSpeedModeNow() string {
+	switch contentBuildSpeedCurrent.Load() {
+	case contentBuildSpeedModeFast:
+		return contentBuildSpeedFast
+	case contentBuildSpeedModeGentle:
+		return contentBuildSpeedGentle
+	default:
+		return contentBuildSpeedBalanced
+	}
+}
 
 // contentUserActiveNow and contentOnBatteryNow are the adaptive-policy probes.
 // They are vars so tests can inject activity and power states deterministically.
@@ -61,7 +98,10 @@ func contentLowerIOPriorityNow() bool {
 	if v := strings.TrimSpace(os.Getenv("SEEKFS_CONTENT_IOPRIORITY")); v != "" {
 		return strings.EqualFold(v, "low")
 	}
-	return contentUserActiveNow() || contentOnBatteryNow()
+	if contentBuildSpeedModeNow() == contentBuildSpeedFast {
+		return false
+	}
+	return contentUserActiveNow() || contentBuildQueriesActiveNow() || contentInputActiveNow() || contentOnBatteryNow()
 }
 
 // contentBuildWorkerCount is the desired extraction concurrency for the
@@ -78,13 +118,30 @@ func contentLowerIOPriorityNow() bool {
 // any count because the prefetch stream is consumed in item order. The
 // streaming assembler reuses the same count for its tokenize stage.
 func contentBuildWorkerCount() int {
-	if contentBuildWorkers <= 1 {
-		return contentBuildWorkers
+	cap := contentBuildWorkers
+	if cap < 1 {
+		cap = 1
 	}
-	if contentUserActiveNow() || contentBuildQueriesActiveNow() || contentInputActiveNow() || contentOnBatteryNow() {
+	if contentBuildQueriesActiveNow() {
 		return 1
 	}
-	return contentBuildWorkers
+	switch contentBuildSpeedModeNow() {
+	case contentBuildSpeedFast:
+		return cap
+	case contentBuildSpeedGentle:
+		if contentUserActiveNow() || contentInputActiveNow() || contentOnBatteryNow() {
+			return 1
+		}
+		return cap
+	default:
+		if contentOnBatteryNow() {
+			return min(2, cap)
+		}
+		if contentUserActiveNow() || contentInputActiveNow() {
+			return min(4, cap)
+		}
+		return cap
+	}
 }
 
 // contentBuildAdaptivePrefetch is the service build's extraction stream with

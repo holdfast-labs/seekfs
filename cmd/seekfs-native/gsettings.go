@@ -85,6 +85,7 @@ type settingsPanelState struct {
 	overrideBool widget.Bool
 	enabledBool  widget.Bool
 	modeBtns     [3]widget.Clickable
+	speedBtns    [3]widget.Clickable
 	addRootBtn   widget.Clickable
 	addExclBtn   widget.Clickable
 	rootDel      []widget.Clickable
@@ -1034,6 +1035,11 @@ func (u *UI) layoutSettingsContent(gtx layout.Context, p *settingsPanelState) la
 	p.block(gtx, "content-mode", func(gtx layout.Context) layout.Dimensions {
 		return u.layoutContentMode(gtx, p, v.Mode)
 	})
+	if p.drive == "" {
+		p.block(gtx, "content-speed", func(gtx layout.Context) layout.Dimensions {
+			return u.layoutContentSpeed(gtx, p, v.BuildSpeed)
+		})
+	}
 	p.block(gtx, "content-roots", func(gtx layout.Context) layout.Dimensions {
 		return u.layoutPathList(gtx, p, "Folders", v.Roots, true)
 	})
@@ -1183,6 +1189,58 @@ func (u *UI) layoutContentMode(gtx layout.Context, p *settingsPanelState, mode s
 		}),
 		layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 			return u.fieldError(gtx, p, "mode")
+		}),
+	)
+}
+
+// layoutContentSpeed renders the global indexing-speed selector. Balanced
+// keeps the build responsive, Fast always uses the full worker cap, and
+// Gentle always yields to the user.
+func (u *UI) layoutContentSpeed(gtx layout.Context, p *settingsPanelState, speed string) layout.Dimensions {
+	s := u.scheme
+	speeds := [3]string{contentSpeedBalanced, contentSpeedFast, contentSpeedGentle}
+	labels := [3]string{"Balanced", "Fast", "Gentle"}
+	for i := range p.speedBtns {
+		if p.speedBtns[i].Clicked(gtx) {
+			p.model.setBuildSpeed(speeds[i])
+		}
+	}
+	return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
+		layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+			return label(u.th, Sp(12), "Indexing speed", s.Muted).Layout(gtx)
+		}),
+		layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+			return layout.Inset{Top: Dp(6)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+				return layout.Flex{Axis: layout.Horizontal, Alignment: layout.Middle}.Layout(gtx,
+					layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+						return chip(gtx, u.th, s, &p.speedBtns[0], labels[0], speed == speeds[0])
+					}),
+					layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+						return layout.Inset{Left: Dp(8)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+							return chip(gtx, u.th, s, &p.speedBtns[1], labels[1], speed == speeds[1])
+						})
+					}),
+					layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+						return layout.Inset{Left: Dp(8)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+							return chip(gtx, u.th, s, &p.speedBtns[2], labels[2], speed == speeds[2])
+						})
+					}),
+				)
+			})
+		}),
+		layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+			hint := "Uses a few workers while you work, then the full cap when idle."
+			if speed == contentSpeedFast {
+				hint = "Always uses the full worker cap, including on battery."
+			} else if speed == contentSpeedGentle {
+				hint = "Waits for you: one worker whenever you are active."
+			}
+			return layout.Inset{Top: Dp(4)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+				return label(u.th, Sp(11), hint, s.Muted).Layout(gtx)
+			})
+		}),
+		layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+			return u.fieldError(gtx, p, "build_speed")
 		}),
 	)
 }

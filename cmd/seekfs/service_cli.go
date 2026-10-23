@@ -451,6 +451,9 @@ func contentHealthSummary(h *contentHealth) string {
 		if h.BuildTotal > 0 {
 			fmt.Fprintf(&b, " progress=%d/%d", h.BuildDone, h.BuildTotal)
 		}
+		if h.BuildWorkers > 0 {
+			fmt.Fprintf(&b, " workers=%d", h.BuildWorkers)
+		}
 	}
 	if h.ScopeReconcile {
 		fmt.Fprintf(&b, " scope_reconcile_pending=%d", h.ScopeReconcilePending)

@@ -19,6 +19,10 @@ const (
 	contentModeExplicit = "explicit"
 	contentModeOff      = "off"
 
+	contentSpeedBalanced = "balanced"
+	contentSpeedFast     = "fast"
+	contentSpeedGentle   = "gentle"
+
 	gbBytes = int64(1) << 30
 
 	serviceModeWindowsService = "windows-service"
@@ -65,6 +69,7 @@ type serviceContent struct {
 	Git            *bool                           `json:"git,omitempty"`
 	SystemExcludes *bool                           `json:"system_excludes,omitempty"`
 	BudgetBytes    *int64                          `json:"budget_bytes,omitempty"`
+	BuildSpeed     *string                         `json:"build_speed,omitempty"`
 	Volumes        map[string]serviceContentVolume `json:"volumes,omitempty"`
 }
 
@@ -100,6 +105,7 @@ type contentDraft struct {
 	Git            bool
 	SystemExcludes bool
 	BudgetBytes    int64
+	BuildSpeed     string
 	Volumes        map[string]*contentVolumeDraft
 }
 
@@ -139,6 +145,7 @@ type contentValues struct {
 	Git            bool
 	SystemExcludes bool
 	BudgetBytes    int64
+	BuildSpeed     string
 	HasOverride    bool
 }
 
@@ -159,8 +166,9 @@ func newSettingsModel(s serviceSettings) *settingsModel {
 
 func draftFromService(s serviceSettings) settingsDraft {
 	d := settingsDraft{Content: contentDraft{
-		Mode:    contentModeAuto,
-		Volumes: map[string]*contentVolumeDraft{},
+		Mode:       contentModeAuto,
+		BuildSpeed: contentSpeedBalanced,
+		Volumes:    map[string]*contentVolumeDraft{},
 	}}
 	for _, v := range s.Volumes {
 		indexed := false
@@ -204,6 +212,9 @@ func draftFromService(s serviceSettings) settingsDraft {
 		}
 		if c.BudgetBytes != nil {
 			d.Content.BudgetBytes = *c.BudgetBytes
+		}
+		if c.BuildSpeed != nil && *c.BuildSpeed != "" {
+			d.Content.BuildSpeed = *c.BuildSpeed
 		}
 		for drive, ov := range c.Volumes {
 			d.Content.Volumes[drive] = contentVolumeFromService(ov)
@@ -286,6 +297,7 @@ func (d settingsDraft) clone() settingsDraft {
 			Git:            d.Content.Git,
 			SystemExcludes: d.Content.SystemExcludes,
 			BudgetBytes:    d.Content.BudgetBytes,
+			BuildSpeed:     d.Content.BuildSpeed,
 			Volumes:        map[string]*contentVolumeDraft{},
 		},
 	}
@@ -386,6 +398,7 @@ func (m *settingsModel) contentValues(drive string) contentValues {
 		Git:            g.Git,
 		SystemExcludes: g.SystemExcludes,
 		BudgetBytes:    g.BudgetBytes,
+		BuildSpeed:     g.BuildSpeed,
 	}
 	if drive == "" {
 		return v
@@ -593,6 +606,21 @@ func (m *settingsModel) setSystemExcludes(drive string, on bool) {
 	ov.SystemExcludes, ov.HasSystemExcludes = on, true
 }
 
+// setBuildSpeed stages the global indexing-speed policy. There is no
+// per-drive override: the policy governs the process-wide worker pool.
+func (m *settingsModel) setBuildSpeed(speed string) {
+	switch speed {
+	case contentSpeedBalanced, contentSpeedFast, contentSpeedGentle:
+	default:
+		return
+	}
+	if m.draft.Content.BuildSpeed == speed {
+		return
+	}
+	m.snapshot()
+	m.draft.Content.BuildSpeed = speed
+}
+
 func (m *settingsModel) setBudget(drive string, bytes int64) {
 	if drive == "" {
 		if m.draft.Content.BudgetBytes == bytes {
@@ -700,6 +728,10 @@ func (m *settingsModel) patch() *serviceSettings {
 	if d.BudgetBytes != b.BudgetBytes {
 		v := d.BudgetBytes
 		c.BudgetBytes, changed = &v, true
+	}
+	if d.BuildSpeed != b.BuildSpeed {
+		v := d.BuildSpeed
+		c.BuildSpeed, changed = &v, true
 	}
 
 	for drive, dv := range d.Volumes {

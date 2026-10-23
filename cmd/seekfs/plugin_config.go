@@ -71,7 +71,7 @@ func parsePluginDefinitions(text string) (map[string]pluginDefinition, error) {
 		switch key {
 		case "installed":
 			d.Installed, err = strconv.ParseBool(value)
-		case "scope", "roots", "exclude", "exts", "git", "system_excludes", "budget_bytes", "skip", "worktrees":
+		case "scope", "roots", "exclude", "exts", "git", "system_excludes", "budget_bytes", "skip", "worktrees", "build_speed":
 			if name != "content" {
 				err = fmt.Errorf("content-only setting %s", key)
 				break
@@ -89,6 +89,13 @@ func parsePluginDefinitions(text string) (map[string]pluginDefinition, error) {
 				if err == nil {
 					if w := strings.TrimSpace(d.Content.Worktrees); w != "" && !strings.EqualFold(w, contentWorktreesAll) && !strings.EqualFold(w, "main") {
 						err = fmt.Errorf("invalid worktrees (want main or all)")
+					}
+				}
+			case "build_speed":
+				d.Content.BuildSpeed, err = parseFeatureString(value)
+				if err == nil {
+					if _, ok := parseContentBuildSpeed(d.Content.BuildSpeed); !ok {
+						err = fmt.Errorf("invalid build_speed (want balanced, fast or gentle)")
 					}
 				}
 			case "roots", "exclude", "exts", "skip":
@@ -191,6 +198,9 @@ func formatPluginDefinition(name string, d pluginDefinition) string {
 	}
 	if sc.Worktrees != "" {
 		fmt.Fprintf(&b, "worktrees = %s\n", strconvQuote(sc.Worktrees))
+	}
+	if sc.BuildSpeed != "" {
+		fmt.Fprintf(&b, "build_speed = %s\n", strconvQuote(sc.BuildSpeed))
 	}
 	if sc.Git != nil {
 		fmt.Fprintf(&b, "git = %t\n", *sc.Git)
