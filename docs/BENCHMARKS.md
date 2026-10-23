@@ -732,18 +732,53 @@ build's footprint instead of scheduler-dependent peak-transient).
 (`contentUserActiveNow=true`, `contentInputActiveNow=true`), Defender on,
 `GOMAXPROCS=8`, in-process `go test` harness. Balanced is the default.
 
-| Mode | Workers | Wall | Files/s | Peak heap |
-| --- | ---: | ---: | ---: | ---: |
-| Gentle (previous behavior) | 1 | 48.40 s | 194.3 | 414.9 MB |
-| Balanced (default) | 4 | 35.14 s | 267.6 | 474.1 MB |
-| Fast | 8 | 34.48 s | 272.7 | 440.0 MB |
+That first table was measured before the governor was made mode-aware. A
+second session with genuinely cold copies (individual opens ~16 ms, Defender
+not serving cached scan results) showed that activity alone did not explain
+the gap between sessions: cold-open cost varies by several times run to run.
+To attribute the remaining throttling, the local harness wrapped
+`contentOpenForExtract` (counting opens with the Low IO-priority hint and
+their duration), read `contentBuildPausesTaken`/`contentBuildPauseReasons`,
+and used `contentAssemblePhaseCapture` for assembly time. Simulated activity
+sets `contentUserActiveNow` and `contentInputActiveNow`; the sidecar is on E:
+so the system-drive rule does not fire; CPU/disk probes read idle.
 
-Simulated activity keeps Balanced at 4 workers, its active cap: it is 1.38x
-Gentle's throughput and 1.02x Fast (cold builds on this corpus are bound by
-Defender scanning, not CPU). Idle Balanced and Fast both use the full cap.
-An in-flight foreground query drops every mode to one worker for the duration
-of that query. The effective count is exposed as `build_workers` in content
-health and the build summary.
+Attribution on one fresh 9,403-file copy per mode (`GOMAXPROCS=8`, 25 ms batch
+pause, no `SEEKFS_CONTENT_IOPRIORITY` override):
+
+| Mode (active) | Effective workers | Pauses / pause time | Low-IO opens | Open time (sum across workers) | Assembly | Wall | Files/s |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Gentle | 1 | 71 / 1.78 s | 16,210 | 60.4 s | 9.30 s | 50.19 s | 187.3 |
+| Balanced | 4 | 71 / 0.44 s | 16,210 | 134.7 s | 3.90 s | 36.93 s | 254.6 |
+| Fast | 8 | 0 / 0 s | 0 | 218.7 s | 3.75 s | 35.27 s | 266.6 |
+
+Idle at the same worker caps was 269.8 (Gentle), 266.0 (Balanced, 8) and
+265.8 (Fast) files/s, so after the fix Fast active = Fast idle, Balanced
+active is ~96% of idle, and only Gentle (the historical policy) still
+deliberately trades throughput for politeness. The earlier "active" numbers
+were cold-open noise: the same Fast build measured 231 files/s idle and 245
+files/s active in one session, and ~270 files/s in another.
+
+Final sweep (cold fresh copies, 9,403 files, default 25 ms pause,
+`GOMAXPROCS=8`; idle workers use the full cap, active workers follow the
+policy):
+
+| Mode | Activity | Workers | Files/s | Peak heap |
+| --- | --- | ---: | ---: | ---: |
+| Gentle | idle | 8 | 269.8 | 494.7 MB |
+| Gentle | active | 1 | 187.3 | 415.7 MB |
+| Balanced | idle | 8 | 266.0 | 481.9 MB |
+| Balanced | active | 4 | 254.6 | 484.0 MB |
+| Fast | idle | 8 | 265.8 | 484.7 MB |
+| Fast | active | 8 | 266.6 | 475.2 MB |
+
+Governor behavior by mode: Fast ignores input/recent-query/battery pauses
+(0 pauses on the active run above); Balanced shortens input/recent-query
+pauses to a quarter; Gentle keeps the full pause. All modes still yield to an
+in-flight foreground query, to other-process CPU pressure, to a busy disk,
+and to a sidecar on the system drive; Fast keeps normal IO priority, while
+Balanced/Gentle take the Low hint while active. The effective worker count is
+exposed as `build_workers` in content health and the build summary.
 
 ## Name-Index Build Memory (MFT/USN)
 

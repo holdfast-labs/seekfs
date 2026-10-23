@@ -96,10 +96,13 @@ mft_resident = false       # read <=1 KiB resident files from MFT records
   battery.
 - `gentle`: one worker while active or on battery (the previous behavior).
 
-An in-flight foreground query always drops the build to one worker for the
-duration of that query. The effective count is reported as `build_workers` in
-content health and `loaded --json`. The environment override is
-`SEEKFS_CONTENT_BUILD_SPEED`.
+Fast also takes no input- or recent-query-triggered batch pause; Balanced
+shortens those pauses to a quarter; Gentle keeps the full pause. Every mode
+still yields to an in-flight foreground query, to other-process CPU pressure,
+to a busy disk, and to a sidecar on the system drive. An in-flight foreground
+query always drops the build to one worker for the duration of that query.
+The effective count is reported as `build_workers` in content health and
+`loaded --json`. The environment override is `SEEKFS_CONTENT_BUILD_SPEED`.
 
 `mft_resident` (default `false`) lets a USN build read files of at most
 1024 bytes from their MFT record when the unnamed `$DATA` is resident and the

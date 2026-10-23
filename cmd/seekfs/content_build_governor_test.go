@@ -25,6 +25,8 @@ func stubGovernorSignals(t *testing.T) {
 	restoreDrive := contentSystemDriveLetter
 	restorePause := contentBuildBatchPause
 	restoreWindow := contentBuildQueryQuietWindow
+	restoreSpeed := contentBuildSpeedCurrent.Load()
+	contentSetBuildSpeed(contentBuildSpeedBalanced)
 	restoreSID := contentCurrentSessionID
 	restoreWTS := contentWTSLastInput
 	restoreGLII := contentGLIILastInput
@@ -69,6 +71,7 @@ func stubGovernorSignals(t *testing.T) {
 		contentSystemDriveLetter = restoreDrive
 		contentBuildBatchPause = restorePause
 		contentBuildQueryQuietWindow = restoreWindow
+		contentBuildSpeedCurrent.Store(restoreSpeed)
 		contentCurrentSessionID = restoreSID
 		contentWTSLastInput = restoreWTS
 		contentGLIILastInput = restoreGLII
@@ -100,14 +103,15 @@ func TestContentBuildPauseNowTakesWhenBusy(t *testing.T) {
 	cases := []struct {
 		name string
 		busy func()
+		want time.Duration
 	}{
-		{"recentQuery", func() { serviceNoteQueryActivity() }},
-		{"inflightQuery", func() { serviceActiveQueryEnter() }},
-		{"battery", func() { contentOnBatteryNow = func() bool { return true } }},
-		{"input", func() { contentInputActiveNow = func() bool { return true } }},
-		{"cpu", func() { contentSystemBusyNow = func() bool { return true } }},
-		{"disk", func() { contentDiskBusyNow = func() bool { return true } }},
-		{"systemDrive", func() { contentSystemDriveLetter = func() string { return "E:" } }},
+		{"recentQuery", func() { serviceNoteQueryActivity() }, contentBuildBatchPause / 4},
+		{"inflightQuery", func() { serviceActiveQueryEnter() }, contentBuildBatchPause},
+		{"battery", func() { contentOnBatteryNow = func() bool { return true } }, contentBuildBatchPause},
+		{"input", func() { contentInputActiveNow = func() bool { return true } }, contentBuildBatchPause / 4},
+		{"cpu", func() { contentSystemBusyNow = func() bool { return true } }, contentBuildBatchPause},
+		{"disk", func() { contentDiskBusyNow = func() bool { return true } }, contentBuildBatchPause},
+		{"systemDrive", func() { contentSystemDriveLetter = func() string { return "E:" } }, contentBuildBatchPause},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -116,17 +120,71 @@ func TestContentBuildPauseNowTakesWhenBusy(t *testing.T) {
 			if tc.name == "inflightQuery" {
 				defer serviceActiveQueryLeave()
 			}
-			path := `E:\idx\vol.gsx`
-			if tc.name == "systemDrive" {
-				path = `E:\idx\vol.gsx`
-			}
-			if got := contentBuildPauseNow(path); got != contentBuildBatchPause {
-				t.Fatalf("%s pause = %v; want %v", tc.name, got, contentBuildBatchPause)
+			if got := contentBuildPauseNow(`E:\idx\vol.gsx`); got != tc.want {
+				t.Fatalf("%s pause = %v; want %v (balanced)", tc.name, got, tc.want)
 			}
 			if n := contentBuildPausesTaken.Load(); n != 1 {
 				t.Fatalf("%s taken = %d; want 1", tc.name, n)
 			}
 		})
+	}
+}
+
+// The pause policy itself is mode-specific: Fast ignores user activity, and
+// Balanced shortens it; both still yield to an in-flight query and to
+// CPU/disk pressure. Gentle keeps the historical full pause.
+func TestContentBuildPausePolicyPerMode(t *testing.T) {
+	stubGovernorSignals(t)
+	full := contentBuildBatchPause
+	cases := []struct {
+		mode   string
+		reason string
+		want   time.Duration
+	}{
+		{contentBuildSpeedFast, "query-recent", 0},
+		{contentBuildSpeedFast, "input", 0},
+		{contentBuildSpeedFast, "battery", 0},
+		{contentBuildSpeedFast, "query-inflight", full},
+		{contentBuildSpeedFast, "cpu", full},
+		{contentBuildSpeedFast, "disk", full},
+		{contentBuildSpeedFast, "system-drive", full},
+		{contentBuildSpeedBalanced, "query-recent", full / 4},
+		{contentBuildSpeedBalanced, "input", full / 4},
+		{contentBuildSpeedBalanced, "battery", full},
+		{contentBuildSpeedBalanced, "cpu", full},
+		{contentBuildSpeedGentle, "query-recent", full},
+		{contentBuildSpeedGentle, "input", full},
+		{contentBuildSpeedGentle, "battery", full},
+		{contentBuildSpeedGentle, "cpu", full},
+	}
+	for _, c := range cases {
+		contentSetBuildSpeed(c.mode)
+		if got := contentBuildPauseForReason(c.reason, full); got != c.want {
+			t.Errorf("%s/%s pause = %v; want %v", c.mode, c.reason, got, c.want)
+		}
+	}
+	// A Fast build takes no input-triggered pause and records the skip.
+	contentSetBuildSpeed(contentBuildSpeedFast)
+	contentInputActiveNow = func() bool { return true }
+	if got := contentBuildPauseNow(`E:\idx\vol.gsx`); got != 0 {
+		t.Fatalf("fast input pause = %v; want 0", got)
+	}
+	if n := contentBuildPausesTaken.Load(); n != 0 {
+		t.Fatalf("fast input pauses taken = %d; want 0", n)
+	}
+	if got := contentBuildPauseReasonCounts()["mode-skip:input"]; got != 1 {
+		t.Fatalf("fast input skip reason = %v; want 1", got)
+	}
+	// A recent query must not mask an in-flight one under Fast.
+	contentInputActiveNow = func() bool { return false }
+	serviceNoteQueryActivity()
+	serviceActiveQueryEnter()
+	defer serviceActiveQueryLeave()
+	if got := contentBuildBusyReason(`E:\idx\vol.gsx`); got != "query-inflight" {
+		t.Fatalf("fast reason with recent+inflight = %q; want query-inflight", got)
+	}
+	if got := contentBuildPauseNow(`E:\idx\vol.gsx`); got != full {
+		t.Fatalf("fast inflight pause = %v; want %v", got, full)
 	}
 }
 
