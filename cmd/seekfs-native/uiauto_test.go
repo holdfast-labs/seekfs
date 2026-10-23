@@ -49,7 +49,8 @@ func TestAutomationStateDispatch(t *testing.T) {
 		Width: 1600, Height: 1000, SettingsOpen: true, SettingsTab: "drives",
 		Rows: 7, Query: "needle", Health: "ok", Entries: 20000,
 		Contents: true, RowDetails: []automationRow{{Index: 0, Name: "a.txt", Path: `C:\a.txt`, Snippet: "a needle", MatchRanges: [][2]int{{2, 8}}}}, ResultsNotice: "building", ContentDocs: 12,
-		Drives: []automationDrive{{Volume: "X:", Indexed: true, State: "ready", Entries: 20001}},
+		StatusContentText: "Content index: building 42% (42 of 100 files)",
+		Drives:            []automationDrive{{Volume: "X:", Indexed: true, State: "ready", Entries: 20001}},
 	}}
 	resp := decodeAutomationResponse(t, runAutomationCommand([]byte(`{"cmd":"state"}`), sink))
 	if !resp.OK || resp.State == nil {
@@ -60,6 +61,9 @@ func TestAutomationStateDispatch(t *testing.T) {
 	}
 	if !resp.State.Contents || len(resp.State.RowDetails) != 1 || resp.State.RowDetails[0].Snippet != "a needle" || len(resp.State.RowDetails[0].MatchRanges) != 1 || resp.State.ResultsNotice == "" || resp.State.ContentDocs != 12 {
 		t.Fatalf("content state = %+v", resp.State)
+	}
+	if resp.State.StatusContentText != "Content index: building 42% (42 of 100 files)" {
+		t.Fatalf("status content text = %q", resp.State.StatusContentText)
 	}
 	if resp.State.Drives[0].Volume != "X:" || resp.State.Drives[0].Entries != 20001 {
 		t.Fatalf("drive = %+v", resp.State.Drives[0])

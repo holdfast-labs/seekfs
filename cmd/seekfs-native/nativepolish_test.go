@@ -212,3 +212,31 @@ func TestCellIconFallbackGlyph(t *testing.T) {
 		t.Fatal("nil shell icon rendered no fallback glyph")
 	}
 }
+
+func TestEmptyContentPresentation(t *testing.T) {
+	unavailable := "Content index unavailable: content indexing unavailable: the content index is not built or still building"
+	disabled := "content search is disabled; run seekfs plugin add content to enable it"
+	pluginMissing := "content: plugin is not installed; run seekfs plugin add content"
+	cases := []struct {
+		name    string
+		unavail string
+		health  *contentState
+		kind    emptyContentKind
+		title   string
+		hint    string
+	}{
+		{"building with percent", unavailable, &contentState{State: contentStateIndexing, BuildDone: 31, BuildTotal: 100}, emptyContentBuilding, "Content index is building \u2014 31%", "Matches appear as files are indexed"},
+		{"building without percent", unavailable, &contentState{State: contentStateIndexing}, emptyContentBuilding, "Content index is building", "Matches appear as files are indexed"},
+		{"not built but enabled", unavailable, nil, emptyContentBuilding, "Content index is building", "Matches appear as files are indexed"},
+		{"off disabled", disabled, nil, emptyContentOff, "Content search is off", "Turn it on in Settings \u203a Content search"},
+		{"plugin missing", pluginMissing, nil, emptyContentOff, "Content search is off", "Turn it on in Settings \u203a Content search"},
+		{"real build error", unavailable, &contentState{State: contentStateDegraded, BuildError: "disk full"}, emptyContentError, "Content index error", "disk full"},
+		{"no content issue", "", nil, emptyContentNone, "", ""},
+	}
+	for _, tc := range cases {
+		got := emptyContentPresentation(tc.unavail, tc.health)
+		if got.Kind != tc.kind || got.Title != tc.title || got.Hint != tc.hint {
+			t.Errorf("%s = %+v, want kind=%d title=%q hint=%q", tc.name, got, tc.kind, tc.title, tc.hint)
+		}
+	}
+}

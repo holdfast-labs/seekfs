@@ -81,6 +81,42 @@ func gdiTargetSize(cur, want image.Point) image.Point {
 	return out
 }
 
+type gdiMonitorInfo struct {
+	CbSize    uint32
+	RcMonitor rect
+	RcWork    rect
+	DwFlags   uint32
+}
+
+// gdiMonitorWorkArea returns the work area of the monitor nearest hwnd.
+func gdiMonitorWorkArea(hwnd uintptr) image.Point {
+	if hwnd == 0 {
+		return image.Point{}
+	}
+	const monitorDefaultToNearest = 2
+	mon, _, _ := pMonitorFromWindow.Call(hwnd, monitorDefaultToNearest)
+	if mon == 0 {
+		return image.Point{}
+	}
+	mi := gdiMonitorInfo{CbSize: uint32(unsafe.Sizeof(gdiMonitorInfo{}))}
+	ok, _, _ := pGetMonitorInfoW.Call(mon, uintptr(unsafe.Pointer(&mi)))
+	if ok == 0 {
+		return image.Point{}
+	}
+	return image.Pt(int(mi.RcWork.width()), int(mi.RcWork.height()))
+}
+
+// gdiPresizeTarget sizes the first headless context to cover the monitor work
+// area in one step. A drag inside that monitor then never crosses a bucket;
+// gdiTargetSize still grows for multi-monitor moves or larger windows.
+func gdiPresizeTarget(work, want image.Point) image.Point {
+	base := image.Point{}
+	if work.X > 0 && work.Y > 0 {
+		base = gdiTargetSize(base, work)
+	}
+	return gdiTargetSize(base, want)
+}
+
 // presentGDI renders gtx.Ops headlessly and blits to the window. Frame
 // times are logged when SEEKFS_NATIVE_DEBUGLOG is set.
 func (u *UI) presentGDI(gtx layout.Context) {
@@ -98,7 +134,16 @@ func (u *UI) presentGDI(gtx layout.Context) {
 	gh := &u.gdiHead
 	gh.mu.Lock()
 	defer gh.mu.Unlock()
-	target := gdiTargetSize(image.Point{X: gh.w, Y: gh.h}, size)
+	var target image.Point
+	if gh.hw == nil {
+		if os.Getenv("SEEKFS_NATIVE_GDIPRESIZE") == "0" {
+			target = gdiTargetSize(image.Point{}, size)
+		} else {
+			target = gdiPresizeTarget(gdiMonitorWorkArea(hwnd), size)
+		}
+	} else {
+		target = gdiTargetSize(image.Point{X: gh.w, Y: gh.h}, size)
+	}
 	if gh.hw == nil || target != image.Pt(gh.w, gh.h) {
 		if gh.hw != nil {
 			gh.hw.Release()

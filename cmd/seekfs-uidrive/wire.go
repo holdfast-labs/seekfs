@@ -59,6 +59,7 @@ type automationState struct {
 	ElapsedMS           int64               `json:"elapsed_ms,omitempty"`
 	SearchMS            float64             `json:"search_ms,omitempty"`
 	Source              string              `json:"source,omitempty"`
+	StatusContentText   string              `json:"status_content_text,omitempty"`
 }
 
 type automationSideRow struct {

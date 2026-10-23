@@ -493,6 +493,51 @@ func indexingSummary(vols []DBVolume) (string, bool) {
 	}
 }
 
+type emptyContentKind int
+
+const (
+	emptyContentNone emptyContentKind = iota
+	emptyContentBuilding
+	emptyContentOff
+	emptyContentError
+)
+
+type emptyContentView struct {
+	Kind  emptyContentKind
+	Title string
+	Hint  string
+}
+
+// emptyContentPresentation classifies a content-unavailable refusal for the
+// empty view. A build (or an enabled but not-yet-built index) is not "off";
+// only a disabled plugin is. A real build error stays an error.
+func emptyContentPresentation(unavail string, c *contentState) emptyContentView {
+	if c != nil && c.BuildError != "" {
+		return emptyContentView{Kind: emptyContentError, Title: "Content index error",
+			Hint: truncateStatusText(c.BuildError, 120)}
+	}
+	low := strings.ToLower(unavail)
+	if strings.Contains(low, "disabled") || strings.Contains(low, "plugin") ||
+		strings.Contains(low, "enable it") {
+		return emptyContentView{Kind: emptyContentOff, Title: "Content search is off",
+			Hint: "Turn it on in Settings \u203a Content search"}
+	}
+	if contentIndexBuilding(c) || strings.Contains(low, "still building") ||
+		strings.Contains(low, "not built") || strings.Contains(low, "content indexing unavailable") {
+		title := "Content index is building"
+		if c != nil && contentIndexBuilding(c) && c.BuildTotal > 0 {
+			title += " \u2014 " + itoa(contentBuildPercent(c)) + "%"
+		}
+		return emptyContentView{Kind: emptyContentBuilding, Title: title,
+			Hint: "Matches appear as files are indexed"}
+	}
+	if unavail != "" && contentUnavailableString(unavail) {
+		return emptyContentView{Kind: emptyContentError, Title: "Content index unavailable",
+			Hint: "Open Settings \u203a Content search for details"}
+	}
+	return emptyContentView{Kind: emptyContentNone}
+}
+
 func (u *UI) layoutEmpty(gtx layout.Context) layout.Dimensions {
 	th := u.th
 	s := u.scheme
@@ -501,15 +546,22 @@ func (u *UI) layoutEmpty(gtx layout.Context) layout.Dimensions {
 	unavail := u.unavail
 	fuzzy := u.fuzzyMsg
 	noVolumes := u.noVolumes
+	contentHealth := cloneContentState(u.contentHealth)
 	indexingTitle, indexing := indexingSummary(u.volumes)
 	u.mu.Unlock()
+	contentView := emptyContentPresentation(unavail, contentHealth)
+	if contentView.Kind == emptyContentOff && u.contentSettingsBtn.Clicked(gtx) {
+		u.openSettingsTab(settingsTabContent)
+	}
 	if firstRunClicked := noVolumes && !indexing && query == "" && unavail == ""; firstRunClicked && u.emptyDrivesBtn.Clicked(gtx) {
 		u.openSettingsTab(settingsTabDrives)
 	}
 	icon, title, hint := iconSearch, "Type to search", "Results appear as you type"
 	firstRun := false
-	if unavail != "" {
-		icon, title, hint = iconContents, "Content search is off", "Run `seekfs plugin add content` to enable it"
+	showContentSettings := false
+	if contentView.Kind != emptyContentNone {
+		icon, title, hint = iconContents, contentView.Title, contentView.Hint
+		showContentSettings = contentView.Kind == emptyContentOff
 	} else if indexing && noVolumes {
 		// A drive is being indexed: say so instead of offering first-run setup.
 		icon, title, hint = iconFolder, indexingTitle, "Results appear here as soon as indexing finishes"
@@ -540,6 +592,14 @@ func (u *UI) layoutEmpty(gtx layout.Context) layout.Dimensions {
 					})
 				}),
 				layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+					if showContentSettings {
+						if u.contentSettingsBtn.Clicked(gtx) {
+							u.openSettingsTab(settingsTabContent)
+						}
+						return layout.Inset{Top: Dp(16)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+							return chip(gtx, th, s, &u.contentSettingsBtn, "Open content settings", true)
+						})
+					}
 					if !firstRun {
 						return layout.Dimensions{}
 					}

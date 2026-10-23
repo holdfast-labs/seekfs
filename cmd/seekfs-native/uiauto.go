@@ -91,6 +91,7 @@ type automationState struct {
 	ElapsedMS           int64               `json:"elapsed_ms,omitempty"`
 	SearchMS            float64             `json:"search_ms,omitempty"`
 	Source              string              `json:"source,omitempty"`
+	StatusContentText   string              `json:"status_content_text,omitempty"`
 }
 
 type automationSideRow struct {
@@ -401,6 +402,10 @@ func (s uiAutomationSink) AutomationState() automationState {
 		st.RowDetails = append(st.RowDetails, detail)
 	}
 	u.mu.Unlock()
+	u.mu.Lock()
+	statusContent, _ := statusContentText(u.contents, u.content, u.contentHealth, u.unavail)
+	u.mu.Unlock()
+	st.StatusContentText = statusContent
 	st.SettingsOpen = u.settingsOpen
 	if p := u.gsettings; p != nil {
 		st.SettingsTab = automationTabName(p.tab)

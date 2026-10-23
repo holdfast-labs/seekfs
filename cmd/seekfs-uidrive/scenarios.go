@@ -358,6 +358,55 @@ func (h *harness) resizeScenario() *resizeReport {
 
 // ---- settings ----
 
+// slowDragScenario grows the window monotonically across several 256 px
+// buckets, like a slow drag, and reports frame hitches.
+func (h *harness) slowDragScenario() *slowDragReport {
+	rep := &slowDragReport{}
+	hwnd, err := h.auto.HWND()
+	if err != nil || hwnd == 0 {
+		rep.Error = "no window handle"
+		return rep
+	}
+	if err := h.auto.MetricsReset(); err != nil {
+		rep.Error = err.Error()
+		return rep
+	}
+	const steps = 60
+	var stepMax float64
+	start := time.Now()
+	for i := 0; i < steps; i++ {
+		w := 900 + i*(1900-900)/(steps-1)
+		hgt := 600 + i*(1100-600)/(steps-1)
+		stepStart := time.Now()
+		if _, err := setWindowPos(hwnd, w, hgt); err != nil {
+			rep.Error = err.Error()
+			return rep
+		}
+		if d := millis(time.Since(stepStart)); d > stepMax {
+			stepMax = d
+		}
+		if remain := 16*time.Millisecond - time.Since(stepStart); remain > 0 {
+			sleepCtx(h.ctx, remain)
+		}
+	}
+	// Let the last frames land before reading the counters.
+	if remain := 500*time.Millisecond - time.Since(start); remain > 0 {
+		sleepCtx(h.ctx, remain)
+	}
+	m, err := h.auto.Metrics()
+	if err != nil {
+		rep.Error = err.Error()
+		return rep
+	}
+	rep.Steps = steps
+	rep.FrameP50MS = m.Frames.P50
+	rep.FrameP95MS = m.Frames.P95
+	rep.FrameMaxMS = m.Frames.Max
+	rep.FramesOver100 = m.Frames.Slow100
+	rep.StepMaxMS = stepMax
+	return rep
+}
+
 func (h *harness) settingsScenario() *settingsReport {
 	rep := &settingsReport{}
 	if err := h.auto.MetricsReset(); err != nil {

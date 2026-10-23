@@ -62,11 +62,12 @@ type UI struct {
 	accent color.NRGBA
 
 	// Settings overlay (gsettings.go).
-	settingsOpen    bool
-	gsettings       *settingsPanelState
-	settingsPending settingsPendingResult
-	settingsBtn     widget.Clickable
-	emptyDrivesBtn  widget.Clickable
+	settingsOpen       bool
+	gsettings          *settingsPanelState
+	settingsPending    settingsPendingResult
+	settingsBtn        widget.Clickable
+	emptyDrivesBtn     widget.Clickable
+	contentSettingsBtn widget.Clickable
 
 	// Widgets.
 	searchEd    widget.Editor
@@ -159,11 +160,12 @@ type UI struct {
 }
 
 type sideRow struct {
-	kind  sideKind
-	label string
-	under string // scope target
-	query string // saved search to run
-	depth int
+	kind   sideKind
+	label  string
+	under  string // scope target
+	query  string // saved search to run
+	depth  int
+	suffix string // trailing status (indexing percentage, count, error)
 }
 
 // scrollTo moves the results lists so row i is visible.

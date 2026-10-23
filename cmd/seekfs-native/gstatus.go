@@ -62,13 +62,13 @@ func (u *UI) layoutStatus(gtx layout.Context) layout.Dimensions {
 
 	countText := fmt.Sprintf("%s result%s", formatCount(n), plural(n))
 	if msg != "" {
-		countText += " — " + msg
+		countText += " \u2014 " + truncateStatusText(msg, 80)
 	}
-	if unavail != "" {
-		countText = unavail
+	if unavail != "" && !contentUnavailableString(unavail) {
+		countText = truncateStatusText(unavail, 120)
 	}
 	if flash != "" {
-		countText = flash
+		countText = truncateStatusText(flash, 120)
 	}
 
 	timeText := ""
@@ -76,24 +76,18 @@ func (u *UI) layoutStatus(gtx layout.Context) layout.Dimensions {
 		timeText = fmt.Sprintf("%d ms (service %.0f ms)", elapsed, searchMS)
 	}
 
-	contentText := ""
+	contentText, contentTone := statusContentText(contentMode, content, contentIndex, unavail)
 	contentColor := s.Muted
-	if contentMode || (content != nil && content.State != "") {
-		if unavail != "" {
-			contentText = "Contents unavailable"
-		} else {
-			contentText = contentStatusText(content)
-		}
-	}
-	if text, tone := contentIndexStatusText(contentIndex); text != "" {
-		contentText = text
-		if tone == healthToneError {
-			contentColor = s.Error
-		}
+	switch contentTone {
+	case healthToneWarning:
+		contentColor = s.Warning
+	case healthToneError:
+		contentColor = s.Error
 	}
 
-	healthText, healthColor := "Connecting…", s.Muted
+	healthText, healthColor := "Connecting\u2026", s.Muted
 	healthText, tone := healthStatusText(health, healthMsg, entries)
+	healthText = truncateStatusText(healthText, 96)
 	healthColor = s.Muted
 	switch tone {
 	case healthToneOK:
