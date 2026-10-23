@@ -651,6 +651,16 @@ func contentBuildDocSafe(ctx context.Context, item contentBuildItem) (doc conten
 		}
 		return contentBuildDoc{}, contentExtractResult{Skipped: true, Reason: reason, Size: item.size}, false
 	}
+	// Small resident files can be read from their MFT record, with no open.
+	// The source is present only for an enabled USN build; walk volumes and
+	// every doubt fall through to the normal open below.
+	if item.frn != 0 && item.size >= 0 && item.size <= contentMFTResidentMaxBytes {
+		if src, ok := contentResidentFromContext(ctx); ok {
+			if data, _, hit := src.ResidentText(item.frn, item.seq, item.size); hit {
+				return contentBuildDocFromResident(ctx, item, data)
+			}
+		}
+	}
 	s, err := contentSlurpNoRecall(item.path, fileRaw)
 	if err != nil {
 		return contentBuildDoc{}, contentExtractResult{}, false
@@ -677,6 +687,40 @@ func contentBuildDocSafe(ctx context.Context, item contentBuildItem) (doc conten
 		return contentBuildDoc{}, contentExtractResult{Skipped: true, Reason: contentSkipMinified, Size: s.size}, false
 	}
 	return contentBuildDoc{path: item.path, frn: item.frn, text: res.Text, modUnix: s.modUnix, class: res.Class, version: e.Version(), fileSize: s.size, fileModNano: s.modNano, seq: item.seq}, res, true
+}
+
+// contentBuildDocFromResident runs the same extractor path over resident
+// $DATA bytes from the MFT. The name-index mtime/size stand in for the stat:
+// size was already verified against the record by the source, and USN
+// freshness is keyed on FRN/sequence, not mtime.
+func contentBuildDocFromResident(ctx context.Context, item contentBuildItem, data []byte) (contentBuildDoc, contentExtractResult, bool) {
+	if int64(len(data)) != item.size || len(data) > contentMFTResidentMaxBytes {
+		return contentBuildDoc{}, contentExtractResult{Skipped: true, Reason: contentResidentReasonSize, Size: item.size}, false
+	}
+	fctx, _, _ := contentFileExtractContext(ctx, item.inRepo)
+	e := contentExtractorForPath(item.path, data)
+	if e == nil {
+		return contentBuildDoc{}, contentExtractResult{Binary: true, Reason: "binary", Size: int64(len(data))}, false
+	}
+	res, err := contentExtractSafely(fctx, e, &contentSliceReader{b: data}, int64(len(data)))
+	if err != nil || res.Skipped || len(res.Text) == 0 {
+		res.Size = int64(len(data))
+		return contentBuildDoc{}, res, false
+	}
+	if res.Class == contentClassText && contentLooksMinified(res.Text) {
+		return contentBuildDoc{}, contentExtractResult{Skipped: true, Reason: contentSkipMinified, Size: int64(len(data))}, false
+	}
+	return contentBuildDoc{
+		path:        item.path,
+		frn:         item.frn,
+		text:        res.Text,
+		modUnix:     item.mod,
+		class:       res.Class,
+		version:     e.Version(),
+		fileSize:    int64(len(data)),
+		fileModNano: item.mod * int64(time.Second),
+		seq:         item.seq,
+	}, res, true
 }
 
 // contentExtractionSkip enforces the size-gated inclusion skips at
@@ -800,6 +844,7 @@ func (s *goSearchService) runContentBuild(vol *serviceVolumeIndex, reuseSidecar 
 		return
 	}
 	opts.Scope = &resolved
+	contentSetBuildSpeed(resolved.BuildSpeed)
 	// Collect per-reason selection rejections for the CXIS stats.
 	var scanTally contentScanTally
 	opts.ScanTally = &scanTally
@@ -847,6 +892,23 @@ func (s *goSearchService) runContentBuild(vol *serviceVolumeIndex, reuseSidecar 
 	settings := opts.extractSettings()
 	ctx, cancel := context.WithCancel(contentWithExtractSettings(context.Background(), settings))
 	defer cancel()
+	s.indexMu.RLock()
+	isWalkBuild := vol.index != nil && vol.index.Source == "walk"
+	s.indexMu.RUnlock()
+	var residentSrc contentResidentSource
+	if resolved.MFTResident && !isWalkBuild && vol.volume != "" {
+		src, serr := contentOpenResidentSource(vol.volume)
+		if serr != nil {
+			residentSrc = contentResidentSourceUnavailable(serr)
+			serviceLog("content build volume=%s mft_resident unavailable: %v", vol.volume, serr)
+		} else {
+			residentSrc = src
+		}
+		ctx = contentWithResidentSource(ctx, residentSrc)
+	}
+	if residentSrc != nil {
+		defer residentSrc.Close()
+	}
 	go func() {
 		select {
 		case <-s.stop:
@@ -959,9 +1021,6 @@ func (s *goSearchService) runContentBuild(vol *serviceVolumeIndex, reuseSidecar 
 	// Early publish scaffold: identity fields a preview base must carry to be
 	// attachable, and one bounded assemble+attach when enough of the prefix is
 	// spooled. See contentPreviewMinDocs.
-	s.indexMu.RLock()
-	isWalkBuild := vol.index != nil && vol.index.Source == "walk"
-	s.indexMu.RUnlock()
 	previewHeader := &contentIndex{
 		Origin:        contentOriginUSN,
 		JournalID:     journalID,
@@ -1446,6 +1505,11 @@ func (s *goSearchService) runContentBuild(vol *serviceVolumeIndex, reuseSidecar 
 	}
 	err = save()
 	vol.content.setBuildProgress(done, total)
+	if residentSrc != nil {
+		counters := residentSrc.Counters()
+		vol.content.setResidentStats(counters)
+		serviceLog("content build volume=%s resident_hits=%d resident_fallbacks=%d reasons=%v", vol.volume, counters.Hits, contentResidentFallbackTotal(counters), counters.Fallbacks)
+	}
 	if err != nil {
 		// Delete shard files this attempt wrote: no manifest names them, so a
 		// failed build must not leave gigabytes behind on the volume.

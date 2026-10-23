@@ -29,6 +29,13 @@ type synthOpts struct {
 	// link or the DOS 8.3 alias that shares one MFT record.
 	altName      string
 	altNamespace byte
+	// content, when non-nil, fills the resident $DATA bytes and sets size to
+	// its length. seq/baseRef model the record sequence and the header's
+	// base-record reference (extension records set baseRef to another record).
+	content  []byte
+	seq      uint16
+	baseRef  uint64
+	attrList bool
 }
 
 func synthMFTRecord(o synthOpts) []byte {
@@ -62,6 +69,8 @@ func fillSynthMFTRecord(rec []byte, o synthOpts) {
 		flags |= mftFlagDir
 	}
 	binary.LittleEndian.PutUint16(rec[22:24], flags)
+	binary.LittleEndian.PutUint16(rec[16:18], o.seq)
+	binary.LittleEndian.PutUint64(rec[mftBaseRefOffset:mftBaseRefOffset+8], o.baseRef)
 	// first attribute offset
 	firstAttr := 64
 	binary.LittleEndian.PutUint16(rec[20:22], uint16(firstAttr))
@@ -144,8 +153,15 @@ func fillSynthMFTRecord(rec []byte, o synthOpts) {
 		writeAttrHeader(attrFileName, len(alt), alt)
 	}
 
+	if o.attrList {
+		writeAttrHeader(attrAttributeList, 0, nil)
+	}
+
 	// $DATA
 	if !o.isDir {
+		if o.content != nil {
+			o.size = int64(len(o.content))
+		}
 		if o.nonResident {
 			// Non-resident header up to 0x38 with real size at 0x30.
 			data := make([]byte, 0x40)
@@ -175,6 +191,9 @@ func fillSynthMFTRecord(rec []byte, o synthOpts) {
 			rec[pos+9] = byte(nameLen)
 			binary.LittleEndian.PutUint32(rec[pos+0x10:pos+0x14], uint32(o.size))
 			binary.LittleEndian.PutUint16(rec[pos+0x14:pos+0x16], 0x18)
+			if o.content != nil {
+				copy(rec[pos+0x18:pos+0x18+len(o.content)], o.content)
+			}
 			pos += attrLen
 		}
 	}

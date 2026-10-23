@@ -48,6 +48,7 @@ type settingsContentInfo struct {
 	Git            bool                               `json:"git"`
 	SystemExcludes bool                               `json:"system_excludes"`
 	BudgetBytes    int64                              `json:"budget_bytes"`
+	BuildSpeed     string                             `json:"build_speed"`
 	Volumes        map[string]settingsContentOverride `json:"volumes,omitempty"`
 }
 
@@ -82,6 +83,7 @@ type settingsContentPatch struct {
 	Git            *bool                              `json:"git,omitempty"`
 	SystemExcludes *bool                              `json:"system_excludes,omitempty"`
 	BudgetBytes    *int64                             `json:"budget_bytes,omitempty"`
+	BuildSpeed     *string                            `json:"build_speed,omitempty"`
 	Volumes        map[string]settingsContentOverride `json:"volumes,omitempty"`
 }
 
@@ -285,6 +287,7 @@ func settingsContentFromConfig(cfg appConfig) settingsContentInfo {
 		Git:            boolValue(global.Git, true),
 		SystemExcludes: boolValue(global.SystemExcludes, true),
 		BudgetBytes:    global.BudgetBytes,
+		BuildSpeed:     contentBuildSpeedProjection(global.BuildSpeed),
 	}
 	if info.Mode == "" {
 		info.Mode = string(contentScopeAuto)
@@ -324,6 +327,9 @@ func mergeContentScopeConfig(base, over contentScopeConfig) contentScopeConfig {
 	}
 	if over.Worktrees != "" {
 		base.Worktrees = over.Worktrees
+	}
+	if over.BuildSpeed != "" {
+		base.BuildSpeed = over.BuildSpeed
 	}
 	if over.Skip != nil {
 		base.Skip = append([]string{}, over.Skip...)
@@ -369,6 +375,15 @@ func boolValue(value *bool, fallback bool) bool {
 		return fallback
 	}
 	return *value
+}
+
+// contentBuildSpeedProjection resolves a stored build_speed to the effective
+// policy name for settings-get (empty means the default, balanced).
+func contentBuildSpeedProjection(speed string) string {
+	if resolved, ok := parseContentBuildSpeed(speed); ok {
+		return resolved
+	}
+	return contentBuildSpeedBalanced
 }
 
 func normalizeSettingsVolume(volume string) string {
@@ -436,6 +451,11 @@ func validateSettingsContentPatch(field string, patch *settingsContentPatch, kno
 	}
 	if patch.BudgetBytes != nil && *patch.BudgetBytes < 0 {
 		return fmt.Errorf("%s.budget_bytes: must be >= 0", field)
+	}
+	if patch.BuildSpeed != nil {
+		if _, ok := parseContentBuildSpeed(*patch.BuildSpeed); !ok {
+			return fmt.Errorf("%s.build_speed: invalid value %q (want balanced, fast, or gentle)", field, *patch.BuildSpeed)
+		}
 	}
 	return nil
 }
@@ -773,7 +793,8 @@ func settingsRemoveDB(dbs []string, db string) []string {
 func (s *goSearchService) applySettingsContent(patch *settingsContentPatch) error {
 	pluginPath := s.pluginFilePath()
 	hasScope := patch.Mode != nil || patch.Roots != nil || patch.Exclude != nil ||
-		patch.Exts != nil || patch.Git != nil || patch.SystemExcludes != nil || patch.BudgetBytes != nil
+		patch.Exts != nil || patch.Git != nil || patch.SystemExcludes != nil || patch.BudgetBytes != nil ||
+		patch.BuildSpeed != nil
 
 	defs, err := loadPluginDefinitions(pluginPath)
 	if err != nil {
@@ -809,6 +830,9 @@ func (s *goSearchService) applySettingsContent(patch *settingsContentPatch) erro
 			}
 			if patch.BudgetBytes != nil {
 				d.Content.BudgetBytes = *patch.BudgetBytes
+			}
+			if patch.BuildSpeed != nil {
+				d.Content.BuildSpeed = *patch.BuildSpeed
 			}
 			if patch.Enabled != nil {
 				d.Feature.Enabled = *patch.Enabled
@@ -988,6 +1012,9 @@ func formatSettingsContentSection(header string, sc contentScopeConfig) string {
 	}
 	if sc.Worktrees != "" {
 		fmt.Fprintf(&b, "worktrees = %s\n", strconvQuote(sc.Worktrees))
+	}
+	if sc.BuildSpeed != "" {
+		fmt.Fprintf(&b, "build_speed = %s\n", strconvQuote(sc.BuildSpeed))
 	}
 	if sc.Skip != nil {
 		fmt.Fprintf(&b, "skip = %s\n", formatStringArray(sc.Skip))

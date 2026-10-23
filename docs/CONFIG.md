@@ -84,7 +84,34 @@ exts = [".go", ".md"]    # optional verbatim allowlist; unset means sniff
 git = true               # follow worktree .gitignore rules
 system_excludes = true
 budget_bytes = 1073741824  # explicit cap on the final index size (projected)
+build_speed = "balanced"   # balanced | fast | gentle
+mft_resident = false       # read <=1 KiB resident files from MFT records
 ```
+
+`build_speed` selects the indexing-speed policy for the service-owned build:
+
+- `balanced` (default): up to 4 workers with the Low IO-priority hint while
+  someone is active, the full worker cap after 60 s idle, and 2 on battery.
+- `fast`: always the full worker cap with normal IO priority, including on
+  battery.
+- `gentle`: one worker while active or on battery (the previous behavior).
+
+Fast also takes no input- or recent-query-triggered batch pause; Balanced
+shortens those pauses to a quarter; Gentle keeps the full pause. Every mode
+still yields to an in-flight foreground query, to other-process CPU pressure,
+to a busy disk, and to a sidecar on the system drive. An in-flight foreground
+query always drops the build to one worker for the duration of that query.
+The effective count is reported as `build_workers` in content health and
+`loaded --json`. The environment override is `SEEKFS_CONTENT_BUILD_SPEED`.
+
+`mft_resident` (default `false`) lets a USN build read files of at most
+1024 bytes from their MFT record when the unnamed `$DATA` is resident and the
+file is not compressed, encrypted, sparse, a reparse point, or an extension
+record; every doubt falls back to a normal open. It needs the same volume
+access as the USN index build and reports `resident_hits`/
+`resident_fallbacks` in content health. The environment override is
+`SEEKFS_CONTENT_MFT_RESIDENT`. See `CONTENT_SEARCH.md` for the real-drive
+verification procedure.
 
 File selection is ripgrep-style by default: every file the scope admits is
 opened and its head sniffed (NUL in the first 8 KiB means binary, like

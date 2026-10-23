@@ -40,6 +40,7 @@ Response (`serviceResponse` with a new `settings` field):
       "git": true,
       "system_excludes": true,
       "budget_bytes": 0,
+      "build_speed": "balanced",
       "volumes": {"E:": {"mode": "explicit", "roots": ["E:\\src"]}}
     }
   }
@@ -60,7 +61,9 @@ Response (`serviceResponse` with a new `settings` field):
   `[plugins.content]` values from `plugin.toml` merged in; `volumes` holds the
   per-volume `[content."X:"]` overrides from `seekfs.toml` (only keys that are
   set). `budget_bytes` 0 means no explicit budget. `exts` empty means sniff
-  (default).
+  (default). `build_speed` is `balanced` (default), `fast`, or `gentle`; it is
+  global (not per volume) and the service reports the effective worker count as
+  `build_workers` in the content health response while indexing.
 - `can_write` is true when this caller may call `settings-set`.
 - Remote callers are refused for both commands, so local paths in `volumes` and
   `content` never cross the remote transport.
@@ -80,7 +83,8 @@ change. `volumes` entries need only `volume` and `indexed`.
   it from the list (its index file is kept on disk); removing one whose build
   is still pending cancels and ignores that result.
 - Content changes are validated (absolute roots on known volumes, mode in
-  `auto|explicit|off`, `budget_bytes >= 0`). Global scope keys are written to
+  `auto|explicit|off`, `build_speed` in `balanced|fast|gentle`,
+  `budget_bytes >= 0`). Global scope keys are written to
   `plugin.toml`; per-volume overrides are written to `[content."X:"]` in
   `seekfs.toml`. Both are applied with the same live reload as `plugin-reload`.
   `enabled` writes the content selection in `plugin.toml` when the content
