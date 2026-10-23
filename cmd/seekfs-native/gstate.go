@@ -62,11 +62,12 @@ type UI struct {
 	accent color.NRGBA
 
 	// Settings overlay (gsettings.go).
-	settingsOpen    bool
-	gsettings       *settingsPanelState
-	settingsPending settingsPendingResult
-	settingsBtn     widget.Clickable
-	emptyDrivesBtn  widget.Clickable
+	settingsOpen       bool
+	gsettings          *settingsPanelState
+	settingsPending    settingsPendingResult
+	settingsBtn        widget.Clickable
+	emptyDrivesBtn     widget.Clickable
+	contentSettingsBtn widget.Clickable
 
 	// Widgets.
 	searchEd    widget.Editor
