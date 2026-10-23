@@ -36,7 +36,7 @@ Flags:
 
 - `-out <dir>`: output directory.
 - `-timeout 5m`: hard harness deadline; children are killed when it expires.
-- `-scenario all|startup|search|resize|settings|status|content`.
+- `-scenario all|startup|search|resize|slowdrag|settings|status|content`.
 
 ## Automation commands
 
@@ -98,6 +98,10 @@ active.
   then a hold. Reports frame p50/p95/max, slow-frame count, `SetWindowPos`
   durations (WM_SIZE blocking), time to a quiet gap, and the max frame after
   settle.
+- `slowdrag`: 60 monotonic `SetWindowPos` steps from 900x600 to 1900x1100 at
+  16 ms, crossing several 256-px headless buckets. Reports frame p50/p95/max,
+  frames over 100 ms, and the slowest step. `SEEKFS_NATIVE_GDIPRESIZE=0`
+  disables the one-time work-area presize for before/after comparisons.
 - `settings`: drives list latency; fixture drive off then on with Apply;
   action to saving cleared, indexing, and ready (service truth and panel);
   progress samples and increases while the fixture build runs; screenshots at
@@ -176,15 +180,18 @@ The service runs with `SEEKFS_CONTENT_SEARCH=1`, an explicit scope rooted at
 the fixture, and a small explicit content budget (the default disk reserve
 would refuse a build on a nearly full test volume). The scenario:
 
-1. enables Contents mode and records the building notice and rows from an
-   early typed query;
+1. closes Settings, enables Contents mode, and records the building notice,
+   status bar, and rows from an early typed query;
 2. waits for the service content index to reach `ready`;
 3. runs every expected query through both `type-query` and `search-now`,
    compares result paths exactly, and checks snippets;
 4. runs binary/excluded/ignored/oversized negative queries;
 5. rewrites one fixture file (old token out, new token in) and polls for up
    to 60 s;
-6. writes screenshots, latency p50/p95/max, `report.json`, and `summary.md`.
+6. writes `content-status-building.png`, `content-building.png`,
+   `content-snippets.png`, `content-no-results.png`, latency p50/p95/max,
+   `report.json`, and `summary.md`. Settings is closed for every content
+   screenshot.
 
 When a query is wrong, the harness repeats it directly against its private
 service pipe and records whether the UI or the service is at fault.

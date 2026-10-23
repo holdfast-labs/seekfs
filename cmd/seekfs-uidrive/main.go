@@ -69,7 +69,7 @@ type harness struct {
 func runHarness(out string, timeout time.Duration, scenario string) error {
 	scenario = strings.ToLower(strings.TrimSpace(scenario))
 	switch scenario {
-	case "all", "startup", "search", "resize", "settings", "status", "content":
+	case "all", "startup", "search", "resize", "slowdrag", "settings", "status", "content":
 	default:
 		return fmt.Errorf("unknown scenario %q", scenario)
 	}
@@ -130,6 +130,7 @@ func runHarness(out string, timeout time.Duration, scenario string) error {
 		runStartup := scenario == "all" || scenario == "startup"
 		runSearch := scenario == "all" || scenario == "search"
 		runResize := scenario == "all" || scenario == "resize"
+		runSlowDrag := scenario == "all" || scenario == "slowdrag"
 		runSettings := scenario == "all" || scenario == "settings"
 		runContent := scenario == "all" || scenario == "content"
 
@@ -142,6 +143,9 @@ func runHarness(out string, timeout time.Duration, scenario string) error {
 		}
 		if runResize {
 			h.rep.Resize = h.resizeScenario()
+		}
+		if runSlowDrag {
+			h.rep.SlowDrag = h.slowDragScenario()
 		}
 		if runSettings {
 			h.rep.Settings = h.settingsScenario()

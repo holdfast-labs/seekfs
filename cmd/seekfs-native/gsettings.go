@@ -1066,6 +1066,20 @@ func (u *UI) layoutSettingsContent(gtx layout.Context, p *settingsPanelState) la
 	p.block(gtx, "content-exts", func(gtx layout.Context) layout.Dimensions {
 		return u.layoutExts(gtx, p)
 	})
+	u.mu.Lock()
+	health := cloneContentState(u.contentHealth)
+	u.mu.Unlock()
+	if detail := contentHealthDetail(health); detail != "" {
+		p.block(gtx, "content-index-status", func(gtx layout.Context) layout.Dimensions {
+			return layout.Inset{Top: Dp(8)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+				l := material.Label(u.th, Sp(11), detail)
+				l.Color = s.Muted
+				l.MaxLines = 4
+				l.Truncator = "\u2026"
+				return l.Layout(gtx)
+			})
+		})
+	}
 	return layout.Dimensions{Size: image.Pt(gtx.Constraints.Max.X, p.cursor)}
 }
 

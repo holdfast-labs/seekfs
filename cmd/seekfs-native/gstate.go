@@ -159,11 +159,12 @@ type UI struct {
 }
 
 type sideRow struct {
-	kind  sideKind
-	label string
-	under string // scope target
-	query string // saved search to run
-	depth int
+	kind   sideKind
+	label  string
+	under  string // scope target
+	query  string // saved search to run
+	depth  int
+	suffix string // trailing status (indexing percentage, count, error)
 }
 
 // scrollTo moves the results lists so row i is visible.

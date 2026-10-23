@@ -83,6 +83,19 @@ type contentState struct {
 	BuildTotal int    `json:"build_total,omitempty"`
 	BuildError string `json:"build_error,omitempty"`
 	FoldError  string `json:"fold_error,omitempty"`
+	BuildPhase string `json:"build_phase,omitempty"`
+	Stale      bool   `json:"content_stale,omitempty"`
+
+	ScopeDropped          int    `json:"scope_dropped,omitempty"`
+	BudgetBytes           int64  `json:"budget_bytes,omitempty"`
+	ReserveBytes          int64  `json:"reserve_bytes,omitempty"`
+	ScopeReconcile        bool   `json:"scope_reconcile,omitempty"`
+	ScopeReconcilePending int    `json:"scope_reconcile_pending,omitempty"`
+	ExtractorRefresh      bool   `json:"extractor_refresh,omitempty"`
+	StaleExtractorDocs    int    `json:"stale_extractor_docs,omitempty"`
+	SidecarBytes          int64  `json:"sidecar_bytes,omitempty"`
+	SidecarCap            int64  `json:"sidecar_cap,omitempty"`
+	IntegrityError        string `json:"integrity_error,omitempty"`
 }
 
 const defaultServicePipe = `\\.\pipe\seekfs-service`

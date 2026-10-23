@@ -29,6 +29,7 @@ type report struct {
 	Setup         *setupReport    `json:"setup,omitempty"`
 	Search        *searchReport   `json:"search,omitempty"`
 	Resize        *resizeReport   `json:"resize,omitempty"`
+	SlowDrag      *slowDragReport `json:"slow_drag,omitempty"`
 	Settings      *settingsReport `json:"settings,omitempty"`
 	Status        *statusReport   `json:"status,omitempty"`
 	Content       *contentReport  `json:"content,omitempty"`
@@ -123,6 +124,16 @@ type settingsReport struct {
 	ProgressScreenshot string  `json:"progress_screenshot,omitempty"`
 }
 
+type slowDragReport struct {
+	Steps         int     `json:"steps"`
+	FrameP50MS    float64 `json:"frame_p50_ms"`
+	FrameP95MS    float64 `json:"frame_p95_ms"`
+	FrameMaxMS    float64 `json:"frame_max_ms"`
+	FramesOver100 int     `json:"frames_over_100ms"`
+	StepMaxMS     float64 `json:"step_max_ms"`
+	Error         string  `json:"error,omitempty"`
+}
+
 type statusReport struct {
 	InitialHealth       string  `json:"initial_health"`
 	InitialHealthMsg    string  `json:"initial_health_msg"`
@@ -202,6 +213,7 @@ type contentReport struct {
 	BuildingRows        int                     `json:"building_rows"`
 	BuildingNotice      string                  `json:"building_notice,omitempty"`
 	BuildingScreenshot  string                  `json:"building_screenshot,omitempty"`
+	StatusScreenshot    string                  `json:"status_screenshot,omitempty"`
 	SnippetsScreenshot  string                  `json:"snippets_screenshot,omitempty"`
 	NoResultsScreenshot string                  `json:"no_results_screenshot,omitempty"`
 	Queries             []contentQueryReport    `json:"queries"`
@@ -286,6 +298,21 @@ func renderSummary(r *report) string {
 		fmt.Fprintf(&b, "| time to settle | %.1f ms |\n", r.Resize.SettleMS)
 		fmt.Fprintf(&b, "| max frame after settle | %.1f ms |\n\n", r.Resize.AfterSettleMaxMS)
 	}
+	if r.SlowDrag != nil {
+		d := r.SlowDrag
+		fmt.Fprintf(&b, "## Slow drag\n\n")
+		fmt.Fprintf(&b, "| metric | value |\n|---|---:|\n")
+		fmt.Fprintf(&b, "| steps | %d |\n", d.Steps)
+		fmt.Fprintf(&b, "| frame p50 | %.1f ms |\n", d.FrameP50MS)
+		fmt.Fprintf(&b, "| frame p95 | %.1f ms |\n", d.FrameP95MS)
+		fmt.Fprintf(&b, "| frame max | %.1f ms |\n", d.FrameMaxMS)
+		fmt.Fprintf(&b, "| frames over 100 ms | %d |\n", d.FramesOver100)
+		fmt.Fprintf(&b, "| SetWindowPos max | %.1f ms |\n", d.StepMaxMS)
+		if d.Error != "" {
+			fmt.Fprintf(&b, "| error | %s |\n", mdCell(d.Error))
+		}
+		fmt.Fprintln(&b)
+	}
 	if r.Settings != nil {
 		fmt.Fprintf(&b, "## Settings\n\n")
 		fmt.Fprintf(&b, "| metric | value |\n|---|---:|\n")
@@ -366,7 +393,7 @@ func renderSummary(r *report) string {
 			fmt.Fprintf(&b, "| SearchNow latency p50/p95/max | %.1f / %.1f / %.1f ms |\n", p50, p95, max)
 		}
 		if c.SnippetsScreenshot != "" {
-			fmt.Fprintf(&b, "| screenshots | `%s`, `%s`, `%s` |\n", shortPath(c.SnippetsScreenshot), shortPath(c.BuildingScreenshot), shortPath(c.NoResultsScreenshot))
+			fmt.Fprintf(&b, "| screenshots | `%s`, `%s`, `%s`, `%s` |\n", shortPath(c.SnippetsScreenshot), shortPath(c.BuildingScreenshot), shortPath(c.StatusScreenshot), shortPath(c.NoResultsScreenshot))
 		}
 		fmt.Fprintln(&b)
 		fmt.Fprintf(&b, "| query | pass | rows | missing | extra | snippet | typed ms | now ms | attribution |\n|---|---:|---:|---|---|---:|---:|---:|---|\n")
@@ -446,6 +473,14 @@ func collectFindings(r *report) []string {
 		}
 		if r.Resize.AfterSettleMaxMS > 100 {
 			out = append(out, fmt.Sprintf("a frame after settle still took %.1f ms", r.Resize.AfterSettleMaxMS))
+		}
+	}
+	if r.SlowDrag != nil {
+		if r.SlowDrag.Error != "" {
+			out = append(out, "slow drag scenario: "+r.SlowDrag.Error)
+		}
+		if r.SlowDrag.FramesOver100 > 0 {
+			out = append(out, fmt.Sprintf("%d frame(s) over 100 ms during the slow drag (max %.1f ms)", r.SlowDrag.FramesOver100, r.SlowDrag.FrameMaxMS))
 		}
 	}
 	if r.Search != nil {

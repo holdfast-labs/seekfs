@@ -174,6 +174,7 @@ func (h *harness) contentScenario() *contentReport {
 		return rep
 	}
 
+	_ = h.auto.Action("close-settings", nil)
 	if err := h.auto.Action("set-contents-mode", true); err != nil {
 		rep.Error = "set contents mode: " + err.Error()
 		return rep
@@ -202,6 +203,9 @@ func (h *harness) contentScenario() *contentReport {
 	rep.BuildingRows = st.Rows
 	rep.BuildingNotice = st.ResultsNotice
 	rep.BuildingNoticeSeen = st.ResultsNotice != ""
+	_ = h.auto.Action("close-settings", nil)
+	rep.StatusScreenshot = filepath.Join(h.out, "shots", "content-status-building.png")
+	_ = h.auto.Screenshot(rep.StatusScreenshot)
 	if rep.BuildingNoticeSeen {
 		rep.BuildingScreenshot = filepath.Join(h.out, "shots", "content-building.png")
 		_ = h.auto.Screenshot(rep.BuildingScreenshot)
@@ -268,6 +272,7 @@ func (h *harness) contentScenario() *contentReport {
 		}
 		rep.Queries = append(rep.Queries, qr)
 	}
+	_ = h.auto.Action("close-settings", nil)
 	rep.SnippetsScreenshot = filepath.Join(h.out, "shots", "content-snippets.png")
 	_ = h.auto.Screenshot(rep.SnippetsScreenshot)
 
