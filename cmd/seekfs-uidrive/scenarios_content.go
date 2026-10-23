@@ -21,6 +21,16 @@ type contentHealthView struct {
 	BuildDone  int    `json:"build_done"`
 	BuildTotal int    `json:"build_total"`
 	BuildError string `json:"build_error"`
+
+	ScopeReconcile        bool  `json:"scope_reconcile"`
+	ScopeReconcilePending int   `json:"scope_reconcile_pending"`
+	ExtractorRefresh      bool  `json:"extractor_refresh"`
+	StaleExtractorDocs    int   `json:"stale_extractor_docs"`
+	ScopeDropped          int   `json:"scope_dropped"`
+	BudgetBytes           int64 `json:"budget_bytes"`
+	ReserveBytes          int64 `json:"reserve_bytes"`
+	SidecarBytes          int64 `json:"sidecar_bytes"`
+	SidecarCap            int64 `json:"sidecar_cap"`
 }
 
 type serviceInfoView struct {
@@ -203,6 +213,7 @@ func (h *harness) contentScenario() *contentReport {
 	rep.BuildingRows = st.Rows
 	rep.BuildingNotice = st.ResultsNotice
 	rep.BuildingNoticeSeen = st.ResultsNotice != ""
+	rep.StatusText = st.StatusContentText
 	_ = h.auto.Action("close-settings", nil)
 	rep.StatusScreenshot = filepath.Join(h.out, "shots", "content-status-building.png")
 	_ = h.auto.Screenshot(rep.StatusScreenshot)
@@ -347,6 +358,10 @@ func (h *harness) contentScenario() *contentReport {
 		rep.ContentPartial = info.Content.Partial
 		rep.ContentIncomplete = info.Content.Incomplete
 		rep.ContentStale = info.Content.Stale
+		rep.ContentReconcile = info.Content.ScopeReconcile
+		rep.ContentReconcileN = info.Content.ScopeReconcilePending
+		rep.ContentExtractorRef = info.Content.ExtractorRefresh
+		rep.ContentSidecarCap = info.Content.SidecarCap > 0 && info.Content.SidecarBytes >= info.Content.SidecarCap
 		rep.ContentBuildError = info.Content.BuildError
 		rep.ContentBuildDone = info.Content.BuildDone
 		rep.ContentBuildTotal = info.Content.BuildTotal

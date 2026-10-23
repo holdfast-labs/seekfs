@@ -207,11 +207,16 @@ type contentReport struct {
 	ContentPartial      bool                    `json:"content_partial,omitempty"`
 	ContentIncomplete   bool                    `json:"content_incomplete,omitempty"`
 	ContentStale        bool                    `json:"content_stale,omitempty"`
+	ContentReconcile    bool                    `json:"content_scope_reconcile,omitempty"`
+	ContentReconcileN   int                     `json:"content_scope_reconcile_pending,omitempty"`
+	ContentExtractorRef bool                    `json:"content_extractor_refresh,omitempty"`
+	ContentSidecarCap   bool                    `json:"content_sidecar_capped,omitempty"`
 	ContentReadyMS      float64                 `json:"content_ready_ms"`
 	BuildingSeen        bool                    `json:"building_seen"`
 	BuildingNoticeSeen  bool                    `json:"building_notice_seen"`
 	BuildingRows        int                     `json:"building_rows"`
 	BuildingNotice      string                  `json:"building_notice,omitempty"`
+	StatusText          string                  `json:"status_text,omitempty"`
 	BuildingScreenshot  string                  `json:"building_screenshot,omitempty"`
 	StatusScreenshot    string                  `json:"status_screenshot,omitempty"`
 	SnippetsScreenshot  string                  `json:"snippets_screenshot,omitempty"`
@@ -374,6 +379,8 @@ func renderSummary(r *report) string {
 		fmt.Fprintf(&b, "| metric | value |\n|---|---:|\n")
 		fmt.Fprintf(&b, "| content state | %s |\n", mdCell(c.ContentState))
 		fmt.Fprintf(&b, "| content docs | %d |\n", c.ContentDocs)
+		fmt.Fprintf(&b, "| content flags partial/incomplete/stale/reconcile/extractor/cap | %t / %t / %t / %t (%d) / %t / %t |\n",
+			c.ContentPartial, c.ContentIncomplete, c.ContentStale, c.ContentReconcile, c.ContentReconcileN, c.ContentExtractorRef, c.ContentSidecarCap)
 		if c.ContentBuildError != "" {
 			fmt.Fprintf(&b, "| content build error | %s |\n", mdCell(c.ContentBuildError))
 		}
@@ -381,6 +388,7 @@ func renderSummary(r *report) string {
 		fmt.Fprintf(&b, "| building state seen | %t |\n", c.BuildingSeen)
 		fmt.Fprintf(&b, "| building notice shown | %t |\n", c.BuildingNoticeSeen)
 		fmt.Fprintf(&b, "| rows while building | %d |\n", c.BuildingRows)
+		fmt.Fprintf(&b, "| status bar while building | %s |\n", mdCell(c.StatusText))
 		if c.Error != "" {
 			fmt.Fprintf(&b, "| error | %s |\n", mdCell(c.Error))
 		}
@@ -525,6 +533,9 @@ func collectFindings(r *report) []string {
 		}
 		if c.BuildingSeen && !c.BuildingNoticeSeen {
 			out = append(out, "content scenario: index was building but the results notice was not shown")
+		}
+		if c.BuildingSeen && strings.Contains(strings.ToLower(c.StatusText), "unavailable") {
+			out = append(out, fmt.Sprintf("content scenario: status bar repeated the raw building error: %q", c.StatusText))
 		}
 		for _, q := range c.Queries {
 			if !q.Pass {
