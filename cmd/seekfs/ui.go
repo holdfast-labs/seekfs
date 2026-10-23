@@ -93,6 +93,8 @@ type UIContentStatus struct {
 	ScopeDroppedBytes int64  `json:"scope_dropped_bytes,omitempty"`
 	BudgetBytes       int64  `json:"budget_bytes,omitempty"`
 	ReserveBytes      int64  `json:"reserve_bytes,omitempty"`
+	ResidentHits      int    `json:"resident_hits,omitempty"`
+	ResidentFallbacks int    `json:"resident_fallbacks,omitempty"`
 	Error             string `json:"error,omitempty"`
 }
 
@@ -127,6 +129,8 @@ func uiContentStatusFrom(h *contentHealth) *UIContentStatus {
 		ScopeDroppedBytes: h.ScopeDroppedBytes,
 		BudgetBytes:       h.BudgetBytes,
 		ReserveBytes:      h.ReserveBytes,
+		ResidentHits:      h.ResidentHits,
+		ResidentFallbacks: h.ResidentFallbacks,
 		Error:             firstNonEmpty(h.BuildError, h.FoldError),
 	}
 }

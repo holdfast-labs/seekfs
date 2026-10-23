@@ -64,6 +64,7 @@ activation in a running service; --wait waits for readiness.`)
 	system := fs.Bool("system-excludes", true, "exclude generated/system directories")
 	worktrees := fs.String("worktrees", "", "linked git worktrees: main (default) or all")
 	buildSpeed := fs.String("build-speed", "", "content indexing speed: balanced (default), fast or gentle")
+	mftResident := fs.Bool("mft-resident", false, "read small resident files from MFT records (default false)")
 	var roots, excludes, exts, skips, commandArgs stringList
 	fs.Var(&roots, "root", "content root; repeatable")
 	fs.Var(&excludes, "exclude", "excluded content path; repeatable")
@@ -121,7 +122,7 @@ activation in a running service; --wait waits for readiness.`)
 		return err
 	}
 	settingsChanged := false
-	for _, key := range []string{"command", "arg", "timeout-seconds", "scope", "root", "exclude", "ext", "git", "system-excludes", "budget-bytes", "skip", "worktrees", "build-speed"} {
+	for _, key := range []string{"command", "arg", "timeout-seconds", "scope", "root", "exclude", "ext", "git", "system-excludes", "budget-bytes", "skip", "worktrees", "build-speed", "mft-resident"} {
 		settingsChanged = settingsChanged || changed[key]
 	}
 	mutating := op == "add" || op == "remove" || op == "enable" || op == "disable" || op == "config" && settingsChanged
@@ -138,7 +139,7 @@ activation in a running service; --wait waits for readiness.`)
 		if serviceErr == nil && info.PluginConfig != "" && !samePath(info.PluginConfig, *pluginPath) {
 			return fmt.Errorf("running service uses %s; select that plugin file", info.PluginConfig)
 		}
-		if name != "content" && (changed["scope"] || changed["root"] || changed["exclude"] || changed["ext"] || changed["git"] || changed["system-excludes"] || changed["budget-bytes"] || changed["skip"] || changed["worktrees"] || changed["build-speed"]) {
+		if name != "content" && (changed["scope"] || changed["root"] || changed["exclude"] || changed["ext"] || changed["git"] || changed["system-excludes"] || changed["budget-bytes"] || changed["skip"] || changed["worktrees"] || changed["build-speed"] || changed["mft-resident"]) {
 			return fmt.Errorf("content settings require plugin content")
 		}
 		if name == "content" && (changed["command"] || changed["arg"] || changed["timeout-seconds"]) {
@@ -245,6 +246,9 @@ activation in a running service; --wait waits for readiness.`)
 					return d, fmt.Errorf("invalid build-speed (want balanced, fast or gentle)")
 				}
 				d.Content.BuildSpeed = speed
+			}
+			if changed["mft-resident"] {
+				d.Content.MFTResident = *mftResident
 			}
 			if changed["ext"] {
 				d.Content.Exts = append([]string{}, exts...)

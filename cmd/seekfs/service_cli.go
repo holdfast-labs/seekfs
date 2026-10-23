@@ -467,6 +467,12 @@ func contentHealthSummary(h *contentHealth) string {
 				h.ScopeDropped, h.ScopeDroppedBytes, contentBudgetLabel(h.BudgetBytes))
 		}
 	}
+	if h.ResidentHits > 0 || h.ResidentFallbacks > 0 {
+		fmt.Fprintf(&b, " resident_hits=%d resident_fallbacks=%d", h.ResidentHits, h.ResidentFallbacks)
+		if len(h.ResidentFallbackReasons) > 0 {
+			fmt.Fprintf(&b, " resident_fallback_reasons=%v", h.ResidentFallbackReasons)
+		}
+	}
 	if h.BuildError != "" {
 		fmt.Fprintf(&b, " build_error=%s", h.BuildError)
 	}

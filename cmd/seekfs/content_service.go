@@ -279,6 +279,12 @@ type contentHealth struct {
 	// BuildWorkers is the effective extraction concurrency for the running
 	// build under the configured build_speed policy, so the app can show it.
 	BuildWorkers int `json:"build_workers,omitempty"`
+	// ResidentHits/ResidentFallbacks report the mft_resident small-file path:
+	// files read from their MFT record (no open), and candidates that fell
+	// back to a normal open, split by ResidentFallbackReasons.
+	ResidentHits            int            `json:"resident_hits,omitempty"`
+	ResidentFallbacks       int            `json:"resident_fallbacks,omitempty"`
+	ResidentFallbackReasons map[string]int `json:"resident_fallback_reasons,omitempty"`
 }
 
 // contentDeltaDoc is an extracted document for a file changed since the base,
@@ -774,6 +780,14 @@ func mergeContentHealth(dst *contentHealth, src contentHealth) {
 	if src.BuildWorkers > dst.BuildWorkers {
 		dst.BuildWorkers = src.BuildWorkers
 	}
+	dst.ResidentHits += src.ResidentHits
+	dst.ResidentFallbacks += src.ResidentFallbacks
+	for reason, n := range src.ResidentFallbackReasons {
+		if dst.ResidentFallbackReasons == nil {
+			dst.ResidentFallbackReasons = make(map[string]int, len(src.ResidentFallbackReasons))
+		}
+		dst.ResidentFallbackReasons[reason] += n
+	}
 	for _, v := range src.DegradedVolumes {
 		if !containsVolumeName(dst.DegradedVolumes, v) {
 			dst.DegradedVolumes = append(dst.DegradedVolumes, v)
@@ -866,6 +880,12 @@ func aggregateContentHealth(healths []contentHealth) contentHealth {
 	// The reason map is shared by the snapshot; clone it before merging so a
 	// per-volume state is never mutated by aggregation.
 	out.ExtractErrorReasons = cloneContentExtractErrorReasons(healths[0].ExtractErrorReasons)
+	if len(healths[0].ResidentFallbackReasons) > 0 {
+		out.ResidentFallbackReasons = make(map[string]int, len(healths[0].ResidentFallbackReasons))
+		for reason, n := range healths[0].ResidentFallbackReasons {
+			out.ResidentFallbackReasons[reason] = n
+		}
+	}
 	// Build progress is only meaningful while a volume is indexing; a ready
 	// volume can carry a stale BuildTotal from its last build, so only indexing
 	// volumes contribute.
@@ -1422,6 +1442,25 @@ func (s *contentVolumeState) setBuildProgress(done, total int) {
 	s.health.BuildDone = done
 	s.health.BuildTotal = total
 	s.health.BuildWorkers = contentBuildWorkerCount()
+}
+
+// setResidentStats records the completed build's resident-MFT telemetry.
+func (s *contentVolumeState) setResidentStats(c contentResidentCounters) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.health.ResidentHits = int(c.Hits)
+	s.health.ResidentFallbacks = int(contentResidentFallbackTotal(c))
+	if len(c.Fallbacks) > 0 {
+		s.health.ResidentFallbackReasons = make(map[string]int, len(c.Fallbacks))
+		for reason, n := range c.Fallbacks {
+			s.health.ResidentFallbackReasons[reason] = int(n)
+		}
+	} else {
+		s.health.ResidentFallbackReasons = nil
+	}
 }
 
 // markBuildFailed leaves the volume visibly degraded (never ready with an

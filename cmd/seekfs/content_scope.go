@@ -65,6 +65,10 @@ type contentScopeConfig struct {
 	// BuildSpeed selects the indexing-speed policy: "" (default), "balanced",
 	// "fast" or "gentle". See contentBuildSpeedMode.
 	BuildSpeed string
+	// MFTResident enables reading small (<= 1024 B) resident $DATA from MFT
+	// records instead of opening the file. Default false until verified on a
+	// real drive.
+	MFTResident bool
 }
 
 // Indexing-speed policies for a service-owned content build.
@@ -111,6 +115,8 @@ type contentScope struct {
 	Skip []string
 	// BuildSpeed is the resolved indexing-speed policy (never empty).
 	BuildSpeed string
+	// MFTResident enables the resident small-file MFT read optimization.
+	MFTResident bool
 	// BudgetExplicit is true when the budget came from config or environment
 	// (vs the free-space-derived default). Only an explicit budget joins the
 	// scope fingerprint.
@@ -220,6 +226,9 @@ func contentScopeForVolume(cfg appConfig, volume string) contentScope {
 		if speed, ok := parseContentBuildSpeed(sc.BuildSpeed); ok {
 			s.BuildSpeed = speed
 		}
+		if sc.MFTResident {
+			s.MFTResident = true
+		}
 		if sc.Skip != nil {
 			s.Skip = contentNormalizeSkipPatterns(sc.Skip)
 		}
@@ -299,6 +308,11 @@ func applyContentScopeEnv(s *contentScope) bool {
 			s.BuildSpeed = speed
 		}
 	}
+	if v := strings.TrimSpace(os.Getenv("SEEKFS_CONTENT_MFT_RESIDENT")); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			s.MFTResident = b
+		}
+	}
 	if v := strings.TrimSpace(os.Getenv("SEEKFS_CONTENT_BUDGET_BYTES")); v != "" {
 		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 {
 			s.BudgetBytes = n
@@ -373,6 +387,10 @@ func applyContentScopeKey(sc *contentScopeConfig, key, value string) {
 		sc.Worktrees = parseTOMLString(value)
 	case "build_speed", "build-speed":
 		sc.BuildSpeed = parseTOMLString(value)
+	case "mft_resident", "mft-resident":
+		if b, ok := parseTOMLBool(value); ok {
+			sc.MFTResident = b
+		}
 	case "skip", "content_skip", "content-skip":
 		sc.Skip = append(sc.Skip, parseTOMLStringArray(value)...)
 	}

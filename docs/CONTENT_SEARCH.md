@@ -168,6 +168,41 @@ merge straight into section files, and the `.gsx` is written by streaming
 those payloads with a running section table (see §6j). A 64 MiB shard builds
 or folds under ~250 MB of heap.
 
+**Resident small files from MFT (`mft_resident`, default off).** A USN build
+can read files whose name-index size is at most 1024 bytes from their MFT
+record instead of opening them: `FSCTL_GET_NTFS_FILE_RECORD` returns the
+record (metadata only; data clusters are never read), the parser applies the
+update-sequence fixups, and the unnamed `$DATA` bytes are used only when they
+are resident and the file is not compressed, encrypted, sparse, a reparse
+point, an `$ATTRIBUTE_LIST`/extension record, not in use, a directory, or when
+the record sequence or data length do not match the name index. Any doubt
+falls back to the normal open. The build opens one volume handle for the whole
+build when the setting is on; if it lacks access, every candidate falls back
+and the reason is visible. Health and `loaded --json` report `resident_hits`,
+`resident_fallbacks`, and `resident_fallback_reasons`; the build log prints the
+same counts.
+
+Verify on a real drive (no elevated run is possible in the development
+sandbox, so this is the acceptance procedure):
+
+1. Pin a small explicit root, for example
+   `plugin config content --root E:\smalltest --scope explicit`.
+2. Build with the setting off and record the baseline:
+   `plugin config content --mft-resident=false`, rebuild the content index
+   (`settings set` with `{"content":{"build_speed":"fast"}}` triggers a
+   reattach; a fresh sidecar or `content-index -db` is equivalent), then read
+   `seekfs loaded --json` and note `content.resident_hits` (0) and the build
+   log's `resident_hits=0`.
+3. Enable it: `plugin config content --mft-resident=true`, rebuild.
+4. Confirm `resident_hits` is non-zero and `resident_fallbacks` is split into
+   plausible reasons (`nonresident` dominates). Query for a few known small
+   files and compare the hits/snippets with the disabled run; they must be
+   identical. Any parse doubt must appear only under `resident_fallback_reasons`,
+   never as a wrong or missing result.
+5. If `resident_fallbacks.unavailable` is non-zero, the service cannot open the
+   volume handle (it needs the same access as the USN index build); the build
+   still produced correct results through normal opens.
+
 File selection is ripgrep-style: unless `[content] exts` pins an explicit
 allowlist, every file the scope admits is opened and head-sniffed at build
 time — NUL in the first 8 KiB means binary (the same heuristic ripgrep uses;
