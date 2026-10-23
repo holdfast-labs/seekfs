@@ -328,7 +328,7 @@ func (w *contentScanWorker) scanRange(s *goSearchService, vol *serviceVolumeInde
 				members = append(members, m)
 				continue
 			}
-			it := contentBuildItem{frn: m.frn, path: m.path, priority: m.priority}
+			it := contentBuildItem{frn: m.frn, path: m.path, priority: m.priority, mod: m.mod, size: m.size}
 			if !limited {
 				top = append(top, contentScanHeapItem{item: it, member: m})
 				if len(top) >= cfg.maxFiles {
@@ -389,7 +389,7 @@ func mergeScanMembers(lists [][]contentScopeMember, maxFiles int) (items []conte
 	if maxFiles <= 0 {
 		for _, l := range lists {
 			for _, m := range l {
-				items = append(items, contentBuildItem{frn: m.frn, path: m.path, priority: m.priority, inRepo: m.inRepo})
+				items = append(items, contentBuildItem{frn: m.frn, path: m.path, priority: m.priority, inRepo: m.inRepo, mod: m.mod, size: m.size})
 			}
 		}
 		return items, false
@@ -397,7 +397,7 @@ func mergeScanMembers(lists [][]contentScopeMember, maxFiles int) (items []conte
 	var h contentScanHeap
 	for _, l := range lists {
 		for _, m := range l {
-			it := contentBuildItem{frn: m.frn, path: m.path, priority: m.priority}
+			it := contentBuildItem{frn: m.frn, path: m.path, priority: m.priority, mod: m.mod, size: m.size}
 			if len(h) < maxFiles {
 				h = append(h, contentScanHeapItem{item: it, member: m})
 				if len(h) == maxFiles {

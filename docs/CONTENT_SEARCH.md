@@ -180,6 +180,32 @@ do not. `content-index -db <gsi> --estimate` reports `text_candidates` and
 `binary_candidates` separately, and `--sniff-sample N` opens a stride sample
 of the candidates to project the binary share (`projected_text_files`).
 
+Every skip that name-index metadata can decide runs before the open:
+known-binary extensions, lockfiles, JSON at or above 100 KiB,
+minified/bundle names (`.min.`, `.bundle.`, `.chunk.`, `.map`) and
+container formats a rich extractor claims when the source exceeds the
+per-file raw cap. `contentPreOpenSkip` is shared by the selection scan and
+the extraction path, so a service build and a size-blind drain/fold caller
+both avoid the open. Directory, git and operator-skip rules still run in the
+selection scan, which has the resolved scope. Text files over the cap are
+still indexed as a bounded prefix, not skipped.
+
+Extraction order is scope tier first (Git worktrees, configured roots,
+Documents/Desktop/Downloads, then the volume root), then mtime descending,
+then path and FRN. The final sidecar is still assembled in FRN order, so
+published bytes do not depend on the extraction order. Once 2,048 documents
+or 8 MiB of text are staged, the service build publishes that prefix as a
+partial base (`state=indexing`, `partial=true`, `build_done`/`build_total`)
+and keeps extracting; the complete base replaces it atomically. A build is
+therefore queryable within seconds on a cold corpus instead of only at the
+end. `setReady` clears `partial` when the final base attaches.
+
+Retained selection metadata is one compact item per admitted file (FRN, path,
+tier, mtime, size, ~56 B plus the path text) and one `selectedDoc` (~64 B,
+which stores the item index rather than a second item). Build peak does not
+track corpus size: assembly is bounded by the 64 MiB shard target. Measured
+values and the cold worker sweep are in [BENCHMARKS.md](BENCHMARKS.md).
+
 There is no default extracted-text budget: the default scope indexes
 everything selected, and selection stops only when the projected index would
 push the volume holding the sidecar below a free-space reserve — 5% of the
