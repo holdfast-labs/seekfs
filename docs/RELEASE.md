@@ -38,12 +38,12 @@ from the previous release. The tag is passed through verbatim, so
 
 ## Current Release
 
-Current release: `v1.12.1`.
+Current release: `v1.13.0`.
 
 Release notes:
 
 ```text
-docs/RELEASE_NOTES_1.12.1.md
+docs/RELEASE_NOTES_1.13.0.md
 ```
 
 ## Signing
