@@ -67,6 +67,14 @@ func (u *UI) layoutSideRow(gtx layout.Context, r sideRow, clk *widget.Clickable)
 				layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
 					return label(th, Sp(13), r.label, s.Text).Layout(gtx)
 				}),
+				layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+					if r.suffix == "" {
+						return layout.Dimensions{}
+					}
+					return layout.Inset{Left: Dp(6)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+						return label(th, Sp(11), r.suffix, s.Muted).Layout(gtx)
+					})
+				}),
 			)
 		})
 		call := mac.Stop()
@@ -159,6 +167,26 @@ func (u *UI) saveCurrentSearch() {
 	u.saveSoon()
 }
 
+// sidebarVolumeDisplay splits a volume row into the truncatable label and a
+// fixed trailing status. The indexing percentage must stay visible when a long
+// label is ellipsized, so it lives in the suffix and never in the label.
+func sidebarVolumeDisplay(label, state string, pct, entries int) (string, string) {
+	switch state {
+	case "indexing":
+		if pct >= 0 {
+			return label, "(indexing " + itoa(pct) + "%)"
+		}
+		return label, "(indexing\u2026)"
+	case "error":
+		return label, "(error)"
+	default:
+		if entries > 0 {
+			return label, "(" + formatCount(entries) + ")"
+		}
+		return label, ""
+	}
+}
+
 // rebuildSideRows reconstructs the sidebar rows; vols nil keeps current.
 func (u *UI) rebuildSideRows(vols []DBVolume) {
 	u.mu.Lock()
@@ -192,10 +220,8 @@ func (u *UI) rebuildSideRows(vols []DBVolume) {
 		if lbl == "" {
 			lbl = v.Path
 		}
-		if v.Entries > 0 {
-			lbl += "  (" + formatCount(v.Entries) + ")"
-		}
-		rows = append(rows, sideRow{kind: sideScope, label: lbl, under: under, depth: 1})
+		lbl, suffix := sidebarVolumeDisplay(lbl, v.State, indexingPercent(v.Progress), v.Entries)
+		rows = append(rows, sideRow{kind: sideScope, label: lbl, under: under, depth: 1, suffix: suffix})
 	}
 	rows = append(rows, sideRow{kind: sideHeader, label: "Saved searches"})
 	for _, q := range saved {

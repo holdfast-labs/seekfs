@@ -11,6 +11,36 @@ import (
 // gstatus.go: the bottom status bar — result count/message, query time,
 // content health, and index health.
 
+type healthTone int
+
+const (
+	healthToneMuted healthTone = iota
+	healthToneOK
+	healthToneWarning
+	healthToneError
+)
+
+// healthStatusText maps the service health to the status bar text and tone.
+// The normal first-run state (service up, no drives indexed yet) is neutral,
+// not an error.
+func healthStatusText(health, msg string, entries int) (string, healthTone) {
+	switch health {
+	case serviceHealthOK:
+		return fmt.Sprintf("Index ready (%s entries)", formatCount(entries)), healthToneOK
+	case serviceHealthDegraded:
+		return "Index: " + firstNonEmpty(msg, "degraded"), healthToneWarning
+	case serviceHealthEmpty:
+		return firstNonEmpty(msg, "No drives indexed yet"), healthToneMuted
+	case serviceHealthError:
+		return "Index: " + firstNonEmpty(msg, "error"), healthToneError
+	default:
+		if msg != "" {
+			return msg, healthToneMuted
+		}
+		return "Connecting…", healthToneMuted
+	}
+}
+
 // layoutStatus renders the status bar.
 func (u *UI) layoutStatus(gtx layout.Context) layout.Dimensions {
 	s := u.scheme
@@ -20,23 +50,25 @@ func (u *UI) layoutStatus(gtx layout.Context) layout.Dimensions {
 	elapsed := u.elapsedMS
 	searchMS := u.searchMS
 	content := u.content
+	contentIndex := u.contentHealth
 	contentMode := u.contents
 	unavail := u.unavail
 	health, healthMsg := u.health, u.healthMsg
 	entries := u.entries
 	flash := u.flashMsg
+	snapshot := u.settingsSnapshot
 	u.flashMsg = ""
 	u.mu.Unlock()
 
 	countText := fmt.Sprintf("%s result%s", formatCount(n), plural(n))
 	if msg != "" {
-		countText += " — " + msg
+		countText += " \u2014 " + truncateStatusText(msg, 80)
 	}
-	if unavail != "" {
-		countText = unavail
+	if unavail != "" && !contentUnavailableString(unavail) {
+		countText = truncateStatusText(unavail, 120)
 	}
 	if flash != "" {
-		countText = flash
+		countText = truncateStatusText(flash, 120)
 	}
 
 	timeText := ""
@@ -44,29 +76,34 @@ func (u *UI) layoutStatus(gtx layout.Context) layout.Dimensions {
 		timeText = fmt.Sprintf("%d ms (service %.0f ms)", elapsed, searchMS)
 	}
 
-	contentText := ""
-	if contentMode || (content != nil && content.State != "") {
-		if unavail != "" {
-			contentText = "Contents unavailable"
-		} else {
-			contentText = contentStatusText(content)
-		}
+	contentText, contentTone := statusContentText(contentMode, content, contentIndex, unavail)
+	contentColor := s.Muted
+	switch contentTone {
+	case healthToneWarning:
+		contentColor = s.Warning
+	case healthToneError:
+		contentColor = s.Error
 	}
 
-	healthText, healthColor := "Connecting…", s.Muted
-	switch health {
-	case serviceHealthOK:
-		healthText = fmt.Sprintf("Index ready (%s entries)", formatCount(entries))
+	healthText, healthColor := "Connecting\u2026", s.Muted
+	healthText, tone := healthStatusText(health, healthMsg, entries)
+	healthText = truncateStatusText(healthText, 96)
+	healthColor = s.Muted
+	switch tone {
+	case healthToneOK:
 		healthColor = s.OK
-	case serviceHealthDegraded:
-		healthText = "Index: " + firstNonEmpty(healthMsg, "degraded")
+	case healthToneWarning:
 		healthColor = s.Warning
-	case serviceHealthError:
-		healthText = "Index: " + firstNonEmpty(healthMsg, "error")
+	case healthToneError:
 		healthColor = s.Error
-	default:
-		if healthMsg != "" {
-			healthText = healthMsg
+	}
+	if snapshot != nil {
+		for _, v := range snapshot.Volumes {
+			if v.State == "indexing" {
+				healthText = formatIndexingStatus(v.Volume, v.Progress)
+				healthColor = s.Warning
+				break
+			}
 		}
 	}
 
@@ -82,7 +119,7 @@ func (u *UI) layoutStatus(gtx layout.Context) layout.Dimensions {
 			}),
 			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 				return layout.Inset{Left: Dp(16)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
-					return label(u.th, Sp(12), contentText, s.Muted).Layout(gtx)
+					return label(u.th, Sp(12), contentText, contentColor).Layout(gtx)
 				})
 			}),
 			layout.Rigid(func(gtx layout.Context) layout.Dimensions {

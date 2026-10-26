@@ -19,6 +19,10 @@ const (
 	contentModeExplicit = "explicit"
 	contentModeOff      = "off"
 
+	contentSpeedBalanced = "balanced"
+	contentSpeedFast     = "fast"
+	contentSpeedGentle   = "gentle"
+
 	gbBytes = int64(1) << 30
 
 	serviceModeWindowsService = "windows-service"
@@ -35,15 +39,23 @@ type serviceSettings struct {
 }
 
 type serviceVolume struct {
-	Volume     string `json:"volume"`
-	Indexed    *bool  `json:"indexed,omitempty"`
-	FS         string `json:"fs,omitempty"`
-	Label      string `json:"label,omitempty"`
-	TotalBytes int64  `json:"total_bytes,omitempty"`
-	FreeBytes  int64  `json:"free_bytes,omitempty"`
-	Entries    int64  `json:"entries,omitempty"`
-	State      string `json:"state,omitempty"`
-	Error      string `json:"error,omitempty"`
+	Volume     string                 `json:"volume"`
+	Indexed    *bool                  `json:"indexed,omitempty"`
+	FS         string                 `json:"fs,omitempty"`
+	Label      string                 `json:"label,omitempty"`
+	TotalBytes int64                  `json:"total_bytes,omitempty"`
+	FreeBytes  int64                  `json:"free_bytes,omitempty"`
+	Entries    int64                  `json:"entries,omitempty"`
+	State      string                 `json:"state,omitempty"`
+	Error      string                 `json:"error,omitempty"`
+	Progress   *serviceVolumeProgress `json:"progress,omitempty"`
+}
+
+type serviceVolumeProgress struct {
+	Phase     string `json:"phase"`
+	Done      int64  `json:"done"`
+	Total     int64  `json:"total"`
+	StartedAt string `json:"started_at"`
 }
 
 // serviceContent mirrors [content] plus per-drive overrides. Every field is a
@@ -57,6 +69,7 @@ type serviceContent struct {
 	Git            *bool                           `json:"git,omitempty"`
 	SystemExcludes *bool                           `json:"system_excludes,omitempty"`
 	BudgetBytes    *int64                          `json:"budget_bytes,omitempty"`
+	BuildSpeed     *string                         `json:"build_speed,omitempty"`
 	Volumes        map[string]serviceContentVolume `json:"volumes,omitempty"`
 }
 
@@ -80,6 +93,7 @@ type volumeDraft struct {
 	FreeBytes  int64
 	Entries    int64
 	Error      string
+	Progress   *serviceVolumeProgress
 }
 
 type contentDraft struct {
@@ -91,6 +105,7 @@ type contentDraft struct {
 	Git            bool
 	SystemExcludes bool
 	BudgetBytes    int64
+	BuildSpeed     string
 	Volumes        map[string]*contentVolumeDraft
 }
 
@@ -130,6 +145,7 @@ type contentValues struct {
 	Git            bool
 	SystemExcludes bool
 	BudgetBytes    int64
+	BuildSpeed     string
 	HasOverride    bool
 }
 
@@ -150,8 +166,9 @@ func newSettingsModel(s serviceSettings) *settingsModel {
 
 func draftFromService(s serviceSettings) settingsDraft {
 	d := settingsDraft{Content: contentDraft{
-		Mode:    contentModeAuto,
-		Volumes: map[string]*contentVolumeDraft{},
+		Mode:       contentModeAuto,
+		BuildSpeed: contentSpeedBalanced,
+		Volumes:    map[string]*contentVolumeDraft{},
 	}}
 	for _, v := range s.Volumes {
 		indexed := false
@@ -168,6 +185,7 @@ func draftFromService(s serviceSettings) settingsDraft {
 			FreeBytes:  v.FreeBytes,
 			Entries:    v.Entries,
 			Error:      v.Error,
+			Progress:   v.Progress,
 		})
 	}
 	if c := s.Content; c != nil {
@@ -194,6 +212,9 @@ func draftFromService(s serviceSettings) settingsDraft {
 		}
 		if c.BudgetBytes != nil {
 			d.Content.BudgetBytes = *c.BudgetBytes
+		}
+		if c.BuildSpeed != nil && *c.BuildSpeed != "" {
+			d.Content.BuildSpeed = *c.BuildSpeed
 		}
 		for drive, ov := range c.Volumes {
 			d.Content.Volumes[drive] = contentVolumeFromService(ov)
@@ -228,6 +249,42 @@ func contentVolumeFromService(ov serviceContentVolume) *contentVolumeDraft {
 	return d
 }
 
+// mergeServerState refreshes server-side volume state, entries and progress
+// while keeping the user's staged (unapplied) edits. Content edits are kept
+// as staged too: only the snapshot used to compute the patch is updated.
+func (m *settingsModel) mergeServerState(s serviceSettings) {
+	if m == nil {
+		return
+	}
+	m.canWrite = s.CanWrite
+	m.serviceMode = s.ServiceMode
+	next := draftFromService(s)
+	merged := make([]volumeDraft, 0, len(next.Volumes))
+	for _, nv := range next.Volumes {
+		for i := range m.draft.Volumes {
+			if m.draft.Volumes[i].Volume == nv.Volume {
+				nv.Indexed = m.draft.Volumes[i].Indexed
+				break
+			}
+		}
+		merged = append(merged, nv)
+	}
+	m.base = next
+	m.draft.Volumes = merged
+}
+
+func hasIndexingVolume(s *serviceSettings) bool {
+	if s == nil {
+		return false
+	}
+	for _, v := range s.Volumes {
+		if v.State == "indexing" {
+			return true
+		}
+	}
+	return false
+}
+
 func (d settingsDraft) clone() settingsDraft {
 	out := settingsDraft{
 		Volumes: append([]volumeDraft(nil), d.Volumes...),
@@ -240,6 +297,7 @@ func (d settingsDraft) clone() settingsDraft {
 			Git:            d.Content.Git,
 			SystemExcludes: d.Content.SystemExcludes,
 			BudgetBytes:    d.Content.BudgetBytes,
+			BuildSpeed:     d.Content.BuildSpeed,
 			Volumes:        map[string]*contentVolumeDraft{},
 		},
 	}
@@ -340,6 +398,7 @@ func (m *settingsModel) contentValues(drive string) contentValues {
 		Git:            g.Git,
 		SystemExcludes: g.SystemExcludes,
 		BudgetBytes:    g.BudgetBytes,
+		BuildSpeed:     g.BuildSpeed,
 	}
 	if drive == "" {
 		return v
@@ -547,6 +606,21 @@ func (m *settingsModel) setSystemExcludes(drive string, on bool) {
 	ov.SystemExcludes, ov.HasSystemExcludes = on, true
 }
 
+// setBuildSpeed stages the global indexing-speed policy. There is no
+// per-drive override: the policy governs the process-wide worker pool.
+func (m *settingsModel) setBuildSpeed(speed string) {
+	switch speed {
+	case contentSpeedBalanced, contentSpeedFast, contentSpeedGentle:
+	default:
+		return
+	}
+	if m.draft.Content.BuildSpeed == speed {
+		return
+	}
+	m.snapshot()
+	m.draft.Content.BuildSpeed = speed
+}
+
 func (m *settingsModel) setBudget(drive string, bytes int64) {
 	if drive == "" {
 		if m.draft.Content.BudgetBytes == bytes {
@@ -654,6 +728,10 @@ func (m *settingsModel) patch() *serviceSettings {
 	if d.BudgetBytes != b.BudgetBytes {
 		v := d.BudgetBytes
 		c.BudgetBytes, changed = &v, true
+	}
+	if d.BuildSpeed != b.BuildSpeed {
+		v := d.BuildSpeed
+		c.BuildSpeed, changed = &v, true
 	}
 
 	for drive, dv := range d.Volumes {
@@ -833,6 +911,57 @@ func parseExtList(s string) ([]string, error) {
 
 func formatExtList(exts []string) string {
 	return strings.Join(exts, ", ")
+}
+
+func formatCompactCount(n int64) string {
+	if n < 0 {
+		n = 0
+	}
+	if n < 1000 {
+		return strconv.FormatInt(n, 10)
+	}
+	units := []string{"K", "M", "B", "T"}
+	v := float64(n)
+	i := -1
+	for v >= 1000 && i < len(units)-1 {
+		v /= 1000
+		i++
+	}
+	text := strconv.FormatFloat(v, 'f', 1, 64)
+	text = strings.TrimSuffix(text, ".0")
+	return text + units[i]
+}
+
+func indexingPercent(v *serviceVolumeProgress) int {
+	if v == nil || v.Total <= 0 {
+		return -1
+	}
+	pct := int(v.Done * 100 / v.Total)
+	if pct < 0 {
+		return 0
+	}
+	if pct > 100 {
+		return 100
+	}
+	return pct
+}
+
+func formatIndexingProgress(v *serviceVolumeProgress) string {
+	pct := indexingPercent(v)
+	if pct >= 0 {
+		return fmt.Sprintf("Indexing… %d%% (%s of %s files)", pct, formatCompactCount(v.Done), formatCompactCount(v.Total))
+	}
+	if v != nil && v.Done > 0 {
+		return "Indexing… " + formatCompactCount(v.Done) + " files"
+	}
+	return "Indexing…"
+}
+
+func formatIndexingStatus(volume string, v *serviceVolumeProgress) string {
+	if pct := indexingPercent(v); pct >= 0 {
+		return fmt.Sprintf("Indexing %s %d%%", volume, pct)
+	}
+	return "Indexing " + volume
 }
 
 func formatBytesCompact(n int64) string {

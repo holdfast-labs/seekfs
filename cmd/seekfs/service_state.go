@@ -21,6 +21,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode"
+	"unicode/utf8"
 )
 
 func (vol *serviceVolumeIndex) replayWALWithLimit(maxBytes int64) error {
@@ -937,7 +939,7 @@ func buildCompactTypeOrderRank(idx *Index) ([]uint32, []uint32) {
 	return order, compactRanksFromOrder(order, recordCount)
 }
 
-func buildCompactPathOrderRank(idx *Index) ([]uint32, []uint32) {
+func buildCompactPathOrderRankLegacy(idx *Index) ([]uint32, []uint32) {
 	recordCount := 0
 	if idx != nil {
 		recordCount = idx.compactRecordCount()
@@ -967,6 +969,197 @@ func buildCompactPathOrderRank(idx *Index) ([]uint32, []uint32) {
 		}
 		if keys[a] != keys[b] {
 			return keys[a] < keys[b]
+		}
+		return a < b
+	})
+	return order, compactRanksFromOrder(order, recordCount)
+}
+
+// appendLowerName appends the lowercase form of name without allocating.
+func appendLowerName(dst []byte, name string) []byte {
+	ascii := true
+	for i := 0; i < len(name); i++ {
+		if name[i] >= 0x80 || (name[i] >= 'A' && name[i] <= 'Z') {
+			ascii = false
+			break
+		}
+	}
+	if ascii {
+		return append(dst, name...)
+	}
+	for _, r := range name {
+		dst = utf8.AppendRune(dst, unicode.ToLower(r))
+	}
+	return dst
+}
+
+// appendLowerPath writes the joined lowercase path for a component chain.
+func appendLowerPath(dst []byte, chain []int32, lowerRoot string, idx *Index) []byte {
+	dst = dst[:0]
+	dst = append(dst, lowerRoot...)
+	for _, id := range chain {
+		name := idx.compactRecord(int(id)).Name
+		if len(dst) == 0 {
+			dst = appendLowerName(dst, name)
+		} else {
+			dst = append(dst, '\\')
+			dst = appendLowerName(dst, name)
+		}
+	}
+	return dst
+}
+
+// pathRankCache mirrors reconstructLowerPathInto's lazy key memo, but stores
+// each key as a chain of record ids in one int32 arena. The joined lowercase
+// path is rebuilt into a reusable buffer only while comparing, so no
+// per-record path string is ever allocated.
+type pathRankCache struct {
+	idx         *Index
+	recordCount int
+	lowerRoot   string
+	rootName    string
+	haveRoots   bool
+	seen        []int32
+	gen         int32
+	parts       []int32
+	computed    []bool
+	unresolved  []bool
+	keyOff      []uint32
+	keyLen      []uint32
+	keyIDs      []int32
+}
+
+func newPathRankCache(idx *Index, recordCount int) *pathRankCache {
+	root := idx.Volume
+	rootName := ""
+	if len(idx.Roots) > 0 {
+		root = strings.TrimRight(idx.Roots[0], `\`)
+		rootName = filepath.Base(root)
+	}
+	return &pathRankCache{
+		idx: idx, recordCount: recordCount,
+		lowerRoot: strings.ToLower(root), rootName: rootName,
+		haveRoots:  len(idx.Roots) > 0,
+		seen:       make([]int32, recordCount),
+		computed:   make([]bool, recordCount),
+		unresolved: make([]bool, recordCount),
+		keyOff:     make([]uint32, recordCount),
+		keyLen:     make([]uint32, recordCount),
+		keyIDs:     make([]int32, 0, recordCount),
+	}
+}
+
+func (c *pathRankCache) compute(i int) {
+	if c.computed[i] {
+		return
+	}
+	c.parts = c.parts[:0]
+	c.gen++
+	g := c.gen
+	cur := i
+	baseOff, baseLen := 0, 0
+	haveBase := false
+	unresolved := false
+	for depth := 0; depth < 1024; depth++ {
+		if cur < 0 || cur >= c.recordCount {
+			unresolved = true
+			break
+		}
+		if c.computed[cur] {
+			if c.unresolved[cur] || (c.lowerRoot == "" && c.keyLen[cur] == 0) {
+				unresolved = true
+				break
+			}
+			baseOff, baseLen, haveBase = int(c.keyOff[cur]), int(c.keyLen[cur]), true
+			break
+		}
+		if c.seen[cur] == g {
+			// Self-parented root or cycle: ends at the root, not an orphan.
+			break
+		}
+		c.seen[cur] = g
+		rec := c.idx.compactRecord(cur)
+		if rec.Name != "." {
+			c.parts = append(c.parts, int32(cur))
+		}
+		if rec.Parent < 0 {
+			if c.haveRoots && rec.ParentFRN != 0 && rec.ParentFRN != rec.FRN {
+				unresolved = true
+			}
+			break
+		}
+		if int(rec.Parent) >= c.recordCount {
+			unresolved = true
+			break
+		}
+		cur = int(rec.Parent)
+	}
+	c.computed[i] = true
+	if unresolved {
+		c.unresolved[i] = true
+		c.keyOff[i], c.keyLen[i] = 0, 0
+		return
+	}
+	start := len(c.keyIDs)
+	if haveBase {
+		if baseLen > 0 {
+			c.keyIDs = append(c.keyIDs, c.keyIDs[baseOff:baseOff+baseLen]...)
+		}
+		for p := len(c.parts) - 1; p >= 0; p-- {
+			c.keyIDs = append(c.keyIDs, c.parts[p])
+		}
+	} else {
+		for p := len(c.parts) - 1; p >= 0; p-- {
+			if c.lowerRoot == "" && p == len(c.parts)-1 {
+				c.keyIDs = append(c.keyIDs, c.parts[p])
+				continue
+			}
+			if c.rootName != "" && p == len(c.parts)-1 && len(c.parts) > 1 &&
+				c.idx.compactRecord(int(c.parts[p])).Name == c.rootName {
+				continue
+			}
+			c.keyIDs = append(c.keyIDs, c.parts[p])
+		}
+	}
+	c.keyOff[i] = uint32(start)
+	c.keyLen[i] = uint32(len(c.keyIDs) - start)
+}
+
+func (c *pathRankCache) chain(id uint32) ([]int32, bool) {
+	c.compute(int(id))
+	off, length := c.keyOff[id], c.keyLen[id]
+	return c.keyIDs[int(off):int(off+length)], !c.unresolved[id]
+}
+
+// buildCompactPathOrderRank orders live records by their lowercase full path
+// without materialising one path string per record. It keeps the legacy lazy
+// memo semantics (including the root-name skip) but memoizes component chains
+// in one int32 arena, and rebuilds a joined path only inside the comparator.
+func buildCompactPathOrderRank(idx *Index) ([]uint32, []uint32) {
+	recordCount := 0
+	if idx != nil {
+		recordCount = idx.compactRecordCount()
+	}
+	if recordCount == 0 {
+		return nil, nil
+	}
+	order := liveCompactIDs(idx, recordCount)
+	cache := newPathRankCache(idx, recordCount)
+	var bufA, bufB []byte
+	sort.Slice(order, func(i, j int) bool {
+		a, b := order[i], order[j]
+		chainA, okA := cache.chain(a)
+		bufA = bufA[:0]
+		if okA {
+			bufA = appendLowerPath(bufA, chainA, cache.lowerRoot, cache.idx)
+		}
+		chainB, okB := cache.chain(b)
+		bufB = bufB[:0]
+		if okB {
+			bufB = appendLowerPath(bufB, chainB, cache.lowerRoot, cache.idx)
+		}
+		if c := bytes.Compare(bufA, bufB); c != 0 {
+			return c < 0
 		}
 		return a < b
 	})

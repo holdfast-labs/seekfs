@@ -288,11 +288,19 @@ func contentBuildBusyReason(sidecarPath string) string {
 	case "always":
 		return "always"
 	}
-	if contentUserActiveNow() {
-		return "query-recent"
-	}
-	if contentBuildQueriesActiveNow() {
-		return "query-inflight"
+	// Fast ignores recent-query and input politeness, but an in-flight query
+	// must still win: check it first so a recent query cannot mask it.
+	if contentBuildSpeedModeNow() == contentBuildSpeedFast {
+		if contentBuildQueriesActiveNow() {
+			return "query-inflight"
+		}
+	} else {
+		if contentUserActiveNow() {
+			return "query-recent"
+		}
+		if contentBuildQueriesActiveNow() {
+			return "query-inflight"
+		}
 	}
 	if contentOnBatteryNow() {
 		return "battery"
@@ -319,21 +327,56 @@ func contentBuildBusyNow(sidecarPath string) bool {
 	return contentBuildBusyReason(sidecarPath) != ""
 }
 
+// contentBuildPauseForReason applies the active build_speed policy to one
+// tripped signal. Fast ignores user-activity signals entirely (recent query,
+// input, battery) and still yields to an in-flight query and to CPU/disk
+// pressure; Balanced shortens the user-activity pause to a quarter; Gentle
+// takes the full pause for every signal (the historical behavior).
+func contentBuildPauseForReason(reason string, full time.Duration) time.Duration {
+	if full <= 0 {
+		return 0
+	}
+	switch contentBuildSpeedModeNow() {
+	case contentBuildSpeedFast:
+		switch reason {
+		case "query-inflight", "cpu", "disk", "system-drive", "always":
+			return full
+		}
+		return 0
+	case contentBuildSpeedGentle:
+		return full
+	default: // balanced
+		switch reason {
+		case "query-recent", "input":
+			return full / 4
+		}
+		return full
+	}
+}
+
 // contentBuildPauseNow is the pause for one batch boundary: zero on an idle
-// machine (or when tests zero contentBuildBatchPause), else the configured
-// pause. It counts the decision for harness reporting.
+// machine (or when tests zero contentBuildBatchPause). A signal the active
+// policy ignores counts as a skip. It counts the decision for harness
+// reporting.
 func contentBuildPauseNow(sidecarPath string) time.Duration {
 	if contentBuildBatchPause <= 0 {
 		return 0
 	}
-	if reason := contentBuildBusyReason(sidecarPath); reason != "" {
-		contentBuildPausesTaken.Add(1)
-		contentBuildNoteReason(reason)
-		return contentBuildBatchPause
+	reason := contentBuildBusyReason(sidecarPath)
+	if reason == "" {
+		contentBuildPauseSkips.Add(1)
+		contentBuildNoteReason("idle")
+		return 0
 	}
-	contentBuildPauseSkips.Add(1)
-	contentBuildNoteReason("idle")
-	return 0
+	d := contentBuildPauseForReason(reason, contentBuildBatchPause)
+	if d <= 0 {
+		contentBuildPauseSkips.Add(1)
+		contentBuildNoteReason("mode-skip:" + reason)
+		return 0
+	}
+	contentBuildPausesTaken.Add(1)
+	contentBuildNoteReason(reason)
+	return d
 }
 
 // contentSystemDriveLetter reports the Windows system drive ("C:") for the

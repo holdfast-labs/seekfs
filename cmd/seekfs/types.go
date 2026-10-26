@@ -398,6 +398,15 @@ type Index struct {
 	// own lock; entries are validated by query signature, record count and
 	// generation before use.
 	nameMemo nameMemoCache
+	// nameArena marks an in-memory build whose CompactRecord.NameOff values are
+	// byte offsets into NameBlob (not persisted token ids). Names are interned
+	// in NameBlob, and nameArenaOffsets/nameArenaLens list each distinct name in
+	// first-use order, which writeIndexFile publishes as the token table.
+	nameArena bool
+	// nameArenaOffsets/nameArenaLens hold the distinct arena names. Both are
+	// parallel, sorted by increasing offset.
+	nameArenaOffsets []uint32
+	nameArenaLens    []uint16
 }
 
 type indexDerivedSections struct {

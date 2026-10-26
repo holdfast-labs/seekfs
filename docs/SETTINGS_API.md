@@ -24,7 +24,12 @@ Response (`serviceResponse` with a new `settings` field):
        "entries": 1460000, "state": "ready"},
       {"volume": "F:", "indexed": false, "fs": "NTFS", "label": "Data",
        "total_bytes": 2000398934016, "free_bytes": 900000000000,
-       "entries": 0, "state": "not_indexed"}
+       "entries": 0, "state": "not_indexed"},
+      {"volume": "X:", "indexed": true, "fs": "NTFS", "label": "Fixture",
+       "total_bytes": 549755813888, "free_bytes": 274877906944,
+       "entries": 0, "state": "indexing",
+       "progress": {"phase": "building", "done": 1200000, "total": 2900000,
+                    "started_at": "2026-10-22T10:00:00Z"}}
     ],
     "content": {
       "enabled": true,
@@ -35,6 +40,7 @@ Response (`serviceResponse` with a new `settings` field):
       "git": true,
       "system_excludes": true,
       "budget_bytes": 0,
+      "build_speed": "balanced",
       "volumes": {"E:": {"mode": "explicit", "roots": ["E:\\src"]}}
     }
   }
@@ -45,11 +51,19 @@ Response (`serviceResponse` with a new `settings` field):
   that are not indexed yet), plus any indexed volume that is not fixed/NTFS.
   `state` is one of `ready`, `indexing`, `not_indexed`, `error`. `error`, when
   present, is the last background build failure for that volume.
+- `progress` is present only while `state` is `indexing`. `phase` is
+  `enumerating` (reading the MFT or USN journal), `building` (converting
+  records), or `writing` (persisting the index). `done` and `total` count
+  records where the phase can report a total (MFT enumeration); `total` is 0
+  when the count is unknown (USN fallback). `started_at` is an RFC 3339
+  timestamp. The app uses this for a determinate progress bar.
 - `content` mirrors the `[content]` keys in docs/CONFIG.md, with
   `[plugins.content]` values from `plugin.toml` merged in; `volumes` holds the
   per-volume `[content."X:"]` overrides from `seekfs.toml` (only keys that are
   set). `budget_bytes` 0 means no explicit budget. `exts` empty means sniff
-  (default).
+  (default). `build_speed` is `balanced` (default), `fast`, or `gentle`; it is
+  global (not per volume) and the service reports the effective worker count as
+  `build_workers` in the content health response while indexing.
 - `can_write` is true when this caller may call `settings-set`.
 - Remote callers are refused for both commands, so local paths in `volumes` and
   `content` never cross the remote transport.
@@ -69,7 +83,8 @@ change. `volumes` entries need only `volume` and `indexed`.
   it from the list (its index file is kept on disk); removing one whose build
   is still pending cancels and ignores that result.
 - Content changes are validated (absolute roots on known volumes, mode in
-  `auto|explicit|off`, `budget_bytes >= 0`). Global scope keys are written to
+  `auto|explicit|off`, `build_speed` in `balanced|fast|gentle`,
+  `budget_bytes >= 0`). Global scope keys are written to
   `plugin.toml`; per-volume overrides are written to `[content."X:"]` in
   `seekfs.toml`. Both are applied with the same live reload as `plugin-reload`.
   `enabled` writes the content selection in `plugin.toml` when the content

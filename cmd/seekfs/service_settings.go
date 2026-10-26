@@ -35,6 +35,8 @@ type settingsVolume struct {
 	Entries    int    `json:"entries"`
 	State      string `json:"state"`
 	Error      string `json:"error,omitempty"`
+	// Progress is present only while State is "indexing".
+	Progress *settingsVolumeProgress `json:"progress,omitempty"`
 }
 
 type settingsContentInfo struct {
@@ -46,6 +48,7 @@ type settingsContentInfo struct {
 	Git            bool                               `json:"git"`
 	SystemExcludes bool                               `json:"system_excludes"`
 	BudgetBytes    int64                              `json:"budget_bytes"`
+	BuildSpeed     string                             `json:"build_speed"`
 	Volumes        map[string]settingsContentOverride `json:"volumes,omitempty"`
 }
 
@@ -80,6 +83,7 @@ type settingsContentPatch struct {
 	Git            *bool                              `json:"git,omitempty"`
 	SystemExcludes *bool                              `json:"system_excludes,omitempty"`
 	BudgetBytes    *int64                             `json:"budget_bytes,omitempty"`
+	BuildSpeed     *string                            `json:"build_speed,omitempty"`
 	Volumes        map[string]settingsContentOverride `json:"volumes,omitempty"`
 }
 
@@ -89,8 +93,10 @@ var settingsVolumeEnumeration = enumerateSettingsVolumes
 
 // serviceIndexUSNVolume is the low-level index build seam shared by the
 // index-usn path. Tests replace it with a small synthetic Index instead of
-// touching a real USN journal.
-var serviceIndexUSNVolume = indexUSNVolume
+// touching a real USN journal. progress is nil outside settings-driven builds.
+var serviceIndexUSNVolume = func(volume string, progress *volumeBuildProgress) (*Index, error) {
+	return indexUSNVolume(volume, progress)
+}
 
 func (s *goSearchService) settingsConfigPath() string {
 	if s != nil && s.configPath != "" {
@@ -160,17 +166,18 @@ func (s *goSearchService) currentServiceSettings(caps serviceCapabilities) servi
 }
 
 type settingsVolumeStateOverride struct {
-	indexed bool
-	state   string
-	err     string
+	indexed  bool
+	state    string
+	err      string
+	progress *volumeBuildProgress
 }
 
 func (s *goSearchService) settingsVolumeStateOverrides() map[string]settingsVolumeStateOverride {
 	s.settingsVolumeMu.Lock()
 	defer s.settingsVolumeMu.Unlock()
 	out := make(map[string]settingsVolumeStateOverride, len(s.settingsVolumeTasks)+len(s.settingsVolumeErrs))
-	for volume := range s.settingsVolumeTasks {
-		out[volume] = settingsVolumeStateOverride{indexed: true, state: "indexing"}
+	for volume, task := range s.settingsVolumeTasks {
+		out[volume] = settingsVolumeStateOverride{indexed: true, state: "indexing", progress: task.progress}
 	}
 	for volume, message := range s.settingsVolumeErrs {
 		if _, pending := out[volume]; pending {
@@ -229,6 +236,9 @@ func settingsVolumeList(infos []settingsVolumeInfo, volumes []*serviceVolumeInde
 		entry.Indexed = override.indexed
 		entry.State = override.state
 		entry.Error = override.err
+		if override.state == "indexing" {
+			entry.Progress = override.progress.settingsProgress()
+		}
 		if override.state != "ready" {
 			entry.Entries = 0
 		}
@@ -277,6 +287,7 @@ func settingsContentFromConfig(cfg appConfig) settingsContentInfo {
 		Git:            boolValue(global.Git, true),
 		SystemExcludes: boolValue(global.SystemExcludes, true),
 		BudgetBytes:    global.BudgetBytes,
+		BuildSpeed:     contentBuildSpeedProjection(global.BuildSpeed),
 	}
 	if info.Mode == "" {
 		info.Mode = string(contentScopeAuto)
@@ -316,6 +327,9 @@ func mergeContentScopeConfig(base, over contentScopeConfig) contentScopeConfig {
 	}
 	if over.Worktrees != "" {
 		base.Worktrees = over.Worktrees
+	}
+	if over.BuildSpeed != "" {
+		base.BuildSpeed = over.BuildSpeed
 	}
 	if over.Skip != nil {
 		base.Skip = append([]string{}, over.Skip...)
@@ -361,6 +375,15 @@ func boolValue(value *bool, fallback bool) bool {
 		return fallback
 	}
 	return *value
+}
+
+// contentBuildSpeedProjection resolves a stored build_speed to the effective
+// policy name for settings-get (empty means the default, balanced).
+func contentBuildSpeedProjection(speed string) string {
+	if resolved, ok := parseContentBuildSpeed(speed); ok {
+		return resolved
+	}
+	return contentBuildSpeedBalanced
 }
 
 func normalizeSettingsVolume(volume string) string {
@@ -428,6 +451,11 @@ func validateSettingsContentPatch(field string, patch *settingsContentPatch, kno
 	}
 	if patch.BudgetBytes != nil && *patch.BudgetBytes < 0 {
 		return fmt.Errorf("%s.budget_bytes: must be >= 0", field)
+	}
+	if patch.BuildSpeed != nil {
+		if _, ok := parseContentBuildSpeed(*patch.BuildSpeed); !ok {
+			return fmt.Errorf("%s.build_speed: invalid value %q (want balanced, fast, or gentle)", field, *patch.BuildSpeed)
+		}
 	}
 	return nil
 }
@@ -519,6 +547,7 @@ func (s *goSearchService) addSettingsVolume(volume string) error {
 		db:       db,
 		cancel:   make(chan struct{}),
 		finished: make(chan struct{}),
+		progress: newVolumeBuildProgress(),
 	}
 	s.settingsVolumeTasks[volume] = task
 	delete(s.settingsVolumeErrs, volume)
@@ -546,7 +575,12 @@ func (s *goSearchService) runSettingsVolumeBuild(task *settingsVolumeTask) {
 	default:
 	}
 
-	idx, err := s.buildIndexUSNVolume(task.volume, task.db)
+	// Whether the build succeeds or fails, the in-memory Index and its MFT
+	// tables are unreachable once it returns. Drop them and give the pages back
+	// to the OS so a 2 GB build peak does not stay resident in lowmem mode.
+	defer releaseBuildMemoryAfterSettings(task.volume)
+
+	idx, err := s.buildIndexUSNVolume(task.volume, task.db, task.progress)
 
 	s.settingsVolumeMu.Lock()
 	current := s.settingsVolumeTasks[task.volume] == task
@@ -759,7 +793,8 @@ func settingsRemoveDB(dbs []string, db string) []string {
 func (s *goSearchService) applySettingsContent(patch *settingsContentPatch) error {
 	pluginPath := s.pluginFilePath()
 	hasScope := patch.Mode != nil || patch.Roots != nil || patch.Exclude != nil ||
-		patch.Exts != nil || patch.Git != nil || patch.SystemExcludes != nil || patch.BudgetBytes != nil
+		patch.Exts != nil || patch.Git != nil || patch.SystemExcludes != nil || patch.BudgetBytes != nil ||
+		patch.BuildSpeed != nil
 
 	defs, err := loadPluginDefinitions(pluginPath)
 	if err != nil {
@@ -795,6 +830,9 @@ func (s *goSearchService) applySettingsContent(patch *settingsContentPatch) erro
 			}
 			if patch.BudgetBytes != nil {
 				d.Content.BudgetBytes = *patch.BudgetBytes
+			}
+			if patch.BuildSpeed != nil {
+				d.Content.BuildSpeed = *patch.BuildSpeed
 			}
 			if patch.Enabled != nil {
 				d.Feature.Enabled = *patch.Enabled
@@ -975,6 +1013,9 @@ func formatSettingsContentSection(header string, sc contentScopeConfig) string {
 	if sc.Worktrees != "" {
 		fmt.Fprintf(&b, "worktrees = %s\n", strconvQuote(sc.Worktrees))
 	}
+	if sc.BuildSpeed != "" {
+		fmt.Fprintf(&b, "build_speed = %s\n", strconvQuote(sc.BuildSpeed))
+	}
 	if sc.Skip != nil {
 		fmt.Fprintf(&b, "skip = %s\n", formatStringArray(sc.Skip))
 	}
@@ -1118,6 +1159,7 @@ func runSettingsSet(args []string, out io.Writer) (err error) {
 	pipe := fs.String("pipe", defaultServicePipe, "resident service pipe")
 	jsonPath := fs.String("json", "", "settings JSON file")
 	resultPath := fs.String("result", "", "write the service response JSON here (for the elevated app helper)")
+	progressPath := fs.String("progress", "", "append JSON progress lines here (for the elevated app helper)")
 	installService := fs.Bool("install-service", false, "first install and start seekfs as an automatic Windows service on --pipe (elevated)")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -1146,13 +1188,16 @@ func runSettingsSet(args []string, out io.Writer) (err error) {
 	if err := json.Unmarshal(data, &raw); err != nil {
 		return fmt.Errorf("settings JSON: %w", err)
 	}
+	progress := newSettingsProgress(*progressPath)
+	progress.report(progressPhaseStart)
 	if *installService {
-		if err := settingsInstallService(*pipe); err != nil {
+		if err := settingsInstallService(*pipe, progress); err != nil {
 			return err
 		}
-	} else if err := ensureSettingsServiceElevated(*pipe, raw); err != nil {
+	} else if err := ensureSettingsServiceElevated(*pipe, raw, progress); err != nil {
 		return err
 	}
+	progress.report(progressPhaseApply)
 	resp, err = callService(*pipe, serviceRequest{Command: "settings-set", Settings: raw})
 	if err != nil {
 		return err

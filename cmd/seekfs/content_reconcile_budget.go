@@ -96,7 +96,7 @@ func contentReconcileTrimNewLimits(newKeys []uint64, rank map[uint64]contentScop
 			cands = append(cands, cand{item: contentBuildItem{frn: key, priority: int(^uint(0) >> 1)}})
 			continue
 		}
-		cands = append(cands, cand{item: contentBuildItem{frn: key, path: m.path, priority: m.priority}, size: contentReconcileCharge(m)})
+		cands = append(cands, cand{item: contentBuildItem{frn: key, path: m.path, priority: m.priority, mod: m.mod, size: m.size}, size: contentReconcileCharge(m)})
 	}
 	sort.Slice(cands, func(i, j int) bool { return contentBuildItemLess(cands[i].item, cands[j].item) })
 	var used, indexUsed int64

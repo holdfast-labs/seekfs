@@ -316,6 +316,13 @@ func TestSettingsSetRequiresElevationAndRemoteIsDenied(t *testing.T) {
 
 func useSettingsIndexStub(t *testing.T, stub func(string) (*Index, error)) {
 	t.Helper()
+	useSettingsIndexProgressStub(t, func(volume string, _ *volumeBuildProgress) (*Index, error) {
+		return stub(volume)
+	})
+}
+
+func useSettingsIndexProgressStub(t *testing.T, stub func(string, *volumeBuildProgress) (*Index, error)) {
+	t.Helper()
 	previous := serviceIndexUSNVolume
 	serviceIndexUSNVolume = stub
 	t.Cleanup(func() { serviceIndexUSNVolume = previous })

@@ -222,10 +222,11 @@ func groupByFolder(rows []ResultRow) []Group {
 // DBVolume describes one loaded index from the service info response, for
 // the sidebar's volume list.
 type DBVolume struct {
-	Path    string
-	Volume  string
-	Entries int
-	State   string
+	Path     string
+	Volume   string
+	Entries  int
+	State    string
+	Progress *serviceVolumeProgress
 }
 
 func dbVolumesFrom(resp serviceResponse) []DBVolume {

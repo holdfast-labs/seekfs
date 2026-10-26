@@ -47,13 +47,14 @@ func TestContentBuildWorkerCountAdaptive(t *testing.T) {
 		contentBuildBatchSize = restoreBatch
 	})
 	contentBuildWorkers = 4
+	contentSetBuildSpeed(contentBuildSpeedBalanced)
 	if got := contentBuildWorkerCount(); got != 4 {
 		t.Fatalf("quiet+mains workers = %d; want the static cap 4", got)
 	}
-	// Each user-activity signal alone drops the build to one worker.
+	// Balanced: recent activity uses the active cap (4), not one worker.
 	serviceNoteQueryActivity()
-	if got := contentBuildWorkerCount(); got != 1 {
-		t.Fatalf("recent-query workers = %d; want 1", got)
+	if got := contentBuildWorkerCount(); got != 4 {
+		t.Fatalf("recent-query workers = %d; want the active cap 4", got)
 	}
 	serviceLastQueryUnixNano.Store(0)
 	serviceActiveQueryEnter()
@@ -63,18 +64,26 @@ func TestContentBuildWorkerCountAdaptive(t *testing.T) {
 	}
 	serviceActiveQueryLeave()
 	contentInputActiveNow = func() bool { return true }
-	if got := contentBuildWorkerCount(); got != 1 {
-		t.Fatalf("input workers = %d; want 1", got)
+	if got := contentBuildWorkerCount(); got != 4 {
+		t.Fatalf("input workers = %d; want the active cap 4", got)
 	}
 	contentInputActiveNow = func() bool { return false }
 	contentOnBatteryNow = func() bool { return true }
-	if got := contentBuildWorkerCount(); got != 1 {
-		t.Fatalf("battery workers = %d; want 1", got)
+	if got := contentBuildWorkerCount(); got != 2 {
+		t.Fatalf("battery workers = %d; want 2", got)
 	}
 	contentOnBatteryNow = func() bool { return false }
 	if got := contentBuildWorkerCount(); got != 4 {
 		t.Fatalf("quiet-again workers = %d; want the static cap 4", got)
 	}
+	// Gentle keeps the old one-worker-while-active behavior.
+	contentSetBuildSpeed(contentBuildSpeedGentle)
+	contentUserActiveNow = func() bool { return true }
+	if got := contentBuildWorkerCount(); got != 1 {
+		t.Fatalf("gentle active workers = %d; want 1", got)
+	}
+	contentUserActiveNow = func() bool { return false }
+	contentSetBuildSpeed(contentBuildSpeedBalanced)
 	// Background CPU/disk pressure slows pauses but must not serialize
 	// extraction: workers stay at the cap.
 	contentSystemBusyNow = func() bool { return true }
@@ -104,6 +113,7 @@ func TestContentBuildAdaptivePrefetchScalesDownAndUp(t *testing.T) {
 	})
 	contentBuildWorkers = 4
 	contentBuildBatchSize = 4
+	contentSetBuildSpeed(contentBuildSpeedBalanced)
 	const n = 24
 	items := make([]contentBuildItem, n)
 	for i := range items {
@@ -125,7 +135,9 @@ func TestContentBuildAdaptivePrefetchScalesDownAndUp(t *testing.T) {
 			t.Fatalf("chunk item %d: frn=%d live=%v; want frn=%d", i, got.doc.frn, live, i+1)
 		}
 	}
-	serviceNoteQueryActivity()
+	// An in-flight foreground query drops every mode to one worker for the
+	// duration of the query.
+	serviceActiveQueryEnter()
 	a.adapt()
 	if got := a.workerCount(); got != 1 {
 		t.Fatalf("loaded workers = %d; want 1", got)
@@ -141,9 +153,9 @@ func TestContentBuildAdaptivePrefetchScalesDownAndUp(t *testing.T) {
 			t.Fatalf("loaded workers at item %d = %d; want 1", i, got)
 		}
 	}
-	// Load clears mid-build: the stream scales back to the cap and still
-	// delivers the tail exactly once, in order.
-	serviceLastQueryUnixNano.Store(0)
+	// The query finishes mid-build: the stream scales back to the cap and
+	// still delivers the tail exactly once, in order.
+	serviceActiveQueryLeave()
 	a.adapt()
 	if got := a.workerCount(); got != 4 {
 		t.Fatalf("recovered workers = %d; want 4", got)

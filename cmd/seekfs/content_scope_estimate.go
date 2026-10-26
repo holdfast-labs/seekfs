@@ -271,7 +271,7 @@ func scanContentScope(idx *Index, scope contentScope, volume string, maxFiles in
 		if cap := contentInclusionTextCap(inRepo); n > cap {
 			n = cap
 		}
-		c := contentEstimateCandidate{item: contentBuildItem{frn: rec.FRN, path: path, priority: resolved.priority(path)}, unit: unit, kind: kind, ext: ext, bytes: n, size: size}
+		c := contentEstimateCandidate{item: contentBuildItem{frn: rec.FRN, path: path, priority: resolved.priority(path), mod: rec.ModUnix, size: size}, unit: unit, kind: kind, ext: ext, bytes: n, size: size}
 		if maxFiles <= 0 || len(candidates) < maxFiles {
 			candidates = append(candidates, c)
 			continue

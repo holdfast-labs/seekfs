@@ -123,6 +123,10 @@ func runUI(pipe string, limit int) error {
 	u := newUI(pipe, limit, w.Invalidate)
 	u.win = w
 	u.gdiPresent = gdi
+	if err := startUIAutomation(u); err != nil {
+		return err
+	}
+	defer stopUIAutomation()
 
 	// Restore window size (settings store 96-dpi px; Gio takes dp).
 	ww, hh := u.settings.WindowW, u.settings.WindowH
@@ -145,6 +149,11 @@ func runUI(pipe string, limit int) error {
 
 	// Theme poll: re-render when the OS theme or accent changes.
 	go u.themePoll(w)
+	// Background status refresher: info polls at a state-dependent cadence.
+	go u.statusRefreshLoop()
+	// Settings poll: progress animation frames and a settings-get every 500 ms
+	// while the panel is open or a drive is indexing.
+	go u.settingsProgressPoll(w)
 
 	var ops op.Ops
 	for {
@@ -158,6 +167,7 @@ func runUI(pipe string, limit int) error {
 		case app.ConfigEvent:
 			u.onConfig(e)
 		case app.FrameEvent:
+			uiautoFrameBegin(u, e)
 			gtx := app.NewContext(&ops, e)
 			u.layout(gtx)
 			u.maybeSaveShot(gtx)
@@ -165,6 +175,7 @@ func runUI(pipe string, limit int) error {
 				u.presentGDI(gtx)
 			}
 			e.Frame(gtx.Ops)
+			uiautoFrameEnd(u)
 		}
 	}
 }
@@ -206,30 +217,42 @@ func (u *UI) themePoll(w *app.Window) {
 	}
 }
 
-// initialInfo runs the service handshake off the UI thread.
+// settingsProgressPoll renders the progress animation at at most 10 Hz and
+// polls settings-get every 500 ms while the Settings panel is open or a drive
+// is indexing. It stops polling (but keeps the cheap ticker) when neither is
+// active.
+func (u *UI) settingsProgressPoll(w *app.Window) {
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	lastPoll := time.Time{}
+	for range ticker.C {
+		u.mu.Lock()
+		indexing := u.settingsIndexing
+		panel := u.settingsPoll
+		u.mu.Unlock()
+		if !indexing && !panel {
+			continue
+		}
+		if indexing {
+			w.Invalidate()
+		}
+		if time.Since(lastPoll) < 500*time.Millisecond {
+			continue
+		}
+		lastPoll = time.Now()
+		resp, err := u.client.SettingsGet()
+		if err == nil && resp.OK && resp.Settings != nil {
+			u.postSettingsMerge(resp)
+		}
+	}
+}
+
+// initialInfo runs the service handshake off the UI thread. The background
+// refresher owns later info polls.
 func (u *UI) initialInfo() {
 	resp, err := u.ensureService()
-	u.mu.Lock()
-	u.noVolumes = err == nil && len(resp.DBs) == 0
-	if err != nil {
-		u.health, u.healthMsg = serviceHealthError, err.Error()
-	} else if resp.Loading {
-		u.health, u.healthMsg = serviceHealthDegraded, "Loading indexes…"
-		u.entries = resp.Entries
-	} else if resp.OK && resp.Entries > 0 {
-		u.health = resp.Health
-		if u.health == "" {
-			u.health = serviceHealthOK
-		}
-		u.healthMsg = resp.HealthMessage
-		u.entries = resp.Entries
-	} else {
-		u.health, u.healthMsg = serviceHealthError, firstNonEmpty(resp.Message, "service has no search indexes loaded")
-	}
-	vols := dbVolumesFrom(resp)
-	u.mu.Unlock()
-	u.rebuildSideRows(vols)
-	u.invalidate()
+	u.applyStatus(statusFromInfo(resp, err))
+	go u.seedSettingsSnapshot()
 }
 
 // deliver handles a Searcher result on the searcher goroutine: store under

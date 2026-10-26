@@ -107,24 +107,30 @@ func TestSelectedRowKeepsTextX(t *testing.T) {
 	}
 }
 
-func TestSettingsHeaderSubtitleOnlyWhenBusyOrIndexing(t *testing.T) {
-	_, p := settingsTestUI(t, false)
-	if got := settingsHeaderSubtitle(p); got != "" {
+func TestSettingsHeaderSubtitleOnlyDetailedText(t *testing.T) {
+	u, p := settingsTestUI(t, false)
+	if got := u.settingsHeaderSubtitle(p); got != "" {
 		t.Fatalf("ready volumes subtitle = %q, want empty", got)
 	}
-	p.model.draft.Volumes[0].State = "indexing"
-	if got := settingsHeaderSubtitle(p); got != "Indexing..." {
-		t.Fatalf("indexing volume subtitle = %q, want \"Indexing...\"", got)
+	v := &p.model.draft.Volumes[0]
+	v.State = "indexing"
+	v.Progress = &serviceVolumeProgress{Done: 42, Total: 100}
+	if got, want := u.settingsHeaderSubtitle(p), formatIndexingProgress(v.Progress); got != want {
+		t.Fatalf("indexing volume subtitle = %q, want %q", got, want)
 	}
-	p.model.draft.Volumes[0].State = "ready"
+	v.State = "ready"
 	p.load = true
-	if got := settingsHeaderSubtitle(p); got != "Loading..." {
-		t.Fatalf("in-flight load subtitle = %q, want \"Loading...\"", got)
+	if got := u.settingsHeaderSubtitle(p); got != "" {
+		t.Fatalf("in-flight load subtitle = %q, want empty", got)
 	}
 	p.load = false
 	p.saving = true
-	if got := settingsHeaderSubtitle(p); got != "Applying..." {
-		t.Fatalf("in-flight save subtitle = %q, want \"Applying...\"", got)
+	if got := u.settingsHeaderSubtitle(p); got != "" {
+		t.Fatalf("generic apply subtitle = %q, want empty", got)
+	}
+	u.setApplyStep("Installing service…")
+	if got := u.settingsHeaderSubtitle(p); got != "Installing service…" {
+		t.Fatalf("detailed apply subtitle = %q", got)
 	}
 }
 
@@ -204,5 +210,33 @@ func TestCellIconFallbackGlyph(t *testing.T) {
 	}
 	if ink == 0 {
 		t.Fatal("nil shell icon rendered no fallback glyph")
+	}
+}
+
+func TestEmptyContentPresentation(t *testing.T) {
+	unavailable := "Content index unavailable: content indexing unavailable: the content index is not built or still building"
+	disabled := "content search is disabled; run seekfs plugin add content to enable it"
+	pluginMissing := "content: plugin is not installed; run seekfs plugin add content"
+	cases := []struct {
+		name    string
+		unavail string
+		health  *contentState
+		kind    emptyContentKind
+		title   string
+		hint    string
+	}{
+		{"building with percent", unavailable, &contentState{State: contentStateIndexing, BuildDone: 31, BuildTotal: 100}, emptyContentBuilding, "Content index is building \u2014 31%", "Matches appear as files are indexed"},
+		{"building without percent", unavailable, &contentState{State: contentStateIndexing}, emptyContentBuilding, "Content index is building", "Matches appear as files are indexed"},
+		{"not built but enabled", unavailable, nil, emptyContentBuilding, "Content index is building", "Matches appear as files are indexed"},
+		{"off disabled", disabled, nil, emptyContentOff, "Content search is off", "Turn it on in Settings \u203a Content search"},
+		{"plugin missing", pluginMissing, nil, emptyContentOff, "Content search is off", "Turn it on in Settings \u203a Content search"},
+		{"real build error", unavailable, &contentState{State: contentStateDegraded, BuildError: "disk full"}, emptyContentError, "Content index error", "disk full"},
+		{"no content issue", "", nil, emptyContentNone, "", ""},
+	}
+	for _, tc := range cases {
+		got := emptyContentPresentation(tc.unavail, tc.health)
+		if got.Kind != tc.kind || got.Title != tc.title || got.Hint != tc.hint {
+			t.Errorf("%s = %+v, want kind=%d title=%q hint=%q", tc.name, got, tc.kind, tc.title, tc.hint)
+		}
 	}
 }

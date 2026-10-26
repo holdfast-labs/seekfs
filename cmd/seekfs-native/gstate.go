@@ -62,11 +62,12 @@ type UI struct {
 	accent color.NRGBA
 
 	// Settings overlay (gsettings.go).
-	settingsOpen    bool
-	gsettings       *settingsPanelState
-	settingsPending settingsPendingResult
-	settingsBtn     widget.Clickable
-	emptyDrivesBtn  widget.Clickable
+	settingsOpen       bool
+	gsettings          *settingsPanelState
+	settingsPending    settingsPendingResult
+	settingsBtn        widget.Clickable
+	emptyDrivesBtn     widget.Clickable
+	contentSettingsBtn widget.Clickable
 
 	// Widgets.
 	searchEd    widget.Editor
@@ -140,14 +141,31 @@ type UI struct {
 	gdiHead gdiHeadless
 	// frame times for perf measurement.
 	frameTimes []float64
+
+	// Indexing progress snapshot from the last settings-get (also kept while
+	// the Settings panel is closed) and the elevated helper step.
+	settingsSnapshot *serviceSettings
+	settingsIndexing bool
+	applyStep        string
+
+	// Status refresher state. contentHealth is the content-index telemetry
+	// from the last info response; loadedVolumes is the loaded volume set
+	// (without build-only rows); loadingIndex reports an in-flight service
+	// index load; settingsPoll keeps settings-get polling alive while the
+	// Settings panel is open. All are guarded by mu.
+	contentHealth *contentState
+	loadedVolumes []DBVolume
+	loadingIndex  bool
+	settingsPoll  bool
 }
 
 type sideRow struct {
-	kind  sideKind
-	label string
-	under string // scope target
-	query string // saved search to run
-	depth int
+	kind   sideKind
+	label  string
+	under  string // scope target
+	query  string // saved search to run
+	depth  int
+	suffix string // trailing status (indexing percentage, count, error)
 }
 
 // scrollTo moves the results lists so row i is visible.

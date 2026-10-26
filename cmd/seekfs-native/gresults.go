@@ -3,12 +3,15 @@ package main
 import (
 	"image"
 	"image/color"
+	"strings"
 
 	"gioui.org/f32"
 	"gioui.org/io/event"
 	"gioui.org/io/key"
 	"gioui.org/io/pointer"
 	"gioui.org/layout"
+	"gioui.org/op"
+	"gioui.org/op/clip"
 	"gioui.org/op/paint"
 	"gioui.org/text"
 	"gioui.org/unit"
@@ -44,6 +47,13 @@ func (u *UI) layoutResults(gtx layout.Context) layout.Dimensions {
 				return layout.Dimensions{}
 			}
 			return u.layoutHeader(gtx)
+		}),
+		layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+			notice := u.contentNotice()
+			if notice == "" {
+				return layout.Dimensions{}
+			}
+			return u.layoutContentNotice(gtx, notice)
 		}),
 		layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
 			switch view {
@@ -91,6 +101,28 @@ func (u *UI) layoutResults(gtx layout.Context) layout.Dimensions {
 		}
 	}
 	return base
+}
+
+// contentNotice reports the contents-incomplete banner text for this frame.
+func (u *UI) contentNotice() string {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return contentIncompleteNotice(u.contents, u.contentHealth)
+}
+
+// layoutContentNotice renders the contents-incomplete banner under the header.
+func (u *UI) layoutContentNotice(gtx layout.Context, text string) layout.Dimensions {
+	s := u.scheme
+	mac := op.Record(gtx.Ops)
+	dims := layout.Inset{Left: Dp(12), Right: Dp(12), Top: Dp(5), Bottom: Dp(5)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+		return label(u.th, Sp(12), text, s.Warning).Layout(gtx)
+	})
+	call := mac.Stop()
+	defer clip.Rect{Max: dims.Size}.Push(gtx.Ops).Pop()
+	paint.ColorOp{Color: s.Header}.Add(gtx.Ops)
+	paint.PaintOp{}.Add(gtx.Ops)
+	call.Add(gtx.Ops)
+	return dims
 }
 
 // hoverTipRow returns the hovered row index when its folder is truncated,
@@ -439,6 +471,73 @@ func (u *UI) layoutDetailList(gtx layout.Context, rows []ResultRow) layout.Dimen
 
 // layoutEmpty renders the centered empty/error state for the results area:
 // icon + title + hint. It lives below the column headers, never over them.
+// indexingSummary returns the empty-view title for volumes still being
+// indexed, e.g. "Indexing C: 42%" or "Indexing C:, D:…", and whether any is.
+func indexingSummary(vols []DBVolume) (string, bool) {
+	var names []string
+	pct := -1
+	for _, v := range vols {
+		if v.State != "indexing" {
+			continue
+		}
+		names = append(names, firstNonEmpty(v.Volume, v.Path))
+		pct = indexingPercent(v.Progress)
+	}
+	switch {
+	case len(names) == 0:
+		return "", false
+	case len(names) == 1 && pct >= 0:
+		return "Indexing " + names[0] + " " + itoa(pct) + "%", true
+	default:
+		return "Indexing " + strings.Join(names, ", ") + "…", true
+	}
+}
+
+type emptyContentKind int
+
+const (
+	emptyContentNone emptyContentKind = iota
+	emptyContentBuilding
+	emptyContentOff
+	emptyContentError
+)
+
+type emptyContentView struct {
+	Kind  emptyContentKind
+	Title string
+	Hint  string
+}
+
+// emptyContentPresentation classifies a content-unavailable refusal for the
+// empty view. A build (or an enabled but not-yet-built index) is not "off";
+// only a disabled plugin is. A real build error stays an error.
+func emptyContentPresentation(unavail string, c *contentState) emptyContentView {
+	if c != nil && c.BuildError != "" {
+		return emptyContentView{Kind: emptyContentError, Title: "Content index error",
+			Hint: truncateStatusText(c.BuildError, 120)}
+	}
+	low := strings.ToLower(unavail)
+	if strings.Contains(low, "disabled") || strings.Contains(low, "plugin") ||
+		strings.Contains(low, "enable it") {
+		return emptyContentView{Kind: emptyContentOff, Title: "Content search is off",
+			Hint: "Turn it on in Settings \u203a Content search"}
+	}
+	if contentIndexBuilding(c) || strings.Contains(low, "still building") ||
+		strings.Contains(low, "not built") || strings.Contains(low, "content indexing unavailable") {
+		title := "Content index is building"
+		if c != nil && contentIndexBuilding(c) && c.BuildTotal > 0 {
+			title += " \u2014 " + itoa(contentBuildPercent(c)) + "%"
+		}
+		return emptyContentView{Kind: emptyContentBuilding, Title: title,
+			Hint: "Matches appear as files are indexed"}
+	}
+	if unavail != "" && contentUnavailableString(unavail) {
+		return emptyContentView{Kind: emptyContentError, Title: "Content index unavailable",
+			Hint: "Open Settings \u203a Content search for details"}
+	}
+	return emptyContentView{Kind: emptyContentNone}
+}
+
 func (u *UI) layoutEmpty(gtx layout.Context) layout.Dimensions {
 	th := u.th
 	s := u.scheme
@@ -447,14 +546,25 @@ func (u *UI) layoutEmpty(gtx layout.Context) layout.Dimensions {
 	unavail := u.unavail
 	fuzzy := u.fuzzyMsg
 	noVolumes := u.noVolumes
+	contentHealth := cloneContentState(u.contentHealth)
+	indexingTitle, indexing := indexingSummary(u.volumes)
 	u.mu.Unlock()
-	if firstRunClicked := noVolumes && query == "" && unavail == ""; firstRunClicked && u.emptyDrivesBtn.Clicked(gtx) {
+	contentView := emptyContentPresentation(unavail, contentHealth)
+	if contentView.Kind == emptyContentOff && u.contentSettingsBtn.Clicked(gtx) {
+		u.openSettingsTab(settingsTabContent)
+	}
+	if firstRunClicked := noVolumes && !indexing && query == "" && unavail == ""; firstRunClicked && u.emptyDrivesBtn.Clicked(gtx) {
 		u.openSettingsTab(settingsTabDrives)
 	}
 	icon, title, hint := iconSearch, "Type to search", "Results appear as you type"
 	firstRun := false
-	if unavail != "" {
-		icon, title, hint = iconContents, "Content search is off", "Run `seekfs plugin add content` to enable it"
+	showContentSettings := false
+	if contentView.Kind != emptyContentNone {
+		icon, title, hint = iconContents, contentView.Title, contentView.Hint
+		showContentSettings = contentView.Kind == emptyContentOff
+	} else if indexing && noVolumes {
+		// A drive is being indexed: say so instead of offering first-run setup.
+		icon, title, hint = iconFolder, indexingTitle, "Results appear here as soon as indexing finishes"
 	} else if noVolumes && query == "" {
 		icon, title, hint = iconFolder, "No drives indexed", "Choose the drives seekfs should index"
 		firstRun = true
@@ -482,6 +592,14 @@ func (u *UI) layoutEmpty(gtx layout.Context) layout.Dimensions {
 					})
 				}),
 				layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+					if showContentSettings {
+						if u.contentSettingsBtn.Clicked(gtx) {
+							u.openSettingsTab(settingsTabContent)
+						}
+						return layout.Inset{Top: Dp(16)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+							return chip(gtx, th, s, &u.contentSettingsBtn, "Open content settings", true)
+						})
+					}
 					if !firstRun {
 						return layout.Dimensions{}
 					}

@@ -85,6 +85,7 @@ type settingsPanelState struct {
 	overrideBool widget.Bool
 	enabledBool  widget.Bool
 	modeBtns     [3]widget.Clickable
+	speedBtns    [3]widget.Clickable
 	addRootBtn   widget.Clickable
 	addExclBtn   widget.Clickable
 	rootDel      []widget.Clickable
@@ -105,9 +106,10 @@ type settingsPanelState struct {
 // settingsPendingResult carries a settings-get/set outcome from the
 // background client goroutine to the UI goroutine.
 type settingsPendingResult struct {
-	set  bool
-	resp serviceResponse
-	err  error
+	set   bool
+	resp  serviceResponse
+	err   error
+	merge bool
 }
 
 func newSettingsPanelState(s Settings) *settingsPanelState {
@@ -127,6 +129,9 @@ func (u *UI) openSettings() {
 		return
 	}
 	u.settingsOpen = true
+	u.mu.Lock()
+	u.settingsPoll = true
+	u.mu.Unlock()
 	if u.gsettings == nil {
 		u.gsettings = newSettingsPanelState(u.settings)
 	}
@@ -162,6 +167,9 @@ func (u *UI) openSettingsTab(tab int) {
 // closeSettings hides the panel and discards staged edits.
 func (u *UI) closeSettings() {
 	u.settingsOpen = false
+	u.mu.Lock()
+	u.settingsPoll = false
+	u.mu.Unlock()
 	if u.gsettings != nil {
 		u.gsettings.fieldErr = map[string]string{}
 		u.gsettings.err = ""
@@ -170,11 +178,73 @@ func (u *UI) closeSettings() {
 }
 
 func (u *UI) fetchSettings() {
+	uiautoMark("settings-fetch-start")
 	resp, err := u.client.SettingsGet()
 	u.mu.Lock()
 	u.settingsPending = settingsPendingResult{set: true, resp: resp, err: err}
 	u.mu.Unlock()
+	uiautoMark("settings-fetch-finish")
 	u.invalidate()
+}
+
+// postSettingsMerge delivers a background settings-get result that must not
+// replace the user's staged draft edits.
+func (u *UI) postSettingsMerge(resp serviceResponse) {
+	u.mu.Lock()
+	if u.settingsPending.set && !u.settingsPending.merge {
+		// A fetch or Apply result is waiting; do not replace it.
+		u.mu.Unlock()
+		return
+	}
+	u.settingsPending = settingsPendingResult{set: true, resp: resp, merge: true}
+	u.mu.Unlock()
+	u.invalidate()
+}
+
+// seedSettingsSnapshot reads settings once after startup so indexing that
+// began before the app opened is visible and starts the background poll.
+func (u *UI) seedSettingsSnapshot() {
+	resp, err := u.client.SettingsGet()
+	if err == nil && resp.OK && resp.Settings != nil {
+		u.postSettingsMerge(resp)
+	}
+}
+
+// noteSettingsSnapshot stores the newest server-side view for the status bar
+// and refreshes the main view when the last indexing build finishes.
+func (u *UI) noteSettingsSnapshot(s *serviceSettings) {
+	if s == nil {
+		return
+	}
+	active := hasIndexingVolume(s)
+	u.mu.Lock()
+	was := u.settingsIndexing
+	u.settingsIndexing = active
+	u.settingsSnapshot = s
+	u.mu.Unlock()
+	u.refreshSidebarFromState()
+	if was && !active {
+		go u.refreshAfterIndexing()
+	}
+}
+
+// refreshAfterIndexing polls info once through the status refresher (no
+// service spawn); a changed volume set triggers the query rerun.
+func (u *UI) refreshAfterIndexing() {
+	u.refreshStatusOnce()
+}
+
+func (u *UI) setApplyStep(step string) {
+	u.mu.Lock()
+	u.applyStep = step
+	u.mu.Unlock()
+	u.invalidate()
+}
+
+func (u *UI) currentApplyStep() string {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return u.applyStep
 }
 
 // consumeSettingsPending applies a background result on the UI goroutine.
@@ -183,7 +253,23 @@ func (u *UI) consumeSettingsPending() {
 	pend := u.settingsPending
 	u.settingsPending = settingsPendingResult{}
 	u.mu.Unlock()
-	if !pend.set || u.gsettings == nil {
+	if !pend.set {
+		return
+	}
+	if pend.merge {
+		if pend.err == nil && pend.resp.OK && pend.resp.Settings != nil {
+			p := u.gsettings
+			if p != nil && p.model != nil && !p.saving {
+				p.model.mergeServerState(*pend.resp.Settings)
+			}
+			u.noteSettingsSnapshot(pend.resp.Settings)
+		}
+		return
+	}
+	if u.gsettings == nil {
+		if pend.err == nil && pend.resp.Settings != nil {
+			u.noteSettingsSnapshot(pend.resp.Settings)
+		}
 		return
 	}
 	p := u.gsettings
@@ -192,6 +278,12 @@ func (u *UI) consumeSettingsPending() {
 	p.load = false
 	p.saving = false
 	p.installing = false
+	if wasSaving {
+		uiautoMark("settings-apply-finish")
+		u.mu.Lock()
+		u.applyStep = ""
+		u.mu.Unlock()
+	}
 	if pend.err != nil {
 		p.err = pend.err.Error()
 		return
@@ -204,6 +296,7 @@ func (u *UI) consumeSettingsPending() {
 		p.budgetCustom = p.model.contentValues(p.drive).BudgetBytes > 0
 		p.installService = p.model.offerServiceInstallByDefault()
 		p.syncEditors()
+		u.noteSettingsSnapshot(pend.resp.Settings)
 	}
 	if !pend.resp.OK {
 		p.err = pend.resp.Message
@@ -332,15 +425,41 @@ func (u *UI) applySettings() {
 	p.saving = true
 	p.installing = install
 	p.notice = ""
+	if install {
+		u.setApplyStep("Waiting for administrator approval…")
+	} else {
+		u.setApplyStep("Applying…")
+	}
+	uiautoMark("settings-apply-start")
 	canWrite := p.model.canWrite
 	go u.applySettingsAsync(patch, canWrite, install)
 }
 
+func settingsApplyStepLabel(phase string, install bool) string {
+	switch {
+	case strings.HasPrefix(phase, "restart-"):
+		return "Restarting service as administrator…"
+	case strings.HasPrefix(phase, "install-stop"), strings.HasPrefix(phase, "install-configure"):
+		return "Installing service…"
+	case strings.HasPrefix(phase, "install-start"), strings.HasPrefix(phase, "install-wait"):
+		return "Starting service…"
+	case phase == "apply", phase == "start":
+		return "Applying…"
+	}
+	if install {
+		return "Installing service…"
+	}
+	return "Applying…"
+}
+
 func (u *UI) applySettingsAsync(patch *serviceSettings, canWrite, installService bool) {
+	onPhase := func(phase string) {
+		u.setApplyStep(settingsApplyStepLabel(phase, installService))
+	}
 	if installService {
 		// Installing the service needs the elevated helper; it applies the
 		// staged changes after the service is up.
-		if err := runElevatedSettings(patch, u.client.PipeName, true); err != nil {
+		if err := runElevatedSettings(patch, u.client.PipeName, true, onPhase); err != nil {
 			u.postSettings(serviceResponse{}, err)
 			return
 		}
@@ -354,7 +473,8 @@ func (u *UI) applySettingsAsync(patch *serviceSettings, canWrite, installService
 		return
 	}
 	if err == nil && elevationDecision(canWrite, &resp) {
-		if eerr := runElevatedSettings(patch, u.client.PipeName, false); eerr != nil {
+		u.setApplyStep("Waiting for administrator approval…")
+		if eerr := runElevatedSettings(patch, u.client.PipeName, false, onPhase); eerr != nil {
 			u.postSettings(serviceResponse{}, eerr)
 			return
 		}
@@ -462,19 +582,24 @@ func (u *UI) layoutSettingsCard(gtx layout.Context) layout.Dimensions {
 	return dims
 }
 
-// settingsHeaderSubtitle reports the truthful state line under the Settings
-// title: only an in-flight request or an actually indexing volume qualifies.
-func settingsHeaderSubtitle(p *settingsPanelState) string {
+// settingsHeaderSubtitle reports the detailed state line under the Settings
+// title. It never repeats the generic footer text: a specific apply step or
+// indexing progress qualifies, everything else shows nothing.
+func (u *UI) settingsHeaderSubtitle(p *settingsPanelState) string {
 	if p.saving {
-		return "Applying..."
+		step := u.currentApplyStep()
+		if step == "" || step == "Applying…" || step == "Applying settings…" {
+			return ""
+		}
+		return step
 	}
 	if p.load {
-		return "Loading..."
+		return ""
 	}
 	if p.model != nil {
 		for _, v := range p.model.draft.Volumes {
 			if v.State == "indexing" {
-				return "Indexing..."
+				return formatIndexingProgress(v.Progress)
 			}
 		}
 	}
@@ -498,7 +623,7 @@ func (u *UI) layoutSettingsHeader(gtx layout.Context, p *settingsPanelState) lay
 							return label(u.th, Sp(18), "Settings", s.Text).Layout(gtx)
 						}),
 						layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-							subtitle := settingsHeaderSubtitle(p)
+							subtitle := u.settingsHeaderSubtitle(p)
 							if subtitle == "" {
 								return layout.Dimensions{}
 							}
@@ -551,7 +676,7 @@ func (u *UI) layoutSettingsTabs(gtx layout.Context, p *settingsPanelState) layou
 func (u *UI) layoutSettingsBody(gtx layout.Context, p *settingsPanelState) layout.Dimensions {
 	if p.load && p.model == nil {
 		return layout.Center.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
-			return label(u.th, Sp(14), "Loading settings...", u.scheme.Muted).Layout(gtx)
+			return label(u.th, Sp(14), "Loading settings…", u.scheme.Muted).Layout(gtx)
 		})
 	}
 	if p.model == nil {
@@ -736,7 +861,27 @@ func (u *UI) layoutDriveRow(gtx layout.Context, p *settingsPanelState, v volumeD
 								free = formatBytesCompact(v.FreeBytes) + " free of " + formatBytesCompact(v.TotalBytes)
 							}
 							return layout.Inset{Top: Dp(2)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
-								return label(u.th, Sp(11), free, s.Muted).Layout(gtx)
+								return layout.Flex{Axis: layout.Horizontal, Alignment: layout.Middle}.Layout(gtx,
+									layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
+										return label(u.th, Sp(11), free, s.Muted).Layout(gtx)
+									}),
+									layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+										if state != "indexing" {
+											return layout.Dimensions{}
+										}
+										return layout.Inset{Left: Dp(12)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+											return label(u.th, Sp(11), formatIndexingProgress(v.Progress), s.Muted).Layout(gtx)
+										})
+									}),
+								)
+							})
+						}),
+						layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+							if state != "indexing" {
+								return layout.Dimensions{}
+							}
+							return layout.Inset{Top: Dp(6)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+								return u.indexingBar(gtx, v.Progress)
 							})
 						}),
 						layout.Rigid(func(gtx layout.Context) layout.Dimensions {
@@ -773,7 +918,7 @@ func stateLabel(state string) string {
 	case "ready":
 		return "Indexed"
 	case "indexing":
-		return "Indexing..."
+		return "Indexing…"
 	case "error":
 		return "Error"
 	case "not_indexed":
@@ -804,6 +949,45 @@ func (u *UI) usageBar(gtx layout.Context, total, free int64) layout.Dimensions {
 		fw := int(float64(w) * float64(used) / float64(total))
 		if fw > 0 {
 			defer clip.RRect{Rect: image.Rect(0, 0, fw, h), SE: gtx.Dp(Dp(3)), SW: gtx.Dp(Dp(3)), NW: gtx.Dp(Dp(3)), NE: gtx.Dp(Dp(3))}.Push(gtx.Ops).Pop()
+			paint.ColorOp{Color: s.Muted}.Add(gtx.Ops)
+			paint.PaintOp{}.Add(gtx.Ops)
+		}
+	}
+	return layout.Dimensions{Size: image.Pt(w, h)}
+}
+
+// indexingBar draws a determinate build bar, or a moving segment when the
+// service cannot report a total yet.
+func (u *UI) indexingBar(gtx layout.Context, progress *serviceVolumeProgress) layout.Dimensions {
+	s := u.scheme
+	w := gtx.Constraints.Max.X
+	h := gtx.Dp(Dp(6))
+	if w <= 0 {
+		w = gtx.Dp(Dp(120))
+	}
+	gtx.Constraints.Min = image.Pt(w, h)
+	gtx.Constraints.Max = image.Pt(w, h)
+	roundedFill(gtx, s.Border, image.Pt(w, h), Dp(3))
+	start, width := 0, 0
+	if pct := indexingPercent(progress); pct >= 0 {
+		width = int(float64(w) * float64(pct) / 100)
+	} else {
+		seg := w / 5
+		cycle := int(gtx.Now.UnixMilli() % 1400)
+		start = int(float64(w+seg)*float64(cycle)/1400) - seg
+		width = seg
+	}
+	if width > 0 {
+		minX, maxX := start, start+width
+		if minX < 0 {
+			minX = 0
+		}
+		if maxX > w {
+			maxX = w
+		}
+		if maxX > minX {
+			rect := image.Rect(minX, 0, maxX, h)
+			defer clip.RRect{Rect: rect, SE: gtx.Dp(Dp(3)), SW: gtx.Dp(Dp(3)), NW: gtx.Dp(Dp(3)), NE: gtx.Dp(Dp(3))}.Push(gtx.Ops).Pop()
 			paint.ColorOp{Color: s.Accent}.Add(gtx.Ops)
 			paint.PaintOp{}.Add(gtx.Ops)
 		}
@@ -851,6 +1035,11 @@ func (u *UI) layoutSettingsContent(gtx layout.Context, p *settingsPanelState) la
 	p.block(gtx, "content-mode", func(gtx layout.Context) layout.Dimensions {
 		return u.layoutContentMode(gtx, p, v.Mode)
 	})
+	if p.drive == "" {
+		p.block(gtx, "content-speed", func(gtx layout.Context) layout.Dimensions {
+			return u.layoutContentSpeed(gtx, p, v.BuildSpeed)
+		})
+	}
 	p.block(gtx, "content-roots", func(gtx layout.Context) layout.Dimensions {
 		return u.layoutPathList(gtx, p, "Folders", v.Roots, true)
 	})
@@ -883,6 +1072,20 @@ func (u *UI) layoutSettingsContent(gtx layout.Context, p *settingsPanelState) la
 	p.block(gtx, "content-exts", func(gtx layout.Context) layout.Dimensions {
 		return u.layoutExts(gtx, p)
 	})
+	u.mu.Lock()
+	health := cloneContentState(u.contentHealth)
+	u.mu.Unlock()
+	if detail := contentHealthDetail(health); detail != "" {
+		p.block(gtx, "content-index-status", func(gtx layout.Context) layout.Dimensions {
+			return layout.Inset{Top: Dp(8)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+				l := material.Label(u.th, Sp(11), detail)
+				l.Color = s.Muted
+				l.MaxLines = 4
+				l.Truncator = "\u2026"
+				return l.Layout(gtx)
+			})
+		})
+	}
 	return layout.Dimensions{Size: image.Pt(gtx.Constraints.Max.X, p.cursor)}
 }
 
@@ -1000,6 +1203,58 @@ func (u *UI) layoutContentMode(gtx layout.Context, p *settingsPanelState, mode s
 		}),
 		layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 			return u.fieldError(gtx, p, "mode")
+		}),
+	)
+}
+
+// layoutContentSpeed renders the global indexing-speed selector. Balanced
+// keeps the build responsive, Fast always uses the full worker cap, and
+// Gentle always yields to the user.
+func (u *UI) layoutContentSpeed(gtx layout.Context, p *settingsPanelState, speed string) layout.Dimensions {
+	s := u.scheme
+	speeds := [3]string{contentSpeedBalanced, contentSpeedFast, contentSpeedGentle}
+	labels := [3]string{"Balanced", "Fast", "Gentle"}
+	for i := range p.speedBtns {
+		if p.speedBtns[i].Clicked(gtx) {
+			p.model.setBuildSpeed(speeds[i])
+		}
+	}
+	return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
+		layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+			return label(u.th, Sp(12), "Indexing speed", s.Muted).Layout(gtx)
+		}),
+		layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+			return layout.Inset{Top: Dp(6)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+				return layout.Flex{Axis: layout.Horizontal, Alignment: layout.Middle}.Layout(gtx,
+					layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+						return chip(gtx, u.th, s, &p.speedBtns[0], labels[0], speed == speeds[0])
+					}),
+					layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+						return layout.Inset{Left: Dp(8)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+							return chip(gtx, u.th, s, &p.speedBtns[1], labels[1], speed == speeds[1])
+						})
+					}),
+					layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+						return layout.Inset{Left: Dp(8)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+							return chip(gtx, u.th, s, &p.speedBtns[2], labels[2], speed == speeds[2])
+						})
+					}),
+				)
+			})
+		}),
+		layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+			hint := "Uses a few workers while you work, then the full cap when idle."
+			if speed == contentSpeedFast {
+				hint = "Always uses the full worker cap, including on battery."
+			} else if speed == contentSpeedGentle {
+				hint = "Waits for you: one worker whenever you are active."
+			}
+			return layout.Inset{Top: Dp(4)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+				return label(u.th, Sp(11), hint, s.Muted).Layout(gtx)
+			})
+		}),
+		layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+			return u.fieldError(gtx, p, "build_speed")
 		}),
 	)
 }
@@ -1300,7 +1555,7 @@ func (u *UI) layoutSettingsFooter(gtx layout.Context, p *settingsPanelState) lay
 		notice = p.err
 	}
 	if p.saving {
-		notice = "Applying settings..."
+		notice = firstNonEmpty(u.currentApplyStep(), "Applying settings…")
 	}
 	noticeColor := s.Muted
 	if p.err != "" {

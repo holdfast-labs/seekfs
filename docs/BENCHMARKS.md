@@ -724,3 +724,274 @@ build's footprint instead of scheduler-dependent peak-transient).
   reported `overlay_aware_count` at 17.742 ms/op and
   `search_merge_fallback` at 304.145 ms/op on a 200k-base-record fixture with
   10k overlay creates and 10k tombstones.
+
+## Content Indexing-Speed Policy
+
+2026-10-23, branch `ux/content-speed2`. Cold build of a fresh copy of
+`third_party/blink/renderer/core` (9,403 files) with simulated user activity
+(`contentUserActiveNow=true`, `contentInputActiveNow=true`), Defender on,
+`GOMAXPROCS=8`, in-process `go test` harness. Balanced is the default.
+
+That first table was measured before the governor was made mode-aware. A
+second session with genuinely cold copies (individual opens ~16 ms, Defender
+not serving cached scan results) showed that activity alone did not explain
+the gap between sessions: cold-open cost varies by several times run to run.
+To attribute the remaining throttling, the local harness wrapped
+`contentOpenForExtract` (counting opens with the Low IO-priority hint and
+their duration), read `contentBuildPausesTaken`/`contentBuildPauseReasons`,
+and used `contentAssemblePhaseCapture` for assembly time. Simulated activity
+sets `contentUserActiveNow` and `contentInputActiveNow`; the sidecar is on E:
+so the system-drive rule does not fire; CPU/disk probes read idle.
+
+Attribution on one fresh 9,403-file copy per mode (`GOMAXPROCS=8`, 25 ms batch
+pause, no `SEEKFS_CONTENT_IOPRIORITY` override):
+
+| Mode (active) | Effective workers | Pauses / pause time | Low-IO opens | Open time (sum across workers) | Assembly | Wall | Files/s |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Gentle | 1 | 71 / 1.78 s | 16,210 | 60.4 s | 9.30 s | 50.19 s | 187.3 |
+| Balanced | 4 | 71 / 0.44 s | 16,210 | 134.7 s | 3.90 s | 36.93 s | 254.6 |
+| Fast | 8 | 0 / 0 s | 0 | 218.7 s | 3.75 s | 35.27 s | 266.6 |
+
+Idle at the same worker caps was 269.8 (Gentle), 266.0 (Balanced, 8) and
+265.8 (Fast) files/s, so after the fix Fast active = Fast idle, Balanced
+active is ~96% of idle, and only Gentle (the historical policy) still
+deliberately trades throughput for politeness. The earlier "active" numbers
+were cold-open noise: the same Fast build measured 231 files/s idle and 245
+files/s active in one session, and ~270 files/s in another.
+
+Final sweep (cold fresh copies, 9,403 files, default 25 ms pause,
+`GOMAXPROCS=8`; idle workers use the full cap, active workers follow the
+policy):
+
+| Mode | Activity | Workers | Files/s | Peak heap |
+| --- | --- | ---: | ---: | ---: |
+| Gentle | idle | 8 | 269.8 | 494.7 MB |
+| Gentle | active | 1 | 187.3 | 415.7 MB |
+| Balanced | idle | 8 | 266.0 | 481.9 MB |
+| Balanced | active | 4 | 254.6 | 484.0 MB |
+| Fast | idle | 8 | 265.8 | 484.7 MB |
+| Fast | active | 8 | 266.6 | 475.2 MB |
+
+Governor behavior by mode: Fast ignores input/recent-query/battery pauses
+(0 pauses on the active run above); Balanced shortens input/recent-query
+pauses to a quarter; Gentle keeps the full pause. All modes still yield to an
+in-flight foreground query, to other-process CPU pressure, to a busy disk,
+and to a sidecar on the system drive; Fast keeps normal IO priority, while
+Balanced/Gentle take the Low hint while active. The effective worker count is
+exposed as `build_workers` in content health and the build summary.
+
+## Name-Index Build Memory (MFT/USN)
+
+2026-10-22, branch `ux/build-memory`. Synthetic MFT records (8-40 char names,
+about 8% directories, depth about 8) fed through the same parse/accumulate
+code that `enumMFT` uses, then `buildRecordsFromMFT`, `buildOrders`, and
+`stageIndexFile` into a temp file. Run on an unelevated shell with no raw
+volume access:
+
+```powershell
+$env:SEEKFS_MFT_BENCH_N='1000000'
+go test ./cmd/seekfs -tags uiautomation -run '^$' -bench '^BenchmarkMFTBuildMemory$' -benchtime=1x -v
+```
+
+Bytes per record at each stage (peak HeapInuse). The before column was
+measured at 200,000 records before the change; the after column at 1,000,000
+records. Both shapes scale linearly, so the per-record values compare:
+
+| Stage | Before B/record | After B/record | Change |
+| --- | ---: | ---: | ---: |
+| MFT accumulate (`parseMFTRecordInto`) | 303.9 | 120.7 | -60% |
+| `buildRecordsFromMFT` | 260.9 | 147.2 | -44% |
+| `buildOrders` | 132.4 | 115.2 | -13% |
+| `stageIndexFile` | 646.7 | 447.7 | -31% |
+| Build peak (stage max) | 646.7 | 447.7 | -31% |
+
+Retained heap after the build returns and `runtime.GC()` runs:
+1.3 MB before and after, a 0.0 MB delta from baseline. The former
+`map[uint64]mftEntry` is replaced by a 40-byte record slice indexed by MFT
+record number plus one name byte arena. Names are not copied again for the
+Index: `CompactRecord.Name` views `Index.NameBlob`, and `writeIndexFile`
+publishes that arena as the token table directly.
+
+What still dominates: `stageIndexFile` and its path-rank derived section.
+`buildCompactPathOrderRank` materialises a full lowercase path string for
+every record (about 150-200 MB at 1M records), so the whole-build peak stays
+above the 40% target even though accumulation and record construction now
+clear it. Reducing that needs an arena or trie path key, which this change
+does not attempt.
+
+Service path: a settings-driven build now releases the built `Index` as soon
+as `buildIndexUSNVolume` returns. `runSettingsVolumeBuild` defers a single
+`debug.FreeOSMemory()` and logs
+`index-usn memory volume=... heap_inuse_mb=... released_mb=...`.
+`TestSettingsBuildReleasesBuiltIndex` proves the stub Index is finalizable
+after the build, the installed volume is the reloaded mmap index, and
+HeapInuse returns within a generous baseline bound.
+
+### Name Reuse (Zipf) and Dedup
+
+2026-10-22 follow-up on `ux/build-memory`. Corpus: 1M records, 35% drawn
+from a 2,048-name pool (`index.js`, `README.md`, `.gitignore`,
+`__init__.py`, `package.json`, ...), the rest unique, about 8% directories.
+
+```powershell
+$env:SEEKFS_ZIPF_REPORT='1'; $env:SEEKFS_ZIPF_N='1000000'
+go test ./cmd/seekfs -run TestZipfIndexSizeReport -v
+```
+
+| Metric | Legacy | Compact arena |
+| --- | ---: | ---: |
+| Token count | 651,435 | 651,435 |
+| `.gsi` file bytes | 164,265,724 | 164,265,724 |
+| Token table + name blob | 15,497,716 | 15,497,716 |
+| `LOWR` section | 3,912,103 | 3,912,103 |
+| `PNGR` section | 11,829,861 | 11,829,861 |
+| `PNGC` section | 4,084,648 | 4,084,648 |
+| Accumulate peak | 394.0 B/rec | 115.6 B/rec |
+| Record build peak | 320.2 B/rec | 145.2 B/rec |
+| Build peak (stage max) | 405.8 B/rec | 390.9 B/rec |
+
+The arena now interns names at insert time with an open-addressing table of
+`uint32` arena offsets, so equal names share one arena slice. `Index` carries
+the distinct offset/length list and `writeIndexFile` publishes it as the token
+table. Token count, total file size, name blob, token table, `LOWR`, `PNGR`,
+and `PNGC` match the legacy path byte for byte. `TestZipfNameDedupMatchesLegacy`
+pins this at 20,000 records.
+
+`TestZipfIndexSizeReport` is skipped unless `SEEKFS_ZIPF_REPORT=1`. Retained
+heap after build plus GC is 1.4 MB.
+
+Whole-build peak is still paced by the unchanged `buildCompactPathOrderRank`
+path strings, so on this shorter-name corpus it is only 3.7% below a legacy
+run of the same corpus. Against the pre-change unique-name peak of
+646.7 B/rec, the compact Zipf peak is 40% lower. Accumulation itself is 71%
+lower on identical input.
+
+### Path Rank Without Path Strings
+
+2026-10-22, same 1M Zipf corpus. `buildCompactPathOrderRank` no longer
+materialises one lowercase path string per record. It keeps the legacy lazy
+memo semantics but stores each key as a chain of record ids in one `int32`
+arena, walks parent links, and rebuilds a joined lowercase path only in a
+reusable comparator buffer.
+
+| Metric | Legacy | New |
+| --- | ---: | ---: |
+| Path-rank stage peak | 263.9 B/rec | 242.9 B/rec |
+| Path-rank stage delta over prior stage | 155 MB | 141 MB |
+| Whole-build peak | 415.0 B/rec | 373.1 B/rec |
+| Token count / file size | 651,435 / 164,265,724 | identical |
+| `LOWR` / `PNGR` / `PNGC` | 3,912,103 / 11,829,861 / 4,084,648 | identical |
+
+`TestPathOrderRankMatchesLegacy` checks order and rank arrays plus `PRNK`
+bytes on the Zipf corpus and on an edge fixture (case-only names, deep
+nesting, shared prefixes, unicode, root/root-name skip, orphan).
+`TestPathOrderRankSectionsByteIdentical` routes the legacy arrays through the
+writer and compares the whole index file byte for byte.
+
+The 25% whole-build target is not met: the new whole-build peak is 10% below
+the legacy 415.0 B/rec. Path rank is no longer the peak. The next largest
+consumer is the name-trigram posting build (`PNGR`), whose stage peak is
+355.9 B/rec (about 356 MB at 1M records), followed by path rank at 242.9.
+`PNGR` now sets the whole-build peak, so further reduction needs a streaming
+merge for the trigram postings rather than path work.
+## Content Build: Earlier Availability, Fewer Opens, Bounded Memory
+
+2026-10-22, branch `ux/content-speed` (based on `ux/integ`), local in-process
+`go test` harnesses only (no service process). Machine: Intel i7-10700KF,
+NVMe, Defender real-time scanning on. Every run used
+`GOCACHE=E:\bench\gocache`, `GOMODCACHE=E:\bench\gomodcache`, `go test -p 1`.
+
+### Pre-open selection (fewer opens)
+
+Rules that need only name-index metadata now run before the file is opened:
+known-binary extensions, lockfiles, JSON at or above 100 KiB, minified/bundle
+names (`.min.`, `.bundle.`, `.chunk.`, `.map`), and container formats a rich
+extractor claims (`pdf`, OOXML, RTF, email, ...) when the source size exceeds
+the per-file raw cap. `contentInclusionSkip` and `contentBuildDocSafe` share
+the decision, so both the selection scan and size-blind drain/fold callers
+avoid the open. Directory/git/operator skip rules stay in the selection scan
+where the resolved scope is available.
+
+| Corpus | Live file records | Selection-admitted | Avoided before any open | Over-cap containers added | Avoided of old opens |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Chromium walk index (auto scope) | 509,271 | 468,148 | 41,123 (8.1%) | 0 | 8.1% |
+| Synthetic mixed corpus (365 files: text, images, `node_modules`, `build`, `.cache`, minified, lockfiles, large JSON, 3 MiB PDF/DOCX) | 365 | 210 | 151 (41.4%) | 4 | 42.5% |
+
+Chromium has one PDF over 1 MiB (`complex_document.pdf`, 1.4 MiB, inside a
+repo, raw cap 20 MiB) and no over-cap container, so that corpus gains nothing
+from the container rule; the synthetic corpus exercises it (4 of 214 old
+opens, 1.9%). The remaining Chromium opens are text/code or extensionless
+files whose head must be sniffed.
+
+### Priority order (newest first within a tier)
+
+Extraction order is scope tier first (Git worktrees, configured roots, known
+folders, volume root), then mtime descending, then path/FRN. The record
+mtime rides the snapshot (`contentBuildItem.mod`), so a running build and a
+budget-capped build both have the most recently edited files usable first.
+The final sidecar is still assembled in FRN order, so published bytes are
+unchanged. The estimate and reconcile budget use the same ordering.
+
+### Early publish (time to first usable result)
+
+After `contentPreviewMinDocs` (2,048) documents or 8 MiB of extracted text,
+the build assembles and attaches that prefix as a partial base, reports
+`state=indexing`, `partial=true`, `build_done`/`build_total`, and keeps
+extracting; the final publish replaces the prefix atomically. Measured on a
+Defender-cold copy of `third_party/blink/renderer/core` (9,403 files) with 16
+open workers:
+
+| Metric | Before | After |
+| --- | ---: | ---: |
+| Time to a queryable content base | 12.98 s (end of build) | 2.46 s (preview) |
+| Build wall time | 12.98 s | 12.98 s |
+
+### Memory
+
+Selection metadata retained for the Chromium auto scope (468,148 admitted
+files): 149.1 B/file before (66.6 MB) and 170.6 B/file after (76.1 MB). The
++21.5 B/file is `mod` and `size`, which buy mtime ordering and the pre-open
+size rules. About 90 B of each value is the path text itself (42.0 MB).
+`selectedDoc` now stores an index into the item slice instead of a second
+`contentBuildItem`: 96 B -> 64 B per selected file. Net retained
+selection+selected metadata is about 106 MB after versus 112 MB before for
+this corpus (path text included; structural metadata excluding paths is about
+80 B/file).
+
+Peak heap for a full service build (workers=2 unless noted), sampling
+`HeapAlloc` every 50 ms:
+
+| Corpus | Files | Extracted text | Peak heap | Peak/B/file |
+| --- | ---: | ---: | ---: | ---: |
+| `blink/renderer/core` | 9,403 | 78.7 MB | 399.5 MB | 42.5 KB |
+| `blink/renderer` | 19,540 | about 150 MB | 531.3 MB | 27.2 KB |
+
+Peak is dominated by the per-shard assembler working set (64 MiB shard
+target, token maps plus posting arenas), not by per-file metadata: doubling
+the corpus raised peak by 1.33x, not 2x. The 2026-10-15 profile already
+measured a 64 MiB shard under about 250 MB; the remaining fixed cost is the
+walk index plus the extraction prefetch.
+
+### Cold open-worker sweep
+
+Defender-cold copies of the same 9,403-file subtree, one fresh copy per run
+(new file IDs), `GOMAXPROCS=8`, batch 128, full build wall:
+
+| Open workers | Wall | Files/s | Peak heap |
+| ---: | ---: | ---: | ---: |
+| 1 | 46.53 s | 202.1 | 443.7 MB |
+| 4 | 20.06 s | 468.8 | 463.3 MB |
+| 16 | 12.80 s | 734.6 | 473.1 MB |
+| 64 | 12.53 s | 750.4 | 481.5 MB |
+
+16 workers capture the cold win (3.6x over 1); 64 adds 2%. This supersedes
+the earlier note that 16 workers gave only about 1.5x.
+
+What still dominates cold build time: Defender on-access scanning at first
+open (about 200 files/s at one worker on this corpus). What still dominates
+peak heap: the 64 MiB per-shard assembler batch. The whole-drive report's
+~8 GB spike is not content metadata: the name-index build is the linear
+component, and `ux/build-memory` records it at 447.7 B/record
+(~4.5 GB at 10M records) before its release step (see "Name-Index Build
+Memory"). Content adds about 0.1 GB of retained selection metadata per
+million admitted files plus a bounded per-shard assembler peak.

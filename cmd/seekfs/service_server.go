@@ -167,7 +167,7 @@ func handleServiceConn(conn *os.File, s *goSearchService) {
 	// impersonating the pipe client.  Failures fail closed (read-only).  A
 	// RevertToSelf failure is process-fatal and does not return.
 	principal := servicePrincipalForPipeConn(conn)
-	caps := localServiceCapabilities(principal)
+	caps := fixtureCapabilities(localServiceCapabilities(principal))
 	s.handleServiceCommand(conn, principal, caps, &req)
 }
 
@@ -849,7 +849,7 @@ func (s *goSearchService) serviceCommandWatchDelta(w io.Writer, req *serviceRequ
 }
 
 func (s *goSearchService) serviceCommandIndexUSN(w io.Writer, req *serviceRequest) {
-	idx, err := s.buildIndexUSNVolume(req.Volume, req.DB)
+	idx, err := s.buildIndexUSNVolume(req.Volume, req.DB, nil)
 	if err != nil {
 		_ = json.NewEncoder(w).Encode(serviceResponse{OK: false, Message: err.Error()})
 		return
@@ -860,19 +860,21 @@ func (s *goSearchService) serviceCommandIndexUSN(w io.Writer, req *serviceReques
 // buildIndexUSNVolume runs the index-usn path for one volume and installs the
 // persisted index into the service. The settings API calls the same path when
 // an operator adds a volume.
-func (s *goSearchService) buildIndexUSNVolume(volume, db string) (*Index, error) {
+func (s *goSearchService) buildIndexUSNVolume(volume, db string, progress *volumeBuildProgress) (*Index, error) {
 	serviceLog("index-usn start volume=%s db=%s", volume, db)
-	idx, err := serviceIndexUSNVolume(volume)
+	idx, err := serviceIndexUSNVolume(volume, progress)
 	if err != nil {
 		serviceLog("index-usn error volume=%s err=%v", volume, err)
 		return nil, err
 	}
 	serviceLog("index-usn built volume=%s entries=%d", volume, idx.entryCount())
+	progress.setPhase("building")
 	buildOrders(idx)
 	serviceLog("index-usn orders volume=%s", volume)
 	// Stage the multi-GB v9 write outside the global lock so pipe
 	// requests keep serving while it runs; only the fast swap-in below
 	// takes indexMu.Lock().
+	progress.setPhase("writing")
 	tmp, stageErr := stageIndexFile(db, idx)
 	if stageErr != nil {
 		serviceLog("index-usn stage error volume=%s err=%v", volume, stageErr)

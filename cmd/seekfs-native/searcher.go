@@ -24,10 +24,13 @@ type SearchResult struct {
 	Err          error
 }
 
-// Searcher debounces as-you-type searches and drops stale responses by
-// sequence number, mirroring UIApp.SearchAsync in cmd/seekfs/ui.go. All
-// service I/O happens on a single background goroutine; results arrive on
-// the deliver channel for the UI thread to pick up.
+// Searcher runs as-you-type searches with a leading edge and latest-wins
+// coalescing, and drops stale responses by sequence number, mirroring
+// UIApp.SearchAsync in cmd/seekfs/ui.go. The first query after an idle period
+// is sent without a trailing debounce. While one request is in flight only the
+// latest query is kept and sent when that request returns. All service I/O
+// happens on a background goroutine; results arrive on the deliver channel for
+// the UI thread to pick up.
 type Searcher struct {
 	client *Client
 	limit  int
@@ -42,6 +45,22 @@ type Searcher struct {
 	stopped   bool
 	readyFn   func() bool
 	onDeliver func(SearchResult)
+	inFlight  bool
+}
+
+// searcherBurst is the upper bound on the pre-send coalescing tick. It merges
+// keystrokes that arrive in the same input burst before the first request
+// leaves, but it is much shorter than the old 120 ms trailing debounce.
+const searcherBurst = 2 * time.Millisecond
+
+// burstWindow clamps the constructor's debounce argument to a short pre-send
+// coalescing tick. The argument no longer delays every search by its full
+// value; leading-edge sends start after at most searcherBurst.
+func burstWindow(debounce time.Duration) time.Duration {
+	if debounce <= 0 || debounce > searcherBurst {
+		return searcherBurst
+	}
+	return debounce
 }
 
 func NewSearcher(client *Client, limit int, debounce time.Duration) *Searcher {
@@ -60,8 +79,10 @@ func (s *Searcher) OnDeliver(fn func(SearchResult)) {
 	s.onDeliver = fn
 }
 
-// Query queues a debounced search; only the latest input within the window
-// is sent. Empty or incomplete input yields an immediate empty result.
+// Query queues a search with a leading edge. If no request is in flight it is
+// sent after a short burst-coalescing tick; otherwise only the latest query is
+// kept and sent when the in-flight request returns. Empty or incomplete input
+// yields an immediate empty result.
 func (s *Searcher) Query(raw string, contentsMode bool, under string) int64 {
 	seq := s.seq.Add(1)
 	trimmed := strings.TrimSpace(raw)
@@ -75,9 +96,12 @@ func (s *Searcher) Query(raw string, contentsMode bool, under string) int64 {
 	s.hasPend = true
 	if s.timer != nil {
 		s.timer.Stop()
+		s.timer = nil
 	}
-	want := seq
-	s.timer = time.AfterFunc(s.debounce, func() { s.fire(want) })
+	if !s.inFlight {
+		want := seq
+		s.timer = time.AfterFunc(burstWindow(s.debounce), func() { s.fire(want) })
+	}
 	s.mu.Unlock()
 	return seq
 }
@@ -102,14 +126,32 @@ func (s *Searcher) SearchNow(raw string, contentsMode bool, under string) int64 
 
 func (s *Searcher) fire(want int64) {
 	s.mu.Lock()
-	if !s.hasPend || s.pending.Seq != want || s.stopped {
+	if !s.hasPend || s.pending.Seq != want || s.stopped || s.inFlight {
 		s.mu.Unlock()
 		return
 	}
 	p := s.pending
 	s.hasPend = false
+	s.inFlight = true
 	s.mu.Unlock()
-	s.run(p)
+	go s.runLoop(p)
+}
+
+// runLoop sends p, then sends the latest pending query (if any) as soon as the
+// previous request returns. Only one request is in flight at a time.
+func (s *Searcher) runLoop(p SearchParams) {
+	for {
+		s.run(p)
+		s.mu.Lock()
+		if s.stopped || !s.hasPend {
+			s.inFlight = false
+			s.mu.Unlock()
+			return
+		}
+		p = s.pending
+		s.hasPend = false
+		s.mu.Unlock()
+	}
 }
 
 func (s *Searcher) run(p SearchParams) {

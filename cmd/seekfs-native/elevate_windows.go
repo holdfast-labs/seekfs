@@ -3,12 +3,15 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"syscall"
+	"time"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
@@ -58,7 +61,7 @@ func settingsHelperPath() (string, error) {
 // helper against pipeName, first installing the Windows service when
 // installService is set. It waits for the helper to exit and reports a
 // non-zero status.
-func runElevatedSettings(patch *serviceSettings, pipeName string, installService bool) error {
+func runElevatedSettings(patch *serviceSettings, pipeName string, installService bool, onPhase func(string)) error {
 	helper, err := settingsHelperPath()
 	if err != nil {
 		return err
@@ -92,10 +95,14 @@ func runElevatedSettings(patch *serviceSettings, pipeName string, installService
 	// its outcome (including a validation message) to a result file.
 	resultName := name + ".result"
 	defer os.Remove(resultName)
+	// The elevated helper appends one JSON line per step so the Apply area
+	// can say which step is slow.
+	progressName := name + ".progress"
+	defer os.Remove(progressName)
 
 	verb, _ := syscall.UTF16PtrFromString("runas")
 	file, _ := syscall.UTF16PtrFromString(helper)
-	params, _ := syscall.UTF16PtrFromString(elevatedSettingsArgs(name, resultName, pipeName, installService))
+	params, _ := syscall.UTF16PtrFromString(elevatedSettingsArgs(name, resultName, progressName, pipeName, installService))
 	dir, _ := syscall.UTF16PtrFromString(filepath.Dir(helper))
 	sei := shellExecuteInfo{
 		CbSize:       uint32(unsafe.Sizeof(shellExecuteInfo{})),
@@ -117,29 +124,84 @@ func runElevatedSettings(patch *serviceSettings, pipeName string, installService
 		return errors.New("elevated settings helper did not start")
 	}
 	defer windows.CloseHandle(windows.Handle(sei.HProcess))
-	if _, err := windows.WaitForSingleObject(windows.Handle(sei.HProcess), windows.INFINITE); err != nil {
-		return err
-	}
-	var code uint32
-	if err := windows.GetExitCodeProcess(windows.Handle(sei.HProcess), &code); err != nil {
-		return err
-	}
-	if code != 0 {
-		var result struct {
-			Message string `json:"message"`
+	done := make(chan error, 1)
+	go func() {
+		if _, err := windows.WaitForSingleObject(windows.Handle(sei.HProcess), windows.INFINITE); err != nil {
+			done <- err
+			return
 		}
-		if data, err := os.ReadFile(resultName); err == nil && json.Unmarshal(data, &result) == nil && result.Message != "" {
-			return errors.New(result.Message)
+		var code uint32
+		if err := windows.GetExitCodeProcess(windows.Handle(sei.HProcess), &code); err != nil {
+			done <- err
+			return
 		}
-		return fmt.Errorf("elevated settings helper exited with code %d", code)
+		if code != 0 {
+			var result struct {
+				Message string `json:"message"`
+			}
+			if data, err := os.ReadFile(resultName); err == nil && json.Unmarshal(data, &result) == nil && result.Message != "" {
+				done <- errors.New(result.Message)
+				return
+			}
+			done <- fmt.Errorf("elevated settings helper exited with code %d", code)
+			return
+		}
+		done <- nil
+	}()
+
+	ticker := time.NewTicker(150 * time.Millisecond)
+	defer ticker.Stop()
+	var progressOffset int64
+	for {
+		select {
+		case err := <-done:
+			pollSettingsProgress(progressName, &progressOffset, onPhase)
+			return err
+		case <-ticker.C:
+			pollSettingsProgress(progressName, &progressOffset, onPhase)
+		}
 	}
-	return nil
+}
+
+// pollSettingsProgress reads new JSON progress lines and reports each phase.
+func pollSettingsProgress(path string, offset *int64, onPhase func(string)) {
+	if onPhase == nil || path == "" {
+		return
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	if _, err := f.Seek(*offset, 0); err != nil {
+		return
+	}
+	data, err := io.ReadAll(f)
+	if err != nil {
+		return
+	}
+	lastNewline := bytes.LastIndexByte(data, '\n')
+	if lastNewline < 0 {
+		return
+	}
+	for _, raw := range bytes.Split(data[:lastNewline], []byte{'\n'}) {
+		var line struct {
+			Phase string `json:"phase"`
+		}
+		if json.Unmarshal(raw, &line) == nil && line.Phase != "" {
+			onPhase(line.Phase)
+		}
+	}
+	*offset += int64(lastNewline + 1)
 }
 
 // elevatedSettingsArgs is the helper command line. The pipe is passed so a
 // service on a non-default pipe receives the write.
-func elevatedSettingsArgs(patchPath, resultPath, pipeName string, installService bool) string {
+func elevatedSettingsArgs(patchPath, resultPath, progressPath, pipeName string, installService bool) string {
 	args := "settings set --json " + quoteArg(patchPath) + " --result " + quoteArg(resultPath)
+	if progressPath != "" {
+		args += " --progress " + quoteArg(progressPath)
+	}
 	if pipeName != "" {
 		args += " --pipe " + quoteArg(pipeName)
 	}
